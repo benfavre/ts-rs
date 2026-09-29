@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Workspace check
+        run: cargo check --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -W clippy::all
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests (all crates)
+        run: cargo test --workspace
+
+      - name: Emitter regression suite
+        run: cargo test -p tsc_rs_emitter --test emit_tests -- --nocapture
+
+      - name: Harness smoke baseline suite
+        run: cargo test -p tsc_rs_harness --test baseline_tests run_small_compiler_subset -- --nocapture
+
+  baseline:
+    name: Baseline Non-Regression (${{ matrix.suite }}, ${{ matrix.baseline }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [compiler, conformance]
+        baseline: [js, errors]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request) base_sha="$PR_BASE_SHA" ;;
+            merge_group) base_sha="$MERGE_GROUP_BASE_SHA" ;;
+            push) base_sha="$PUSH_BEFORE_SHA" ;;
+            *) base_sha="" ;;
+          esac
+          if [ -z "$base_sha" ] || [ "$base_sha" = "0000000000000000000000000000000000000000" ]; then
+            base_sha="$(git rev-parse HEAD^)"
+          fi
+          git cat-file -e "${base_sha}^{commit}"
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Reject upstream corpus or oracle changes
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          if ! git diff --quiet "$BASE_SHA" HEAD -- tests; then
+            echo '::error::Baseline repair PRs must not modify upstream tests or reference oracles.'
+            git diff --name-status "$BASE_SHA" HEAD -- tests
+            exit 1
+          fi
+
+      - name: Prepare isolated base and trusted manifest tools
+        id: tools
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          git worktree add --detach /tmp/ts-rs-base "$BASE_SHA"
+          report='crates/tsc_rs_harness/src/bin/baseline-report.rs'
+          compare='crates/tsc_rs_harness/src/bin/baseline-compare.rs'
+          if git -C /tmp/ts-rs-base grep -q -- '--save-manifest' -- "$report" \
+            && [ -f "/tmp/ts-rs-base/$compare" ]; then
+            cp "/tmp/ts-rs-base/$report" "$report"
+            if git -C /tmp/ts-rs-base grep -q -- '--allow-skip-resolutions' -- "$compare"; then
+              cp "/tmp/ts-rs-base/$compare" "$compare"
+              echo 'bootstrap=false' >> "$GITHUB_OUTPUT"
+            else
+              # One-time rollout exception: candidate comparator code may be
+              # used only when this PR contains no compiler, harness behavior,
+              # corpus, or oracle changes. Future revisions use the trusted
+              # comparator from their base commit as usual.
+              unexpected_changes="$(
+                git diff --name-only "$BASE_SHA" HEAD \
+                  | grep -Ev '^(\.github/workflows/rust-ci\.yml|Makefile|crates/tsc_rs_harness/src/bin/baseline-compare\.rs)$' \
+                  || true
+              )"
+              if [ -n "$unexpected_changes" ]; then
+                echo '::error::Refusing comparator bootstrap for a PR with behavior or unrelated changes.'
+                printf '%s\n' "$unexpected_changes"
+                exit 1
+              fi
+              cp "$compare" "/tmp/ts-rs-base/$compare"
+              cmp "$compare" "/tmp/ts-rs-base/$compare"
+              echo 'bootstrap=true' >> "$GITHUB_OUTPUT"
+              echo '::warning::Base comparator predates monotonic skip resolution; using this infrastructure change as identical one-time instrumentation in both revisions.'
+            fi
+          else
+            mkdir -p "$(dirname "/tmp/ts-rs-base/$compare")"
+            cp "$report" "/tmp/ts-rs-base/$report"
+            cp "$compare" "/tmp/ts-rs-base/$compare"
+            echo 'bootstrap=true' >> "$GITHUB_OUTPUT"
+            echo '::warning::Base predates canonical manifests; using this infrastructure change as identical one-time instrumentation in both revisions.'
+          fi
+
+      - name: Generate cache-free candidate manifest
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo run --locked -p tsc_rs_harness --bin baseline-report -- \
+            --suite "${{ matrix.suite }}" \
+            --baseline "${{ matrix.baseline }}" \
+            --no-cache --json \
+            --save-manifest /tmp/candidate.json \
+            > /tmp/candidate-report.json
+
+      - name: Generate cache-free base manifest
+        env:
+          CARGO_TARGET_DIR: /tmp/ts-rs-base-target
+        run: |
+          cargo run --locked \
+            --manifest-path /tmp/ts-rs-base/Cargo.toml \
+            -p tsc_rs_harness --bin baseline-report -- \
+            --root /tmp/ts-rs-base \
+            --suite "${{ matrix.suite }}" \
+            --baseline "${{ matrix.baseline }}" \
+            --no-cache --json \
+            --save-manifest /tmp/base.json \
+            > /tmp/base-report.json
+
+      - name: Enforce exact pass-set non-regression
+        env:
+          CARGO_TARGET_DIR: /tmp/ts-rs-base-target
+        run: |
+          cargo run --locked \
+            --manifest-path /tmp/ts-rs-base/Cargo.toml \
+            -p tsc_rs_harness --bin baseline-compare -- \
+            --base /tmp/base.json --candidate /tmp/candidate.json \
+            --allow-skip-resolutions

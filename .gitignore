@@ -1,0 +1,27 @@
+/target
+/reference
+/.harness-cache/
+/.agent-farm/
+/.agent-worktrees/
+/editors/vscode/node_modules/
+/editors/vscode/dist/
+/editors/vscode/out/
+/editors/vscode/*.vsix
+
+# npm publish staging — per-platform packages get their binary copied
+# into bin/ by `scripts/build-npm.sh` just before publish. Don't commit
+# the binaries (each is ~7MB and they're built artifacts).
+/npm/@bext-stack/tsc-rs-*/bin/tsc-rs
+/npm/@bext-stack/tsc-rs-*/bin/tsc-rs.exe
+/npm/*.tgz
+/npm/@bext-stack/*/*.tgz
+
+# Scratch debugging probes (untracked, per-session)
+crates/tsc_rs_harness/examples/*
+!crates/tsc_rs_harness/examples/profile_check.rs
+a.out
+
+# Local-only telemetry / scratch
+activity.jsonl
+/.harness-manifests/
+*.bak

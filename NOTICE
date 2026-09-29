@@ -1,0 +1,32 @@
+tsc-rs
+Copyright (c) 2025-2026 Benjamin Favre and tsc-rs contributors
+
+The tsc-rs source code is licensed under the MIT License (see LICENSE).
+
+This repository also contains or derives from third-party material that is
+licensed separately:
+
+-------------------------------------------------------------------------------
+TypeScript (https://github.com/microsoft/TypeScript)
+Copyright (c) Microsoft Corporation. All rights reserved.
+Licensed under the Apache License, Version 2.0.
+
+  * tests/ contains the TypeScript compiler test corpus (test cases and
+    reference baselines under tests/cases and tests/baselines, plus the
+    library declaration files under tests/lib), used unmodified as a
+    conformance oracle. tests/cases/zod/ is original to tsc-rs.
+  * Diagnostic message texts in crates/tsc_rs_types (and elsewhere) reproduce
+    TypeScript's diagnostic messages for output compatibility.
+  * Many compiler algorithms are reimplemented after TypeScript's behavior and
+    source code.
+
+-------------------------------------------------------------------------------
+stc (https://github.com/dudykr/stc)
+Licensed under the Apache License, Version 2.0.
+
+  * Parts of crates/tsc_rs_types (type_ops.rs, inference.rs) are ported from
+    stc's type analysis passes.
+
+-------------------------------------------------------------------------------
+A copy of the Apache License, Version 2.0 is available at
+https://www.apache.org/licenses/LICENSE-2.0 and in LICENSE-APACHE-2.0.

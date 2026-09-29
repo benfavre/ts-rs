@@ -1,0 +1,11 @@
+[package]
+name = "tsc_rs_incremental"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Incremental build metadata and change detection for tsc-rs"
+
+[dependencies]
+tsc_rs_project = { path = "../tsc_rs_project" }

@@ -1,0 +1,12 @@
+[package]
+name = "tsc_rs_ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "TypeScript AST types for tsc-rs"
+
+[dependencies]
+compact_str = "0.9"
+

@@ -1,0 +1,19 @@
+{
+  "name": "@bext-stack/tsc-rs-linux-x64",
+  "version": "0.1.1",
+  "description": "tsc-rs prebuilt binary for linux-x64. Installed automatically by @bext-stack/tsc-rs on matching platforms.",
+  "license": "MIT",
+  "author": "Benjamin Favre <benfavre@gmail.com>",
+  "homepage": "https://github.com/benfavre/ts-rs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/benfavre/ts-rs.git",
+    "directory": "npm/@bext-stack/tsc-rs-linux-x64"
+  },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["bin/tsc-rs"],
+  "publishConfig": {
+    "access": "public"
+  }
+}

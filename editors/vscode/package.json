@@ -1,0 +1,209 @@
+{
+  "name": "tsc-rs",
+  "displayName": "tsc-rs TypeScript",
+  "description": "TypeScript language support powered by tsc-rs",
+  "version": "0.4.1",
+  "publisher": "tsc-rs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benfavre/ts-rs",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tsc-rs-sidebar",
+          "title": "tsc-rs",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "tsc-rs-sidebar": [
+        {
+          "id": "tsc-rs.sidebar",
+          "name": "tsc-rs",
+          "type": "webview"
+        }
+      ],
+      "panel": [
+        {
+          "id": "tsc-rs.panel",
+          "name": "tsc-rs",
+          "type": "webview",
+          "when": "true"
+        }
+      ]
+    },
+    "submenus": [
+      {
+        "id": "tsc-rs.submenu",
+        "label": "tsc-rs"
+      }
+    ],
+    "commands": [
+      {
+        "command": "tsc-rs.restartLanguageServer",
+        "title": "Restart Language Server",
+        "category": "tsc-rs"
+      },
+      {
+        "command": "tsc-rs.copyType",
+        "title": "Copy Type",
+        "category": "tsc-rs"
+      },
+      {
+        "command": "tsc-rs.showCompetingExtensions",
+        "title": "Show Competing TypeScript Extensions",
+        "category": "tsc-rs"
+      },
+      {
+        "command": "tsc-rs.copyDebugInfo",
+        "title": "Copy Debug Info (Bug Report)",
+        "category": "tsc-rs"
+      },
+      {
+        "command": "tsc-rs.peekType",
+        "title": "Peek Type",
+        "category": "tsc-rs"
+      },
+      {
+        "command": "tsc-rs.showDiagnostics",
+        "title": "Show Diagnostics at Cursor",
+        "category": "tsc-rs"
+      },
+      {
+        "command": "tsc-rs.showExportMap",
+        "title": "Show Export Map",
+        "category": "tsc-rs"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "submenu": "tsc-rs.submenu",
+          "group": "tsc-rs@1",
+          "when": "editorLangId =~ /typescript|javascript/"
+        }
+      ],
+      "tsc-rs.submenu": [
+        {
+          "command": "tsc-rs.copyType",
+          "group": "1_type@1",
+          "when": "editorLangId =~ /typescript|javascript/"
+        },
+        {
+          "command": "tsc-rs.peekType",
+          "group": "1_type@2",
+          "when": "editorLangId =~ /typescript|javascript/"
+        },
+        {
+          "command": "tsc-rs.showDiagnostics",
+          "group": "1_type@3",
+          "when": "editorLangId =~ /typescript|javascript/"
+        },
+        {
+          "command": "tsc-rs.copyDebugInfo",
+          "group": "2_debug@1",
+          "when": "editorLangId =~ /typescript|javascript/"
+        },
+        {
+          "command": "tsc-rs.restartLanguageServer",
+          "group": "3_server@1"
+        },
+        {
+          "command": "tsc-rs.showCompetingExtensions",
+          "group": "3_server@2"
+        },
+        {
+          "command": "tsc-rs.showExportMap",
+          "group": "3_server@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "tsc-rs",
+      "properties": {
+        "tsc-rs.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit path to the tsc-rs binary. Leave empty to auto-detect a workspace build or fall back to PATH."
+        },
+        "tsc-rs.serverArgs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Extra arguments appended after --lsp when launching tsc-rs."
+        },
+        "tsc-rs.preferWorkspaceBinary": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prefer target/debug/tsc-rs or target/release/tsc-rs from the current workspace when no explicit serverPath is set."
+        },
+        "tsc-rs.disableBuiltinTypescript": {
+          "type": "boolean",
+          "default": true,
+          "description": "Disable the built-in TypeScript/JavaScript language features when tsc-rs is active, to prevent duplicate diagnostics."
+        },
+        "tsc-rs.hover.showDebugInfo": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show debug information (symbol ID, flags, offset, resolution path) in hover tooltips."
+        },
+        "tsc-rs.hover.copyButton": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a 'Copy' button in hover tooltips to copy the type signature."
+        },
+        "tsc-rs.activityLogFile": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a JSONL file for logging all LSP activity. Each line is a JSON object with timestamp, method, file, elapsed, result, and raw server data. Useful for analyzing tsc-rs behavior. Leave empty to disable file logging."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ./",
+    "bundle": "node ./esbuild.mjs",
+    "compile": "npm run typecheck && npm run bundle",
+    "watch": "node ./esbuild.mjs --watch",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "d3-drag": "^3.0.0",
+    "d3-force": "^3.0.0",
+    "d3-selection": "^3.0.0",
+    "d3-zoom": "^3.0.0",
+    "vscode-languageclient": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/d3-drag": "^3.0.7",
+    "@types/d3-force": "^3.0.10",
+    "@types/d3-selection": "^3.0.11",
+    "@types/d3-zoom": "^3.0.8",
+    "@types/node": "^20.17.24",
+    "@types/vscode": "^1.75.0",
+    "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.25.2",
+    "typescript": "^5.0.0"
+  }
+}

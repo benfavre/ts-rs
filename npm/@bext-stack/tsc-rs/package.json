@@ -1,0 +1,28 @@
+{
+  "name": "@bext-stack/tsc-rs",
+  "version": "0.1.1",
+  "description": "tsc-rs — TypeScript compiler in Rust. Drop-in replacement for tsc + a long-running stdin/stdout pipe API used by bext's PRISM dispatcher. Ships prebuilt binaries via per-platform optionalDependencies.",
+  "license": "MIT",
+  "author": "Benjamin Favre <benfavre@gmail.com>",
+  "homepage": "https://github.com/benfavre/ts-rs",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/benfavre/ts-rs.git",
+    "directory": "npm/@bext-stack/tsc-rs"
+  },
+  "keywords": ["typescript", "compiler", "tsc", "ts-rs", "bext"],
+  "type": "module",
+  "bin": {
+    "tsc-rs": "./bin/tsc-rs.mjs"
+  },
+  "files": ["bin/tsc-rs.mjs", "lib/resolve.mjs", "README.md"],
+  "optionalDependencies": {
+    "@bext-stack/tsc-rs-linux-x64": "0.1.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

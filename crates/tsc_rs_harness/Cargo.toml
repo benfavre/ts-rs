@@ -1,0 +1,27 @@
+[package]
+name = "tsc_rs_harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Test harness for tsc-rs"
+
+[dependencies]
+tsc_rs_ast = { path = "../tsc_rs_ast" }
+tsc_rs_scanner = { path = "../tsc_rs_scanner" }
+tsc_rs_parser = { path = "../tsc_rs_parser" }
+tsc_rs_symbols = { path = "../tsc_rs_symbols" }
+tsc_rs_types = { path = "../tsc_rs_types" }
+tsc_rs_emitter = { path = "../tsc_rs_emitter" }
+tsc_rs_resolver = { path = "../tsc_rs_resolver" }
+tsc_rs_project = { path = "../tsc_rs_project" }
+tsc_rs_query = { path = "../tsc_rs_query" }
+tsc_rs_server = { path = "../tsc_rs_server" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+rayon = "1"
+mimalloc = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

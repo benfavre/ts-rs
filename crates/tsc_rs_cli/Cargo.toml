@@ -1,0 +1,34 @@
+[package]
+name = "tsc-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "TypeScript compiler CLI written in Rust"
+
+[dependencies]
+tsc_rs_ast = { path = "../tsc_rs_ast" }
+tsc_rs_emitter = { path = "../tsc_rs_emitter" }
+tsc_rs_harness = { path = "../tsc_rs_harness" }
+tsc_rs_parser = { path = "../tsc_rs_parser" }
+tsc_rs_project = { path = "../tsc_rs_project" }
+tsc_rs_server = { path = "../tsc_rs_server" }
+tsc_rs_analyze = { path = "../tsc_rs_analyze" }
+mimalloc = { version = "0.1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+
+# Used only for the early-boot `setrlimit(RLIMIT_AS, ...)` guardrail in
+# main.rs::install_vmsize_rlimit. Bounds the per-invocation virtual
+# address space so a pathological input (e.g. the 88 MB single-file
+# concat bundle bext-server occasionally hands to us) can't run the
+# host out of memory. Unix targets only; on other platforms the call
+# is compiled out so the dep is still safe to enable unconditionally.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "tsc-rs"
+path = "src/main.rs"

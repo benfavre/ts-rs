@@ -1,0 +1,13 @@
+[package]
+name = "tsc_rs_analyze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Static analysis tools for TypeScript monorepos"
+
+[dependencies]
+tsc_rs_ast = { path = "../tsc_rs_ast" }
+tsc_rs_parser = { path = "../tsc_rs_parser" }
+tsc_rs_resolver = { path = "../tsc_rs_resolver" }

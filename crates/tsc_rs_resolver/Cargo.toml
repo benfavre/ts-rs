@@ -1,0 +1,15 @@
+[package]
+name = "tsc_rs_resolver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Module resolution for tsc-rs"
+
+[dependencies]
+tsc_rs_ast = { path = "../tsc_rs_ast" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

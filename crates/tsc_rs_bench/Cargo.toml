@@ -1,0 +1,46 @@
+[package]
+name = "tsc_rs_bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Benchmarks for tsc-rs scanner, parser, and emitter"
+publish = false
+
+[dependencies]
+tsc_rs_ast = { path = "../tsc_rs_ast" }
+tsc_rs_scanner = { path = "../tsc_rs_scanner" }
+tsc_rs_parser = { path = "../tsc_rs_parser" }
+tsc_rs_emitter = { path = "../tsc_rs_emitter" }
+mimalloc = "0.1"
+
+# Competitors — for head-to-head comparison
+oxc = { version = "0.117.0", features = ["codegen"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "scanner"
+harness = false
+
+[[bench]]
+name = "parser"
+harness = false
+
+[[bench]]
+name = "emitter"
+harness = false
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "compare_parser"
+harness = false
+
+[[bench]]
+name = "compare_pipeline"
+harness = false

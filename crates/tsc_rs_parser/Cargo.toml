@@ -1,0 +1,12 @@
+[package]
+name = "tsc_rs_parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "TypeScript parser for tsc-rs"
+
+[dependencies]
+tsc_rs_ast = { path = "../tsc_rs_ast" }
+tsc_rs_scanner = { path = "../tsc_rs_scanner" }

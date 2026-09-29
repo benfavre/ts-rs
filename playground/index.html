@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>tsc-rs Playground</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    header {
+      padding: 12px 20px;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #f0f6fc;
+    }
+    header h1 span { color: #58a6ff; }
+    .controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-left: auto;
+    }
+    select, button {
+      background: #21262d;
+      color: #c9d1d9;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 5px 12px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    button:hover { background: #30363d; }
+    button.primary {
+      background: #238636;
+      border-color: #2ea043;
+      color: #fff;
+      font-weight: 600;
+    }
+    button.primary:hover { background: #2ea043; }
+    .status {
+      font-size: 12px;
+      color: #8b949e;
+    }
+    .status.ready { color: #3fb950; }
+    .status.error { color: #f85149; }
+    .editors {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+    .panel {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid #30363d;
+    }
+    .panel:last-child { border-right: none; }
+    .panel-header {
+      padding: 8px 16px;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      font-size: 12px;
+      font-weight: 600;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .panel-header .badge {
+      background: #30363d;
+      padding: 1px 6px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: normal;
+    }
+    textarea {
+      flex: 1;
+      background: #0d1117;
+      color: #c9d1d9;
+      border: none;
+      padding: 16px;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+      font-size: 14px;
+      line-height: 1.5;
+      resize: none;
+      outline: none;
+      tab-size: 2;
+    }
+    textarea::placeholder { color: #484f58; }
+    .diagnostics {
+      max-height: 120px;
+      overflow-y: auto;
+      padding: 8px 16px;
+      background: #161b22;
+      border-top: 1px solid #30363d;
+      font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .diag-error { color: #f85149; }
+    .diag-info { color: #8b949e; }
+    .diag-line { color: #484f58; }
+    .timing {
+      font-size: 11px;
+      color: #8b949e;
+      margin-left: auto;
+    }
+    footer {
+      padding: 8px 20px;
+      background: #161b22;
+      border-top: 1px solid #30363d;
+      font-size: 12px;
+      color: #484f58;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    footer a { color: #58a6ff; text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><span>tsc-rs</span> Playground</h1>
+    <div class="controls">
+      <label>
+        <select id="target">
+          <option value="esnext">ESNext</option>
+          <option value="es2022">ES2022</option>
+          <option value="es2020" selected>ES2020</option>
+          <option value="es2015">ES2015</option>
+          <option value="es5">ES5</option>
+        </select>
+      </label>
+      <label>
+        <select id="module">
+          <option value="esnext" selected>ESNext</option>
+          <option value="commonjs">CommonJS</option>
+          <option value="amd">AMD</option>
+          <option value="system">System</option>
+        </select>
+      </label>
+      <button class="primary" id="compile-btn">Compile</button>
+    </div>
+    <span class="status" id="status">Loading WASM...</span>
+  </header>
+
+  <div class="editors">
+    <div class="panel">
+      <div class="panel-header">
+        TypeScript Input
+      </div>
+      <textarea id="input" spellcheck="false" placeholder="Type TypeScript here...">// tsc-rs: TypeScript compiler in Rust, running in your browser via WASM
+
+interface User {
+  id: number;
+  name: string;
+  email: string;
+}
+
+function greet(user: User): string {
+  return `Hello, ${user.name}!`;
+}
+
+const users: User[] = [
+  { id: 1, name: "Alice", email: "alice@example.com" },
+  { id: 2, name: "Bob", email: "bob@example.com" },
+];
+
+// Decorators, enums, generics -- all supported
+enum Direction {
+  Up = "UP",
+  Down = "DOWN",
+  Left = "LEFT",
+  Right = "RIGHT",
+}
+
+class Queue&lt;T&gt; {
+  private items: T[] = [];
+
+  enqueue(item: T): void {
+    this.items.push(item);
+  }
+
+  dequeue(): T | undefined {
+    return this.items.shift();
+  }
+
+  get size(): number {
+    return this.items.length;
+  }
+}
+
+const queue = new Queue&lt;User&gt;();
+users.forEach(u => queue.enqueue(u));
+
+console.log(greet(queue.dequeue()!));
+console.log(`Direction: ${Direction.Up}`);
+</textarea>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        JavaScript Output
+        <span class="timing" id="timing"></span>
+      </div>
+      <textarea id="output" readonly spellcheck="false" placeholder="Compiled JavaScript will appear here..."></textarea>
+      <div class="diagnostics" id="diagnostics"></div>
+    </div>
+  </div>
+
+  <footer>
+    <span>Powered by tsc-rs compiled to WebAssembly</span>
+    <a href="https://github.com/benfavre/ts-rs" target="_blank">GitHub</a>
+    <span style="margin-left: auto;">MIT License</span>
+  </footer>
+
+  <script type="module">
+    // For published package:
+    //   import init, { compile } from 'https://unpkg.com/@tsc-rs/wasm@latest';
+    //
+    // For local dev, copy the WASM build output:
+    //   cp -r crates/tsc_rs_wasm/pkg playground/pkg
+    //   python3 -m http.server -d playground 8080
+
+    const inputEl = document.getElementById('input');
+    const outputEl = document.getElementById('output');
+    const diagEl = document.getElementById('diagnostics');
+    const statusEl = document.getElementById('status');
+    const timingEl = document.getElementById('timing');
+    const targetEl = document.getElementById('target');
+    const moduleEl = document.getElementById('module');
+    const compileBtn = document.getElementById('compile-btn');
+
+    let wasmReady = false;
+    let compileFn = null;
+
+    // Try to load WASM module
+    async function initWasm() {
+      try {
+        const wasm = await import('./pkg/tsc-rs-wasm.js');
+        await wasm.default();
+        compileFn = wasm.compile;
+        wasmReady = true;
+        statusEl.textContent = 'Ready (3.7 MB WASM)';
+        statusEl.className = 'status ready';
+        doCompile();
+      } catch (e) {
+        statusEl.textContent = 'WASM load failed';
+        statusEl.className = 'status error';
+        console.error('Failed to load WASM:', e);
+      }
+    }
+
+    function doCompile() {
+      if (!wasmReady || !compileFn) return;
+
+      const source = inputEl.value;
+      const opts = {
+        target: targetEl.value,
+        module: moduleEl.value,
+        fileName: 'input.ts',
+      };
+
+      const start = performance.now();
+      try {
+        const result = compileFn(source, opts);
+        const elapsed = (performance.now() - start).toFixed(1);
+        timingEl.textContent = `${elapsed}ms`;
+
+        outputEl.value = result.js || '';
+
+        // Show diagnostics
+        diagEl.innerHTML = '';
+        if (result.diagnostics && result.diagnostics.length > 0) {
+          result.diagnostics.forEach(d => {
+            const line = document.createElement('div');
+            line.className = 'diag-error';
+            line.textContent = `Line ${d.line}:${d.column} - ${d.message}`;
+            if (d.code) {
+              const code = document.createElement('span');
+              code.className = 'diag-line';
+              code.textContent = ` (TS${d.code})`;
+              line.appendChild(code);
+            }
+            diagEl.appendChild(line);
+          });
+        } else {
+          const line = document.createElement('div');
+          line.className = 'diag-info';
+          line.textContent = 'No errors';
+          diagEl.appendChild(line);
+        }
+      } catch (e) {
+        outputEl.value = `// Compilation error: ${e.message}`;
+        timingEl.textContent = '';
+      }
+    }
+
+    // Auto-compile on input change (debounced)
+    let debounceTimer;
+    inputEl.addEventListener('input', () => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(doCompile, 300);
+    });
+
+    // Compile on option change
+    targetEl.addEventListener('change', doCompile);
+    moduleEl.addEventListener('change', doCompile);
+    compileBtn.addEventListener('click', doCompile);
+
+    // Tab key inserts spaces in textarea
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const start = inputEl.selectionStart;
+        const end = inputEl.selectionEnd;
+        inputEl.value = inputEl.value.substring(0, start) + '  ' + inputEl.value.substring(end);
+        inputEl.selectionStart = inputEl.selectionEnd = start + 2;
+      }
+    });
+
+    initWasm();
+  </script>
+</body>
+</html>

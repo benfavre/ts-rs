@@ -1,0 +1,6 @@
+# Downloaded benchmark fixtures — not checked in.
+# Run `make bench-fixtures` to download them.
+*.js
+*.ts
+*.tsx
+!.gitignore

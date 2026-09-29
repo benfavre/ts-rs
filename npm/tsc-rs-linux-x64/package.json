@@ -1,0 +1,19 @@
+{
+  "name": "@tsc-rs/linux-x64",
+  "version": "0.1.1",
+  "description": "tsc-rs binary for Linux x64",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benfavre/ts-rs"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "tsc-rs"
+  ]
+}

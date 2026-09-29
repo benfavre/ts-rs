@@ -1,0 +1,20 @@
+# Cargo build configuration for tsc-rs
+# See: https://doc.rust-lang.org/cargo/reference/config.html
+
+[target.x86_64-unknown-linux-gnu]
+# Use lld linker — much faster than default ld for large binaries.
+# Debug binaries are 60-80MB, lld links them ~3-5x faster.
+linker = "clang"
+rustflags = ["-Clink-arg=-fuse-ld=lld"]
+
+[build]
+# Use all available cores for compilation
+jobs = 24
+
+[profile.release]
+# LTO for smallest/fastest release binary
+lto = "thin"
+# Single codegen unit for best optimization
+codegen-units = 1
+# Strip symbols from release binary
+strip = true

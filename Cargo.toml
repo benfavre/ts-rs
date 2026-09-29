@@ -1,0 +1,88 @@
+[workspace]
+members = [
+  "crates/tsc_rs_ast",
+  "crates/tsc_rs_scanner",
+  "crates/tsc_rs_parser",
+  "crates/tsc_rs_symbols",
+  "crates/tsc_rs_types",
+  "crates/tsc_rs_resolver",
+  "crates/tsc_rs_emitter",
+  "crates/tsc_rs_project",
+  "crates/tsc_rs_server",
+  "crates/tsc_rs_harness",
+  "crates/tsc_rs_cli",
+  "crates/tsc_rs_constraints",
+  "crates/tsc_rs_control_flow",
+  "crates/tsc_rs_incremental",
+  "crates/tsc_rs_query",
+  "crates/tsc_rs_bench",
+  "crates/tsc_rs_analyze",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.4.1"
+repository = "https://github.com/benfavre/ts-rs"
+homepage = "https://github.com/benfavre/ts-rs"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# ---------------------------------------------------------------------------
+# Build profiles
+# ---------------------------------------------------------------------------
+
+# Optimize stable dependencies in dev builds for faster test suite runs.
+# These crates change rarely — the initial opt-level=1 compile cost is
+# amortized across many incremental rebuilds.
+# The emitter, harness, server, and CLI stay at opt-level=0 for fast
+# incremental compiles during active development.
+[profile.dev.package.tsc_rs_ast]
+opt-level = 1
+[profile.dev.package.tsc_rs_scanner]
+opt-level = 1
+[profile.dev.package.tsc_rs_parser]
+opt-level = 1
+[profile.dev.package.tsc_rs_symbols]
+opt-level = 1
+[profile.dev.package.tsc_rs_types]
+opt-level = 1
+[profile.dev.package.tsc_rs_resolver]
+opt-level = 1
+[profile.dev.package.tsc_rs_project]
+opt-level = 1
+[profile.dev.package.tsc_rs_query]
+opt-level = 1
+[profile.dev.package.tsc_rs_constraints]
+opt-level = 1
+[profile.dev.package.tsc_rs_control_flow]
+opt-level = 1
+[profile.dev.package.tsc_rs_incremental]
+opt-level = 1
+
+# Fast release profile — optimized but quick to compile.
+# Use for: testing, benchmarking, pre-release validation.
+# Command: cargo build --profile release-fast --bin tsc-rs
+[profile.release-fast]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+strip = false
+incremental = true
+
+# Profiling profile that MATCHES the benchmark harness's release profile
+# (lto="fat", codegen-units=1). The default release profile uses lto=false and
+# codegen-units=16, so prof_* binaries built with it are a DIFFERENT binary from
+# the one the benchmark measures — different inlining, different hot spots.
+# Use this for any perf work:  cargo build --profile perf --example prof_oxc
+# (panic stays "unwind": the test harness relies on catch_unwind per case.)
+[profile.perf]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1
+strip = "none"

@@ -1,0 +1,40 @@
+{
+  "name": "tsc-rs",
+  "version": "0.1.1",
+  "description": "TypeScript compiler written in Rust — fast, embeddable, runs everywhere",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benfavre/ts-rs"
+  },
+  "homepage": "https://github.com/benfavre/ts-rs",
+  "keywords": [
+    "typescript",
+    "compiler",
+    "rust",
+    "wasm",
+    "type-checker",
+    "lsp",
+    "transpiler"
+  ],
+  "bin": {
+    "tsc-rs": "bin/tsc-rs"
+  },
+  "files": [
+    "bin",
+    "install.js"
+  ],
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "optionalDependencies": {
+    "@tsc-rs/linux-x64": "0.1.1",
+    "@tsc-rs/linux-arm64": "0.1.1",
+    "@tsc-rs/darwin-x64": "0.1.1",
+    "@tsc-rs/darwin-arm64": "0.1.1",
+    "@tsc-rs/win32-x64": "0.1.1"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

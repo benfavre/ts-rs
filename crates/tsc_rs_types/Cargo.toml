@@ -1,0 +1,20 @@
+[package]
+name = "tsc_rs_types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Type system primitives for tsc-rs"
+
+[dependencies]
+tsc_rs_ast = { path = "../tsc_rs_ast" }
+tsc_rs_parser = { path = "../tsc_rs_parser" }
+tsc_rs_resolver = { path = "../tsc_rs_resolver" }
+tsc_rs_scanner = { path = "../tsc_rs_scanner" }
+tsc_rs_symbols = { path = "../tsc_rs_symbols" }
+rustc-hash = "2"
+rayon = "1"
+num-bigint = "0.4"
+num-traits = "0.2"
+ryu = "1"

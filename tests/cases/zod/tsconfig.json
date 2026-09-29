@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowSyntheticDefaultImports": true
+  },
+  "include": ["*.ts", "node_modules/zod/**/*.d.ts"],
+  "exclude": ["node_modules/zod/v3/**", "node_modules/zod/mini/**", "node_modules/zod/locales/**", "node_modules/zod/v4/mini/**", "node_modules/zod/v4/locales/**"]
+}

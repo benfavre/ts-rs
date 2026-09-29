@@ -1,0 +1,217 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (build only, skip GitHub release)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ─── Extract version from tag or Cargo.toml ───
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      dry_run: ${{ steps.flags.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Determine flags
+        id: flags
+        run: |
+          DRY_RUN="${{ inputs.dry_run || 'false' }}"
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+          echo "Dry run: $DRY_RUN"
+
+  # ─── Build on each platform ───
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross (Linux aarch64)
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build release binary
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }} -p tsc-rs
+          else
+            cargo build --release --target ${{ matrix.target }} -p tsc-rs
+          fi
+        shell: bash
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../tsc-rs-${{ matrix.target }}.tar.gz tsc-rs
+        shell: bash
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../tsc-rs-${{ matrix.target }}.zip tsc-rs.exe
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tsc-rs-${{ matrix.target }}
+          path: tsc-rs-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # ─── Build VSCode extension ───
+  vscode-extension:
+    name: Build VSCode Extension
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build extension
+        working-directory: editors/vscode
+        run: |
+          npm install
+          npm run compile
+          npx vsce package -o ../../tsc-rs.vsix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tsc-rs-vsix
+          path: tsc-rs.vsix
+          if-no-files-found: error
+          retention-days: 14
+
+  # ─── Create GitHub Release ───
+  release:
+    name: Create Release
+    needs: [prepare, build, vscode-extension]
+    if: startsWith(github.ref, 'refs/tags/v') && needs.prepare.outputs.dry_run != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          for dir in artifacts/*/; do
+            cp "$dir"/* release-assets/ 2>/dev/null || true
+          done
+          echo "=== Release Assets ==="
+          ls -la release-assets/
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: tsc-rs ${{ needs.prepare.outputs.version }}
+          draft: false
+          prerelease: ${{ contains(needs.prepare.outputs.version, '-beta') || contains(needs.prepare.outputs.version, '-rc') }}
+          generate_release_notes: true
+          files: |
+            release-assets/*
+
+      - name: Release summary
+        run: |
+          echo "=== Release Published ==="
+          echo "  Version: ${{ needs.prepare.outputs.version }}"
+          echo "  Tag:     ${{ github.ref_name }}"
+          echo "  Assets:"
+          ls -la release-assets/
+
+  # ─── Dry run summary ───
+  dry-run-summary:
+    name: Dry Run Summary
+    needs: [prepare, build, vscode-extension]
+    if: needs.prepare.outputs.dry_run == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Summary
+        run: |
+          echo "=== DRY RUN ==="
+          echo "Would have released:"
+          echo "  Version: ${{ needs.prepare.outputs.version }}"
+          echo ""
+          echo "  Binaries:"
+          find artifacts/tsc-rs-* -type f 2>/dev/null | sed 's/^/    /' || echo "    (none)"
+          echo ""
+          echo "  VSCode extension:"
+          find artifacts/tsc-rs-vsix -type f 2>/dev/null | sed 's/^/    /' || echo "    (none)"

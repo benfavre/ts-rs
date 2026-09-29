@@ -1,0 +1,15 @@
+[package]
+name = "tsc_rs_emitter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "TypeScript-to-JavaScript emitter for tsc-rs"
+
+[dependencies]
+tsc_rs_ast = { path = "../tsc_rs_ast" }
+tsc_rs_scanner = { path = "../tsc_rs_scanner" }
+
+[dev-dependencies]
+tsc_rs_parser = { path = "../tsc_rs_parser" }
