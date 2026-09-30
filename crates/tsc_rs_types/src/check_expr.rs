@@ -9812,9 +9812,9 @@ impl TypeChecker {
                 // including anonymous expressions. This preserves private
                 // instance/static nominal origins across construction and
                 // assignment; a structural ObjectType would erase them.
-                let identity = self
-                    .pending_class_expression_name
-                    .take()
+                let inferred_name = self.pending_class_expression_name.take();
+                self.check_static_property_name_conflicts(class_decl, inferred_name.as_deref());
+                let identity = inferred_name
                     .unwrap_or_else(|| format!("__class_expression_{}", expr.span.start));
                 let class_name = class_decl.name.clone();
                 if let Some(ref name) = class_name {

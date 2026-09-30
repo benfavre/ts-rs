@@ -1818,6 +1818,99 @@ impl TypeChecker {
         map
     }
 
+    /// Static members conflict with the constructor's built-in properties.
+    /// Ambient classes have no runtime members, and define semantics permit
+    /// all of these names except `prototype`.
+    pub(crate) fn check_static_property_name_conflicts(
+        &mut self,
+        class: &ClassDecl,
+        inferred_name: Option<&str>,
+    ) {
+        let ambient = self.ambient_depth > 0
+            || self.current_file_is_declaration()
+            || class.modifiers & MOD_DECLARE != 0;
+        let target = self.compiler_options.target.unwrap_or(ScriptTarget::ES2025);
+        let define_fields = self
+            .compiler_options
+            .use_define_for_class_fields
+            .unwrap_or(target >= ScriptTarget::ES2022);
+        let class_name = class.name.as_deref().or(inferred_name).unwrap_or(
+            if class.modifiers & MOD_DEFAULT != 0 {
+                "default"
+            } else {
+                "(Anonymous class)"
+            },
+        );
+        for member in &class.members {
+            let name = match &member.kind {
+                ClassMemberKind::Property(property) if property.modifiers & MOD_STATIC != 0 => {
+                    &property.name
+                }
+                ClassMemberKind::Method(method) if method.modifiers & MOD_STATIC != 0 => {
+                    &method.name
+                }
+                ClassMemberKind::GetAccessor(accessor) | ClassMemberKind::SetAccessor(accessor)
+                    if accessor.modifiers & MOD_STATIC != 0 =>
+                {
+                    &accessor.name
+                }
+                _ => continue,
+            };
+            let Some(property) = self.pattern_property_name(name) else {
+                continue;
+            };
+            let span = name.span();
+            // Every class already declares a `prototype` property. Methods
+            // and accessors cannot merge with that symbol, even in ambient
+            // classes, while an ordinary property declaration can.
+            let conflicts_with_prototype = property == "prototype"
+                && match &member.kind {
+                    ClassMemberKind::Property(property) => property.modifiers & MOD_ACCESSOR != 0,
+                    _ => true,
+                };
+            if conflicts_with_prototype
+                && !self
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == 2300 && diagnostic.span == Some(span))
+            {
+                let display = self
+                    .current_source
+                    .as_deref()
+                    .and_then(|source| source.get(span.start as usize..span.end as usize))
+                    .unwrap_or(&property);
+                self.diagnostics
+                    .push(error_duplicate_identifier(display, span));
+            }
+            if ambient {
+                continue;
+            }
+            if property != "prototype"
+                && (define_fields
+                    || !matches!(
+                        property.as_str(),
+                        "name" | "length" | "caller" | "arguments"
+                    ))
+            {
+                continue;
+            }
+            if !self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == 2699 && diagnostic.span == Some(span))
+            {
+                self.diagnostics.push(Diagnostic {
+                    code: 2699,
+                    message: format!("Static property '{property}' conflicts with built-in property 'Function.{property}' of constructor function '{class_name}'."),
+                    category: DiagnosticCategory::Error,
+                    file_name: None,
+                    span: Some(span),
+                    related: None,
+                });
+            }
+        }
+    }
+
     fn instance_class_display(class: &ClassDecl) -> String {
         Type::TypeReference(
             class.name.as_deref().unwrap_or_default().to_string(),

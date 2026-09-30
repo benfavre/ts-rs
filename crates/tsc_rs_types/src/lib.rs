@@ -23595,6 +23595,7 @@ impl TypeChecker {
                 if let Some(name) = &class_decl.name {
                     self.check_reserved_type_name(name, class_decl.name_span, 2414, "Class");
                 }
+                self.check_static_property_name_conflicts(class_decl, None);
                 let pushed_type_param_names =
                     self.push_active_type_param_names(class_decl.type_params.as_deref());
                 self.report_js_checked_export_decorator_position(

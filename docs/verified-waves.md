@@ -1199,3 +1199,27 @@ Validation: 1,606 scanner/parser/checker tests and 96 harness tests passed;
 `make ci` passed. New coverage includes target boundaries, diagnostic
 precedence, modifier groups, Unicode flag spans/trivia, misplaced shebang
 recovery, `noCheck`, and an exact upstream errors-baseline comparison.
+
+## 2026-09-30: static constructor property conflicts (TS2699 / TS2300)
+
+Static `prototype` members now report TS2699; `name`, `length`, `caller`, and
+`arguments` do so when `useDefineForClassFields` is disabled. Computed literal
+names, methods, accessors, class expressions, and default exports preserve
+their names and spans. Ambient classes are exempt from TS2699. Methods and
+accessors named `prototype` additionally conflict with the class's implicit
+prototype symbol (TS2300), including ambient declarations.
+
+Every expected TS2699 matches in both expanded suites, with no false
+positives. Total diagnostic matches increase by 172: compiler 8,783 to 8,786,
+conformance 18,401 to 18,570. False-positive totals remain 1,517 and 2,785.
+
+| Suite | Baseline | Before | After | Lost passes |
+| --- | --- | ---: | ---: | ---: |
+| Compiler | Diagnostics | 4,780 | 4,781 | 0 |
+| Conformance | Diagnostics | 3,622 | 3,623 | 0 |
+| Compiler | JavaScript | 6,032 | 6,032 | 0 |
+| Conformance | JavaScript | 5,388 | 5,388 | 0 |
+
+Cache-free comparisons show no changed skip counts. Newly passing cases:
+`staticPrototypeProperty` and `propertyNamedPrototype`. All 1,201 checker
+tests, including eight new regression tests, and `make ci` passed.
