@@ -1892,7 +1892,9 @@ impl TypeChecker {
                     method_names,
                 })
             }
-            ExprKind::Ident(name) => self.lookup_var(name).cloned().unwrap_or(Type::Any),
+            ExprKind::Ident(name) => crate::infer_param_binding(name)
+                .or_else(|| self.lookup_var(name).cloned())
+                .unwrap_or(Type::Any),
             ExprKind::FnExpr(fn_decl) => Type::Function(self.resolve_fn_type(fn_decl)),
             ExprKind::Arrow(arrow) => {
                 let params = arrow

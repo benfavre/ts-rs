@@ -258,14 +258,6 @@ pub fn parse_fourslash(test_name: &str, raw: &str) -> Result<LspTest, String> {
     // Flush last file
     file_sections.push((current_file, current_lines));
 
-    // Fourslash tests run with tsc's language-service defaults, which are NOT
-    // strict (the checker otherwise follows TS 6's strict-by-default CLI
-    // semantics). Expectations like `optionalParam?: string` (no
-    // `| undefined`) depend on it; tests opt in with `// @strict: true`.
-    if options.strict.is_none() {
-        options.strict = Some(false);
-    }
-
     // Process files: strip markers from content, record marker positions
     let mut files = Vec::new();
     let mut markers = Vec::new();

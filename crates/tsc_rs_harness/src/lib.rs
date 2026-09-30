@@ -5132,6 +5132,23 @@ impl BaselineRunner {
                     resolved_paths.push((specifier.clone(), test_case.files[idx].name.clone()));
                     resolved.push(specifier);
                 }
+                if cross_file_injection_enabled() {
+                    for specifier in collect_module_augmentation_specifiers(parsed) {
+                        if resolved_paths.iter().any(|(known, _)| known == &specifier) {
+                            continue;
+                        }
+                        if let Some(idx) = resolve_module_specifier_for_diagnostics(
+                            &importer,
+                            &specifier,
+                            test_case,
+                            &path_to_idx,
+                            &path_ctx,
+                            self_name_resolution,
+                        ) {
+                            resolved_paths.push((specifier, test_case.files[idx].name.clone()));
+                        }
+                    }
+                }
                 if effective_options.import_helpers == Some(true) {
                     // tsc resolves the helpers module ('tslib') from each
                     // file that needs an emit helper (TS2354/TS2343).
@@ -5215,6 +5232,14 @@ impl BaselineRunner {
                 checker_donor.register_virtual_module_paths(&importer, &resolved_paths);
                 checker_donor.register_esm_specifiers(&importer, &esm_resolved);
                 checker_donor.register_esm_extensionless_specifiers(&importer, &esm_extensionless);
+            }
+            if cross_file_injection_enabled() {
+                // Seed the donor with every program file's declarations so
+                // imports resolve to real types instead of `any`. The
+                // injection pass's own diagnostics are program-wide and
+                // would repeat under every file; per-file checks report them.
+                checker_donor.inject_external_types(&parsed_refs);
+                checker_donor.take_diagnostics();
             }
         }
 
@@ -7346,6 +7371,18 @@ pub(crate) use source_classify::*;
 mod transforms;
 pub(crate) use transforms::*;
 
+/// Whether errors baselines seed the donor checker with every program
+/// file's declarations (`inject_external_types`), so multi-file imports get
+/// real types. Controlled by `TSC_RS_HARNESS_CROSS_FILE` (`1` on, `0` off).
+pub(crate) fn cross_file_injection_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("TSC_RS_HARNESS_CROSS_FILE")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Utility functions (kept in lib.rs — used only by impl blocks above)
 // ---------------------------------------------------------------------------
@@ -7669,6 +7706,35 @@ fn collect_require_form_specifiers(file: &SourceFile) -> std::collections::HashS
         }
     }
     out
+}
+
+/// Module augmentation specifiers of an external module
+/// (`declare module "./x" { … }` at top level of a file with imports or
+/// exports). Only their resolved paths are registered, so the checker can
+/// merge augmentation declarations into the target module's exports.
+fn collect_module_augmentation_specifiers(file: &SourceFile) -> Vec<String> {
+    let is_module = file.statements.iter().any(|stmt| {
+        matches!(
+            stmt.kind,
+            tsc_rs_ast::StmtKind::Import(_)
+                | tsc_rs_ast::StmtKind::ImportEquals(_)
+                | tsc_rs_ast::StmtKind::Export(_)
+                | tsc_rs_ast::StmtKind::ExportAssign(_)
+        )
+    });
+    if !is_module {
+        return Vec::new();
+    }
+    file.statements
+        .iter()
+        .filter_map(|stmt| match &stmt.kind {
+            tsc_rs_ast::StmtKind::ModuleDecl(module) => match &module.name {
+                tsc_rs_ast::ModuleName::String(specifier) => Some(specifier.clone()),
+                tsc_rs_ast::ModuleName::Ident(_) => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 fn collect_project_module_specifiers(file: &SourceFile) -> Vec<String> {

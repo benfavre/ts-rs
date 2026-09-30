@@ -5207,6 +5207,90 @@ fn find_type_param_parent_with_generics(source_text: &str, offset: u32) -> Optio
     Some(format!("{}{}{}{}", prefix, name, type_params, suffix))
 }
 
+/// The innermost class or interface whose body contains `offset`, displayed
+/// with its declared type-parameter list (`c2<T extends c<string>>`).
+fn enclosing_type_owner_display(
+    sym_table: &SymbolTable,
+    file_name: &str,
+    source_text: &str,
+    offset: u32,
+) -> Option<String> {
+    let bytes = source_text.as_bytes();
+    let off = offset as usize;
+    let mut best: Option<(usize, String)> = None;
+    for sym in &sym_table.symbols {
+        if sym.flags & (tsc_rs_symbols::SYM_CLASS | tsc_rs_symbols::SYM_INTERFACE) == 0 {
+            continue;
+        }
+        for decl in &sym.declarations {
+            if decl.file_name != file_name {
+                continue;
+            }
+            let start = decl.span.start as usize;
+            if start > off || start >= bytes.len() {
+                continue;
+            }
+            // The name, then an optional `<…>` list, then the body.
+            let Some(name_rel) = source_text[start..].find(sym.name.as_str()) else {
+                continue;
+            };
+            let name_end = start + name_rel + sym.name.len();
+            let mut type_params = String::new();
+            let mut k = name_end;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if bytes.get(k) == Some(&b'<') {
+                let mut depth = 0i32;
+                let mut end = k;
+                while end < bytes.len() {
+                    match bytes[end] {
+                        b'<' => depth += 1,
+                        b'>' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                if end < bytes.len() {
+                    type_params = source_text[k..=end].to_string();
+                    k = end + 1;
+                }
+            }
+            let Some(brace_rel) = source_text[k..].find('{') else {
+                continue;
+            };
+            let open = k + brace_rel;
+            if open >= off {
+                continue;
+            }
+            let mut depth = 0i32;
+            let mut close = None;
+            for (j, &b) in bytes.iter().enumerate().skip(open) {
+                match b {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if close.is_some_and(|c| c > off) && best.as_ref().is_none_or(|(s, _)| *s < open) {
+                best = Some((open, format!("{}{}", sym.name, type_params)));
+            }
+        }
+    }
+    best.map(|(_, display)| display)
+}
+
 /// Check if the token at `offset` is preceded by the `new` keyword.
 fn is_new_expression(source_text: &str, offset: u32) -> bool {
     let bytes = source_text.as_bytes();
@@ -7390,6 +7474,7 @@ pub fn hover_at(
     )?;
     let hover = overload_object_call_site_hover(hover, check_out, source_text, offset);
     let hover = normalize_single_quoted_literals(&hover);
+    let hover = strip_optional_param_undefined(&hover);
     if !is_js_like_file_name(file_name) {
         return Some(hover);
     }
@@ -7402,6 +7487,102 @@ pub fn hover_at(
         source_text,
         offset,
     ))
+}
+
+/// Under strictNullChecks the checker gives a `?`-optional parameter the type
+/// `T | undefined` (tsc does the same for diagnostics), but the language
+/// service prints signatures with the optionality removed:
+/// `function foo(optionalParam?: string)` while the parameter's own hover
+/// stays `(parameter) optionalParam: string | undefined`. Strip a trailing
+/// ` | undefined` from every `name?: …` entry of a parameter list (entries
+/// end at a top-level `,` or the closing `)`; object-type members, which end
+/// at `;`, are untouched).
+fn strip_optional_param_undefined(hover: &str) -> String {
+    const SUFFIX: &str = " | undefined";
+    let (display, docs) = match hover.find("\n\n---\n\n") {
+        Some(i) => (&hover[..i], &hover[i..]),
+        None => (hover, ""),
+    };
+    if !display.contains("?: ") || !display.contains(SUFFIX) {
+        return hover.to_string();
+    }
+    let bytes = display.as_bytes();
+    let mut removals: Vec<(usize, usize, String)> = Vec::new();
+    let mut i = 0;
+    while let Some(rel) = display[i..].find("?: ") {
+        let q = i + rel;
+        i = q + 3;
+        let is_param_name = q > 0
+            && (bytes[q - 1].is_ascii_alphanumeric()
+                || bytes[q - 1] == b'_'
+                || bytes[q - 1] == b'$');
+        if !is_param_name {
+            continue;
+        }
+        // Find the end of this entry's type at depth 0.
+        let start = q + 3;
+        let mut depth: i32 = 0;
+        let mut end = None;
+        let mut j = start;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'(' | b'[' | b'{' | b'<' => depth += 1,
+                b'>' if j > 0 && bytes[j - 1] == b'=' => {}
+                b')' | b']' | b'}' | b'>' => {
+                    if depth == 0 {
+                        if bytes[j] == b')' {
+                            end = Some(j);
+                        }
+                        break;
+                    }
+                    depth -= 1;
+                }
+                b',' if depth == 0 => {
+                    end = Some(j);
+                    break;
+                }
+                b';' | b'\n' if depth == 0 => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        let Some(end) = end else { continue };
+        let ty = &display[start..end];
+        if ty.ends_with(SUFFIX) && ty.len() > SUFFIX.len() {
+            let inner = &ty[..ty.len() - SUFFIX.len()];
+            // `(() => string) | undefined` → `() => string`: drop the parens
+            // that only existed to scope the function type in the union.
+            let unwrapped = inner
+                .strip_prefix('(')
+                .and_then(|s| s.strip_suffix(')'))
+                .filter(|s| {
+                    let mut d = 0i32;
+                    s.bytes().all(|b| {
+                        match b {
+                            b'(' => d += 1,
+                            b')' => d -= 1,
+                            _ => {}
+                        }
+                        d >= 0
+                    }) && d == 0
+                        && find_top_level_arrow(s).is_some()
+                });
+            removals.push((start, end, unwrapped.unwrap_or(inner).to_string()));
+        }
+    }
+    if removals.is_empty() {
+        return hover.to_string();
+    }
+    let mut out = String::with_capacity(hover.len());
+    let mut last = 0;
+    for (s, e, replacement) in removals {
+        out.push_str(&display[last..s]);
+        out.push_str(&replacement);
+        last = e;
+    }
+    out.push_str(&display[last..]);
+    out.push_str(docs);
+    out
 }
 
 /// At a call site of a variable whose type is an object of only call
@@ -9621,6 +9802,7 @@ fn hover_at_impl(
                 // An unannotated function parent: tsc prints its inferred
                 // return type (`U in foo<U>(a: U): U`). Borrow it from the
                 // checked type of the function symbol named before `<`.
+                let decl_offset = sym.declarations.first().map(|d| d.span.start);
                 let parent_with_generics = parent_with_generics.map(|p| {
                     if !p.ends_with(')') {
                         return p;
@@ -9629,6 +9811,51 @@ fn hover_at_impl(
                         return p;
                     };
                     let fn_name = &p[..lt];
+                    // A method's type parameter: tsc qualifies the method
+                    // with its class/interface (`c<T>.method<U>(…): U`).
+                    let owner = decl_offset.and_then(|decl| {
+                        let before = &source_text[..(decl as usize).min(source_text.len())];
+                        let name_pos = before.rfind(&format!("{fn_name}<"))?;
+                        let head = before[..name_pos].trim_end();
+                        if head.ends_with("function") {
+                            return None;
+                        }
+                        enclosing_type_owner_display(sym_table, file_name, source_text, decl)
+                    });
+                    if let Some(owner) = owner {
+                        let has_return = p.rfind(')').is_some_and(|i| i + 1 < p.len());
+                        let ret = if has_return {
+                            None
+                        } else {
+                            sym_table
+                                .symbols
+                                .iter()
+                                .filter(|s| {
+                                    s.name == fn_name && s.flags & tsc_rs_symbols::SYM_METHOD != 0
+                                })
+                                .filter_map(|s| {
+                                    let d = s.declarations.first()?;
+                                    if d.file_name != file_name
+                                        || decl_offset.is_some_and(|o| d.span.start > o)
+                                    {
+                                        return None;
+                                    }
+                                    resolve_symbol_type(
+                                        s,
+                                        check_out,
+                                        d.span.start,
+                                        query_engine,
+                                        None,
+                                    )
+                                })
+                                .last()
+                                .and_then(|t| return_type_of_function_type(&t).map(str::to_string))
+                        };
+                        return match ret {
+                            Some(r) => format!("{owner}.{p}: {r}"),
+                            None => format!("{owner}.{p}"),
+                        };
+                    }
                     let ret = sym_table
                         .symbols
                         .iter()

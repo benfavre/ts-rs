@@ -4750,6 +4750,50 @@ impl TypeChecker {
             None => Type::This,
         };
         self.declare_var("this", ty);
+        self.declare_var(crate::INSTANCE_MEMBER_MARKER, Type::Never);
+    }
+
+    /// Mark the current scope as the body of a non-static member of the
+    /// innermost enclosing class (see `INSTANCE_MEMBER_MARKER`).
+    pub(crate) fn declare_instance_member_marker(&mut self) {
+        if let Some(class_name) = self.enclosing_class_names.last().cloned() {
+            self.declare_var(
+                crate::INSTANCE_MEMBER_MARKER,
+                Type::TypeReference(class_name, Arc::from([] as [Type; 0])),
+            );
+        }
+    }
+
+    /// TS2663: `name` is an instance member (own or inherited) of the class
+    /// whose non-static member is the current `this` container.
+    fn instance_member_class_for_missing_name(&self, name: &str) -> Option<std::string::String> {
+        if name.starts_with('#') {
+            return None;
+        }
+        let Some(Type::TypeReference(class_name, _)) =
+            self.lookup_var(crate::INSTANCE_MEMBER_MARKER)
+        else {
+            return None;
+        };
+        let mut current = Some(class_name.clone());
+        let mut guard = 0;
+        while let Some(class) = current {
+            guard += 1;
+            if guard > 32 {
+                break;
+            }
+            let info = self.class_info.get(class.as_str())?;
+            // Declared members only: `this.x = …` assignments in a TS
+            // constructor add no member (tsc reports TS2304 there).
+            if (info.instance_properties.iter().any(|(n, _)| n == name)
+                || info.instance_methods.iter().any(|(n, _)| n == name))
+                && info.member_locations.contains_key(name)
+            {
+                return Some(class_name.clone());
+            }
+            current = info.extends.clone();
+        }
+        None
     }
 
     pub(crate) fn check_arrow_or_fn_contextual(
@@ -5611,6 +5655,20 @@ impl TypeChecker {
                                     &class_name,
                                     expr.span,
                                 ));
+                                Type::Error
+                            } else if self.instance_member_class_for_missing_name(name).is_some() {
+                                // TS2663: an instance member of the class whose
+                                // non-static member is the `this` container.
+                                self.diagnostics.push(Diagnostic {
+                                    code: 2663,
+                                    message: format!(
+                                        "Cannot find name '{name}'. Did you mean the instance member 'this.{name}'?"
+                                    ),
+                                    category: DiagnosticCategory::Error,
+                                    file_name: None,
+                                    span: Some(expr.span),
+                                    related: None,
+                                });
                                 Type::Error
                             } else if self
                                 .ctor_params_in_initializer
@@ -6593,6 +6651,10 @@ impl TypeChecker {
                                     Some(value_name.clone())
                                 }
                                 _ => {
+                                    // Namespace-owned classes are keyed by
+                                    // their full path, root included
+                                    // (`A.Point`).
+                                    segments.extend(root);
                                     segments.reverse();
                                     (0..segments.len()).find_map(|skip| {
                                         let candidate = segments[skip..].join(".");
@@ -7451,7 +7513,10 @@ impl TypeChecker {
                                         || f.ends_with(".cjs")
                                 })
                                 .unwrap_or(false);
-                            if !is_js_file && !reported_future_lib_member {
+                            if !is_js_file
+                                && !reported_future_lib_member
+                                && !self.namespace_member_may_be_elsewhere(&info.name)
+                            {
                                 // tsc underlines the member name, not the
                                 // whole access expression.
                                 let property_span = Span::new(
@@ -12577,6 +12642,9 @@ impl TypeChecker {
                 self.declare_class_member_super_marker();
                 self.declare_var(THIS_OK_MARKER, Type::Never);
                 self.bind_function_this(&method.params);
+                if method.modifiers & MOD_STATIC == 0 {
+                    self.declare_instance_member_marker();
+                }
                 // TS2369: check for parameter properties in non-constructor methods
                 for param in &method.params {
                     self.check_parameter_property(param);
@@ -12687,6 +12755,7 @@ impl TypeChecker {
                 self.declare_class_member_super_marker();
                 self.declare_var(THIS_OK_MARKER, Type::Never);
                 self.bind_function_this(&[]);
+                self.declare_instance_member_marker();
                 let saved_super_pending_depth = self.super_pending_depth;
                 if is_derived {
                     self.declare_var(SUPER_PENDING_MARKER, Type::Never);
@@ -12845,6 +12914,9 @@ impl TypeChecker {
                 self.declare_class_member_super_marker();
                 self.declare_var(THIS_OK_MARKER, Type::Never);
                 self.bind_function_this(&[]);
+                if acc.modifiers & MOD_STATIC == 0 {
+                    self.declare_instance_member_marker();
+                }
                 // TS2369: check for parameter properties in accessors
                 for param in &acc.params {
                     self.check_parameter_property(param);

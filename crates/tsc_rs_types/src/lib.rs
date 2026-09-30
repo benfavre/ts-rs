@@ -139,6 +139,39 @@ thread_local! {
 }
 
 thread_local! {
+    /// Parameter bindings visible to `infer_expr_type` while a method's
+    /// return type is inferred from its body at class-registration time
+    /// (`build_class_info` takes `&self`, so it cannot push a real scope).
+    static INFER_PARAM_SCOPE: RefCell<Vec<Vec<(std::string::String, Type)>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Run `f` with `bindings` visible to `infer_expr_type` identifiers.
+pub(crate) fn with_infer_param_scope<R>(
+    bindings: Vec<(std::string::String, Type)>,
+    f: impl FnOnce() -> R,
+) -> R {
+    INFER_PARAM_SCOPE.with(|s| s.borrow_mut().push(bindings));
+    let result = f();
+    INFER_PARAM_SCOPE.with(|s| {
+        s.borrow_mut().pop();
+    });
+    result
+}
+
+/// The innermost `with_infer_param_scope` binding of `name`, if any.
+pub(crate) fn infer_param_binding(name: &str) -> Option<Type> {
+    INFER_PARAM_SCOPE.with(|s| {
+        s.borrow().iter().rev().find_map(|frame| {
+            frame
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, t)| t.clone())
+        })
+    })
+}
+
+thread_local! {
     /// Covariant inference candidates of the most recent
     /// `infer_type_arguments` run, per type parameter in argument order
     /// (the recorder unions them; callers with relation access pick tsc's
@@ -779,6 +812,10 @@ const CTOR_PARAMS_IN_INIT: &str = "__tsrs_ctor_params_in_init__";
 /// arrows (they declare neither) and respects branch-scoped `super()` calls.
 const SUPER_PENDING_MARKER: &str = "__tsrs_super_pending__";
 const THIS_OK_MARKER: &str = "__tsrs_this_ok__";
+/// Scope marker for tsc's `this` container: a non-static class member binds
+/// it to its class (`TypeReference(class)`), every other function-like
+/// binds `Never` (TS2663 "Did you mean the instance member 'this.x'?").
+const INSTANCE_MEMBER_MARKER: &str = "__tsrs_instance_member__";
 /// Declared in the scope of a function where `super.x` is legal (class
 /// members, object-literal methods and accessors) ...
 const SUPER_PROPERTY_OK_MARKER: &str = "__tsrs_super_property_ok__";
@@ -2576,6 +2613,16 @@ pub struct TypeChecker {
     /// namespace` body). Classes there are implicitly ambient, so TS2564 does
     /// not apply — the members have no runtime initialization.
     ambient_depth: u32,
+    /// Nesting depth inside a dotted namespace declaration (`namespace A.B`).
+    dotted_namespace_depth: u32,
+    /// Names of namespace values assembled from dotted declarations of the
+    /// current file only; in a multi-file program other files may add
+    /// members, so a missing member there is not reported.
+    dotted_namespace_value_names: rustc_hash::FxHashSet<std::string::String>,
+    /// Merged value exports of every namespace block, keyed by full dotted
+    /// path (`M.N.X`); built only for files that use dotted namespaces.
+    namespace_path_exports:
+        std::collections::HashMap<std::string::String, Vec<(std::string::String, Type)>>,
     /// Nesting depth of function/arrow bodies. TS2454 is suppressed inside
     /// nested functions because the variable may be assigned before the
     /// callback is actually invoked.
@@ -2922,6 +2969,9 @@ impl Clone for TypeChecker {
             check_definite_assignment: self.check_definite_assignment,
             strict_property_initialization: self.strict_property_initialization,
             ambient_depth: self.ambient_depth,
+            dotted_namespace_depth: self.dotted_namespace_depth,
+            dotted_namespace_value_names: self.dotted_namespace_value_names.clone(),
+            namespace_path_exports: self.namespace_path_exports.clone(),
             fn_nesting_depth: self.fn_nesting_depth,
             jump_targets: self.jump_targets.clone(),
             jump_function_depth: self.jump_function_depth,
@@ -3110,6 +3160,9 @@ impl TypeChecker {
             check_definite_assignment: true,
             strict_property_initialization: false,
             ambient_depth: 0,
+            dotted_namespace_depth: 0,
+            dotted_namespace_value_names: Default::default(),
+            namespace_path_exports: std::collections::HashMap::new(),
             fn_nesting_depth: 0,
             jump_targets: Vec::new(),
             jump_function_depth: 0,
@@ -3770,6 +3823,56 @@ impl TypeChecker {
         self.index_alias_cycles(files);
         self.build_module_exports(files);
         self.build_module_type_exports(files);
+        self.declare_umd_globals(files);
+    }
+
+    /// `export as namespace Foo;` in a module makes the module's value a
+    /// global named `Foo` (tsc UMD global): its `export =` target, or else a
+    /// namespace of its exports. The parser records the declaration as a
+    /// body-less ambient module with no name span.
+    fn declare_umd_globals(&mut self, files: &[&SourceFile]) {
+        for file in files {
+            let has_export_assignment = file
+                .statements
+                .iter()
+                .any(|statement| matches!(statement.kind, StmtKind::ExportAssign(_)));
+            if !Self::file_is_module(file) && !has_export_assignment {
+                continue;
+            }
+            for statement in &file.statements {
+                let StmtKind::ModuleDecl(module) = &statement.kind else {
+                    continue;
+                };
+                let ModuleName::Ident(name) = &module.name else {
+                    continue;
+                };
+                if module.body.is_some() || module.name_span.is_some() || name == "global" {
+                    continue;
+                }
+                // A body-less namespace binding for the same declaration may
+                // already exist (script-mode injection); it carries nothing.
+                let replaceable = match self.lookup_var(name) {
+                    None | Some(Type::Any) => true,
+                    Some(Type::Namespace(namespace)) => namespace.exports.is_empty(),
+                    Some(_) => false,
+                };
+                if !replaceable {
+                    continue;
+                }
+                let Some(exports) = self.lookup_module_exports(&file.file_name) else {
+                    continue;
+                };
+                let value = match exports.iter().find(|(export, _)| export == "export=") {
+                    Some((_, value)) => value.clone(),
+                    None => Type::Namespace(NamespaceType {
+                        name: name.clone(),
+                        exports,
+                        readonly_exports: Vec::new(),
+                    }),
+                };
+                self.declare_var(name, value);
+            }
+        }
     }
 
     /// Cache only the exported-name inventory for a set of program files.
@@ -4208,8 +4311,19 @@ impl TypeChecker {
             self.file_shadows_global_intl = Self::file_shadows_global_intl(file);
             self.file_shadows_global_array = Self::file_shadows_global_array(file);
             let mut exports: Vec<(String, Type)> = Vec::new();
+            // A declaration file is ambient throughout: namespace members
+            // are exported without an `export` keyword.
+            let declaration_file = file.file_name.ends_with(".d.ts")
+                || file.file_name.ends_with(".d.mts")
+                || file.file_name.ends_with(".d.cts");
+            if declaration_file {
+                self.ambient_depth += 1;
+            }
             for stmt in &file.statements {
                 self.collect_exports_from_stmt(stmt, file, &mut exports);
+            }
+            if declaration_file {
+                self.ambient_depth -= 1;
             }
             self.resolve_local_export_aliases(&mut exports);
             Self::resolve_namespace_unique_aliases(&mut exports);
@@ -4221,6 +4335,7 @@ impl TypeChecker {
             self.file_shadows_global_array = previous_array_shadow;
             direct.insert(file.file_name.clone(), exports);
         }
+        self.merge_module_augmentation_exports(files, &mut direct);
         // Mirror direct entries under canonical (symlink-resolved) paths
         // up-front so iteration snapshot lookups succeed for both the
         // original (include-glob) path and the resolver-returned
@@ -7417,13 +7532,71 @@ impl TypeChecker {
                 _ => {} // re-exports handled in the second pass
             },
             StmtKind::ExportAssign(expr) => {
-                let ty = match &expr.kind {
+                let mut ty = match &expr.kind {
                     ExprKind::Ident(name) => self
                         .file_local_binding_type(file, name)
                         .or_else(|| self.lookup_var(name).cloned())
                         .unwrap_or(Type::Any),
                     _ => self.infer_expr_type(expr),
                 };
+                // `export = foo` where `foo` is a class or function merged
+                // with a module-local `namespace foo`: the namespace's
+                // exports are members of the exported value.
+                if let ExprKind::Ident(name) = &expr.kind {
+                    let declares_class = file.statements.iter().any(|statement| {
+                        matches!(
+                            &Self::unwrap_export_stmt(statement).kind,
+                            StmtKind::ClassDecl(class) if class.name.as_deref() == Some(name.as_str())
+                        )
+                    });
+                    // The value side of a function merged with the namespace.
+                    let function_value = if declares_class {
+                        None
+                    } else {
+                        let signatures = self.collect_file_fn_overloads(file, name);
+                        match signatures.len() {
+                            0 => None,
+                            1 => signatures.into_iter().next().map(Type::Function),
+                            _ => Some(Type::Intersection(
+                                signatures.into_iter().map(Type::Function).collect(),
+                            )),
+                        }
+                    };
+                    let merged_value = if declares_class {
+                        Some(Type::TypeReference(
+                            format!("typeof {name}"),
+                            Arc::from([] as [Type; 0]),
+                        ))
+                    } else {
+                        function_value.filter(|value| matches!(value, Type::Function(_)))
+                    };
+                    if let Some(merged_value) =
+                        merged_value.filter(|_| matches!(ty, Type::Namespace(_)))
+                    {
+                        let Type::Namespace(namespace) = std::mem::replace(&mut ty, merged_value)
+                        else {
+                            unreachable!("matched a namespace");
+                        };
+                        if let Err(namespace) = Self::fold_namespace_into_value(&mut ty, namespace)
+                        {
+                            ty = Type::Namespace(namespace);
+                        }
+                    } else if !matches!(ty, Type::Namespace(_)) {
+                        for statement in &file.statements {
+                            let StmtKind::ModuleDecl(module) =
+                                &Self::unwrap_export_stmt(statement).kind
+                            else {
+                                continue;
+                            };
+                            if !matches!(&module.name, ModuleName::Ident(module_name) if module_name == name)
+                            {
+                                continue;
+                            }
+                            let namespace = self.build_namespace_value_exports(module);
+                            let _ = Self::fold_namespace_into_value(&mut ty, namespace);
+                        }
+                    }
+                }
                 out.push(("export=".to_string(), ty));
             }
             _ => {}
@@ -7482,12 +7655,46 @@ impl TypeChecker {
                                 Arc::from([] as [Type; 0]),
                             )
                         });
-                    let properties = self.local_class_unique_static_surface(
+                    let mut properties = self.local_class_unique_static_surface(
                         file,
                         class_decl,
                         &mut HashSet::new(),
                     );
-                    if !properties.is_empty() {
+                    // JavaScript expandos: `C.prop = value;` at the top level
+                    // of the declaring file adds a static member.
+                    let lower = file.file_name.to_ascii_lowercase();
+                    if [".js", ".jsx", ".mjs", ".cjs"]
+                        .iter()
+                        .any(|extension| lower.ends_with(extension))
+                    {
+                        for statement in &file.statements {
+                            let StmtKind::Expr(expression) = &statement.kind else {
+                                continue;
+                            };
+                            let ExprKind::Assign(assignment) = &expression.kind else {
+                                continue;
+                            };
+                            if !matches!(assignment.op, tsc_rs_ast::AssignOp::Assign) {
+                                continue;
+                            }
+                            let ExprKind::Member(target) = &assignment.left.kind else {
+                                continue;
+                            };
+                            if !matches!(&target.object.kind, ExprKind::Ident(object) if object == name)
+                                || properties
+                                    .iter()
+                                    .any(|(property, _)| property == target.property.as_str())
+                            {
+                                continue;
+                            }
+                            let value = self.infer_expr_type(&assignment.right);
+                            properties.push((
+                                target.property.to_string(),
+                                Arc::new(self.widen_type(&value)),
+                            ));
+                        }
+                    }
+                    let class_value = if !properties.is_empty() {
                         let static_surface = Type::ObjectType(ObjectTypeInfo {
                             properties,
                             call_signatures: Vec::new(),
@@ -7496,12 +7703,25 @@ impl TypeChecker {
                             index_signature_name: None,
                             method_names: Vec::new(),
                         });
-                        out.push((
-                            name.clone(),
-                            Type::Intersection(vec![static_surface, nominal].into()),
-                        ));
+                        Type::Intersection(vec![static_surface, nominal].into())
                     } else {
-                        out.push((name.clone(), nominal));
+                        nominal
+                    };
+                    // A namespace declared before its class (legal in
+                    // declaration files) merges into the class value.
+                    let earlier_namespace = out.iter().position(|(existing, ty)| {
+                        existing == name && matches!(ty, Type::Namespace(_))
+                    });
+                    match earlier_namespace {
+                        Some(position) => {
+                            let Type::Namespace(namespace) =
+                                std::mem::replace(&mut out[position].1, class_value)
+                            else {
+                                unreachable!("position matched a namespace export");
+                            };
+                            Self::push_namespace_export(out, name, namespace);
+                        }
+                        None => out.push((name.clone(), class_value)),
                     }
                 }
             }
@@ -7587,10 +7807,212 @@ impl TypeChecker {
                         }
                         _ => self.build_namespace_value_exports(module_decl),
                     };
-                    out.push((name.clone(), Type::Namespace(namespace)));
+                    Self::push_namespace_export(out, name, namespace);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// `declare module "./x" { … }` in an external module augments `./x`:
+    /// the block's value declarations (all implicitly exported — the block is
+    /// ambient) merge into the target's exports. Namespaces merge with the
+    /// target's same-named class or namespace; new names are added. Types are
+    /// merged separately during injection.
+    fn merge_module_augmentation_exports(
+        &mut self,
+        files: &[&SourceFile],
+        direct: &mut rustc_hash::FxHashMap<String, Vec<(String, Type)>>,
+    ) {
+        for file in files {
+            if !Self::file_is_module(file) {
+                continue;
+            }
+            for statement in &file.statements {
+                let StmtKind::ModuleDecl(module) = &statement.kind else {
+                    continue;
+                };
+                let ModuleName::String(specifier) = &module.name else {
+                    continue;
+                };
+                let Some(ModuleBody::Block(body)) = &module.body else {
+                    continue;
+                };
+                let Some(target) = self.resolve_module_to_path(specifier, &file.file_name) else {
+                    continue;
+                };
+                let Some(target_key) = Self::module_path_alternatives(&target)
+                    .into_iter()
+                    .find(|candidate| direct.contains_key(candidate))
+                else {
+                    continue;
+                };
+                let previous_decl_file = self.injected_decl_file.replace(file.file_name.clone());
+                let previous_source = self.current_source.replace(file.text.clone());
+                // Augmentation blocks are ambient: namespace members inside
+                // them are exported without an `export` keyword.
+                self.ambient_depth += 1;
+                let mut augmentation: Vec<(String, Type)> = Vec::new();
+                for inner in body {
+                    let declaration = match &inner.kind {
+                        StmtKind::Export(export) => match &export.kind {
+                            ExportDeclKind::Decl(declaration) => declaration.as_ref(),
+                            _ => continue,
+                        },
+                        _ => inner,
+                    };
+                    if matches!(
+                        declaration.kind,
+                        StmtKind::InterfaceDecl(_) | StmtKind::TypeAlias(_)
+                    ) {
+                        continue;
+                    }
+                    self.collect_exports_from_inner_decl(declaration, file, &mut augmentation);
+                }
+                self.ambient_depth -= 1;
+                self.current_source = previous_source;
+                self.injected_decl_file = previous_decl_file;
+                let Some(target_exports) = direct.get_mut(&target_key) else {
+                    continue;
+                };
+                // A module whose value is `export = x` is augmented through
+                // `x` itself: new names become members of the exported value.
+                if let Some((_, export_equals)) = target_exports
+                    .iter_mut()
+                    .find(|(name, _)| name == "export=")
+                {
+                    let namespace = NamespaceType {
+                        name: String::new(),
+                        exports: augmentation,
+                        readonly_exports: Vec::new(),
+                    };
+                    let _ = Self::fold_namespace_into_value(export_equals, namespace);
+                    continue;
+                }
+                for (name, ty) in augmentation {
+                    match ty {
+                        Type::Namespace(namespace) => {
+                            Self::push_namespace_export(target_exports, &name, namespace);
+                        }
+                        other => {
+                            if !target_exports.iter().any(|(existing, _)| existing == &name) {
+                                target_exports.push((name, other));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record a namespace export, merging it with an earlier same-named
+    /// export of the file (tsc declaration merging): namespace blocks merge
+    /// their exports, and a namespace merged with a class or function adds its
+    /// exports to that value's static surface (`Observable.someValue`).
+    fn push_namespace_export(out: &mut Vec<(String, Type)>, name: &str, namespace: NamespaceType) {
+        let Some(position) = out.iter().position(|(existing, _)| existing == name) else {
+            out.push((name.to_string(), Type::Namespace(namespace)));
+            return;
+        };
+        // A file's export list mixes values and types: only a namespace,
+        // class value, or function absorbs the namespace here (an interface
+        // of the same name stays a separate type export).
+        let existing = &out[position].1;
+        if !matches!(existing, Type::Namespace(_) | Type::Function(_))
+            && !Self::export_is_class_value(existing)
+        {
+            out.push((name.to_string(), Type::Namespace(namespace)));
+            return;
+        }
+        if let Err(namespace) = Self::fold_namespace_into_value(&mut out[position].1, namespace) {
+            out.push((name.to_string(), Type::Namespace(namespace)));
+        }
+    }
+
+    /// Merge a namespace's value exports into `value` — another namespace, a
+    /// class value (`typeof C`, optionally with its static surface), or a
+    /// function. Hands the namespace back when `value` cannot absorb it.
+    fn fold_namespace_into_value(
+        value: &mut Type,
+        namespace: NamespaceType,
+    ) -> Result<(), NamespaceType> {
+        if let Type::Namespace(existing) = value {
+            Self::merge_namespace_exports(existing, namespace);
+            return Ok(());
+        }
+        if !Self::value_absorbs_namespace(value) {
+            return Err(namespace);
+        }
+        if namespace.exports.is_empty() {
+            return Ok(());
+        }
+        let mut properties: Vec<(String, Arc<Type>)> = Vec::new();
+        let nominal = match &*value {
+            Type::Intersection(members)
+                if members.len() == 2 && matches!(members[0], Type::ObjectType(_)) =>
+            {
+                if let Type::ObjectType(info) = &members[0] {
+                    properties = info.properties.clone();
+                }
+                members[1].clone()
+            }
+            other => other.clone(),
+        };
+        for (export_name, export_ty) in namespace.exports {
+            match properties
+                .iter_mut()
+                .find(|(property, _)| property == &export_name)
+            {
+                Some((_, existing)) => {
+                    if let (Type::Namespace(existing_ns), Type::Namespace(incoming_ns)) =
+                        (Arc::make_mut(existing), export_ty)
+                    {
+                        Self::merge_namespace_exports(existing_ns, incoming_ns);
+                    }
+                }
+                None => properties.push((export_name, Arc::new(export_ty))),
+            }
+        }
+        let static_surface = Type::ObjectType(ObjectTypeInfo {
+            properties,
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signature: None,
+            index_signature_name: None,
+            method_names: Vec::new(),
+        });
+        *value = Type::Intersection(vec![static_surface, nominal].into());
+        Ok(())
+    }
+
+    /// Values a merged namespace can extend: class and enum values (`typeof
+    /// C`, or a bare named reference as namespace exports record them),
+    /// functions, and earlier merges of those with a static surface.
+    fn value_absorbs_namespace(ty: &Type) -> bool {
+        match ty {
+            Type::TypeReference(..) | Type::Function(_) => true,
+            Type::Intersection(members) => {
+                members.len() == 2
+                    && matches!(members[0], Type::ObjectType(_))
+                    && matches!(members[1], Type::TypeReference(..) | Type::Function(_))
+            }
+            _ => false,
+        }
+    }
+
+    /// A class value as recorded by `collect_exports_from_inner_decl`:
+    /// `typeof C`, optionally intersected with its static surface (or with a
+    /// merged namespace's exports).
+    fn export_is_class_value(ty: &Type) -> bool {
+        match ty {
+            Type::TypeReference(name, _) => name.starts_with("typeof "),
+            Type::Intersection(members) => {
+                members.len() == 2
+                    && matches!(members[0], Type::ObjectType(_))
+                    && (Self::export_is_class_value(&members[1])
+                        || matches!(members[1], Type::Function(_)))
+            }
+            _ => false,
         }
     }
 
@@ -8228,6 +8650,46 @@ impl TypeChecker {
             this.file_shadows_global_symbol = Self::file_shadows_global_symbol(file);
             this.file_shadows_global_intl = Self::file_shadows_global_intl(file);
             this.file_shadows_global_array = Self::file_shadows_global_array(file);
+            // `declare module "D" { module "a" { interface A { … } } }`: a
+            // string-named module nested in an ambient module augments "a".
+            for stmt in &file.statements {
+                let StmtKind::ModuleDecl(outer) = &stmt.kind else {
+                    continue;
+                };
+                if !matches!(outer.name, ModuleName::String(_)) {
+                    continue;
+                }
+                let Some(ModuleBody::Block(outer_body)) = &outer.body else {
+                    continue;
+                };
+                for inner in outer_body {
+                    let StmtKind::ModuleDecl(augmentation) = &inner.kind else {
+                        continue;
+                    };
+                    let ModuleName::String(specifier) = &augmentation.name else {
+                        continue;
+                    };
+                    let Some(ModuleBody::Block(body)) = &augmentation.body else {
+                        continue;
+                    };
+                    let qualifier = Self::augmented_export_namespace(this, files, specifier, file);
+                    for declaration in body {
+                        let declaration = Self::unwrap_export_stmt(declaration);
+                        let StmtKind::InterfaceDecl(interface) = &declaration.kind else {
+                            continue;
+                        };
+                        let mut target = interface.as_ref().clone();
+                        if let Some(qualifier) = &qualifier {
+                            target.name = format!("{qualifier}.{}", interface.name);
+                        }
+                        this.inject_augmentation_interface(
+                            target,
+                            declaration.span,
+                            block_builtin_shadow,
+                        );
+                    }
+                }
+            }
             for stmt in &file.statements {
                 if is_module {
                     let module = match &stmt.kind {
@@ -8255,14 +8717,73 @@ impl TypeChecker {
                                 this.file_is_module_flag = false;
                                 this.ambient_depth += 1;
                                 for global_statement in body {
+                                    // `namespace globalThis { var x }` adds
+                                    // globals; it must not bind a namespace
+                                    // that shadows `globalThis` itself.
+                                    if let StmtKind::ModuleDecl(inner) = &global_statement.kind {
+                                        if matches!(&inner.name, ModuleName::Ident(name) if name == "globalThis")
+                                        {
+                                            if let Some(ModuleBody::Block(members)) = &inner.body {
+                                                for member in members {
+                                                    this.inject_stmt(member, false);
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    }
                                     this.inject_stmt(global_statement, false);
                                 }
                                 this.ambient_depth = previous_ambient_depth;
                                 this.file_is_module_flag = previous_module_flag;
                             }
                         }
+                        // `declare module "./x" { interface X { … } }` in a
+                        // module file augments the target module: its
+                        // interfaces merge with the target's declarations
+                        // of the same name (tsc mergeModuleAugmentation).
+                        if let ModuleName::String(specifier) = &module.name {
+                            // Augmenting an `export = N` module whose value
+                            // is a namespace targets `N`'s members.
+                            let qualifier =
+                                Self::augmented_export_namespace(this, files, specifier, file);
+                            if let Some(ModuleBody::Block(body)) = &module.body {
+                                for augmentation in body {
+                                    let declaration = match &augmentation.kind {
+                                        StmtKind::Export(export) => match &export.kind {
+                                            ExportDeclKind::Decl(declaration) => {
+                                                declaration.as_ref()
+                                            }
+                                            _ => continue,
+                                        },
+                                        _ => augmentation,
+                                    };
+                                    let StmtKind::InterfaceDecl(interface) = &declaration.kind
+                                    else {
+                                        continue;
+                                    };
+                                    let mut target = interface.as_ref().clone();
+                                    if let Some(qualifier) = &qualifier {
+                                        target.name = format!("{qualifier}.{}", interface.name);
+                                    }
+                                    this.inject_augmentation_interface(
+                                        target,
+                                        declaration.span,
+                                        block_builtin_shadow,
+                                    );
+                                }
+                            }
+                        }
                         // Ordinary namespaces in an external module are
                         // module-owned exports/locals, never global values.
+                        // Their classes/interfaces are still registered by
+                        // qualified path (like the module's own top-level
+                        // types), so `new ext.m1.m2.c()` through an import
+                        // finds the class.
+                        if let ModuleName::Ident(name) = &module.name {
+                            if !is_global_augmentation && module.body.is_some() {
+                                this.inject_namespace_type_members(module, name);
+                            }
+                        }
                         continue;
                     }
                 }
@@ -8276,6 +8797,107 @@ impl TypeChecker {
             this.injected_decl_file = previous_decl_file;
             this.current_source = previous_source;
         }
+    }
+
+    /// An interface declared by a module augmentation merges with the target
+    /// module's declaration of that name even though it lives in another
+    /// file: the fragment takes the target entry's ownership before merging.
+    fn inject_augmentation_interface(
+        &mut self,
+        interface: tsc_rs_ast::InterfaceDecl,
+        span: Span,
+        block_builtin_shadow: bool,
+    ) {
+        if let Some(existing) = self.interface_info.get(&interface.name) {
+            let (is_global, decl_file) = (existing.is_global, existing.decl_file.clone());
+            let mut info = self.build_interface_info(&interface);
+            info.is_global = is_global;
+            info.decl_file = decl_file;
+            self.merge_interface_registry_entry(interface.name.clone(), info);
+            self.ref_resolve_memo
+                .lock()
+                .expect("ref_resolve_memo lock poisoned")
+                .clear();
+            return;
+        }
+        // Augmenting a class: the interface's members join the class
+        // instance side (class/interface declaration merging).
+        if self.class_info.contains_key(&interface.name) {
+            let info = self.build_interface_info(&interface);
+            let object = info.object_type;
+            let classes = Arc::make_mut(&mut self.class_info);
+            if let Some(class) = classes.get_mut(&interface.name) {
+                for (member, ty) in object.properties {
+                    let is_method = object.method_names.iter().any(|name| name == &member);
+                    match (is_method, ty.as_ref()) {
+                        (true, Type::Function(function)) => {
+                            if !class
+                                .instance_methods
+                                .iter()
+                                .any(|(name, _)| name == &member)
+                            {
+                                class.instance_methods.push((member, function.clone()));
+                            }
+                        }
+                        _ => {
+                            if !class
+                                .instance_properties
+                                .iter()
+                                .any(|(name, _)| name == &member)
+                            {
+                                class.instance_properties.push((member, Type::clone(&ty)));
+                            }
+                        }
+                    }
+                }
+            }
+            self.ref_resolve_memo
+                .lock()
+                .expect("ref_resolve_memo lock poisoned")
+                .clear();
+            return;
+        }
+        let statement = Stmt {
+            kind: StmtKind::InterfaceDecl(Box::new(interface)),
+            span,
+        };
+        self.inject_stmt(&statement, block_builtin_shadow);
+    }
+
+    /// For `declare module "<specifier>"` in `augmenting`: when the augmented
+    /// program file ends in `export = N` and declares a namespace `N`, the
+    /// augmentation's declarations merge into `N` — return `N`.
+    fn augmented_export_namespace(
+        this: &Self,
+        files: &[&SourceFile],
+        specifier: &str,
+        augmenting: &SourceFile,
+    ) -> Option<String> {
+        let target = this.resolve_module_to_path(specifier, &augmenting.file_name)?;
+        let alternatives = Self::module_path_alternatives(&target);
+        let target_file = files
+            .iter()
+            .find(|file| alternatives.iter().any(|path| path == &file.file_name))?;
+        let exported =
+            target_file
+                .statements
+                .iter()
+                .find_map(|statement| match &statement.kind {
+                    StmtKind::ExportAssign(expression) => match &expression.kind {
+                        ExprKind::Ident(name) => Some(name.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })?;
+        let declares_namespace = target_file.statements.iter().any(|statement| {
+            matches!(
+                &Self::unwrap_export_stmt(statement).kind,
+                StmtKind::ModuleDecl(module)
+                    if matches!(&module.name, ModuleName::Ident(name) if name == &exported)
+                        && module.body.is_some()
+            )
+        });
+        declares_namespace.then(|| exported.to_string())
     }
 
     /// Returns true iff the source file contains any top-level `import` or
@@ -9374,6 +9996,7 @@ impl TypeChecker {
         self.check_static_init_forward_refs(&file.statements);
         self.check_bigint_member_names(&file.statements);
         self.build_merged_namespace_exports(&file.statements);
+        self.build_namespace_path_exports(&file.statements);
         self.surface_binder_diagnostics(symbols);
         // Check for missing function implementations (TS2391)
         self.check_missing_function_implementations(&file.statements);
@@ -9607,6 +10230,7 @@ impl TypeChecker {
         self.check_static_init_forward_refs(&file.statements);
         self.check_bigint_member_names(&file.statements);
         self.build_merged_namespace_exports(&file.statements);
+        self.build_namespace_path_exports(&file.statements);
         self.surface_binder_diagnostics(symbols);
         // Check for missing function implementations (TS2391)
         self.check_missing_function_implementations(&file.statements);
@@ -12540,10 +13164,31 @@ impl TypeChecker {
                 .iter_mut()
                 .find(|(existing_name, _)| existing_name == &name)
             {
-                if let (Type::Namespace(existing_ns), Type::Namespace(incoming_ns)) =
-                    (existing_ty, incoming_ty)
-                {
-                    Self::merge_namespace_exports(existing_ns, incoming_ns);
+                match (existing_ty, incoming_ty) {
+                    (Type::Namespace(existing_ns), Type::Namespace(incoming_ns)) => {
+                        Self::merge_namespace_exports(existing_ns, incoming_ns);
+                    }
+                    // A namespace merged with a class or function declared in
+                    // another block (or file): the namespace's exports join
+                    // that value, whichever declaration came first.
+                    (existing_ty @ Type::Namespace(_), incoming_value)
+                        if Self::value_absorbs_namespace(&incoming_value) =>
+                    {
+                        let Type::Namespace(namespace) =
+                            std::mem::replace(existing_ty, incoming_value)
+                        else {
+                            unreachable!("matched a namespace");
+                        };
+                        if let Err(namespace) =
+                            Self::fold_namespace_into_value(existing_ty, namespace)
+                        {
+                            *existing_ty = Type::Namespace(namespace);
+                        }
+                    }
+                    (existing_value, Type::Namespace(incoming_ns)) => {
+                        let _ = Self::fold_namespace_into_value(existing_value, incoming_ns);
+                    }
+                    _ => {}
                 }
             } else {
                 existing.exports.push((name, incoming_ty));
@@ -13544,6 +14189,39 @@ impl TypeChecker {
         }
     }
 
+    /// Under a Node module option (node16+), whether the current file is an
+    /// ECMAScript module importing `source`, a CommonJS file (one the
+    /// harness/project did not register as ESM for this importer).
+    fn node_esm_importer_of_commonjs(&self, source: &str) -> bool {
+        if !matches!(
+            self.compiler_options.module,
+            Some(ModuleKind::Node16)
+                | Some(ModuleKind::Node18)
+                | Some(ModuleKind::Node20)
+                | Some(ModuleKind::NodeNext)
+        ) {
+            return false;
+        }
+        let Some(file) = self.current_file_name.as_deref() else {
+            return false;
+        };
+        let lower = file.to_ascii_lowercase();
+        let importer_is_esm = if lower.ends_with(".mts") || lower.ends_with(".mjs") {
+            true
+        } else if lower.ends_with(".cts") || lower.ends_with(".cjs") {
+            false
+        } else {
+            self.current_file_module_format == Some(ModuleKind::ESNext)
+        };
+        let source_lower = source.to_ascii_lowercase();
+        importer_is_esm
+            && !source_lower.ends_with(".json")
+            && !self
+                .esm_specifiers
+                .get(&Self::resolvable_specifier_key(file))
+                .is_some_and(|specifiers| specifiers.contains(source))
+    }
+
     fn register_import_decl(&mut self, import_decl: &ImportDecl) {
         if import_decl.type_only {
             return;
@@ -13590,6 +14268,25 @@ impl TypeChecker {
                 .filter(|t| !matches!(t, Type::Any))
         };
 
+        // Node16+: an ECMAScript-module file importing a CommonJS file sees
+        // `module.exports` as the default export (and as `ns.default`).
+        let commonjs_module_object = exports
+            .as_ref()
+            .filter(|_| {
+                resolved_path.is_some() && self.node_esm_importer_of_commonjs(&import_decl.source)
+            })
+            .map(|list| {
+                list.iter()
+                    .find(|(name, _)| name == "export=")
+                    .map(|(_, ty)| ty.clone())
+                    .unwrap_or_else(|| {
+                        Type::Module(ModuleType {
+                            name: import_decl.source.clone(),
+                            exports: list.clone(),
+                        })
+                    })
+            });
+
         match &import_decl.specifiers {
             ImportClause::Named {
                 default,
@@ -13597,7 +14294,10 @@ impl TypeChecker {
                 namespace,
             } => {
                 if let Some(default) = default {
-                    let ty = resolve_named(&exports, "default").unwrap_or(Type::Any);
+                    let ty = commonjs_module_object
+                        .clone()
+                        .or_else(|| resolve_named(&exports, "default"))
+                        .unwrap_or(Type::Any);
                     self.declare_var(default, ty);
                 }
                 for spec in named {
@@ -13616,11 +14316,37 @@ impl TypeChecker {
                         .and_then(|list| list.iter().find(|(name, _)| name == "export="))
                         .map(|(_, ty)| ty.clone());
                     let ty = match &exports {
-                        _ if export_assigned.is_some() => export_assigned.unwrap(),
-                        Some(list) if !list.is_empty() => Type::Module(ModuleType {
-                            name: import_decl.source.clone(),
-                            exports: list.clone(),
-                        }),
+                        _ if export_assigned.is_some() => {
+                            let mut value = export_assigned.unwrap();
+                            // esModuleInterop: the namespace object of an
+                            // `export =` module also carries the assigned
+                            // value as its synthetic `default`.
+                            if self.compiler_options.es_module_interop == Some(true)
+                                && (matches!(value, Type::Namespace(_))
+                                    || Self::value_absorbs_namespace(&value))
+                            {
+                                let synthetic = NamespaceType {
+                                    name: String::new(),
+                                    exports: vec![("default".into(), value.clone())],
+                                    readonly_exports: Vec::new(),
+                                };
+                                let _ = Self::fold_namespace_into_value(&mut value, synthetic);
+                            }
+                            value
+                        }
+                        Some(list) if !list.is_empty() => {
+                            let mut exports = list.clone();
+                            if let Some(module_object) = &commonjs_module_object {
+                                match exports.iter_mut().find(|(name, _)| name == "default") {
+                                    Some((_, ty)) => *ty = module_object.clone(),
+                                    None => exports.push(("default".into(), module_object.clone())),
+                                }
+                            }
+                            Type::Module(ModuleType {
+                                name: import_decl.source.clone(),
+                                exports,
+                            })
+                        }
                         _ => Type::Any,
                     };
                     self.declare_var(namespace, ty);
@@ -22824,7 +23550,9 @@ impl TypeChecker {
                         Some((minimum, info.type_params.len()))
                     });
                     if let Some((minimum, maximum)) = class_arity {
-                        if provided < minimum || provided > maximum {
+                        // JavaScript: omitted type arguments default to `any`.
+                        let js_defaulted = provided == 0 && self.current_file_is_js();
+                        if (provided < minimum || provided > maximum) && !js_defaulted {
                             let display = self.generic_display_name(&name, maximum);
                             self.diagnostics.push(error_generic_type_requires_args(
                                 &display,
@@ -23930,14 +24658,125 @@ impl TypeChecker {
         }
     }
 
+    /// A namespace body that declares `namespace A.B { … }` members: bind
+    /// each such `A` to the merged namespace value of all its blocks (the
+    /// generic hoist binds them as `any`), so dotted segments checked later
+    /// see every same-path block's exports.
+    fn declare_dotted_namespace_members(&mut self, body: &[Stmt]) {
+        let mut names: Vec<std::string::String> = Vec::new();
+        for s in body {
+            if let StmtKind::ModuleDecl(md) = &Self::unwrap_export_stmt(s).kind {
+                if let (ModuleName::Ident(name), Some(ModuleBody::Module(_))) = (&md.name, &md.body)
+                {
+                    if !names.contains(name) {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        }
+        for name in names {
+            let mut merged: Vec<(std::string::String, Type)> = Vec::new();
+            for s in body {
+                if let StmtKind::ModuleDecl(md) = &Self::unwrap_export_stmt(s).kind {
+                    if matches!(&md.name, ModuleName::Ident(n) if *n == name) {
+                        let md = (**md).clone();
+                        for (member, ty) in self.dotted_namespace_exports(&md) {
+                            Self::merge_namespace_export(&mut merged, member, ty);
+                        }
+                    }
+                }
+            }
+            self.dotted_namespace_value_names.insert(name.clone());
+            self.declare_var(
+                &name,
+                Type::Namespace(NamespaceType {
+                    name: name.clone(),
+                    exports: merged,
+                    readonly_exports: Vec::new(),
+                }),
+            );
+        }
+    }
+
+    /// A missing member of a namespace value assembled from the current
+    /// file's dotted declarations may come from another program file.
+    pub(crate) fn namespace_member_may_be_elsewhere(&self, namespace_name: &str) -> bool {
+        self.available_source_files.len() > 1
+            && self.dotted_namespace_value_names.contains(namespace_name)
+    }
+
+    /// Declare the members of the namespace value `name` (as currently in
+    /// scope) as plain variables, for checking a dotted namespace segment.
+    fn declare_namespace_object_members(&mut self, name: &str) {
+        match self.lookup_var(name).cloned() {
+            Some(Type::Namespace(namespace)) => {
+                for (member, ty) in &namespace.exports {
+                    let ty = self.dotted_binding_type(ty.clone());
+                    self.declare_var(member, ty);
+                }
+            }
+            Some(Type::ObjectType(info)) => {
+                for (member, ty) in &info.properties {
+                    let member = member.trim_start_matches('?');
+                    self.declare_var(member, (**ty).clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Check a namespace/module declaration body.
     ///
     /// `namespace A.B.C { }` nests module declarations (`ModuleBody::Module`);
-    /// those bodies are not checked yet: resolving names inside them needs the
-    /// merged exports of every `A.B` block in the program (across files), and
-    /// `merged_namespace_exports` is keyed by simple name only. Checking them
-    /// with the current scope set-up produced spurious TS2304/TS2339.
+    /// each segment is entered like a nested namespace, with the merged
+    /// exports of every same-path block visible through the enclosing
+    /// namespace value (`declare_namespace_object_members`).
     fn check_namespace_declaration(&mut self, module_decl: &ModuleDecl) {
+        // `namespace A.B { … }`: enter `A` (its merged exports visible, as
+        // for a block body) and check the inner declaration nested in it.
+        if let Some(tsc_rs_ast::ModuleBody::Module(ref nested)) = module_decl.body {
+            let ModuleName::Ident(ref namespace_name) = module_decl.name else {
+                return;
+            };
+            let namespace_path = self
+                .type_resolution_namespace
+                .as_deref()
+                .map(|owner| format!("{owner}.{namespace_name}"))
+                .unwrap_or_else(|| namespace_name.clone());
+            let outer_is_top_level = self.type_resolution_namespace.is_none();
+            let previous_type_resolution_namespace =
+                self.type_resolution_namespace.replace(namespace_path);
+            self.push_scope();
+            if outer_is_top_level {
+                if let Some(exports) = self.merged_namespace_exports.get(namespace_name).cloned() {
+                    for (n, t) in exports {
+                        self.declare_var(&n, t);
+                    }
+                }
+            }
+            self.declare_namespace_object_members(namespace_name);
+            self.declare_namespace_path_exports();
+            // The innermost block's own merged exports (other `A.B` blocks)
+            // come from the enclosing namespace's value object as well.
+            if let (Some(tsc_rs_ast::ModuleBody::Block(_)), ModuleName::Ident(inner)) =
+                (&nested.body, &nested.name)
+            {
+                self.declare_namespace_object_members(inner);
+            }
+            let is_ambient_module = (module_decl.modifiers & tsc_rs_ast::MOD_DECLARE) != 0;
+            if is_ambient_module {
+                self.ambient_depth += 1;
+            }
+            self.dotted_namespace_depth += 1;
+            self.check_namespace_declaration(nested);
+            self.dotted_namespace_depth -= 1;
+            if is_ambient_module {
+                self.ambient_depth -= 1;
+            }
+            self.pop_scope();
+            self.type_resolution_namespace = previous_type_resolution_namespace;
+            return;
+        }
         // Recurse into namespace/module body to check declarations inside.
         // This ensures variables, functions, and classes inside namespaces
         // get their types recorded in expression_types for hover.
@@ -23967,6 +24806,12 @@ impl TypeChecker {
                         self.declare_var(&n, t);
                     }
                 }
+                // Inside a dotted namespace the enclosing value carries the
+                // merged exports of every same-path block.
+                if self.dotted_namespace_depth > 0 {
+                    self.declare_namespace_object_members(ns_name);
+                }
+                self.declare_namespace_path_exports();
             }
             // A `declare module`/`declare namespace` body (or any module
             // body already nested in one) is ambient: its classes need no
@@ -23986,6 +24831,7 @@ impl TypeChecker {
                 self.hoist_lexical_type_declaration(s);
                 self.hoist_namespace_value_member(s);
             }
+            self.declare_dotted_namespace_members(body);
             // Namespace-local import-equals declarations are also
             // hoisted. Resolve their readonly namespace evidence in
             // this exact scope before checking any member, so forward
@@ -24706,6 +25552,10 @@ impl TypeChecker {
         } else if self.class_info.contains_key(root)
             && segs.len() == 2
             && !self.import_equals_aliases.contains_key(root)
+            // An import binding of this file names a module, not the
+            // same-named class another module declared (`import db =
+            // require("./db")`, `db.db`).
+            && !self.file_import_binding_names.contains(root)
         {
             // A local class without a merged namespace has no qualified types.
             if !self.namespace_member_names.contains_key(root) {
@@ -25832,7 +26682,9 @@ impl TypeChecker {
                     .map(|args| args.len())
                     .unwrap_or(0);
                 if let Some((min_required, max_total)) = self.generic_arity_range(&name) {
-                    if provided < min_required || provided > max_total {
+                    // JavaScript: omitted type arguments default to `any`.
+                    let js_defaulted = provided == 0 && self.current_file_is_js();
+                    if (provided < min_required || provided > max_total) && !js_defaulted {
                         let display = self.generic_display_name(&name, max_total);
                         self.diagnostics.push(error_generic_type_requires_args(
                             &display, max_total, node.span,
@@ -26196,6 +27048,10 @@ impl TypeChecker {
         if let Some(availability) = stdlib::stdlib_member_availability(&self.compiler_options) {
             candidates.extend(availability.global_type_names().map(str::to_string));
         }
+        // Registry keys of namespace-owned or other modules' types (qualified
+        // `A.Point`, or the very name that just failed to resolve here) are
+        // not visible identifiers.
+        candidates.retain(|candidate| candidate != name && !candidate.contains('.'));
         candidates.sort();
         candidates.dedup();
         let suggestion = if self.unresolved_name_count < 10 {
@@ -31804,12 +32660,152 @@ impl TypeChecker {
             }
         }
         for (name, md) in decls {
-            let namespace = self.build_namespace_value_exports(&md);
-            self.merged_namespace_exports
-                .entry(name)
-                .or_default()
-                .extend(namespace.exports);
+            let exports = self.dotted_namespace_exports(&md);
+            let merged = self.merged_namespace_exports.entry(name).or_default();
+            for (member, ty) in exports {
+                Self::merge_namespace_export(merged, member, ty);
+            }
         }
+    }
+
+    /// Build `namespace_path_exports` for a file that declares any dotted
+    /// namespace (`namespace A.B { … }`) at any depth.
+    fn build_namespace_path_exports(&mut self, stmts: &[Stmt]) {
+        fn has_dotted(stmts: &[Stmt]) -> bool {
+            stmts.iter().any(|s| {
+                let inner = match &s.kind {
+                    StmtKind::Export(ed) => match &ed.kind {
+                        ExportDeclKind::Decl(d) => d.as_ref(),
+                        _ => return false,
+                    },
+                    _ => s,
+                };
+                match &inner.kind {
+                    StmtKind::ModuleDecl(md) => match &md.body {
+                        Some(ModuleBody::Module(_)) => true,
+                        Some(ModuleBody::Block(body)) => has_dotted(body),
+                        None => false,
+                    },
+                    _ => false,
+                }
+            })
+        }
+        self.namespace_path_exports.clear();
+        if !has_dotted(stmts) {
+            return;
+        }
+        self.collect_namespace_path_exports(stmts, "");
+    }
+
+    fn collect_namespace_path_exports(&mut self, stmts: &[Stmt], prefix: &str) {
+        for s in stmts {
+            let StmtKind::ModuleDecl(md) = &Self::unwrap_export_stmt(s).kind else {
+                continue;
+            };
+            let md = (**md).clone();
+            self.collect_namespace_decl_path_exports(&md, prefix);
+        }
+    }
+
+    fn collect_namespace_decl_path_exports(&mut self, md: &tsc_rs_ast::ModuleDecl, prefix: &str) {
+        let ModuleName::Ident(name) = &md.name else {
+            return;
+        };
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        let exports = self.dotted_namespace_exports(md);
+        let merged = self.namespace_path_exports.entry(path.clone()).or_default();
+        for (member, ty) in exports {
+            Self::merge_namespace_export(merged, member, ty);
+        }
+        match &md.body {
+            Some(ModuleBody::Module(nested)) => {
+                self.collect_namespace_decl_path_exports(nested, &path);
+            }
+            Some(ModuleBody::Block(body)) => {
+                self.collect_namespace_path_exports(body, &path);
+            }
+            None => {}
+        }
+    }
+
+    /// Declare the merged exports of the namespace at the current
+    /// `type_resolution_namespace` path (see `namespace_path_exports`).
+    fn declare_namespace_path_exports(&mut self) {
+        let Some(path) = self.type_resolution_namespace.clone() else {
+            return;
+        };
+        if let Some(exports) = self.namespace_path_exports.get(&path).cloned() {
+            for (member, ty) in exports {
+                let ty = self.dotted_binding_type(ty);
+                self.declare_var(&member, ty);
+            }
+        }
+    }
+
+    /// In a multi-file program a namespace value assembled from this file's
+    /// dotted declarations may merge with a class or function declared in
+    /// another file (`X.Y.Point` class + namespace); bind it as `any` there.
+    fn dotted_binding_type(&self, ty: Type) -> Type {
+        if self.available_source_files.len() > 1 && matches!(ty, Type::Namespace(_)) {
+            Type::Any
+        } else {
+            ty
+        }
+    }
+
+    /// Exports of one namespace declaration; a dotted `namespace A.B { … }`
+    /// exports `B` as a namespace value holding the inner block's exports.
+    fn dotted_namespace_exports(
+        &mut self,
+        md: &tsc_rs_ast::ModuleDecl,
+    ) -> Vec<(std::string::String, Type)> {
+        match &md.body {
+            Some(ModuleBody::Module(nested)) => {
+                let ModuleName::Ident(inner) = &nested.name else {
+                    return Vec::new();
+                };
+                let exports = self.dotted_namespace_exports(nested);
+                self.dotted_namespace_value_names.insert(inner.clone());
+                vec![(
+                    inner.clone(),
+                    Type::Namespace(NamespaceType {
+                        name: inner.clone(),
+                        exports,
+                        readonly_exports: Vec::new(),
+                    }),
+                )]
+            }
+            _ => self.build_namespace_value_exports(md).exports,
+        }
+    }
+
+    /// Add `member` to merged namespace exports; two namespace values of the
+    /// same name (`A.B` in several dotted blocks) merge their exports.
+    fn merge_namespace_export(
+        merged: &mut Vec<(std::string::String, Type)>,
+        member: std::string::String,
+        ty: Type,
+    ) {
+        if let Type::Namespace(incoming) = &ty {
+            if let Some((_, Type::Namespace(existing))) = merged
+                .iter_mut()
+                .rev()
+                .find(|(n, t)| *n == member && matches!(t, Type::Namespace(_)))
+            {
+                for (inner, inner_ty) in incoming.exports.clone() {
+                    Self::merge_namespace_export(&mut existing.exports, inner, inner_ty);
+                }
+                existing
+                    .readonly_exports
+                    .extend(incoming.readonly_exports.iter().cloned());
+                return;
+            }
+        }
+        merged.push((member, ty));
     }
 
     pub(crate) fn current_file_is_js(&self) -> bool {

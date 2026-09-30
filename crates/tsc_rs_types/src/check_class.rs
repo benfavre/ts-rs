@@ -854,7 +854,21 @@ impl TypeChecker {
                         .map(|t| self.resolve_type_node(t))
                         .unwrap_or_else(|| {
                             if let Some(ref body) = method.body {
-                                let inferred = self.infer_return_type_from_stmts(body);
+                                // Bind the parameters so `return a` resolves
+                                // to the parameter's declared type (as the
+                                // FnDecl registration path does).
+                                let bindings: Vec<_> = method
+                                    .params
+                                    .iter()
+                                    .zip(params.iter())
+                                    .filter_map(|(p, (_, pty))| match &p.name.kind {
+                                        PatKind::Ident(n) => Some((n.to_string(), pty.clone())),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                let inferred = crate::with_infer_param_scope(bindings, || {
+                                    self.infer_return_type_from_stmts(body)
+                                });
                                 // An async method's inferred return is a Promise; a
                                 // generator method's is a (Async)Generator.
                                 if method.is_generator {
@@ -1083,6 +1097,25 @@ impl TypeChecker {
                         ClassMemberKind::Method(method) => &method.name,
                         ClassMemberKind::GetAccessor(accessor)
                         | ClassMemberKind::SetAccessor(accessor) => &accessor.name,
+                        // Parameter properties (`constructor(private x)`).
+                        ClassMemberKind::Constructor(ctor) => {
+                            const PROPERTY_MODIFIERS: tsc_rs_ast::ModifierFlags =
+                                tsc_rs_ast::MOD_PUBLIC
+                                    | tsc_rs_ast::MOD_PRIVATE
+                                    | tsc_rs_ast::MOD_PROTECTED
+                                    | tsc_rs_ast::MOD_READONLY;
+                            for param in &ctor.params {
+                                if param.modifiers & PROPERTY_MODIFIERS == 0 {
+                                    continue;
+                                }
+                                if let PatKind::Ident(n) = &param.name.kind {
+                                    locations
+                                        .entry(n.to_string())
+                                        .or_insert((file.clone(), param.name.span));
+                                }
+                            }
+                            continue;
+                        }
                         _ => continue,
                     };
                     locations

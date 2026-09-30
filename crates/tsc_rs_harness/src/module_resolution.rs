@@ -315,6 +315,29 @@ pub(crate) fn resolve_module_specifier_with_conditions(
                 }
             }
         }
+        // `typesVersions` redirects the package's type paths for the
+        // TypeScript versions it lists (the root maps its `types` entry).
+        if let Some((_, content)) = package_json_content {
+            let subpath = if package_entry == "." {
+                extract_json_string(content, "types")
+                    .or_else(|| extract_json_string(content, "typings"))
+                    .unwrap_or_else(|| "index".to_string())
+            } else {
+                package_entry.trim_start_matches("./").to_string()
+            };
+            let subpath = subpath.trim_start_matches("./");
+            for target in types_versions_targets(content, subpath) {
+                let candidate = normalize_path_segments(&join_path(
+                    &package_dir,
+                    &normalize_header_path(&target),
+                ));
+                if let Some(idx) =
+                    resolve_module_path_base(&candidate, path_to_idx, &ctx.module_suffixes)
+                {
+                    return Some(idx);
+                }
+            }
+        }
         if let Some(idx) = resolve_module_path_base(&node_base, path_to_idx, &ctx.module_suffixes) {
             return Some(idx);
         }
@@ -408,6 +431,39 @@ fn resolve_package_map_targets(
 
 /// Split a bare specifier into (package name, export map entry): `inner` →
 /// (`inner`, `.`), `@s/p/sub` → (`@s/p`, `./sub`).
+/// Mapped targets of `subpath` under the first `typesVersions` entry whose
+/// version range admits the current TypeScript (any `*`, `>=`, or `>` range;
+/// ranges with an upper bound are treated as excluding it).
+fn types_versions_targets(package_json: &str, subpath: &str) -> Vec<String> {
+    let Some(json) = parse_json_lenient(package_json) else {
+        return Vec::new();
+    };
+    let Some(JsonValue::Object(ranges)) = json.get("typesVersions") else {
+        return Vec::new();
+    };
+    let Some((_, JsonValue::Object(mappings))) = ranges.iter().find(|(range, _)| {
+        let range = range.trim();
+        range == "*"
+            || ((range.starts_with(">=") || range.starts_with('>')) && !range.contains('<'))
+    }) else {
+        return Vec::new();
+    };
+    for (pattern, targets) in mappings {
+        let Some(matched) = match_path_pattern(subpath, pattern) else {
+            continue;
+        };
+        let JsonValue::Array(targets) = targets else {
+            continue;
+        };
+        return targets
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(|target| target.replace('*', &matched))
+            .collect();
+    }
+    Vec::new()
+}
+
 fn split_package_specifier(spec: &str) -> (String, String) {
     let mut segments = spec.splitn(3, '/');
     let first = segments.next().unwrap_or_default();
