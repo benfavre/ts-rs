@@ -484,6 +484,9 @@ pub struct Binder {
     /// Leading trivia is part of a declaration's full start, but not its
     /// navigation span. Keys are the first byte after a trivia run.
     full_starts: rustc_hash::FxHashMap<u32, u32>,
+    /// Resolve after collecting declarations so forward references and later
+    /// declarations shadowing outer names use the complete lexical scope.
+    pending_references: Vec<(String, Span, ScopeId, ReferenceKind)>,
 }
 
 impl Default for Binder {
@@ -506,6 +509,7 @@ impl Binder {
             current_scope: 0,
             in_export: false,
             full_starts: rustc_hash::FxHashMap::default(),
+            pending_references: Vec::new(),
         }
     }
 
@@ -548,6 +552,17 @@ impl Binder {
         self.scopes[0].span = file.span;
         for stmt in &file.statements {
             self.bind_stmt(stmt, &file.file_name);
+        }
+        for (name, span, scope, kind) in std::mem::take(&mut self.pending_references) {
+            if let Some(symbol_id) = self.resolve_reference(&name, scope) {
+                self.table.position_to_symbol.insert(span.start, symbol_id);
+                self.table.scope_graph.references.push(SymbolReference {
+                    span,
+                    symbol_id,
+                    scope_id: scope,
+                    kind,
+                });
+            }
         }
         self.table.scope_graph.scopes = self
             .scopes
@@ -761,14 +776,29 @@ impl Binder {
         id
     }
 
-    fn record_reference(&mut self, span: Span, symbol_id: SymbolId, kind: ReferenceKind) {
-        self.table.position_to_symbol.insert(span.start, symbol_id);
-        self.table.scope_graph.references.push(SymbolReference {
-            span,
-            symbol_id,
-            scope_id: self.current_scope,
-            kind,
-        });
+    fn record_reference(&mut self, name: &str, span: Span, kind: ReferenceKind) {
+        self.pending_references
+            .push((name.to_string(), span, self.current_scope, kind));
+    }
+
+    fn resolve_reference(&self, name: &str, mut scope: ScopeId) -> Option<SymbolId> {
+        loop {
+            let current = &self.scopes[scope];
+            if let Some(&id) = current.symbols.get(name) {
+                let flags = self.table.symbols[id as usize].flags;
+                // Class and interface members require a receiver; their names
+                // do not shadow lexical bindings in a method or annotation.
+                // Type parameters in the same scope remain visible.
+                let member = matches!(current.kind, ScopeKind::Class | ScopeKind::Interface)
+                    && flags & (SYM_PROPERTY | SYM_METHOD | SYM_GET_ACCESSOR | SYM_SET_ACCESSOR)
+                        != 0
+                    && flags & SYM_TYPE_PARAMETER == 0;
+                if !member {
+                    return Some(id);
+                }
+            }
+            scope = current.parent?;
+        }
     }
 
     /// Public-facing resolve: walk scope chain from given scope index.
@@ -1350,10 +1380,8 @@ impl Binder {
                     // Record identifier references in position_to_symbol so
                     // hover and go-to-definition work at usage sites, not only
                     // at declaration sites. Resolve the name through the scope
-                    // chain to find the symbol it refers to.
-                    if let Some(sym_id) = self.resolve_in_scope(name, self.current_scope) {
-                        self.record_reference(expr.span, sym_id, ReferenceKind::Value);
-                    }
+                    // chain once all declarations have been collected.
+                    self.record_reference(name, expr.span, ReferenceKind::Value);
                 }
                 _ => {}
             }
@@ -1365,9 +1393,7 @@ impl Binder {
         while let Some(expr) = expr_stack.pop() {
             match &expr.kind {
                 ExprKind::Ident(name) => {
-                    if let Some(sym_id) = self.resolve_in_scope(name, self.current_scope) {
-                        self.record_reference(expr.span, sym_id, ReferenceKind::Type);
-                    }
+                    self.record_reference(name, expr.span, ReferenceKind::Type);
                 }
                 ExprKind::Member(member) => expr_stack.push(&member.object),
                 ExprKind::Paren(inner) | ExprKind::NonNull(inner) => expr_stack.push(inner),

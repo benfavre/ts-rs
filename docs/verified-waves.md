@@ -1385,3 +1385,28 @@ ran concurrently. The same report completed under the debugger and in five
 ordinary reruns with identical manifests; the final report also completed.
 The initial crash remains unexplained and is not claimed fixed. Evidence is
 in `/tmp/ts-rs-symbol-positions-20260930/` on the verification host.
+
+## 2026-09-30: forward references and lexical shadowing
+
+Identifier references now resolve after all declarations have been collected,
+retaining the scope of each occurrence. References before a function, class,
+variable, or type declaration can therefore navigate to that declaration, and
+later local bindings shadow outer names for earlier uses. Class/interface
+members do not capture bare lexical references; their type parameters remain
+visible. Bindings in sibling and nested scopes stay isolated.
+
+Compiler symbol passes increase from 1,155 to 1,176 (+21), and conformance
+symbol passes increase from 1,207 to 1,210 (+3). The other six default
+JavaScript, diagnostic, and type matrices are unchanged. All eight cache-free
+comparisons preserve cases, oracles, and skips and lose no passes. Four new
+tests cover forward value/type references, local shadowing, scope isolation,
+and member names. Shadowing and member lookup were independently checked with
+TypeScript 6.0.3.
+
+The full workspace passes 3,613 tests with 37 ignored, and `make ci` passes.
+An earlier workspace
+run encountered a doctest dependency-linking error after source edits during
+testing; the fresh run against the final source passes including doctests.
+The complete LSP run retains 1,800 passes, 563 failures, and 3,957 skips; its
+complete failure set matches a rerun of the prior inventory executable.
+Evidence is in `/tmp/ts-rs-forward-symbols-20260930/` on the verification host.
