@@ -1566,10 +1566,14 @@ impl<'a> Parser<'a> {
             if ch == b'/' && !in_char_class {
                 pos += 1; // skip closing /
                 found_closing = true;
-                // consume flags (g, i, m, s, u, y, d, v)
-                // Also consume non-ASCII bytes for non-BMP Unicode flag chars.
-                while pos < src.len() && (src[pos].is_ascii_alphabetic() || src[pos] >= 0x80) {
-                    pos += 1;
+                // Flags consume identifier parts, including invalid flag
+                // names such as digits and non-BMP letters. Unicode trivia
+                // belongs to the following token, not to the literal.
+                for character in self.source[pos..].chars() {
+                    if !tsc_rs_scanner::char_utils::is_unicode_identifier_continue(character) {
+                        break;
+                    }
+                    pos += character.len_utf8();
                 }
                 break;
             }

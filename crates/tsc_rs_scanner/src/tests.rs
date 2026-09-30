@@ -563,6 +563,28 @@ fn rescan_slash_as_regex() {
 }
 
 #[test]
+fn regex_flags_stop_before_unicode_trivia() {
+    for whitespace in ['\u{00a0}', '\u{2028}', '\u{2029}', '\u{feff}'] {
+        let source = format!("/a/g{whitespace}next");
+        let mut scanner = TsScanner::new(&source);
+        scanner.scan();
+        assert_eq!(scanner.re_scan_slash_token(), TokenKind::RegExpLiteral);
+        assert_eq!(scanner.token_value(), "/a/g");
+        assert_eq!(scanner.scan(), TokenKind::Identifier);
+        assert_eq!(scanner.token_value(), "next");
+    }
+}
+
+#[test]
+fn regex_flags_include_all_identifier_parts() {
+    let mut scanner = TsScanner::new("/a/g1_$𝘨;");
+    scanner.scan();
+    assert_eq!(scanner.re_scan_slash_token(), TokenKind::RegExpLiteral);
+    assert_eq!(scanner.token_value(), "/a/g1_$𝘨");
+    assert_eq!(scanner.scan(), TokenKind::Semicolon);
+}
+
+#[test]
 fn rescan_slash_equals_as_regex() {
     let mut s = TsScanner::new("/=abc/g");
     s.scan();

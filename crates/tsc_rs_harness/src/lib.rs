@@ -5989,6 +5989,11 @@ impl BaselineRunner {
                             } else {
                                 line.len()
                             };
+                            // AST spans are UTF-8 byte offsets; TypeScript's
+                            // baseline columns and marker widths use UTF-16.
+                            let len = line
+                                .get(col..col.saturating_add(len))
+                                .map_or(len, |text| text.encode_utf16().count());
                             let mut prefix = String::from("    ");
                             let mut char_col = 0;
                             for ch in line.chars() {
@@ -5998,7 +6003,9 @@ impl BaselineRunner {
                                 if ch == '\t' {
                                     prefix.push('\t');
                                 } else {
-                                    prefix.push(' ');
+                                    for _ in 0..ch.len_utf16() {
+                                        prefix.push(' ');
+                                    }
                                 }
                                 char_col += ch.len_utf8();
                             }
@@ -6271,7 +6278,7 @@ fn offset_to_line_col_0based(source: &str, offset: u32) -> (usize, usize) {
             line += 1;
             col = 0;
         } else {
-            col += 1;
+            col += ch.len_utf16();
         }
     }
     (line, col)
@@ -8449,6 +8456,24 @@ fn classify_mismatch(oracle: &CommandOutput, candidate: &CommandOutput) -> Vec<M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_bmp_regex_diagnostics_match_utf16_baseline() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let runner = BaselineRunner::new(&root);
+        let result = runner.run_case_impl_with_kind(
+            &root.join("tests/cases/compiler/regularExpressionWithNonBMPFlags.ts"),
+            Suite::Compiler,
+            BaselineKind::Errors,
+        );
+        assert!(result.baseline_exists);
+        assert!(result.passed, "{:?}", result.diff);
+    }
 
     fn source_provenance_workspace(test_name: &str) -> (PathBuf, PathBuf) {
         let root =

@@ -420,6 +420,22 @@ impl<'a> Parser<'a> {
         let mut diagnostics = Vec::new();
 
         for (index, token) in tokens.iter().enumerate() {
+            // The scanner recovers from a misplaced shebang by skipping
+            // its '#'. Preserve the scanner error so recovered regexes in
+            // the rest of that line do not acquire grammar diagnostics.
+            if token.kind == TokenKind::Excl
+                && token.span.start > 0
+                && source.as_bytes()[token.span.start as usize - 1] == b'#'
+            {
+                diagnostics.push(Diagnostic {
+                    code: 18026,
+                    message: "'#!' can only be used at the start of a file.".to_string(),
+                    category: DiagnosticCategory::Error,
+                    file_name: None,
+                    span: Some(Span::new(token.span.start - 1, token.span.end)),
+                    related: None,
+                });
+            }
             if !matches!(
                 token.kind,
                 TokenKind::NumericLiteral | TokenKind::BigIntLiteral
@@ -496,7 +512,7 @@ impl<'a> Parser<'a> {
     /// diagnostics covered by that successful reinterpretation.
     pub(crate) fn suppress_eager_scanner_diagnostics_in_span(&mut self, covered_span: Span) {
         self.diagnostics.retain(|diagnostic| {
-            !matches!(diagnostic.code, 1121 | 1125)
+            !matches!(diagnostic.code, 1121 | 1125 | 18026)
                 || !diagnostic.span.is_some_and(|span| {
                     span.start >= covered_span.start && span.end <= covered_span.end
                 })

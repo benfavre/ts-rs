@@ -1162,3 +1162,40 @@ service.
 Language server (fourslash) before and after: QuickInfo 250 to 298,
 completions 839 to 859, go-to-definition 172 to 191, find-all-references 305
 to 329, signature help 121 to 123.
+
+## 2026-09-30: regular-expression flags and UTF-16 diagnostic formatting
+
+The checker now validates trailing regex flags and flags inside modifier
+groups: unknown flags (TS1499), duplicates (TS1500), target availability
+(TS1501), conflicting Unicode modes (TS1502), and flags that cannot be
+toggled in a subpattern (TS1509). Diagnostic precedence follows TypeScript,
+including repeated Unicode conflicts and duplicates across enabled/disabled
+modifier lists. Escapes, character classes, lookarounds, and named captures
+do not become modifier groups.
+
+The scanner and parser consume identifier parts as flags and stop at Unicode
+trivia. Misplaced shebangs retain TS18026, preventing recovered regexes from
+receiving grammar errors after a syntax error. The errors-baseline formatter
+now converts byte spans to UTF-16 columns and underline widths.
+
+All 119 expected flag diagnostics across expanded compiler/conformance
+variants match, with zero false positives for these codes. Compiler diagnostic
+matches rise from 8,679 to 8,783 (including five TS18026 diagnostics), while
+false positives remain 1,517. The two newly passing whole cases are
+`regularExpressionWithNonBMPFlags` and `jsxEsprimaFbTestSuite`.
+
+| Suite | Baseline | Before | After | Lost passes |
+| --- | --- | ---: | ---: | ---: |
+| Compiler | Diagnostics | 4,779 | 4,780 | 0 |
+| Conformance | Diagnostics | 3,621 | 3,622 | 0 |
+| Compiler | JavaScript | 6,032 | 6,032 | 0 |
+| Conformance | JavaScript | 5,388 | 5,388 | 0 |
+
+All four comparisons use cache-free manifests. Skips are unchanged: none
+for diagnostics, 497 for compiler JavaScript, and 519 for conformance
+JavaScript. No upstream cases or reference baselines changed.
+
+Validation: 1,606 scanner/parser/checker tests and 96 harness tests passed;
+`make ci` passed. New coverage includes target boundaries, diagnostic
+precedence, modifier groups, Unicode flag spans/trivia, misplaced shebang
+recovery, `noCheck`, and an exact upstream errors-baseline comparison.

@@ -384,12 +384,13 @@ impl<'a> TsScanner<'a> {
                 }
                 if ch == b'/' && !in_char_class {
                     self.pos += 1; // consume closing /
-                                   // Scan flags (ASCII alpha + non-ASCII for Unicode flag chars)
-                    while self.pos < self.end
-                        && (is_identifier_continue(self.source[self.pos])
-                            || self.source[self.pos] >= 0x80)
-                    {
-                        self.pos += 1;
+                                   // Consume identifier parts, keeping Unicode whitespace
+                                   // and punctuation outside the regular expression.
+                    for character in self.text[self.pos..self.end].chars() {
+                        if !is_unicode_identifier_continue(character) {
+                            break;
+                        }
+                        self.pos += character.len_utf8();
                     }
                     // Raw token text matches the value verbatim — no cook needed.
                     self.token_kind = TokenKind::RegExpLiteral;
@@ -1777,7 +1778,7 @@ impl<'a> TsScanner<'a> {
         } else if ch == '\u{2028}' || ch == '\u{2029}' {
             self.preceding_line_break = true;
             self.token_kind = TokenKind::NewLineTrivia;
-        } else if ch.is_whitespace() {
+        } else if ch.is_whitespace() || ch == '\u{feff}' {
             self.token_kind = TokenKind::WhitespaceTrivia;
         } else {
             // Not an identifier start and not a line separator -- unknown token

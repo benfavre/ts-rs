@@ -4015,6 +4015,119 @@ impl TypeChecker {
         }
     }
 
+    /// Validate flags in source order, matching the scanner's precedence:
+    /// unknown, duplicate, conflicting Unicode mode, then target availability.
+    fn check_regexp_flag_diagnostics(&mut self, flags: &str, start: u32, subpattern: bool) {
+        let target = match self.compiler_options.target {
+            None | Some(ScriptTarget::ES3) => ScriptTarget::ES2025,
+            Some(target) => target,
+        };
+        let mut seen = 0u8;
+        for (offset, character) in flags.char_indices() {
+            if subpattern && character == '-' {
+                continue;
+            }
+            let (flag, minimum) = match character {
+                'd' => (1, Some((ScriptTarget::ES2022, "es2022"))),
+                'g' => (2, None),
+                'i' => (4, None),
+                'm' => (8, None),
+                's' => (16, Some((ScriptTarget::ES2018, "es2018"))),
+                'u' => (32, Some((ScriptTarget::ES2015, "es6"))),
+                'v' => (64, Some((ScriptTarget::ES2024, "es2024"))),
+                'y' => (128, Some((ScriptTarget::ES2015, "es6"))),
+                _ => (0, None),
+            };
+            let error = if flag == 0 {
+                Some((1499, "Unknown regular expression flag.".to_string()))
+            } else if seen & flag != 0 {
+                Some((1500, "Duplicate regular expression flag.".to_string()))
+            } else if subpattern && flag & 28 == 0 {
+                Some((
+                    1509,
+                    "This regular expression flag cannot be toggled within a subpattern."
+                        .to_string(),
+                ))
+            } else if (seen | flag) & 96 == 96 {
+                Some((1502, "The Unicode (u) flag and the Unicode Sets (v) flag cannot be set simultaneously.".to_string()))
+            } else {
+                // An unavailable flag still counts as seen. A conflicting
+                // Unicode flag does not, so repeated conflicts remain TS1502.
+                seen |= flag;
+                minimum.filter(|(minimum, _)| target < *minimum).map(|(_, name)| {
+                    (1501, format!("This regular expression flag is only available when targeting '{name}' or later."))
+                })
+            };
+            if let Some((code, message)) = error {
+                let span = Span::new(
+                    start + offset as u32,
+                    start + (offset + character.len_utf8()) as u32,
+                );
+                if !self
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code && diagnostic.span == Some(span))
+                {
+                    self.diagnostics.push(Diagnostic {
+                        code,
+                        message,
+                        category: DiagnosticCategory::Error,
+                        file_name: None,
+                        span: Some(span),
+                        related: None,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Locate modifier groups without treating escaped parentheses or
+    /// character-class contents as groups. Each group's enabled and disabled
+    /// flags share a duplicate set, independent of enclosing groups.
+    fn check_regexp_modifier_diagnostics(&mut self, pattern: &str, flags: &str, start: u32) {
+        use tsc_rs_scanner::char_utils::is_unicode_identifier_continue;
+
+        let unicode_sets = flags.chars().find(|ch| matches!(ch, 'u' | 'v')) == Some('v');
+        let mut class_depth = 0u32;
+        let mut characters = pattern.char_indices().peekable();
+        while let Some((offset, character)) = characters.next() {
+            match character {
+                '\\' => {
+                    characters.next();
+                }
+                '[' if class_depth == 0 || unicode_sets => class_depth += 1,
+                ']' => class_depth = class_depth.saturating_sub(1),
+                '(' if class_depth == 0 && characters.peek().is_some_and(|(_, ch)| *ch == '?') => {
+                    characters.next();
+                    if characters
+                        .peek()
+                        .is_some_and(|(_, ch)| matches!(ch, '=' | '!' | '<'))
+                    {
+                        continue;
+                    }
+                    let flag_start = offset + 2;
+                    let mut end = flag_start;
+                    let mut had_minus = false;
+                    while let Some(&(index, ch)) = characters.peek() {
+                        if ch == '-' && !had_minus {
+                            had_minus = true;
+                        } else if !is_unicode_identifier_continue(ch) {
+                            break;
+                        }
+                        characters.next();
+                        end = index + ch.len_utf8();
+                    }
+                    self.check_regexp_flag_diagnostics(
+                        &pattern[flag_start..end],
+                        start + flag_start as u32,
+                        true,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Context-independent regular-expression escape diagnostics. Non-zero
     /// decimal escapes require capture-group and character-class analysis; a
     /// zero followed by any decimal digit always enters the legacy-octal
@@ -10109,6 +10222,16 @@ impl TypeChecker {
             }
             ExprKind::RegexpLit(regex) => {
                 if self.check_expression_grammar {
+                    self.check_regexp_flag_diagnostics(
+                        regex.flags.as_str(),
+                        expr.span.end - regex.flags.len() as u32,
+                        false,
+                    );
+                    self.check_regexp_modifier_diagnostics(
+                        regex.pattern.as_str(),
+                        regex.flags.as_str(),
+                        expr.span.start + 1,
+                    );
                     self.check_regexp_escape_diagnostics(regex.pattern.as_str(), expr.span);
                 }
                 Type::TypeReference("RegExp".to_string(), Arc::from([] as [Type; 0]))
