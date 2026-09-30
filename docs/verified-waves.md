@@ -1223,3 +1223,28 @@ conformance 18,401 to 18,570. False-positive totals remain 1,517 and 2,785.
 Cache-free comparisons show no changed skip counts. Newly passing cases:
 `staticPrototypeProperty` and `propertyNamedPrototype`. All 1,201 checker
 tests, including eight new regression tests, and `make ci` passed.
+
+## 2026-09-30: namespace default exports and export assignments
+
+Internal namespaces now reject default exports (TS1319) and `export =`
+assignments (TS1063). Default declarations underline their `default` modifier
+and retain body checking. Invalid export expressions underline the whole
+statement and stop before value checking, avoiding cascading missing-name
+errors. Ambient external modules and global augmentations remain valid;
+ambient and dotted internal namespaces follow the same restrictions.
+
+All 39 expected TS1319/TS1063 diagnostics match across expanded variants,
+with no false positives for these codes. Conformance false positives decrease
+from 2,785 to 2,782. Newly passing cases are `exportDefaultClassInNamespace`,
+`exportDefaultFunctionInNamespace`, `staticPropertyNameConflicts`,
+`parserExportAssignment5`, and `parserExportAssignment9`.
+
+| Suite | Baseline | Before | After | Lost passes |
+| --- | --- | ---: | ---: | ---: |
+| Compiler | Diagnostics | 4,781 | 4,783 | 0 |
+| Conformance | Diagnostics | 3,623 | 3,626 | 0 |
+| Compiler | JavaScript | 6,032 | 6,032 | 0 |
+| Conformance | JavaScript | 5,388 | 5,388 | 0 |
+
+All four cache-free comparisons preserve skip counts. All 1,207 checker
+tests, including six new regressions, and `make ci` passed.

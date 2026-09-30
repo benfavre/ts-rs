@@ -24860,6 +24860,77 @@ impl TypeChecker {
         }
     }
 
+    /// Invalid namespace export assignments stop before their expressions are
+    /// checked. Default class/function declarations still check their bodies,
+    /// and anchor the grammar error on the `default` modifier instead.
+    fn check_namespace_default_export(&mut self, statement: &Stmt) -> bool {
+        let (code, message, span, skip_expression) = match &statement.kind {
+            StmtKind::ExportAssign(_) => (
+                1063,
+                "An export assignment cannot be used in a namespace.",
+                statement.span,
+                true,
+            ),
+            StmtKind::Export(export) => match &export.kind {
+                ExportDeclKind::Default(_) => (
+                    1319,
+                    "A default export can only be used in an ECMAScript-style module.",
+                    export.span,
+                    true,
+                ),
+                ExportDeclKind::DefaultDecl(_) if self.check_expression_grammar => {
+                    let span = self
+                        .current_source
+                        .as_deref()
+                        .and_then(|source| {
+                            source.get(export.span.start as usize..export.span.end as usize)
+                        })
+                        .and_then(|source| {
+                            let mut scanner = tsc_rs_scanner::TsScanner::new(source);
+                            let mut saw_export = false;
+                            loop {
+                                match scanner.scan() {
+                                    tsc_rs_scanner::TokenKind::Export => saw_export = true,
+                                    tsc_rs_scanner::TokenKind::Default if saw_export => {
+                                        return Some(Span::new(
+                                            export.span.start + scanner.token_pos() as u32,
+                                            export.span.start + scanner.text_pos() as u32,
+                                        ));
+                                    }
+                                    tsc_rs_scanner::TokenKind::EndOfFile => return None,
+                                    _ => {}
+                                }
+                            }
+                        })
+                        .unwrap_or(export.span);
+                    (
+                        1319,
+                        "A default export can only be used in an ECMAScript-style module.",
+                        span,
+                        false,
+                    )
+                }
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if !self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == code && diagnostic.span == Some(span))
+        {
+            self.diagnostics.push(Diagnostic {
+                code,
+                message: message.to_string(),
+                category: DiagnosticCategory::Error,
+                file_name: None,
+                span: Some(span),
+                related: None,
+            });
+        }
+        skip_expression
+    }
+
     /// Check a namespace/module declaration body.
     ///
     /// `namespace A.B.C { }` nests module declarations (`ModuleBody::Module`);
@@ -24987,7 +25058,15 @@ impl TypeChecker {
             // assignment analysis (TS2454) does not cross into it.
             self.fn_nesting_depth += 1;
             let first_body_diagnostic = self.diagnostics.len();
+            let global_augmentation = module_decl.name_span.is_none()
+                && matches!(&module_decl.name, ModuleName::Ident(name) if name == "global");
             for s in body {
+                if !ambient_external_module
+                    && !global_augmentation
+                    && self.check_namespace_default_export(s)
+                {
+                    continue;
+                }
                 self.check_stmt(s);
             }
             self.fn_nesting_depth -= 1;
