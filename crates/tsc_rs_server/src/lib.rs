@@ -4680,6 +4680,406 @@ fn extract_type_params_from_source(
     String::new()
 }
 
+/// tsc displays a value whose type IS a type parameter by printing the type
+/// parameter's declaration (symbolDisplay: `typeParameterToDeclaration`), so a
+/// parameter `test: T` with `<T extends Date>` hovers as `test: T extends Date`.
+/// Given the displayed type text `ts` of a symbol declared at `decl_offset`,
+/// return `T extends C` when `ts` is a bare type-parameter name whose nearest
+/// preceding declaration in `file_name` carries a constraint.
+fn type_param_constraint_display(
+    sym_table: &SymbolTable,
+    source_text: &str,
+    file_name: &str,
+    decl_offset: u32,
+    ts: &str,
+) -> Option<String> {
+    if ts.is_empty() || !ts.bytes().all(is_ident_byte) || ts.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    let mut best: Option<u32> = None;
+    for sym in &sym_table.symbols {
+        if sym.flags & tsc_rs_symbols::SYM_TYPE_PARAMETER == 0 || sym.name != ts {
+            continue;
+        }
+        for decl in &sym.declarations {
+            if decl.file_name != file_name || decl.span.start > decl_offset {
+                continue;
+            }
+            if best.map_or(true, |b| decl.span.start > b) {
+                best = Some(decl.span.start);
+            }
+        }
+    }
+    let start = best? as usize;
+    let bytes = source_text.as_bytes();
+    let mut i = start + ts.len();
+    if source_text.get(start..i) != Some(ts) {
+        return None;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if !source_text[i..].starts_with("extends")
+        || source_text[i + 7..]
+            .bytes()
+            .next()
+            .map_or(true, |b| is_ident_byte(b))
+    {
+        return None;
+    }
+    i += 7;
+    let c_start = i;
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' | b'(' | b'[' | b'{' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'=' => {}
+            b')' | b']' | b'}' => depth -= 1,
+            b'>' => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => break,
+            b'=' if depth == 0 && bytes.get(i + 1) != Some(&b'>') => break,
+            _ => {}
+        }
+        i += 1;
+    }
+    let constraint = source_text[c_start..i].trim();
+    if constraint.is_empty() || constraint.contains('\n') {
+        return None;
+    }
+    Some(format!("{} extends {}", ts, constraint))
+}
+
+/// In a JS class annotated `/** @augments {Base<string>} */` (or `@extends`,
+/// first tag wins), members inherited from a generic `Base<T>` are
+/// instantiated with the tag's type arguments. When a JS hover's type is a
+/// bare type parameter `T` of that base, substitute it
+/// (`(local var) x: T` → `(local var) x: string`).
+fn substitute_js_augments_type_param(
+    hover: String,
+    query_engine: &QueryEngine,
+    source_text: &str,
+    offset: u32,
+) -> String {
+    let Some(colon) = hover.rfind(": ") else {
+        return hover;
+    };
+    let ty = &hover[colon + 2..];
+    if ty.is_empty() || !ty.bytes().all(is_ident_byte) || hover.contains('\n') {
+        return hover;
+    }
+    let off = (offset as usize).min(source_text.len());
+    // Nearest `class` keyword before the hover whose body encloses it.
+    let bytes = source_text.as_bytes();
+    let mut search_end = off;
+    let class_pos = loop {
+        let Some(p) = source_text[..search_end].rfind("class ") else {
+            return hover;
+        };
+        if p > 0 && is_ident_byte(bytes[p - 1]) {
+            search_end = p;
+            continue;
+        }
+        let Some(brace) = source_text[p..].find('{').map(|b| p + b) else {
+            return hover;
+        };
+        let mut depth = 0i32;
+        let mut end = source_text.len();
+        for (k, &b) in bytes.iter().enumerate().skip(brace) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = k;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if brace < off && off <= end {
+            break p;
+        }
+        search_end = p;
+    };
+    // The JSDoc block immediately preceding the class.
+    let before = source_text[..class_pos].trim_end();
+    let Some(doc) = before
+        .strip_suffix("*/")
+        .and_then(|b| b.rfind("/**").map(|s| &before[s..]))
+    else {
+        return hover;
+    };
+    let tag_pos = [doc.find("@augments"), doc.find("@extends")]
+        .into_iter()
+        .flatten()
+        .min();
+    let Some(tag_pos) = tag_pos else {
+        return hover;
+    };
+    let after_tag = &doc[tag_pos..];
+    let Some(open) = after_tag.find('{') else {
+        return hover;
+    };
+    let Some(close) = after_tag[open..].find('}').map(|c| open + c) else {
+        return hover;
+    };
+    let base_ref = after_tag[open + 1..close].trim();
+    let Some(lt) = base_ref.find('<') else {
+        return hover;
+    };
+    if !base_ref.ends_with('>') {
+        return hover;
+    }
+    let base_name = &base_ref[..lt];
+    let args: Vec<&str> = split_top_level(&base_ref[lt + 1..base_ref.len() - 1], b',')
+        .into_iter()
+        .map(str::trim)
+        .collect();
+    // Find the base class's type-parameter list in any loaded file.
+    let needle = format!("class {}<", base_name);
+    for file in query_engine.source_file_names() {
+        let Some(src) = query_engine.get_source_file(&file) else {
+            continue;
+        };
+        let Some(p) = src.find(&needle) else {
+            continue;
+        };
+        let lt_pos = p + needle.len() - 1;
+        let Some(gt) = src[lt_pos..].find('>').map(|g| lt_pos + g) else {
+            continue;
+        };
+        let names: Vec<&str> = split_top_level(&src[lt_pos + 1..gt], b',')
+            .into_iter()
+            .map(|n| n.trim().split_whitespace().next().unwrap_or(""))
+            .collect();
+        if names.len() != args.len() {
+            return hover;
+        }
+        if let Some(i) = names.iter().position(|n| *n == ty) {
+            return format!("{}{}", &hover[..colon + 2], args[i]);
+        }
+        return hover;
+    }
+    hover
+}
+
+/// The type of `= <literal>` following a declaration name ending at
+/// `name_end`: the literal itself for `const`, else its widened primitive.
+fn literal_initializer_type(source_text: &str, name_end: usize, is_const: bool) -> Option<String> {
+    let rest = source_text.get(name_end..)?.trim_start_matches([' ', '\t']);
+    let rest = rest.strip_prefix('=')?;
+    if rest.starts_with('=') {
+        return None;
+    }
+    let rest = rest.trim_start_matches([' ', '\t']);
+    let end = rest
+        .find(|c: char| c == ';' || c == '\n' || c == ',' || c == '\r')
+        .unwrap_or(rest.len());
+    let lit = rest[..end].trim();
+    let b = lit.as_bytes();
+    let is_num = !lit.is_empty()
+        && b[0].is_ascii_digit()
+        && lit
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_');
+    let is_str = b.len() >= 2
+        && matches!(b[0], b'"' | b'\'')
+        && b[b.len() - 1] == b[0]
+        && !lit[1..lit.len() - 1].contains(['"', '\'', '\\']);
+    let is_bool = lit == "true" || lit == "false";
+    if !(is_num || is_str || is_bool) {
+        return None;
+    }
+    if is_const {
+        return Some(if is_str {
+            format!("\"{}\"", &lit[1..lit.len() - 1])
+        } else {
+            lit.to_string()
+        });
+    }
+    Some(widen_literal_type_text(lit))
+}
+
+/// `var x = M.C` (no annotation) where the initializer is an entity name
+/// naming a class — or a function/enum merged with a namespace — has the
+/// constructor object's type, which tsc prints as `typeof M.C`. Returns that
+/// display when the declaration named at `name_end` has such an initializer.
+fn typeof_entity_initializer(
+    sym_table: &SymbolTable,
+    source_text: &str,
+    name_end: usize,
+) -> Option<String> {
+    let bytes = source_text.as_bytes();
+    let mut i = name_end;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'=') || bytes.get(i + 1) == Some(&b'=') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
+        i += 1;
+    }
+    let entity = &source_text[start..i];
+    let mut j = i;
+    while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\r') {
+        j += 1;
+    }
+    if entity.is_empty()
+        || entity.ends_with('.')
+        || entity.starts_with('.')
+        || entity.as_bytes()[0].is_ascii_digit()
+        || !matches!(bytes.get(j), None | Some(b';') | Some(b'\n') | Some(b','))
+    {
+        return None;
+    }
+    let last = entity.rsplit('.').next()?;
+    // Classes and namespaces (alone or merged with a function/enum) are
+    // printed as `typeof X`; a plain function or enum is not.
+    let value_flags = tsc_rs_symbols::SYM_VARIABLE
+        | tsc_rs_symbols::SYM_FUNCTION
+        | tsc_rs_symbols::SYM_CLASS
+        | tsc_rs_symbols::SYM_ENUM
+        | tsc_rs_symbols::SYM_MODULE;
+    // Another variable named like the entity shadows it (the declared
+    // variable itself, e.g. `var C = M.C`, does not count).
+    let has_var = sym_table.symbols.iter().any(|s| {
+        s.name == last
+            && s.flags & tsc_rs_symbols::SYM_VARIABLE != 0
+            && !s
+                .declarations
+                .iter()
+                .any(|d| d.span.end as usize == name_end)
+    });
+    // A namespace is a value only when instantiated (it declares values).
+    let instantiated = |s: &tsc_rs_symbols::Symbol| {
+        s.exports.values().chain(s.members.values()).any(|&m| {
+            sym_table
+                .get_symbol(m)
+                .map_or(false, |ms| ms.flags & value_flags != 0)
+        })
+    };
+    let class_like = !has_var
+        && sym_table.symbols.iter().any(|s| {
+            s.name == last
+                && !s.declarations.is_empty()
+                && (s.flags & tsc_rs_symbols::SYM_CLASS != 0
+                    || (s.flags & tsc_rs_symbols::SYM_MODULE != 0
+                        && (s.flags & (tsc_rs_symbols::SYM_FUNCTION | tsc_rs_symbols::SYM_ENUM)
+                            != 0
+                            || instantiated(s))))
+        });
+    class_like.then(|| format!("typeof {}", entity))
+}
+
+/// tsc's type printer always writes string literal types with double quotes;
+/// type text copied from source may use single quotes (`p: 'literal'`).
+/// Rewrite `'x'` to `"x"` where the quote sits in a type position (after
+/// `(<[,:|&=` or a space, before `)>],;|&` / space / end), leaving
+/// apostrophes in prose alone.
+fn normalize_single_quoted_literals(text: &str) -> String {
+    if !text.contains('\'') {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut last = 0;
+    while i < bytes.len() {
+        // `E['e2']` names keep their source quotes.
+        let element_access_name = i >= 2 && bytes[i - 1] == b'[' && is_ident_byte(bytes[i - 2]);
+        if bytes[i] == b'\''
+            && !element_access_name
+            && (i == 0
+                || matches!(
+                    bytes[i - 1],
+                    b'(' | b'<' | b'[' | b',' | b':' | b'|' | b'&' | b'=' | b' '
+                ))
+        {
+            let mut j = i + 1;
+            while j < bytes.len() && !matches!(bytes[j], b'\'' | b'"' | b'\\' | b'\n') {
+                j += 1;
+            }
+            if j < bytes.len()
+                && bytes[j] == b'\''
+                && bytes.get(j + 1).map_or(true, |b| {
+                    matches!(
+                        b,
+                        b')' | b'>' | b']' | b',' | b';' | b'|' | b'&' | b' ' | b'\n'
+                    )
+                })
+            {
+                out.push_str(&text[last..i]);
+                out.push('"');
+                out.push_str(&text[i + 1..j]);
+                out.push('"');
+                i = j + 1;
+                last = i;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// Return type of a function type string `<T>(a: T) => R` (or `(a) => R`):
+/// the text after the `=>` that follows the top-level parameter list.
+fn return_type_of_function_type(ts: &str) -> Option<&str> {
+    let bytes = ts.as_bytes();
+    let mut i = 0;
+    if bytes.first() == Some(&b'<') {
+        let mut depth = 0i32;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'<' => depth += 1,
+                b'>' if i > 0 && bytes[i - 1] == b'=' => {}
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    i += 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let rest = ts[i..].strip_prefix(" => ")?;
+    (!rest.is_empty()).then_some(rest)
+}
+
 /// For a type parameter at `offset`, find its parent construct (class/interface/function)
 /// with the full type parameter list, e.g. "Foo<TT extends Date>".
 fn find_type_param_parent_with_generics(source_text: &str, offset: u32) -> Option<String> {
@@ -5631,10 +6031,40 @@ fn format_constructor_hover(
     } else {
         String::new()
     };
+    // Generic classes: `constructor c<T>(a: T): c<T>`.
+    let (tp_decl, tp_names) = class_type_param_lists(source_text, class_sym);
     format!(
-        "constructor {}{}({}): {}",
-        prefix, class_name, params, class_name
+        "constructor {}{}{}({}): {}{}",
+        prefix, class_name, tp_decl, params, class_name, tp_names
     )
+}
+
+/// The declared type-parameter list of a class (`<T extends X>`) and the
+/// matching reference list (`<T>`); both empty for a non-generic class.
+fn class_type_param_lists(
+    source_text: &str,
+    class_sym: &tsc_rs_symbols::Symbol,
+) -> (String, String) {
+    let decl =
+        extract_type_params_from_source(source_text, &class_sym.name, 0, &class_sym.declarations);
+    if decl.len() < 2 {
+        return (String::new(), String::new());
+    }
+    let names: Vec<String> = split_top_level(&decl[1..decl.len() - 1], b',')
+        .into_iter()
+        .map(|p| {
+            p.trim()
+                .split(|c: char| c.is_whitespace() || c == '=')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    if names.iter().any(|n| n.is_empty()) {
+        return (String::new(), String::new());
+    }
+    let decl = decl.split_whitespace().collect::<Vec<_>>().join(" ");
+    (decl, format!("<{}>", names.join(", ")))
 }
 
 /// Format a specific constructor overload signature for a given call site.
@@ -5678,6 +6108,23 @@ fn format_constructor_hover_for_new(
     }
     // No overloads — extract from source
     let params = extract_constructor_params_from_source(_source_text, class_sym);
+    let (tp_decl, tp_names) = class_type_param_lists(_source_text, class_sym);
+    if !tp_decl.is_empty() {
+        // `new C(args)` on a generic class: show the instantiated signature.
+        let b = _source_text.as_bytes();
+        let mut st = (offset as usize).min(b.len());
+        while st > 0 && is_ident_byte(b[st - 1]) {
+            st -= 1;
+        }
+        let fn_type = format!("{}({}) => {}{}", tp_decl, params, class_name, tp_names);
+        if let Some(inst) = instantiate_generic_call_type(_source_text, st, &fn_type, check_out) {
+            return format!("constructor {}", format_fn_decl(class_name, &inst));
+        }
+        return format!(
+            "constructor {}{}({}): {}{}",
+            class_name, tp_decl, params, class_name, tp_names
+        );
+    }
     format!("constructor {}({}): {}", class_name, params, class_name)
 }
 
@@ -5768,6 +6215,361 @@ fn call_arg_widened_type(
     } else {
         ty.to_string()
     })
+}
+
+/// Split `text` at top-level occurrences of `sep` (ignoring separators nested
+/// in brackets, parens, braces, angle brackets or string literals).
+fn split_top_level(text: &str, sep: u8) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' | b'\'' | b'`' => {
+                let q = bytes[i];
+                i += 1;
+                while i < bytes.len() && bytes[i] != q {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'=' => {}
+            b')' | b']' | b'}' | b'>' => depth -= 1,
+            b if b == sep && depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// Replace whole-word type-parameter names in `text` (outside string
+/// literals) with their inferred types, parenthesizing union/function
+/// replacements that are followed by `[]`.
+fn substitute_type_params(text: &str, map: &[(String, String)]) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if matches!(b, b'"' | b'\'') {
+            let q = b;
+            let s = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != q {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i = (i + 1).min(bytes.len());
+            out.push_str(&text[s..i]);
+            continue;
+        }
+        if is_ident_byte(b) && (i == 0 || !is_ident_byte(bytes[i - 1])) {
+            let s = i;
+            while i < bytes.len() && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let word = &text[s..i];
+            // Property names (`x.T`, `{ T: ... }`) are not type references.
+            let after_dot = s > 0 && bytes[s - 1] == b'.';
+            match map.iter().find(|(n, _)| n == word).filter(|_| !after_dot) {
+                Some((_, rep)) => {
+                    let needs_parens = text[i..].starts_with("[]")
+                        && (rep.contains(" | ") || rep.contains(" & ") || rep.contains("=>"));
+                    if needs_parens {
+                        out.push('(');
+                        out.push_str(rep);
+                        out.push(')');
+                    } else {
+                        out.push_str(rep);
+                    }
+                }
+                None => out.push_str(word),
+            }
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
+}
+
+/// Whether a checker type string is a literal type (`"a"`, `1`, `-1`,
+/// `true`, `false`, `1n`).
+fn is_literal_type_text(ty: &str) -> bool {
+    let b = ty.as_bytes();
+    match b.first() {
+        Some(b'"') | Some(b'\'') => true,
+        Some(c) if c.is_ascii_digit() => true,
+        Some(b'-') => b.get(1).map_or(false, |c| c.is_ascii_digit()),
+        _ => ty == "true" || ty == "false",
+    }
+}
+
+fn widen_literal_type_text(ty: &str) -> String {
+    let b = ty.as_bytes();
+    match b.first() {
+        Some(b'"') | Some(b'\'') => "string".to_string(),
+        Some(c) if c.is_ascii_digit() || *c == b'-' => {
+            if ty.ends_with('n') {
+                "bigint".to_string()
+            } else {
+                "number".to_string()
+            }
+        }
+        _ if ty == "true" || ty == "false" => "boolean".to_string(),
+        _ => ty.to_string(),
+    }
+}
+
+/// tsc's call-site quick info for a generic function shows the instantiated
+/// signature (`foo<"Hello">(a: "Hello"): "Hello"`). Given the declared
+/// function type `<T, ...>(params) => R` of the callee identifier starting at
+/// `tok_start`, infer each type parameter from the call's arguments and
+/// return the instantiated function type. Explicit type arguments
+/// (`foo<number>(...)`) are used as written. `None` unless every type
+/// parameter is determined.
+fn instantiate_generic_call_type(
+    source: &str,
+    tok_start: usize,
+    fn_type: &str,
+    check_out: &TypeCheckOutput,
+) -> Option<String> {
+    if !fn_type.starts_with('<') {
+        return None;
+    }
+    // Split off `<...>`.
+    let bytes = fn_type.as_bytes();
+    let mut depth = 0i32;
+    let mut tp_end = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'=' => {}
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    tp_end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if tp_end == 0 {
+        return None;
+    }
+    let tparams: Vec<(String, Option<String>)> = split_top_level(&fn_type[1..tp_end], b',')
+        .into_iter()
+        .map(|p| {
+            let p = p.trim();
+            let p = p.split(" = ").next().unwrap_or(p);
+            match p.split_once(" extends ") {
+                Some((n, c)) => (n.trim().to_string(), Some(c.trim().to_string())),
+                None => (p.to_string(), None),
+            }
+        })
+        .collect();
+    if tparams
+        .iter()
+        .any(|(n, _)| n.is_empty() || !n.bytes().all(is_ident_byte))
+    {
+        return None;
+    }
+    let rest = &fn_type[tp_end + 1..];
+    let ret = return_type_of_function_type(rest)?;
+    let close = {
+        let rb = rest.as_bytes();
+        let mut d = 0i32;
+        let mut close = None;
+        for (k, &b) in rb.iter().enumerate() {
+            match b {
+                b'(' => d += 1,
+                b')' => {
+                    d -= 1;
+                    if d == 0 {
+                        close = Some(k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        close?
+    };
+    let params_text = &rest[1..close];
+    let params: Vec<&str> = if params_text.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_top_level(params_text, b',')
+    };
+
+    // Explicit type arguments at the call site.
+    let src = source.as_bytes();
+    let mut i = tok_start;
+    while i < src.len() && is_ident_byte(src[i]) {
+        i += 1;
+    }
+    let mut after = i;
+    while after < src.len() && src[after].is_ascii_whitespace() {
+        after += 1;
+    }
+    let mut map: Vec<(String, String)> = Vec::new();
+    if src.get(after) == Some(&b'<') {
+        let mut d = 0i32;
+        let mut end = after;
+        for (k, &b) in src.iter().enumerate().skip(after) {
+            match b {
+                b'<' => d += 1,
+                b'>' if k > 0 && src[k - 1] == b'=' => {}
+                b'>' => {
+                    d -= 1;
+                    if d == 0 {
+                        end = k;
+                        break;
+                    }
+                }
+                b'\n' | b';' => return None,
+                _ => {}
+            }
+        }
+        let explicit: Vec<String> = split_top_level(&source[after + 1..end], b',')
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .collect();
+        if explicit.len() != tparams.len() {
+            return None;
+        }
+        for ((n, _), a) in tparams.iter().zip(explicit) {
+            map.push((n.clone(), a));
+        }
+    } else {
+        let args = call_args_after_callee(source, tok_start)?;
+        let arg_type = |start: usize, text: &str| -> Option<String> {
+            if let Some(t) = check_out.expression_types.get(&(start as u32)) {
+                return Some(t.trim().to_string());
+            }
+            let first = text.as_bytes().first().copied()?;
+            if first == b'"' || first == b'\'' {
+                let inner = &text[1..text.len().saturating_sub(1)];
+                if inner.contains('"') || inner.contains('\\') {
+                    return None;
+                }
+                return Some(format!("\"{}\"", inner));
+            }
+            if first.is_ascii_digit() && text.bytes().all(|b| b.is_ascii_digit()) {
+                return Some(text.to_string());
+            }
+            if text == "true" || text == "false" {
+                return Some(text.to_string());
+            }
+            None
+        };
+        let ret_members: Vec<&str> = split_top_level(ret, b'|')
+            .into_iter()
+            .map(str::trim)
+            .collect();
+        for (name, constraint) in &tparams {
+            let mut cands: Vec<String> = Vec::new();
+            let mut from_rest = false;
+            for (pi, p) in params.iter().enumerate() {
+                let p = p.trim();
+                let is_rest = p.starts_with("...");
+                let Some((_, pty)) = p.split_once(": ") else {
+                    continue;
+                };
+                let pty = pty.trim();
+                if is_rest {
+                    if pty == format!("{}[]", name) {
+                        from_rest = true;
+                        for (s, t) in args.iter().skip(pi) {
+                            cands.push(arg_type(*s, t)?);
+                        }
+                    }
+                } else if pty == name {
+                    if let Some((s, t)) = args.get(pi) {
+                        cands.push(arg_type(*s, t)?);
+                    }
+                } else if pty == format!("{}[]", name) {
+                    if let Some((s, t)) = args.get(pi) {
+                        let at = arg_type(*s, t)?;
+                        let elem = at.strip_suffix("[]")?;
+                        let elem = elem
+                            .strip_prefix('(')
+                            .and_then(|e| e.strip_suffix(')'))
+                            .unwrap_or(elem);
+                        cands.push(elem.to_string());
+                    }
+                } else if pty
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                    .any(|w| w == name)
+                {
+                    // T nested in a structured parameter type: not handled.
+                    if args.get(pi).is_some() {
+                        return None;
+                    }
+                }
+            }
+            if cands.is_empty() || cands.iter().any(|c| c == "any" && cands.len() > 1) {
+                return None;
+            }
+            // tsc keeps a literal inference only when T is a top-level
+            // return type member or has a primitive constraint.
+            let keep_literal = ret_members.iter().any(|m| m == name)
+                || constraint.as_deref().map_or(false, |c| {
+                    split_top_level(c, b'|')
+                        .iter()
+                        .any(|m| matches!(m.trim(), "string" | "number" | "boolean" | "bigint"))
+                });
+            let cands: Vec<String> = cands
+                .iter()
+                .map(|c| {
+                    if !keep_literal && is_literal_type_text(c) {
+                        widen_literal_type_text(c)
+                    } else {
+                        c.clone()
+                    }
+                })
+                .collect();
+            let mut uniq: Vec<String> = Vec::new();
+            for c in cands {
+                if !uniq.contains(&c) {
+                    uniq.push(c);
+                }
+            }
+            let inferred = if uniq.len() == 1 {
+                uniq.pop()?
+            } else if from_rest {
+                uniq.join(" | ")
+            } else {
+                return None;
+            };
+            map.push((name.clone(), inferred));
+        }
+    }
+    let new_params: Vec<String> = params
+        .iter()
+        .map(|p| substitute_type_params(p.trim(), &map))
+        .collect();
+    let new_ret = substitute_type_params(ret, &map);
+    let targs: Vec<&str> = map.iter().map(|(_, t)| t.as_str()).collect();
+    Some(format!(
+        "<{}>({}) => {}",
+        targs.join(", "),
+        new_params.join(", "),
+        new_ret
+    ))
 }
 
 /// Pick the first overload whose arity and parameter types accept the call's
@@ -6528,6 +7330,12 @@ fn is_inside_function(source: &str, offset: u32) -> bool {
             }
             b'}' => {
                 fn_body_stack.pop();
+                expect_fn_body = false;
+            }
+            // A statement end: a `)` before it (`console.log(x);`) did not
+            // start a function signature.
+            b';' => {
+                expect_fn_body = false;
             }
             b')' => {
                 // After ')' we might see '{' for a function body
@@ -6581,9 +7389,11 @@ pub fn hover_at(
         offset,
     )?;
     let hover = overload_object_call_site_hover(hover, check_out, source_text, offset);
+    let hover = normalize_single_quoted_literals(&hover);
     if !is_js_like_file_name(file_name) {
         return Some(hover);
     }
+    let hover = substitute_js_augments_type_param(hover, query_engine, source_text, offset);
     Some(apply_js_jsdoc_hover_types(
         hover,
         query_engine,
@@ -6781,10 +7591,29 @@ fn apply_js_jsdoc_hover_types(
         "(local const) ",
     ];
     if VAR_PREFIXES.iter().any(|p| display.starts_with(p)) {
-        if let Some(head) = display.strip_suffix(": any") {
+        // A `@type` tag is the variable's declared type in tsc, whatever the
+        // initializer would infer.
+        let head = display.strip_suffix(": any").or_else(|| {
+            let prefix_len = VAR_PREFIXES
+                .iter()
+                .find(|p| display.starts_with(*p))
+                .map_or(0, |p| p.len());
+            let name_end = display[prefix_len..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$' || c == '.'))
+                .map(|e| prefix_len + e)?;
+            display[name_end..]
+                .starts_with(": ")
+                .then(|| &display[..name_end])
+        });
+        if let Some(head) = head {
             if !head.contains('\n') {
                 if let Some(raw) = jsdoc_type_before(source_text, stmt_start as usize, "@type") {
                     let ty = closure_type_to_display(&raw, true);
+                    return format!("{head}: {ty}{docs}");
+                }
+                // `@template` + `@param` on a function-valued variable.
+                let current = display[head.len()..].trim_start_matches(": ");
+                if let Some(ty) = js_template_function_type(source_text, stmt_start, current) {
                     return format!("{head}: {ty}{docs}");
                 }
             }
@@ -6819,6 +7648,97 @@ fn apply_js_jsdoc_hover_types(
         }
     }
     hover
+}
+
+/// A JS `const f = (a, b) => ...` with `@template` tags in its JSDoc is a
+/// generic function in tsc: `<T1 extends C, T2>(a: T1, b: T2) => R`, with
+/// parameter types from the first `@param {T} name` for each name. Returns
+/// the rebuilt function type, or `None` when there are no `@template` tags or
+/// `fn_type` is not a plain `(params) => R`.
+fn js_template_function_type(source: &str, stmt_start: u32, fn_type: &str) -> Option<String> {
+    let raw = extract_raw_jsdoc_block(source, stmt_start)?;
+    let lines = clean_jsdoc_lines(raw);
+    let mut tparams: Vec<String> = Vec::new();
+    let mut param_types: Vec<(String, String)> = Vec::new();
+    for line in &lines {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("@template") {
+            let mut rest = rest.trim_start();
+            let mut constraint = None;
+            if let Some(r) = rest.strip_prefix('{') {
+                let close = r.find('}')?;
+                constraint = Some(closure_type_to_display(&r[..close], false));
+                rest = r[close + 1..].trim_start();
+            }
+            // Names: comma-separated, up to the first space after a name.
+            let names_end = rest
+                .char_indices()
+                .find(|&(i, c)| c == ' ' && !rest[..i].trim_end().ends_with(','))
+                .map_or(rest.len(), |(i, _)| i);
+            for n in rest[..names_end].split(',') {
+                let n = n.trim();
+                if n.is_empty() || !n.bytes().all(is_ident_byte) {
+                    continue;
+                }
+                tparams.push(match &constraint {
+                    Some(c) => format!("{} extends {}", n, c),
+                    None => n.to_string(),
+                });
+            }
+        } else if let Some(rest) = line.strip_prefix("@param") {
+            let rest = rest.trim_start();
+            let Some(r) = rest.strip_prefix('{') else {
+                continue;
+            };
+            let Some(close) = r.find('}') else {
+                continue;
+            };
+            let ty = closure_type_to_display(&r[..close], false);
+            let name: String = r[close + 1..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if !name.is_empty() && !param_types.iter().any(|(n, _)| *n == name) {
+                param_types.push((name, ty));
+            }
+        }
+    }
+    if tparams.is_empty() || !fn_type.starts_with('(') {
+        return None;
+    }
+    let ret = return_type_of_function_type(fn_type)?;
+    let close = fn_type.len() - ret.len() - " => ".len() - 1;
+    if fn_type.as_bytes().get(close) != Some(&b')') {
+        return None;
+    }
+    let params_text = &fn_type[1..close];
+    let params: Vec<String> = if params_text.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_top_level(params_text, b',')
+            .into_iter()
+            .map(|p| {
+                let p = p.trim();
+                match p.split_once(": ") {
+                    Some((n, _)) => {
+                        let bare = n.trim_start_matches("...").trim_end_matches('?');
+                        match param_types.iter().find(|(pn, _)| pn == bare) {
+                            Some((_, t)) => format!("{}: {}", n, t),
+                            None => p.to_string(),
+                        }
+                    }
+                    None => p.to_string(),
+                }
+            })
+            .collect()
+    };
+    Some(format!(
+        "<{}>({}) => {}",
+        tparams.join(", "),
+        params.join(", "),
+        ret
+    ))
 }
 
 /// Split at top-level occurrences of `sep` (outside (), [], {}, <>).
@@ -7807,6 +8727,18 @@ fn hover_at_impl(
             if is_enum_receiver {
                 return Some(format!("(enum member) {} = {}", display_name, &type_str));
             }
+            // `m1.m2` where `m2` is a namespace: tsc shows the namespace
+            // itself, qualified by the receiver.
+            if let Some(ref rn) = receiver_name {
+                if type_str.starts_with("namespace ")
+                    && sym_table
+                        .symbols
+                        .iter()
+                        .any(|s| s.name == token && s.flags & tsc_rs_symbols::SYM_MODULE != 0)
+                {
+                    return Some(format!("namespace {}.{}", rn, token));
+                }
+            }
             // When hover_member_access didn't find the member and the type is just `any`,
             // the property access likely resolved through a non-matching index signature
             // or implicit `any`. Show just the bare type without `(property)` prefix,
@@ -8028,7 +8960,7 @@ fn hover_at_impl(
                     offset,
                     &sym.declarations,
                 );
-                let ns_prefix = find_namespace_parent(sym_table, sid)
+                let ns_prefix = find_namespace_parent_in(sym_table, sid, source_text, file_name)
                     .map(|ns| format!("{}.", ns))
                     .unwrap_or_default();
                 let base = format!("interface {}{}{}", ns_prefix, sym.name, type_params);
@@ -8070,7 +9002,10 @@ fn hover_at_impl(
                     base
                 }
             } else if is_module {
-                let base = format!("namespace {}", sym.name);
+                let ns_prefix = find_namespace_parent_in(sym_table, sid, source_text, file_name)
+                    .map(|ns| format!("{}.", ns))
+                    .unwrap_or_default();
+                let base = format!("namespace {}{}", ns_prefix, sym.name);
                 if is_import {
                     format!("(alias) {}\nimport {}", base, sym.name)
                 } else {
@@ -8167,7 +9102,42 @@ fn hover_at_impl(
                         } else {
                             String::new()
                         };
-                        format!("{} {}({}): {}{}", fn_keyword, sym.name, params, ret, extra)
+                        // Generic overload at a call site: show it instantiated.
+                        let at_decl = sym
+                            .declarations
+                            .iter()
+                            .any(|d| d.span.start <= offset && offset <= d.span.end);
+                        let inst = if !at_decl
+                            && !sig.type_params.is_empty()
+                            && sig.return_type.is_some()
+                        {
+                            let tok_start = {
+                                let b = source_text.as_bytes();
+                                let mut st = offset as usize;
+                                while st > 0 && is_ident_byte(b[st - 1]) {
+                                    st -= 1;
+                                }
+                                st
+                            };
+                            let fn_type =
+                                format!("<{}>({}) => {}", sig.type_params.join(", "), params, ret);
+                            instantiate_generic_call_type(
+                                source_text,
+                                tok_start,
+                                &fn_type,
+                                check_out,
+                            )
+                        } else {
+                            None
+                        };
+                        match inst {
+                            Some(t) => {
+                                format!("{} {}{}", fn_keyword, format_fn_decl(&sym.name, &t), extra)
+                            }
+                            None => {
+                                format!("{} {}({}): {}{}", fn_keyword, sym.name, params, ret, extra)
+                            }
+                        }
                     } else if let Some(ref ts) = type_str {
                         if is_fn_type_str(ts) {
                             format!("{} {}", fn_keyword, format_fn_decl(&sym.name, ts))
@@ -8179,7 +9149,30 @@ fn hover_at_impl(
                     }
                 } else if let Some(ref ts) = type_str {
                     if is_fn_type_str(ts) {
-                        format!("{} {}", fn_keyword, format_fn_decl(&sym.name, ts))
+                        // At a call site of a generic function, tsc shows the
+                        // instantiated signature.
+                        let at_decl = sym
+                            .declarations
+                            .iter()
+                            .any(|d| d.span.start <= offset && offset <= d.span.end);
+                        let tok_start = {
+                            let b = source_text.as_bytes();
+                            let mut st = offset as usize;
+                            while st > 0 && is_ident_byte(b[st - 1]) {
+                                st -= 1;
+                            }
+                            st
+                        };
+                        let inst = if at_decl {
+                            None
+                        } else {
+                            instantiate_generic_call_type(source_text, tok_start, ts, check_out)
+                        };
+                        format!(
+                            "{} {}",
+                            fn_keyword,
+                            format_fn_decl(&sym.name, inst.as_deref().unwrap_or(ts))
+                        )
                     } else {
                         format!("{} {}: {}", fn_keyword, sym.name, ts)
                     }
@@ -8310,7 +9303,20 @@ fn hover_at_impl(
                         .as_deref()
                         .or(annotation.as_deref())
                         .unwrap_or("any");
-                    format!("(parameter) {}: {}", sym.name, ts)
+                    let constrained = sym.declarations.first().and_then(|d| {
+                        type_param_constraint_display(
+                            sym_table,
+                            source_text,
+                            file_name,
+                            d.span.start,
+                            ts,
+                        )
+                    });
+                    format!(
+                        "(parameter) {}: {}",
+                        sym.name,
+                        constrained.as_deref().unwrap_or(ts)
+                    )
                 }
             } else if is_enum_member {
                 // Find parent enum name
@@ -8429,6 +9435,15 @@ fn hover_at_impl(
                     .map(|ns| format!("{}.", ns))
                     .unwrap_or_default();
                 let qualified_name = format!("{}{}", ns_prefix, sym.name);
+                // At usage sites an `import a = m` alias of a namespace is
+                // typed `any`; the import-equals target read from source
+                // gives the real kind.
+                let type_str = type_str.clone().filter(|ts| {
+                    ts != "any"
+                        || extract_import_equals_target(source_text, sym)
+                            .and_then(|t| resolve_import_target_kind(&t, sym_table))
+                            .is_none()
+                });
 
                 if let Some(ref ts) = type_str {
                     if let Some(body) = ts.strip_prefix("type_alias_body=") {
@@ -8527,14 +9542,61 @@ fn hover_at_impl(
                     } else {
                         None
                     };
-                    let ts = type_str
+                    let typeof_init = sym.declarations.first().and_then(|d| {
+                        (d.file_name == file_name)
+                            .then(|| {
+                                typeof_entity_initializer(
+                                    sym_table,
+                                    source_text,
+                                    d.span.end as usize,
+                                )
+                            })
+                            .flatten()
+                    });
+                    // Declarations the checker never visited (dotted
+                    // namespace bodies) still have an obvious type when the
+                    // initializer is a literal.
+                    let literal_init = if type_str.is_none() && var_annotation.is_none() {
+                        sym.declarations.first().and_then(|d| {
+                            (d.file_name == file_name)
+                                .then(|| {
+                                    literal_initializer_type(
+                                        source_text,
+                                        d.span.end as usize,
+                                        is_const,
+                                    )
+                                })
+                                .flatten()
+                        })
+                    } else {
+                        None
+                    };
+                    let ts = typeof_init
                         .as_deref()
+                        .or(type_str.as_deref())
                         .or(var_annotation.as_deref())
+                        .or(literal_init.as_deref())
                         .unwrap_or("any");
                     // Qualify the name with namespace prefix if the variable is
                     // exported from a namespace
-                    let ns_prefix = if !is_local_var {
-                        find_namespace_parent(sym_table, sid).map(|ns| format!("{}.", ns))
+                    // tsc qualifies only EXPORTED namespace members
+                    // (`var M.x`); a plain `var x` in a namespace body is bare.
+                    // The binder's EXPORT flag also marks non-exported members
+                    // of exported namespaces, so read the declaring statement.
+                    let is_exported = match sym.declarations.first().filter(|d| {
+                        d.file_name == file_name && (d.span.start as usize) <= source_text.len()
+                    }) {
+                        Some(d) => {
+                            let st = find_statement_start(source_text, d.span.start) as usize;
+                            source_text[st.min(source_text.len())..]
+                                .trim_start()
+                                .starts_with("export")
+                        }
+                        None => flags & tsc_rs_symbols::SYM_EXPORT != 0,
+                    };
+                    let ns_prefix = if !is_local_var && is_exported {
+                        find_namespace_parent_in(sym_table, sid, source_text, file_name)
+                            .map(|ns| format!("{}.", ns))
                     } else {
                         None
                     };
@@ -8556,6 +9618,36 @@ fn hover_at_impl(
                         // Fallback: try cursor position
                         find_type_param_parent_with_generics(source_text, offset)
                     });
+                // An unannotated function parent: tsc prints its inferred
+                // return type (`U in foo<U>(a: U): U`). Borrow it from the
+                // checked type of the function symbol named before `<`.
+                let parent_with_generics = parent_with_generics.map(|p| {
+                    if !p.ends_with(')') {
+                        return p;
+                    }
+                    let Some(lt) = p.find('<') else {
+                        return p;
+                    };
+                    let fn_name = &p[..lt];
+                    let ret = sym_table
+                        .symbols
+                        .iter()
+                        .filter(|s| {
+                            s.name == fn_name && s.flags & tsc_rs_symbols::SYM_FUNCTION != 0
+                        })
+                        .filter_map(|s| {
+                            let d = s.declarations.first()?;
+                            if d.file_name != file_name {
+                                return None;
+                            }
+                            resolve_symbol_type(s, check_out, d.span.start, query_engine, None)
+                        })
+                        .find_map(|t| return_type_of_function_type(&t).map(str::to_string));
+                    match ret {
+                        Some(r) => format!("{}: {}", p, r),
+                        None => p,
+                    }
+                });
                 if let Some(ref p) = parent_with_generics {
                     format!("(type parameter) {} in {}", sym.name, p)
                 } else {
@@ -9452,6 +10544,83 @@ fn find_matching_brace(source_text: &str, open_pos: usize) -> Option<usize> {
 }
 
 /// Find the namespace/module parent that has this symbol as an export.
+/// `find_namespace_parent`, also recovering the parent path of a namespace
+/// declared with a dotted name (`namespace m1.m2 { ... }`): the binder does
+/// not record `m2` among `m1`'s exports, so read the `m1.` qualifier that
+/// precedes the name in the source.
+fn find_namespace_parent_in(
+    sym_table: &SymbolTable,
+    child_id: u32,
+    source_text: &str,
+    file_name: &str,
+) -> Option<String> {
+    namespace_parent_path(sym_table, child_id, source_text, file_name, 0)
+}
+
+fn namespace_parent_path(
+    sym_table: &SymbolTable,
+    child_id: u32,
+    source_text: &str,
+    file_name: &str,
+    depth: u32,
+) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    for (i, sym) in sym_table.symbols.iter().enumerate() {
+        if sym.flags & tsc_rs_symbols::SYM_MODULE == 0 || i as u32 == child_id {
+            continue;
+        }
+        let is_parent = sym
+            .exports
+            .values()
+            .chain(sym.members.values())
+            .any(|&e| e == child_id);
+        if is_parent {
+            return Some(
+                match namespace_parent_path(sym_table, i as u32, source_text, file_name, depth + 1)
+                {
+                    Some(pp) => format!("{}.{}", pp, sym.name),
+                    None => sym.name.clone(),
+                },
+            );
+        }
+    }
+    dotted_namespace_qualifier(sym_table, child_id, source_text, file_name)
+}
+
+/// For a namespace symbol declared as the inner part of a dotted name
+/// (`namespace a.b.c`), the qualifier text before it (`a.b`).
+fn dotted_namespace_qualifier(
+    sym_table: &SymbolTable,
+    sid: u32,
+    source_text: &str,
+    file_name: &str,
+) -> Option<String> {
+    let sym = sym_table.get_symbol(sid)?;
+    if sym.flags & tsc_rs_symbols::SYM_MODULE == 0 {
+        return None;
+    }
+    let decl = sym.declarations.iter().find(|d| d.file_name == file_name)?;
+    let bytes = source_text.as_bytes();
+    let mut i = decl.span.start as usize;
+    if i == 0 || i > bytes.len() || bytes[i - 1] != b'.' {
+        return None;
+    }
+    let end = i - 1;
+    while i > 0 && (is_ident_byte(bytes[i - 1]) || bytes[i - 1] == b'.') {
+        i -= 1;
+    }
+    let qual = &source_text[i..end];
+    if qual.is_empty()
+        || !source_text[..i].trim_end().ends_with("namespace")
+            && !source_text[..i].trim_end().ends_with("module")
+    {
+        return None;
+    }
+    Some(qual.to_string())
+}
+
 fn find_namespace_parent(sym_table: &SymbolTable, child_id: u32) -> Option<String> {
     for (i, sym) in sym_table.symbols.iter().enumerate() {
         if sym.flags & tsc_rs_symbols::SYM_MODULE == 0 {
@@ -10355,6 +11524,234 @@ fn find_identifier_occurrences(source: &str, name: &str) -> Vec<Span> {
 ///
 /// Handles member access (`obj.prop`) by resolving the receiver's type and
 /// looking up the property in the interface/class members.
+/// When `offset` is inside the string literal of a module specifier
+/// (`from 'e'`, `require('e')`, `import('e')`, `export ... from 'e'`) and a
+/// loaded file declares `declare module "e"`, the definition is that name
+/// literal (quotes included).
+fn ambient_module_specifier_definition(
+    query_engine: &QueryEngine,
+    source_text: &str,
+    offset: u32,
+) -> Option<(String, Span)> {
+    let bytes = source_text.as_bytes();
+    let off = (offset as usize).min(bytes.len());
+    // Find the enclosing quote pair on this line.
+    let line_start = source_text[..off].rfind('\n').map_or(0, |p| p + 1);
+    let open = source_text[line_start..off]
+        .rfind(|c| c == '"' || c == '\'')
+        .map(|p| line_start + p)?;
+    let q = bytes[open];
+    let close = open + 1 + source_text[open + 1..].find(q as char)?;
+    if close < off || source_text[open + 1..close].contains('\n') {
+        return None;
+    }
+    let before = source_text[line_start..open].trim_end();
+    let is_specifier = before.ends_with("from")
+        || before.ends_with("require(")
+        || before.ends_with("import(")
+        || before.ends_with("import")
+        || before.ends_with("module");
+    if !is_specifier || before.ends_with("declare module") {
+        return None;
+    }
+    let spec = &source_text[open + 1..close];
+    if spec.is_empty() || spec.starts_with('.') || spec.starts_with('/') {
+        return None;
+    }
+    for file in query_engine.source_file_names() {
+        let Some(src) = query_engine.get_source_file(&file) else {
+            continue;
+        };
+        for quote in ['"', '\''] {
+            let needle = format!("module {}{}{}", quote, spec, quote);
+            let mut from = 0;
+            while let Some(p) = src[from..].find(&needle) {
+                let abs = from + p;
+                let lit_start = abs + "module ".len();
+                // Must be a declaration: `declare module "e"` or a bare
+                // `module "e"` statement, not text inside a comment/string.
+                let head = src[..abs].trim_end();
+                let line_head = &head[head.rfind('\n').map_or(0, |n| n + 1)..];
+                if line_head.trim().is_empty()
+                    || line_head.trim_end().ends_with("declare")
+                    || line_head.trim_end().ends_with("export")
+                {
+                    return Some((
+                        file.clone(),
+                        Span::new(lit_start as u32, (lit_start + spec.len() + 2) as u32),
+                    ));
+                }
+                from = abs + needle.len();
+            }
+        }
+    }
+    None
+}
+
+/// `const { X } = require("./m")` / `const X = require("./m")`: a usage of
+/// `X` navigates to the declaration in the required module — the declared
+/// class/function/variable named `X` for a destructured binding, or the
+/// named function/class assigned to `module.exports` for a whole-module
+/// binding. `None` when the local binding isn't a require declaration.
+fn require_binding_definition(
+    query_engine: &QueryEngine,
+    sym_table: &SymbolTable,
+    file_name: &str,
+    source_text: &str,
+    token: &str,
+) -> Option<(String, Span)> {
+    if token.is_empty() || !token.bytes().all(is_ident_byte) {
+        return None;
+    }
+    let decl = sym_table
+        .symbols
+        .iter()
+        .filter(|s| s.name == token && s.flags & tsc_rs_symbols::SYM_VARIABLE != 0)
+        .flat_map(|s| s.declarations.iter())
+        .find(|d| d.file_name == file_name)?;
+    let st = find_statement_start(source_text, decl.span.start) as usize;
+    let stmt_end = source_text[st..]
+        .find(|c| c == ';' || c == '\n')
+        .map_or(source_text.len(), |e| st + e);
+    let stmt = source_text.get(st..stmt_end)?.trim();
+    let stmt = ["const ", "let ", "var "]
+        .iter()
+        .find_map(|k| stmt.strip_prefix(k))?
+        .trim_start();
+    let (lhs, rhs) = stmt.split_once('=')?;
+    let rhs = rhs.trim();
+    let spec = rhs.strip_prefix("require(")?.trim_end_matches(')').trim();
+    let q = spec.chars().next()?;
+    if !matches!(q, '"' | '\'') || !spec.ends_with(q) || spec.len() < 2 {
+        return None;
+    }
+    let spec = &spec[1..spec.len() - 1];
+    let lhs = lhs.trim();
+    let destructured = if let Some(inner) = lhs.strip_prefix('{').and_then(|l| l.strip_suffix('}'))
+    {
+        // `{ X }` or `{ Y: X }`: the exported name is the property key.
+        let key = inner
+            .split(',')
+            .map(str::trim)
+            .find_map(|part| match part.split_once(':') {
+                Some((k, v)) if v.trim() == token => Some(k.trim().to_string()),
+                None if part == token => Some(part.to_string()),
+                _ => None,
+            })?;
+        Some(key)
+    } else if lhs == token {
+        None
+    } else {
+        return None;
+    };
+    let target = query_engine.resolve_import_path(spec, file_name)?;
+    let target_src = query_engine.get_source_file(&target)?;
+    let target_syms = query_engine.get_file_symbols(&target)?;
+    let decl_named = |name: &str| -> Option<(String, Span)> {
+        target_syms
+            .symbols
+            .iter()
+            .filter(|s| {
+                s.name == name
+                    && s.flags
+                        & (tsc_rs_symbols::SYM_CLASS
+                            | tsc_rs_symbols::SYM_FUNCTION
+                            | tsc_rs_symbols::SYM_VARIABLE)
+                        != 0
+                    && s.flags & tsc_rs_symbols::SYM_IMPORT == 0
+            })
+            .flat_map(|s| s.declarations.iter())
+            .find(|d| d.file_name == target || d.file_name.is_empty())
+            .map(|d| (target.clone(), d.span))
+    };
+    match destructured {
+        Some(key) => decl_named(&key),
+        None => {
+            // `module.exports = function f() {}` / `= class C {}` / `= f`.
+            let p = target_src.find("module.exports")?;
+            let after = target_src[p + "module.exports".len()..].trim_start();
+            let after = after.strip_prefix('=')?.trim_start();
+            let after = after
+                .strip_prefix("function")
+                .or_else(|| after.strip_prefix("class"))
+                .map(|a| a.trim_start_matches(|c: char| c == '*' || c.is_whitespace()))
+                .unwrap_or(after);
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if name.is_empty() {
+                return None;
+            }
+            decl_named(&name)
+        }
+    }
+}
+
+/// `const Foo = Bar = function () {}` (or `= module.exports = function`):
+/// `new Foo()` resolves to the constructor, i.e. the function expression,
+/// whose declaration name is the assignment target — `Bar` / `exports`.
+fn new_target_assignment_chain_definition(
+    sym_table: &SymbolTable,
+    file_name: &str,
+    source_text: &str,
+    offset: u32,
+    token: &str,
+) -> Option<(String, Span)> {
+    if !is_new_expression(source_text, offset) {
+        return None;
+    }
+    let decl = sym_table
+        .symbols
+        .iter()
+        .filter(|s| s.name == token && s.flags & tsc_rs_symbols::SYM_VARIABLE != 0)
+        .flat_map(|s| s.declarations.iter())
+        .find(|d| d.file_name == file_name)?;
+    let name_end = decl.span.end as usize;
+    let rest = source_text.get(name_end..)?;
+    let first_eq = rest.find('=')?;
+    if !rest[..first_eq].trim().is_empty() {
+        return None;
+    }
+    let after_first = name_end + first_eq + 1;
+    let line_end = source_text[after_first..]
+        .find('\n')
+        .map_or(source_text.len(), |e| after_first + e);
+    let seg = &source_text[after_first..line_end];
+    let second_eq = seg.find('=')?;
+    if seg.as_bytes().get(second_eq + 1) == Some(&b'=')
+        || seg.as_bytes().get(second_eq + 1) == Some(&b'>')
+    {
+        return None;
+    }
+    let rhs = seg[second_eq + 1..].trim_start();
+    if !(rhs.starts_with("function") || rhs.starts_with("class")) {
+        return None;
+    }
+    let lhs = &seg[..second_eq];
+    let lhs_trim = lhs.trim_end();
+    if lhs_trim.is_empty()
+        || !lhs_trim
+            .trim_start()
+            .bytes()
+            .all(|b| is_ident_byte(b) || b == b'.')
+    {
+        return None;
+    }
+    let target_end = after_first + lhs_trim.len();
+    let mut target_start = target_end;
+    let b = source_text.as_bytes();
+    while target_start > after_first && is_ident_byte(b[target_start - 1]) {
+        target_start -= 1;
+    }
+    (target_start < target_end).then(|| {
+        (
+            file_name.to_string(),
+            Span::new(target_start as u32, target_end as u32),
+        )
+    })
+}
+
 pub fn definition_at(
     query_engine: &QueryEngine,
     sym_table: &SymbolTable,
@@ -10458,6 +11855,28 @@ pub fn definition_at(
             }
         }
         return None;
+    }
+
+    // A module specifier naming an ambient module (`declare module "e" {}`
+    // in some loaded file) navigates to that declaration's name literal.
+    if let Some(target) = ambient_module_specifier_definition(query_engine, source_text, offset) {
+        return Some(target);
+    }
+    if !is_inside_string_or_comment(source_text, offset) {
+        if let Some(target) =
+            require_binding_definition(query_engine, sym_table, &sf.file_name, source_text, &token)
+        {
+            return Some(target);
+        }
+        if let Some(target) = new_target_assignment_chain_definition(
+            sym_table,
+            &sf.file_name,
+            source_text,
+            offset,
+            &token,
+        ) {
+            return Some(target);
+        }
     }
 
     // Special case: `@override` in JSDoc comment → navigate to parent class method.

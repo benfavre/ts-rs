@@ -1576,12 +1576,15 @@ impl TypeChecker {
         let mut return_types = Vec::new();
         self.collect_return_types(stmts, &mut return_types);
         // No returns, or only bare `return;` statements: void.
-        if return_types.is_empty() || return_types.iter().all(|t| matches!(t, Type::Undefined)) {
+        if return_types.is_empty() || return_types.iter().all(|t| matches!(t, Type::Void)) {
             Type::Void
         } else {
             let mut widened: Vec<_> = return_types
                 .into_iter()
-                .map(|t| self.widen_type(&t))
+                .map(|t| match t {
+                    Type::Void => Type::Undefined,
+                    t => self.widen_type(&t),
+                })
                 .collect();
             // Without strictNullChecks null/undefined are not part of the
             // inferred type; a function returning only those returns `any`.
@@ -1608,11 +1611,23 @@ impl TypeChecker {
     pub(crate) fn collect_return_types_from_stmt(&self, stmt: &Stmt, out: &mut Vec<Type>) {
         match &stmt.kind {
             StmtKind::Return(Some(ref expr)) => {
-                let ty = self.infer_expr_type(expr);
+                // An unshadowed `undefined` is the undefined value (it has
+                // no scope binding, so the generic lookup falls to `any`).
+                let ty = match &expr.kind {
+                    ExprKind::Ident(name)
+                        if name == "undefined" && self.lookup_var(name).is_none() =>
+                    {
+                        Type::Undefined
+                    }
+                    _ => self.infer_expr_type(expr),
+                };
                 out.push(self.widen_fresh_return_expr_type(expr, ty));
             }
+            // A bare `return;` is recorded as `void` so callers can tell it
+            // from an explicit `return undefined;` (tsc: a function with only
+            // bare returns returns `void`, otherwise they add `undefined`).
             StmtKind::Return(None) => {
-                out.push(Type::Undefined);
+                out.push(Type::Void);
             }
             StmtKind::Block(stmts) => {
                 self.collect_return_types(stmts, out);
@@ -1675,12 +1690,15 @@ impl TypeChecker {
             return Type::Never;
         }
         // No returns, or only bare `return;` statements: void.
-        if return_types.is_empty() || return_types.iter().all(|t| matches!(t, Type::Undefined)) {
+        if return_types.is_empty() || return_types.iter().all(|t| matches!(t, Type::Void)) {
             Type::Void
         } else {
             let mut widened: Vec<_> = return_types
                 .into_iter()
-                .map(|t| self.widen_type(&t))
+                .map(|t| match t {
+                    Type::Void => Type::Undefined,
+                    t => self.widen_type(&t),
+                })
                 .collect();
             // Without strictNullChecks null/undefined are not part of the
             // inferred type; a function returning only those returns `any`.

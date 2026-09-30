@@ -5045,6 +5045,7 @@ impl BaselineRunner {
                     }
                 }
                 let mut resolved: Vec<String> = Vec::new();
+                let mut resolved_paths: Vec<(String, String)> = Vec::new();
                 let mut esm_resolved: Vec<String> = Vec::new();
                 let mut esm_extensionless: Vec<(String, Option<String>)> = Vec::new();
                 let node_format_option = matches!(
@@ -5128,6 +5129,7 @@ impl BaselineRunner {
                     {
                         esm_resolved.push(specifier.clone());
                     }
+                    resolved_paths.push((specifier.clone(), test_case.files[idx].name.clone()));
                     resolved.push(specifier);
                 }
                 if effective_options.import_helpers == Some(true) {
@@ -5210,6 +5212,7 @@ impl BaselineRunner {
                     checker_donor.register_helpers_module(&importer, helpers);
                 }
                 checker_donor.register_resolvable_specifiers(&importer, &resolved);
+                checker_donor.register_virtual_module_paths(&importer, &resolved_paths);
                 checker_donor.register_esm_specifiers(&importer, &esm_resolved);
                 checker_donor.register_esm_extensionless_specifiers(&importer, &esm_extensionless);
             }

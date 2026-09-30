@@ -4907,7 +4907,7 @@ impl TypeChecker {
                             // contextual in the same way), so those params stay
                             // implicit `any`.
                             .filter(|_| arrow.type_params.is_none())
-                            .and_then(|cps| cps.get(i))
+                            .and_then(|cps| Self::contextual_param_at(cps, i))
                         {
                             // Use contextual parameter type; a `?` on the
                             // parameter adds `undefined` under strictNullChecks.
@@ -5186,7 +5186,7 @@ impl TypeChecker {
                             // See the Arrow arm: a function expression with its
                             // own type parameters skips contextual param typing.
                             .filter(|_| fn_decl.type_params.is_none())
-                            .and_then(|cps| cps.get(i))
+                            .and_then(|cps| Self::contextual_param_at(cps, i))
                         {
                             // A `?` on the parameter adds `undefined` under strict.
                             if p.optional && self.strict_null_checks {
@@ -7475,6 +7475,23 @@ impl TypeChecker {
                         // class STATICS.
                         if let Some(cls) = name.strip_prefix("typeof ") {
                             if let Some(ci) = self.class_info.get(cls) {
+                                // `C.prototype` is the instance type with every
+                                // type argument `any` (tsc getTypeOfPrototypeProperty).
+                                // Classes of the same name in different
+                                // namespaces share the bare key; keep `any`
+                                // rather than guess which one this is.
+                                let qualified_suffix = format!(".{cls}");
+                                let ambiguous = self
+                                    .class_info
+                                    .keys()
+                                    .any(|key| key.ends_with(qualified_suffix.as_str()));
+                                if mem.property == "prototype"
+                                    && !ambiguous
+                                    && !self.current_file_is_js()
+                                {
+                                    let args = vec![Type::Any; ci.type_params.len()];
+                                    return Type::TypeReference(cls.to_string(), Arc::from(args));
+                                }
                                 if let Some((_, t)) = ci
                                     .static_properties
                                     .iter()
@@ -7935,7 +7952,22 @@ impl TypeChecker {
                             self.builtins
                                 .lookup_instance_property("Array", &mem.property)
                         })
-                        .unwrap_or(Type::Any),
+                        .unwrap_or_else(|| {
+                            if self.array_member_definitely_missing(&mem.property) {
+                                let property_span = Span::new(
+                                    expr.span.end.saturating_sub(mem.property.len() as u32),
+                                    expr.span.end,
+                                );
+                                self.diagnostics.push(error_property_not_exist(
+                                    &mem.property,
+                                    &obj_ty.display_string(),
+                                    property_span,
+                                ));
+                                Type::Error
+                            } else {
+                                Type::Any
+                            }
+                        }),
                     // Union: resolve property from each member
                     Type::Union(members) => {
                         let presences: Vec<_> = if self.complete_union_flow_depth > 0 {
@@ -11021,6 +11053,35 @@ impl TypeChecker {
             Type::Union(members) => members.iter().all(Self::is_primitive_constraint),
             _ => false,
         }
+    }
+
+    /// The contextual parameter at position `index` of a contextual signature:
+    /// positions at or after a rest parameter (`...args: T[]`) take its
+    /// element type (tsc getTypeAtPosition), not the whole array.
+    pub(crate) fn contextual_param_at(
+        params: &[(String, Type)],
+        index: usize,
+    ) -> Option<(String, Type)> {
+        let rest = params
+            .iter()
+            .enumerate()
+            .find(|(position, (name, _))| *position <= index && name.starts_with("..."));
+        if let Some((_, (name, ty))) = rest {
+            let element = match ty {
+                Type::Array(element) => Some(Type::clone(element)),
+                Type::TypeReference(owner, args)
+                    if matches!(owner.as_str(), "Array" | "ReadonlyArray") && args.len() == 1 =>
+                {
+                    Some(args[0].clone())
+                }
+                Type::Any => Some(Type::Any),
+                _ => None,
+            };
+            if let Some(element) = element {
+                return Some((name.trim_start_matches("...").to_string(), element));
+            }
+        }
+        params.get(index).cloned()
     }
 
     pub(crate) fn widen_fresh_return_expr_type(&self, expr: &Expr, ty: Type) -> Type {

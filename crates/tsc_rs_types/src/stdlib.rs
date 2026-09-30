@@ -86,6 +86,18 @@ impl StdLibMemberAvailability {
         self.active_types.iter().map(String::as_str)
     }
 
+    /// Whether the configured libs declare `owner` at all, and if so whether
+    /// they declare `property` on it.
+    pub(crate) fn declares_member(&self, owner: &str, property: &str) -> Option<bool> {
+        if !self.active_owners.contains(owner) {
+            return None;
+        }
+        Some(
+            self.active
+                .contains(&(owner.to_string(), property.to_string())),
+        )
+    }
+
     pub(crate) fn recommendation(&self, owner: &str, property: &str) -> Option<&'static str> {
         let key = (owner.to_string(), property.to_string());
         if self.active.contains(&key) {

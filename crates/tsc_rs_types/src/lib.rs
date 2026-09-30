@@ -139,6 +139,25 @@ thread_local! {
 }
 
 thread_local! {
+    /// Covariant inference candidates of the most recent
+    /// `infer_type_arguments` run, per type parameter in argument order
+    /// (the recorder unions them; callers with relation access pick tsc's
+    /// common supertype instead).
+    static INFER_COVARIANT: std::cell::RefCell<HashMap<std::string::String, Vec<Type>>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// The covariant candidates the last completed `infer_type_arguments`
+    /// collected.
+    static LAST_INFER_COVARIANT: std::cell::RefCell<HashMap<std::string::String, Vec<Type>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+thread_local! {
+    /// `strictNullChecks` of the file being checked, for the static widening
+    /// helpers: tsc widens `null`/`undefined` to `any` only without it.
+    static WIDEN_STRICT_NULL_CHECKS: Cell<bool> = const { Cell::new(false) };
+}
+
+thread_local! {
     /// Thread-local recursion depth counter for free-standing type functions.
     static FREE_FN_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// Cumulative instantiation counter, reset at each top-level type op and
@@ -2656,6 +2675,10 @@ pub struct TypeChecker {
     /// tsconfig `paths`/`baseUrl`/`rootDirs`, node_modules lookup, package
     /// self-names and `@link` aliases: keyed by normalized file name.
     resolvable_specifiers: Arc<std::collections::HashMap<String, HashSet<String>>>,
+    /// Virtual-program module resolution registered by the harness:
+    /// normalized importer file name → specifier → resolved program file.
+    virtual_module_paths:
+        Arc<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
     /// Per file: where its helpers module ('tslib') resolves, `None` when it
     /// cannot be found (see `external_helpers`).
     helpers_modules: Arc<std::collections::HashMap<String, Option<String>>>,
@@ -2923,6 +2946,7 @@ impl Clone for TypeChecker {
             available_source_files: Arc::clone(&self.available_source_files),
             available_modules: Arc::clone(&self.available_modules),
             resolvable_specifiers: Arc::clone(&self.resolvable_specifiers),
+            virtual_module_paths: Arc::clone(&self.virtual_module_paths),
             helpers_modules: Arc::clone(&self.helpers_modules),
             helpers_requested: Arc::clone(&self.helpers_requested),
             helpers_module_exports: Arc::clone(&self.helpers_module_exports),
@@ -3110,6 +3134,7 @@ impl TypeChecker {
             available_source_files: Arc::new(HashSet::new()),
             available_modules: Arc::new(HashSet::new()),
             resolvable_specifiers: Arc::new(std::collections::HashMap::new()),
+            virtual_module_paths: Arc::new(std::collections::HashMap::new()),
             helpers_modules: Arc::new(std::collections::HashMap::new()),
             helpers_requested: Arc::new(Mutex::new(std::collections::HashMap::new())),
             helpers_module_exports: Arc::new(std::collections::HashMap::new()),
@@ -7445,9 +7470,18 @@ impl TypeChecker {
             }
             StmtKind::ClassDecl(class_decl) => {
                 if let Some(ref name) = class_decl.name {
-                    let nominal = self.lookup_var(name).cloned().unwrap_or_else(|| {
-                        Type::TypeReference(format!("typeof {name}"), Arc::from([] as [Type; 0]))
-                    });
+                    // A placeholder `any` binding (cross-file name
+                    // registration) is not the class value.
+                    let nominal = self
+                        .lookup_var(name)
+                        .filter(|ty| !matches!(ty, Type::Any))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            Type::TypeReference(
+                                format!("typeof {name}"),
+                                Arc::from([] as [Type; 0]),
+                            )
+                        });
                     let properties = self.local_class_unique_static_surface(
                         file,
                         class_decl,
@@ -7680,6 +7714,13 @@ impl TypeChecker {
     /// the current containing file as the resolution anchor. Returns
     /// `None` if resolution fails.
     fn resolve_module_to_path(&self, specifier: &str, containing_file: &str) -> Option<String> {
+        if let Some(path) = self
+            .virtual_module_paths
+            .get(&Self::resolvable_specifier_key(containing_file))
+            .and_then(|specifiers| specifiers.get(specifier))
+        {
+            return Some(path.clone());
+        }
         tsc_rs_resolver::resolve_module_name(specifier, containing_file, &self.compiler_options)
             .map(|m| m.resolved_file_name)
     }
@@ -9473,6 +9514,7 @@ impl TypeChecker {
         let strict_option = |value: Option<bool>| value.unwrap_or(options.strict != Some(false));
         self.no_implicit_any = strict_option(options.no_implicit_any);
         self.strict_null_checks = strict_option(options.strict_null_checks);
+        WIDEN_STRICT_NULL_CHECKS.with(|flag| flag.set(self.strict_null_checks));
         self.strict_function_types = strict_option(options.strict_function_types);
         if self.strict_null_checks {
             self.enable_control_flow_narrowing();
@@ -13567,7 +13609,14 @@ impl TypeChecker {
                     self.declare_var(&spec.local, ty);
                 }
                 if let Some(namespace) = namespace {
+                    // A namespace import of an `export =` module resolves
+                    // to the assigned value.
+                    let export_assigned = exports
+                        .as_ref()
+                        .and_then(|list| list.iter().find(|(name, _)| name == "export="))
+                        .map(|(_, ty)| ty.clone());
                     let ty = match &exports {
+                        _ if export_assigned.is_some() => export_assigned.unwrap(),
                         Some(list) if !list.is_empty() => Type::Module(ModuleType {
                             name: import_decl.source.clone(),
                             exports: list.clone(),
@@ -13579,7 +13628,14 @@ impl TypeChecker {
                 }
             }
             ImportClause::Require(local_name) => {
+                // `import x = require("m")` of an `export =` module binds the
+                // assigned value itself.
+                let export_assigned = exports
+                    .as_ref()
+                    .and_then(|list| list.iter().find(|(name, _)| name == "export="))
+                    .map(|(_, ty)| ty.clone());
                 let ty = match &exports {
+                    _ if export_assigned.is_some() => export_assigned.unwrap(),
                     Some(list) if !list.is_empty() => Type::Module(ModuleType {
                         name: import_decl.source.clone(),
                         exports: list.clone(),
@@ -13795,19 +13851,65 @@ impl TypeChecker {
     /// Whether every link of `class_name`'s extends chain is present in
     /// class_info. A missing link (cross-file or unresolvable base) could hide
     /// member declarations, so strict member-existence checks must bail.
+    /// TS2339 on an array receiver: the member is on neither the loaded lib
+    /// `Array` interface (with any program augmentation) nor `Object`. Unknown
+    /// when no lib `Array` declaration was loaded.
+    pub(crate) fn array_member_definitely_missing(&self, property: &str) -> bool {
+        // In a multi-file virtual program another file may augment `Array`
+        // (`declare global { interface Array<T> … }`) without its
+        // declarations reaching this per-file checker.
+        if self.current_file_is_js()
+            || property.starts_with('#')
+            || property.parse::<f64>().is_ok()
+            || self.available_source_files.len() > 1
+        {
+            return false;
+        }
+        let Some(availability) = stdlib::stdlib_member_availability(&self.compiler_options) else {
+            return false;
+        };
+        // A member of a newer lib is TS2550 territory, handled elsewhere.
+        if availability.recommendation("Array", property).is_some() {
+            return false;
+        }
+        let lib_declares = |owner: &str| availability.declares_member(owner, property);
+        if lib_declares("Array") != Some(false) || lib_declares("Object") != Some(false) {
+            return false;
+        }
+        // Program augmentations (`interface Array<T> { … }`, also under
+        // `declare global`).
+        let augmented = |owner: &str| {
+            self.interface_info.iter().any(|(key, info)| {
+                (key == owner || key.rsplit_once('.').is_some_and(|(_, tail)| tail == owner))
+                    && (info.object_type.index_signature.is_some()
+                        || !info.extends.is_empty()
+                        || info
+                            .object_type
+                            .properties
+                            .iter()
+                            .any(|(name, _)| name == property))
+            })
+        };
+        !augmented("Array") && !augmented("Object")
+    }
+
     fn class_chain_fully_resolved(&self, class_name: &str) -> bool {
         let mut cur = class_name.to_string();
-        let mut hops = 0;
+        let mut visited: Vec<String> = Vec::new();
         loop {
+            // A circular base (TS2506) contributes no members: tsc's
+            // resolveBaseTypesOfClass yields no base types on circularity.
+            if visited.iter().any(|seen| seen == &cur) {
+                return true;
+            }
             let Some(info) = self.class_info.get(cur.as_str()) else {
                 return false;
             };
             match &info.extends {
                 Some(base) => {
-                    cur = base.clone();
-                    hops += 1;
-                    if hops > 64 {
-                        return false; // cycle guard
+                    visited.push(std::mem::replace(&mut cur, base.clone()));
+                    if visited.len() > 64 {
+                        return false;
                     }
                 }
                 None => return true,
@@ -16205,6 +16307,26 @@ impl TypeChecker {
             || matches!(target, Type::Any | Type::Error | Type::This)
         {
             return Some(true);
+        }
+        // A module namespace object relates structurally through its value
+        // exports (`var xs: I[] = [moduleA]`).
+        if let Type::Module(module) = source {
+            if !matches!(target, Type::Module(_)) {
+                let shape = Type::ObjectType(ObjectTypeInfo {
+                    properties: module
+                        .exports
+                        .iter()
+                        .filter(|(name, _)| name != "export=")
+                        .map(|(name, ty)| (name.clone(), Arc::new(ty.clone())))
+                        .collect(),
+                    call_signatures: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signature: None,
+                    index_signature_name: None,
+                    method_names: Vec::new(),
+                });
+                return Some(self.is_assignable_to(&shape, target));
+            }
         }
         // A generic class/interface referenced without its required type
         // arguments is already TS2314; tsc treats that type as erroneous and
@@ -23938,6 +24060,20 @@ impl TypeChecker {
 
     /// Record import specifiers of `file` that the host resolved to a program
     /// file (see `resolvable_specifiers`).
+    /// Record where each import specifier of `file` resolves inside a
+    /// virtual (in-memory) program, so import bindings and re-exports can
+    /// reach the target file's export table without touching the disk.
+    pub fn register_virtual_module_paths(&mut self, file: &str, resolved: &[(String, String)]) {
+        if resolved.is_empty() {
+            return;
+        }
+        let map = Arc::make_mut(&mut self.virtual_module_paths);
+        let entry = map.entry(Self::resolvable_specifier_key(file)).or_default();
+        for (specifier, path) in resolved {
+            entry.insert(specifier.clone(), path.clone());
+        }
+    }
+
     pub fn register_resolvable_specifiers(&mut self, file: &str, specifiers: &[String]) {
         if specifiers.is_empty() {
             return;
@@ -35848,7 +35984,16 @@ impl TypeChecker {
                 // The user-visible bug: `const f = somethingTyped.method` lost
                 // the param's Union-with-undefined, masquerading as `any` and
                 // wrecking infer-from-callback signatures (lib.es5 Promise.then).
-                let widened_ret = Self::widen_nested_literals(&ft.return_type);
+                // Under strictNullChecks a `() => undefined` / `() => null`
+                // return is not widened (tsc has no nullable widening types
+                // then).
+                let widened_ret = if matches!(*ft.return_type, Type::Null | Type::Undefined)
+                    && WIDEN_STRICT_NULL_CHECKS.with(Cell::get)
+                {
+                    (*ft.return_type).clone()
+                } else {
+                    Self::widen_nested_literals(&ft.return_type)
+                };
                 Type::Function(FunctionType {
                     type_param_constraints: ft.type_param_constraints.clone(),
                     params: ft.params.clone(),
@@ -37114,10 +37259,15 @@ impl TypeChecker {
             type_params.iter().map(|s| s.as_str()).collect();
         // Re-entrant: keep an enclosing inference's contravariant table.
         let saved_contra = INFER_CONTRA.with(|contra| std::mem::take(&mut *contra.borrow_mut()));
+        let saved_covariant =
+            INFER_COVARIANT.with(|covariant| std::mem::take(&mut *covariant.borrow_mut()));
         let saved_depth = INFER_CONTRA_DEPTH.with(|depth| depth.replace(0));
         for (arg_ty, (_pname, param_ty)) in call_arg_types.iter().zip(param_types.iter()) {
             Self::infer_from_types(arg_ty, param_ty, &tp_set, &mut result);
         }
+        let covariant = INFER_COVARIANT
+            .with(|covariant| std::mem::replace(&mut *covariant.borrow_mut(), saved_covariant));
+        LAST_INFER_COVARIANT.with(|last| *last.borrow_mut() = covariant);
         let contra =
             INFER_CONTRA.with(|contra| std::mem::replace(&mut *contra.borrow_mut(), saved_contra));
         INFER_CONTRA_DEPTH.with(|depth| depth.set(saved_depth));
@@ -37178,6 +37328,13 @@ impl TypeChecker {
         }
         let contravariant = INFER_CONTRA_DEPTH.with(|depth| depth.get() % 2 == 1);
         let mut record = |table: &mut HashMap<std::string::String, Type>| {
+            INFER_COVARIANT.with(|covariant| {
+                let mut covariant = covariant.borrow_mut();
+                let candidates = covariant.entry(name.to_string()).or_default();
+                if !candidates.contains(arg_ty) {
+                    candidates.push(arg_ty.clone());
+                }
+            });
             if let Some(existing) = table.get(name) {
                 if existing != arg_ty && !matches!(existing, Type::Any) {
                     let union = Type::flatten_union(vec![existing.clone(), arg_ty.clone()]);
@@ -37225,7 +37382,79 @@ impl TypeChecker {
                 (name.clone(), resolved)
             })
             .collect();
-        Self::infer_type_arguments(call_arg_types, &resolved_params, type_params)
+        let mut inferred =
+            Self::infer_type_arguments(call_arg_types, &resolved_params, type_params);
+        let covariant = LAST_INFER_COVARIANT.with(|last| std::mem::take(&mut *last.borrow_mut()));
+        for (name, candidates) in covariant {
+            // Only candidates that are whole arguments bound to a bare `T`:
+            // members split off a union argument (one candidate in tsc) and
+            // callback return types keep the recorder's union.
+            if candidates.len() < 2
+                || !candidates.iter().all(|candidate| {
+                    matches!(candidate, Type::Null | Type::Undefined)
+                        || call_arg_types.contains(candidate)
+                })
+            {
+                continue;
+            }
+            if let Some(choice) = self.common_supertype_candidate(&candidates) {
+                inferred.insert(name, choice);
+            }
+        }
+        inferred
+    }
+
+    /// tsc getCommonSupertype over covariant inference candidates: nullable
+    /// candidates are set aside, the rest reduce left-to-right keeping the
+    /// earlier candidate unless it is assignable to the later one, and the
+    /// nullable parts are added back. `None` keeps the recorder's union
+    /// (unresolved shapes the relation cannot judge).
+    fn common_supertype_candidate(&self, candidates: &[Type]) -> Option<Type> {
+        let (nullish, rest): (Vec<&Type>, Vec<&Type>) = candidates
+            .iter()
+            .partition(|candidate| matches!(candidate, Type::Null | Type::Undefined));
+        if rest.len() < 2 {
+            return None;
+        }
+        // Only plain, fully known shapes: type parameters, unresolved
+        // references and deferred forms keep today's union.
+        let judgeable = |ty: &Type| {
+            matches!(
+                ty,
+                Type::String
+                    | Type::Number
+                    | Type::Boolean
+                    | Type::BigInt
+                    | Type::StringLiteral(_)
+                    | Type::NumberLiteral(_)
+                    | Type::BooleanLiteral(_)
+                    | Type::BigIntLiteral(_)
+            ) || matches!(ty, Type::TypeReference(name, args)
+                    if args.is_empty()
+                        && (self.interface_info.contains_key(name.as_str())
+                            || self.class_info.contains_key(name.as_str())))
+        };
+        if !rest.iter().all(|candidate| judgeable(candidate)) {
+            return None;
+        }
+        let widened: Vec<Type> = rest
+            .iter()
+            .map(|candidate| self.widen_type(candidate))
+            .collect();
+        let mut chosen = 0;
+        for index in 1..widened.len() {
+            if self.is_assignable_to(&widened[chosen], &widened[index]) {
+                chosen = index;
+            }
+        }
+        // Mutually related candidates (all the same widened type) keep the
+        // union so literal-preserving contexts still see every literal.
+        if widened.iter().all(|ty| *ty == widened[chosen]) {
+            return None;
+        }
+        let mut members = vec![widened[chosen].clone()];
+        members.extend(nullish.into_iter().cloned());
+        Some(Type::flatten_union(members))
     }
 
     /// Recursively match an argument type against a parameter type to solve type variables.
