@@ -40,6 +40,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Some checker tests load real TypeScript lib files (e.g.
+      # lib.esnext.temporal.d.ts); pin the version the oracles target.
+      - name: Install TypeScript lib files
+        run: |
+          npm install --no-save --no-package-lock --prefix "$RUNNER_TEMP/ts" typescript@6.0.3
+          echo "TSC_RS_TYPESCRIPT_LIB_DIR=$RUNNER_TEMP/ts/node_modules/typescript/lib" >> "$GITHUB_ENV"
 
       - name: Unit tests (all crates)
         run: cargo test --workspace
