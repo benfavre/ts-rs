@@ -677,12 +677,12 @@ impl TypeChecker {
                 // `typeof c` for display (their anonymous object types).
                 let function_declaration = self.function_param_spans.contains_key(&name)
                     || self.overloads.contains_key(&name);
-                if matches!(expr.kind, ExprKind::Ident(_)) && !self.namespace_paths.contains(&name) {
+                if matches!(expr.kind, ExprKind::Ident(_)) && !self.namespace_paths.contains(&name)
+                {
                     if let Some(resolved) = self.lookup_var(&name).filter(|resolved| {
                         Self::is_concrete_typeof_target(resolved)
                             && !(function_declaration && matches!(resolved, Type::Function(_)))
-                    })
-                    {
+                    }) {
                         return resolved.clone();
                     }
                 }

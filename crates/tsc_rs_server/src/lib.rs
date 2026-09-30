@@ -2262,8 +2262,19 @@ fn contextual_string_completions(
             // A bare TYPE-PARAMETER name: resolve its declared constraint —
             // `K extends keyof Foo` completes Foo's keys, and
             // `K extends "a" | "b"` completes the literal union
-            // (completionForStringLiteral5).
-            let tyt = ty.trim();
+            // (completionForStringLiteral5). Under strict an optional
+            // parameter reads `T | undefined`; the nullish members don't
+            // contribute completions.
+            let non_nullish: Vec<&str> = ty
+                .split('|')
+                .map(str::trim)
+                .filter(|m| !m.is_empty() && *m != "undefined" && *m != "null")
+                .collect();
+            let tyt = if non_nullish.len() == 1 {
+                non_nullish[0]
+            } else {
+                ty.trim()
+            };
             if !tyt.is_empty()
                 && tyt
                     .chars()
@@ -3552,8 +3563,57 @@ fn is_fn_type_str(ts: &str) -> bool {
 
 fn split_named_fn_type_str(type_str: &str) -> Option<(&str, &str)> {
     let (name, fn_type) = type_str.split_once(": ")?;
-    let fn_type = fn_type.trim();
+    let fn_type = strip_nullish_from_fn_union(fn_type.trim());
     is_fn_type_str(fn_type).then_some((name.trim(), fn_type))
+}
+
+/// `((a: string) => void) | undefined` → `(a: string) => void`: an optional
+/// callee (optional call chains, optional properties) is called through its
+/// single function member. Anything else is returned unchanged.
+fn strip_nullish_from_fn_union(ty: &str) -> &str {
+    let bytes = ty.as_bytes();
+    let mut depth = 0i32;
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'=' => {}
+            b')' | b']' | b'}' | b'>' => depth -= 1,
+            b'|' if depth == 0 => {
+                parts.push(ty[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if parts.is_empty() {
+        return ty;
+    }
+    parts.push(ty[start..].trim());
+    let mut rest = parts
+        .into_iter()
+        .filter(|p| !p.is_empty() && *p != "undefined" && *p != "null");
+    let (Some(only), None) = (rest.next(), rest.next()) else {
+        return ty;
+    };
+    // Unwrap one layer of parentheses when they enclose the whole member.
+    if only.starts_with('(') && only.ends_with(')') {
+        let inner = &only[1..only.len() - 1];
+        let mut d = 0i32;
+        let balanced = inner.bytes().all(|b| {
+            match b {
+                b'(' => d += 1,
+                b')' => d -= 1,
+                _ => {}
+            }
+            d >= 0
+        });
+        if balanced && d == 0 && is_fn_type_str(inner.trim()) {
+            return inner.trim();
+        }
+    }
+    only
 }
 
 fn normalize_function_type_label(label: &str) -> String {
@@ -5523,7 +5583,21 @@ fn format_constructor_hover(
                     count += 1;
                     search += p + "constructor".len();
                 }
-                ord.filter(|i| *i < overloads.len()).unwrap_or(0)
+                ord.filter(|i| *i < overloads.len())
+                    .or_else(|| {
+                        // `new C(args)`: pick by the call's arguments.
+                        let b = source_text.as_bytes();
+                        let mut st = hover_pos.min(b.len());
+                        while st > 0 && is_ident_byte(b[st - 1]) {
+                            st -= 1;
+                        }
+                        source_text[..st]
+                            .trim_end()
+                            .ends_with("new")
+                            .then(|| pick_overload_by_call_args(source_text, st, overloads, None))
+                            .flatten()
+                    })
+                    .unwrap_or(0)
             };
             let sig = &overloads[idx];
             let params = format_overload_params(sig);
@@ -5569,12 +5643,23 @@ fn format_constructor_hover_for_new(
     sym_table: &SymbolTable,
     class_sym: &tsc_rs_symbols::Symbol,
     _source_text: &str,
+    offset: u32,
+    check_out: &TypeCheckOutput,
 ) -> String {
-    // Reuse the same logic - for now, just show the first overload
     let class_name = &class_sym.name;
     if let Some(overloads) = sym_table.overload_signatures.get(&class_sym.id) {
         if !overloads.is_empty() {
-            let sig = &overloads[0];
+            // Pick the overload the call's arguments select (first by default).
+            let idx = {
+                let b = _source_text.as_bytes();
+                let mut st = (offset as usize).min(b.len());
+                while st > 0 && is_ident_byte(b[st - 1]) {
+                    st -= 1;
+                }
+                pick_overload_by_call_args(_source_text, st, overloads, Some(check_out))
+                    .unwrap_or(0)
+            };
+            let sig = &overloads[idx];
             let params = format_overload_params(sig);
             let extra = if overloads.len() > 1 {
                 format!(
@@ -5597,6 +5682,143 @@ fn format_constructor_hover_for_new(
 }
 
 /// Format overload parameters as a comma-separated string.
+/// The argument expressions of a call whose callee identifier starts at
+/// `tok_start`: `(start offset, text)` per top-level argument. `None` when the
+/// token isn't directly followed by `(`.
+fn call_args_after_callee(source: &str, tok_start: usize) -> Option<Vec<(usize, &str)>> {
+    let bytes = source.as_bytes();
+    let mut i = tok_start;
+    while i < bytes.len() && is_ident_byte(bytes[i]) {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+    let mut args = Vec::new();
+    let mut depth = 0i32;
+    let mut start = i + 1;
+    let mut j = i;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'"' | b'\'' | b'`' => {
+                let q = bytes[j];
+                j += 1;
+                while j < bytes.len() && bytes[j] != q {
+                    if bytes[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let text = &source[start..j];
+                    if !text.trim().is_empty() {
+                        let lead = text.len() - text.trim_start().len();
+                        args.push((start + lead, text.trim()));
+                    }
+                    return Some(args);
+                }
+            }
+            b',' if depth == 1 => {
+                let text = &source[start..j];
+                let lead = text.len() - text.trim_start().len();
+                args.push((start + lead, text.trim()));
+                start = j + 1;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    None
+}
+
+/// The widened display type of a call argument: literals by their syntax,
+/// otherwise the checker's recorded expression type with literal types
+/// widened (`"a"` → `string`, `1` → `number`, `true` → `boolean`).
+fn call_arg_widened_type(
+    check_out: Option<&TypeCheckOutput>,
+    start: usize,
+    text: &str,
+) -> Option<String> {
+    let first = text.as_bytes().first().copied()?;
+    if matches!(first, b'"' | b'\'' | b'`') {
+        return Some("string".to_string());
+    }
+    if first.is_ascii_digit() {
+        return Some("number".to_string());
+    }
+    if text == "true" || text == "false" {
+        return Some("boolean".to_string());
+    }
+    let ty = check_out?.expression_types.get(&(start as u32))?;
+    let ty = ty.trim();
+    let b = ty.as_bytes().first().copied()?;
+    Some(if matches!(b, b'"' | b'\'') {
+        "string".to_string()
+    } else if b.is_ascii_digit() || (b == b'-' && ty.len() > 1) {
+        "number".to_string()
+    } else if ty == "true" || ty == "false" {
+        "boolean".to_string()
+    } else {
+        ty.to_string()
+    })
+}
+
+/// Pick the first overload whose arity and parameter types accept the call's
+/// arguments (tsc's resolution order), for call sites where the checker
+/// recorded no selection. `None` when no argument information is available
+/// or no overload clearly matches.
+fn pick_overload_by_call_args(
+    source: &str,
+    tok_start: usize,
+    overloads: &[tsc_rs_symbols::OverloadSignature],
+    check_out: Option<&TypeCheckOutput>,
+) -> Option<usize> {
+    let args = call_args_after_callee(source, tok_start)?;
+    let arg_types: Vec<Option<String>> = args
+        .iter()
+        .map(|(start, text)| call_arg_widened_type(check_out, *start, text))
+        .collect();
+    overloads.iter().position(|sig| {
+        let required = sig.params.iter().filter(|p| !p.optional && !p.rest).count();
+        let has_rest = sig.params.iter().any(|p| p.rest);
+        if args.len() < required || (!has_rest && args.len() > sig.params.len()) {
+            return false;
+        }
+        arg_types.iter().enumerate().all(|(i, arg_ty)| {
+            let Some(param) = sig
+                .params
+                .get(i)
+                .or_else(|| sig.params.last().filter(|p| p.rest))
+            else {
+                return false;
+            };
+            let Some(ann) = param.type_ann.as_ref() else {
+                return true;
+            };
+            let mut p_ty = format_type_node(ann);
+            if param.rest {
+                if let Some(elem) = p_ty.strip_suffix("[]") {
+                    p_ty = elem.to_string();
+                }
+            }
+            let Some(arg_ty) = arg_ty else {
+                return true;
+            };
+            p_ty == "any"
+                || arg_ty == "any"
+                || p_ty == *arg_ty
+                || p_ty.split(" | ").any(|m| m.trim() == arg_ty)
+        })
+    })
+}
+
 fn format_overload_params(sig: &tsc_rs_symbols::OverloadSignature) -> String {
     sig.params
         .iter()
@@ -6343,6 +6565,472 @@ fn is_inside_function(source: &str, offset: u32) -> bool {
 
 /// Build the hover display string for a symbol.
 pub fn hover_at(
+    query_engine: &QueryEngine,
+    file_name: &str,
+    sym_table: &SymbolTable,
+    check_out: &TypeCheckOutput,
+    source_text: &str,
+    offset: u32,
+) -> Option<String> {
+    let hover = hover_at_impl(
+        query_engine,
+        file_name,
+        sym_table,
+        check_out,
+        source_text,
+        offset,
+    )?;
+    let hover = overload_object_call_site_hover(hover, check_out, source_text, offset);
+    if !is_js_like_file_name(file_name) {
+        return Some(hover);
+    }
+    Some(apply_js_jsdoc_hover_types(
+        hover,
+        query_engine,
+        file_name,
+        sym_table,
+        source_text,
+        offset,
+    ))
+}
+
+/// At a call site of a variable whose type is an object of only call
+/// signatures (`var h: { (a: string): number; (a: number): string; }` then
+/// `h(10)`), tsc shows the resolved signature: `var h: (a: number) => string
+/// (+1 overload)`.
+fn overload_object_call_site_hover(
+    hover: String,
+    check_out: &TypeCheckOutput,
+    source_text: &str,
+    offset: u32,
+) -> String {
+    let (display, docs) = match hover.find("\n\n---\n\n") {
+        Some(i) => (&hover[..i], &hover[i..]),
+        None => (hover.as_str(), ""),
+    };
+    let Some((head, body)) = display.split_once(": {\n") else {
+        return hover;
+    };
+    if head.contains('\n')
+        || ![
+            "var ",
+            "let ",
+            "const ",
+            "(local var) ",
+            "(local let) ",
+            "(local const) ",
+        ]
+        .iter()
+        .any(|p| head.starts_with(p))
+    {
+        return hover;
+    }
+    let Some(body) = body.strip_suffix("\n}") else {
+        return hover;
+    };
+    // Each member must be a single-line call signature `(params): ret;`.
+    let mut sigs: Vec<(&str, &str)> = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        let Some(line) = line.strip_suffix(';') else {
+            return hover;
+        };
+        if !line.starts_with('(') {
+            return hover;
+        }
+        let bytes = line.as_bytes();
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'(' | b'[' | b'{' | b'<' => depth += 1,
+                b')' | b']' | b'}' | b'>' => {
+                    depth -= 1;
+                    if depth == 0 && b == b')' {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            return hover;
+        };
+        let Some(ret) = line[close + 1..].trim_start().strip_prefix(':') else {
+            return hover;
+        };
+        sigs.push((&line[1..close], ret.trim()));
+    }
+    if sigs.len() < 2 {
+        return hover;
+    }
+    let b = source_text.as_bytes();
+    let mut st = (offset as usize).min(b.len());
+    while st > 0 && is_ident_byte(b[st - 1]) {
+        st -= 1;
+    }
+    let Some(args) = call_args_after_callee(source_text, st) else {
+        return hover;
+    };
+    let arg_types: Vec<Option<String>> = args
+        .iter()
+        .map(|(start, text)| call_arg_widened_type(Some(check_out), *start, text))
+        .collect();
+    let chosen = sigs.iter().position(|(params, _)| {
+        let params: Vec<&str> = if params.trim().is_empty() {
+            Vec::new()
+        } else {
+            split_top_level_closure(params, b',')
+        };
+        let required = params
+            .iter()
+            .filter(|p| {
+                let name = p.split(':').next().unwrap_or("").trim();
+                !name.ends_with('?') && !name.starts_with("...")
+            })
+            .count();
+        let has_rest = params.iter().any(|p| p.trim().starts_with("..."));
+        if args.len() < required || (!has_rest && args.len() > params.len()) {
+            return false;
+        }
+        arg_types.iter().enumerate().all(|(i, arg_ty)| {
+            let Some(param) = params
+                .get(i)
+                .or_else(|| params.last().filter(|p| p.trim().starts_with("...")))
+            else {
+                return false;
+            };
+            let Some((_, p_ty)) = param.split_once(':') else {
+                return true;
+            };
+            let mut p_ty = p_ty.trim();
+            if param.trim().starts_with("...") {
+                p_ty = p_ty.strip_suffix("[]").unwrap_or(p_ty);
+            }
+            let Some(arg_ty) = arg_ty else {
+                return true;
+            };
+            p_ty == "any"
+                || arg_ty == "any"
+                || p_ty == arg_ty
+                || p_ty.split(" | ").any(|m| m.trim() == arg_ty)
+        })
+    });
+    let Some(idx) = chosen else {
+        return hover;
+    };
+    let (params, ret) = sigs[idx];
+    let extra = format!(
+        " (+{} overload{})",
+        sigs.len() - 1,
+        if sigs.len() > 2 { "s" } else { "" }
+    );
+    format!("{head}: ({params}) => {ret}{extra}{docs}")
+}
+
+fn is_js_like_file_name(file_name: &str) -> bool {
+    file_name.ends_with(".js")
+        || file_name.ends_with(".jsx")
+        || file_name.ends_with(".mjs")
+        || file_name.ends_with(".cjs")
+}
+
+/// JS files carry their types in JSDoc, which the checker doesn't read for
+/// declarations: a variable hover `var x: any` takes a preceding
+/// `/** @type {T} */`, and a function hover takes `@param {T}` /
+/// `@returns {T}` types for its `any`/`void` slots.
+fn apply_js_jsdoc_hover_types(
+    hover: String,
+    query_engine: &QueryEngine,
+    file_name: &str,
+    sym_table: &SymbolTable,
+    source_text: &str,
+    offset: u32,
+) -> String {
+    let (display, docs) = match hover.find("\n\n---\n\n") {
+        Some(i) => (&hover[..i], &hover[i..]),
+        None => (hover.as_str(), ""),
+    };
+    let Some(sym_id) =
+        find_symbol_at_offset_or_by_name(sym_table, source_text, offset, query_engine, file_name)
+    else {
+        return hover;
+    };
+    let Some(sym) = sym_table.get_symbol(sym_id) else {
+        return hover;
+    };
+    let Some(decl) = sym
+        .declarations
+        .iter()
+        .find(|d| d.file_name.is_empty() || d.file_name == file_name)
+    else {
+        return hover;
+    };
+    if decl.span.start as usize > source_text.len() {
+        return hover;
+    }
+    let stmt_start = find_statement_start(source_text, decl.span.start);
+
+    const VAR_PREFIXES: [&str; 6] = [
+        "var ",
+        "let ",
+        "const ",
+        "(local var) ",
+        "(local let) ",
+        "(local const) ",
+    ];
+    if VAR_PREFIXES.iter().any(|p| display.starts_with(p)) {
+        if let Some(head) = display.strip_suffix(": any") {
+            if !head.contains('\n') {
+                if let Some(raw) = jsdoc_type_before(source_text, stmt_start as usize, "@type") {
+                    let ty = closure_type_to_display(&raw, true);
+                    return format!("{head}: {ty}{docs}");
+                }
+            }
+        }
+        return hover;
+    }
+    if let Some(head) = display
+        .strip_prefix("(parameter) ")
+        .and_then(|rest| rest.strip_suffix(": any"))
+    {
+        let name = head.trim_end_matches('?');
+        if !name.is_empty() && name.bytes().all(is_ident_byte) {
+            if let Some(info) = extract_signature_jsdoc(source_text, stmt_start) {
+                if let Some((ty, _)) = info.param_types.get(name) {
+                    let ty = closure_type_to_display(ty, true);
+                    return format!("(parameter) {head}: {ty}{docs}");
+                }
+            }
+        }
+        return hover;
+    }
+    if display.starts_with("function ") {
+        if let Some(mut info) = extract_signature_jsdoc(source_text, stmt_start) {
+            for (ty, _) in info.param_types.values_mut() {
+                *ty = closure_type_to_display(ty, true);
+            }
+            if let Some(ret) = info.return_type.as_mut() {
+                *ret = closure_type_to_display(ret, true);
+            }
+            let merged = merge_jsdoc_types_into_label(display, &info);
+            return format!("{merged}{docs}");
+        }
+    }
+    hover
+}
+
+/// Split at top-level occurrences of `sep` (outside (), [], {}, <>).
+fn split_top_level_closure(s: &str, sep: u8) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'=' => {}
+            b')' | b']' | b'}' | b'>' => depth -= 1,
+            c if c == sep && depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Convert a Closure/JSDoc type expression to tsc's quick-info display
+/// (`?number` → `number | null`, `function (number): number` →
+/// `(arg0: number) => number`, `Array.<T>` → `T[]`, `{b:number}` → an object
+/// literal type; `String`/`Number`/`Boolean` are the primitives in JSDoc).
+fn closure_type_to_display(raw: &str, multiline: bool) -> String {
+    let mut t = raw.trim();
+    if let Some(rest) = t.strip_suffix('=') {
+        t = rest.trim_end();
+    }
+    if let Some(rest) = t.strip_prefix('!') {
+        t = rest.trim_start();
+    }
+    if t.is_empty() || t == "*" || t == "?" {
+        return "any".to_string();
+    }
+    let union = split_top_level_closure(t, b'|');
+    if union.len() > 1 {
+        return union
+            .iter()
+            .map(|part| closure_type_to_display(part, multiline))
+            .collect::<Vec<_>>()
+            .join(" | ");
+    }
+    if let Some(rest) = t.strip_prefix('?') {
+        return format!("{} | null", closure_type_to_display(rest, multiline));
+    }
+    if t.starts_with('(') && t.ends_with(')') {
+        let inner = &t[1..t.len() - 1];
+        let mut d = 0i32;
+        let balanced = inner.bytes().all(|b| {
+            match b {
+                b'(' => d += 1,
+                b')' => d -= 1,
+                _ => {}
+            }
+            d >= 0
+        });
+        if balanced && d == 0 {
+            return closure_type_to_display(inner, multiline);
+        }
+    }
+    match t {
+        "String" => return "string".to_string(),
+        "Number" => return "number".to_string(),
+        "Boolean" => return "boolean".to_string(),
+        "Void" => return "void".to_string(),
+        "Undefined" => return "undefined".to_string(),
+        "Null" => return "null".to_string(),
+        "Array" => return "any[]".to_string(),
+        "Promise" => return "Promise<any>".to_string(),
+        "function" => return "Function".to_string(),
+        _ => {}
+    }
+    if let Some(elem) = t.strip_suffix("[]") {
+        return array_of_display(&closure_type_to_display(elem, multiline));
+    }
+    // Generic applications: `Array.<T>` / `Array<T>` / `Foo.<A, B>`.
+    if t.ends_with('>') {
+        if let Some(lt) = t.find('<') {
+            let base = t[..lt].trim_end_matches('.');
+            let args: Vec<String> = split_top_level_closure(&t[lt + 1..t.len() - 1], b',')
+                .iter()
+                .map(|a| closure_type_to_display(a, multiline))
+                .collect();
+            if base == "Array" && args.len() == 1 {
+                return array_of_display(&args[0]);
+            }
+            return format!("{}<{}>", base, args.join(", "));
+        }
+    }
+    // `function (A, B): R`
+    if let Some(rest) = t.strip_prefix("function") {
+        let rest = rest.trim_start();
+        if rest.starts_with('(') {
+            let bytes = rest.as_bytes();
+            let mut d = 0i32;
+            let mut close = None;
+            for (i, &b) in bytes.iter().enumerate() {
+                match b {
+                    b'(' | b'[' | b'{' | b'<' => d += 1,
+                    b')' | b']' | b'}' | b'>' => {
+                        d -= 1;
+                        if d == 0 && b == b')' {
+                            close = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else {
+                return t.to_string();
+            };
+            let params_text = rest[1..close].trim();
+            let mut params = Vec::new();
+            let mut construct: Option<String> = None;
+            if !params_text.is_empty() {
+                for (i, p) in split_top_level_closure(params_text, b',')
+                    .iter()
+                    .enumerate()
+                {
+                    let p = p.trim();
+                    if let Some(target) = p.strip_prefix("new:") {
+                        construct = Some(closure_type_to_display(target, multiline));
+                        continue;
+                    }
+                    if let Some(this_ty) = p.strip_prefix("this:") {
+                        params.push(format!(
+                            "this: {}",
+                            closure_type_to_display(this_ty, multiline)
+                        ));
+                        continue;
+                    }
+                    if let Some(rest_ty) = p.strip_prefix("...") {
+                        params.push(format!(
+                            "...arg{}: {}",
+                            i,
+                            array_of_display(&closure_type_to_display(rest_ty, multiline))
+                        ));
+                    } else {
+                        params.push(format!(
+                            "arg{}: {}",
+                            i,
+                            closure_type_to_display(p, multiline)
+                        ));
+                    }
+                }
+            }
+            let after = rest[close + 1..].trim_start();
+            if let Some(target) = construct {
+                return format!("new ({}) => {}", params.join(", "), target);
+            }
+            let ret = match after.strip_prefix(':') {
+                Some(r) => closure_type_to_display(r, multiline),
+                None => "any".to_string(),
+            };
+            return format!("({}) => {}", params.join(", "), ret);
+        }
+    }
+    // Tuples `[A,B]`.
+    if t.starts_with('[') && t.ends_with(']') {
+        let elems: Vec<String> = split_top_level_closure(&t[1..t.len() - 1], b',')
+            .iter()
+            .filter(|e| !e.trim().is_empty())
+            .map(|e| closure_type_to_display(e, multiline))
+            .collect();
+        return format!("[{}]", elems.join(", "));
+    }
+    // Object literal types `{a: number, b}`.
+    if t.starts_with('{') && t.ends_with('}') {
+        let inner = t[1..t.len() - 1].trim();
+        if inner.is_empty() {
+            return "{}".to_string();
+        }
+        let mut members = Vec::new();
+        for m in split_top_level_closure(inner, b',') {
+            let m = m.trim().trim_end_matches(';').trim();
+            if m.is_empty() {
+                continue;
+            }
+            match m.find(':') {
+                Some(c) => members.push(format!(
+                    "{}: {};",
+                    m[..c].trim(),
+                    closure_type_to_display(&m[c + 1..], multiline)
+                )),
+                None => members.push(format!("{}: any;", m)),
+            }
+        }
+        return if multiline {
+            let body: Vec<String> = members.iter().map(|m| format!("    {m}")).collect();
+            format!("{{\n{}\n}}", body.join("\n"))
+        } else {
+            format!("{{ {} }}", members.join(" "))
+        };
+    }
+    t.to_string()
+}
+
+fn array_of_display(elem: &str) -> String {
+    if elem.contains('|') || elem.contains("=>") {
+        format!("({elem})[]")
+    } else {
+        format!("{elem}[]")
+    }
+}
+
+fn hover_at_impl(
     query_engine: &QueryEngine,
     file_name: &str,
     sym_table: &SymbolTable,
@@ -7317,7 +8005,7 @@ pub fn hover_at(
             } else if is_class {
                 if is_new_expression(source_text, offset) {
                     // `new ClassName()` — show constructor signature
-                    format_constructor_hover_for_new(sym_table, sym, source_text)
+                    format_constructor_hover_for_new(sym_table, sym, source_text, offset, check_out)
                 } else {
                     let type_params = extract_type_params_from_source(
                         source_text,
@@ -7453,6 +8141,14 @@ pub fn hover_at(
                                     .get(&tok_start)
                                     .copied()
                                     .filter(|i| *i < overloads.len())
+                                    .or_else(|| {
+                                        pick_overload_by_call_args(
+                                            source_text,
+                                            tok_start as usize,
+                                            overloads,
+                                            Some(check_out),
+                                        )
+                                    })
                             })
                             .unwrap_or(0);
                         let sig = &overloads[overload_idx];
@@ -21222,9 +21918,19 @@ fn member_completions_for_type(
             .trim_start_matches('{')
             .trim_end_matches('}')
             .trim();
-        for prop in inner.split(';') {
+        for prop in split_type_literal_members(inner) {
             let prop = prop.trim();
+            let prop = prop.strip_prefix("readonly ").unwrap_or(prop).trim_start();
             if prop.is_empty() {
+                continue;
+            }
+            // Call / construct / index signatures contribute no member name.
+            if prop.starts_with('(')
+                || prop.starts_with('<')
+                || prop.starts_with('[')
+                || prop.starts_with("new ")
+                || prop.starts_with("new(")
+            {
                 continue;
             }
             // Quoted names (`'postal code': string`) — strip the quotes and
@@ -21244,12 +21950,23 @@ fn member_completions_for_type(
                 }
                 continue;
             }
-            if let Some(colon) = prop.find(':') {
-                let name = prop[..colon].trim();
-                let ty = prop[colon + 1..].trim();
-                let kind = if ty.contains("=>") { 2 } else { 5 }; // method or property
-                items.push(json!({"label": name, "kind": kind, "detail": ty}));
+            // The name ends at the first `(`/`<` (method `foo(bar: any): any`,
+            // displayed method-style) or `:`.
+            let Some(end) = prop.find(|c: char| c == ':' || c == '(' || c == '<') else {
+                continue;
+            };
+            let name = prop[..end].trim().trim_end_matches('?').trim_end();
+            if name.is_empty() {
+                continue;
             }
+            let is_method = !prop[end..].starts_with(':');
+            let ty = if is_method {
+                prop[end..].trim()
+            } else {
+                prop[end + 1..].trim()
+            };
+            let kind = if is_method || ty.contains("=>") { 2 } else { 5 }; // method or property
+            items.push(json!({"label": name, "kind": kind, "detail": ty}));
         }
         if !items.is_empty() {
             return items;
@@ -21360,6 +22077,29 @@ fn split_union_type(type_str: &str) -> Vec<String> {
 
 /// Find the common members across all constituent types in a union.
 /// Returns completions for members that exist in ALL union parts.
+/// Split the body of a type literal (`{ ... }` without braces) into member
+/// texts at top-level `;` / newline separators.
+fn split_type_literal_members(inner: &str) -> Vec<&str> {
+    let bytes = inner.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'(' | b'{' | b'[' | b'<' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'=' => {}
+            b')' | b'}' | b']' | b'>' => depth -= 1,
+            b';' | b'\n' if depth == 0 => {
+                out.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&inner[start..]);
+    out
+}
+
 fn union_member_completions(
     parts: &[String],
     sym_table: &SymbolTable,
@@ -25360,6 +26100,7 @@ fn resolved_symbol_signature_help(
     prefer_rest_overload: bool,
 ) -> Option<Value> {
     let type_str = resolve_symbol_type(sym, check_out, callee_offset, query_engine, None)?;
+    let type_str = strip_nullish_from_fn_union(&type_str).to_string();
     // Rest-tuple params expand into pseudo-signatures (tsc's
     // getExpandedParameters) — takes precedence over the plain fn-type label.
     let fallback_ret = find_top_level_arrow(&type_str).map(|a| type_str[a + 2..].trim_start());

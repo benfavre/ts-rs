@@ -7563,7 +7563,23 @@ impl TypeChecker {
                         // Return the enum type reference rather than the literal value,
                         // matching TypeScript's behavior where enum member accesses have
                         // the enum type (e.g., `Colors`, not `number`).
-                        if let Some(members) = self.enum_info.get(name.as_str()) {
+                        // Namespace enums are keyed by their qualified path
+                        // (`m.Color`) while the receiver reads `Color`. The
+                        // qualified entry holds a single declaration's members
+                        // (merged declarations aren't combined), so it is only
+                        // used when it has the accessed member.
+                        let qualified_enum_key = if self.enum_info.contains_key(name.as_str()) {
+                            None
+                        } else {
+                            Self::simple_expression_path(&mem.object).filter(|path| {
+                                path.rsplit('.').next() == Some(name.as_str())
+                                    && self.enum_info.get(path.as_str()).is_some_and(|members| {
+                                        members.iter().any(|(n, _)| n == mem.property.as_str())
+                                    })
+                            })
+                        };
+                        let enum_key = qualified_enum_key.as_deref().unwrap_or(name.as_str());
+                        if let Some(members) = self.enum_info.get(enum_key) {
                             let primitive_member = self
                                 .builtins
                                 .lookup_instance_property("Number", &mem.property)
@@ -7582,7 +7598,7 @@ impl TypeChecker {
                                 // subtype of the enum (tsc); mutable bindings
                                 // widen it back to the enum.
                                 Type::EnumVariant {
-                                    enum_name: name.clone(),
+                                    enum_name: enum_key.into(),
                                     variant_name: mem.property.to_string(),
                                     value: Some(Arc::new(value.clone())),
                                 }
@@ -9777,7 +9793,7 @@ impl TypeChecker {
                     _ => ty,
                 }
             }
-            ExprKind::Yield(_, inner) => {
+            ExprKind::Yield(delegate, inner) => {
                 // tsc checkYieldExpression: outside a generator body the
                 // expression is `any` and its operand is not checked.
                 let in_generator = self.generator_stack.last().copied().unwrap_or(false);
@@ -9799,7 +9815,13 @@ impl TypeChecker {
                 }
                 if let Some(ref e) = inner {
                     if in_generator {
-                        self.check_expr(e);
+                        let operand = self.check_expr(e);
+                        let in_async = self.return_is_async_stack.last().copied().unwrap_or(false);
+                        if *delegate && !in_async {
+                            if self.iteration_uses_protocol() {
+                                self.report_not_iterable(&operand, e.span, false);
+                            }
+                        }
                     }
                 }
                 Type::Any
@@ -9873,10 +9895,22 @@ impl TypeChecker {
                             | ExprKind::JsxFragment(_)
                     )
                 });
-                let exempt = self.in_callee_position
-                    || unreachable_allowed
-                    || !self.check_expression_grammar
-                    || jsx_siblings;
+                // tsc reports TS2695 even in files with parse errors; only
+                // skip a comma our parser recovery built — one with a parse
+                // error inside it.
+                let recovered = exprs
+                    .first()
+                    .zip(exprs.last())
+                    .is_some_and(|(first, last)| {
+                        let idx = self
+                            .syntax_error_starts
+                            .partition_point(|&d| d < first.span.start);
+                        self.syntax_error_starts
+                            .get(idx)
+                            .is_some_and(|&d| d <= last.span.end)
+                    });
+                let exempt =
+                    self.in_callee_position || unreachable_allowed || jsx_siblings || recovered;
                 let mut last = Type::Any;
                 let mut chain_free = true;
                 for (i, e) in exprs.iter().enumerate() {

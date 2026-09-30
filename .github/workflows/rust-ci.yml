@@ -80,7 +80,9 @@ jobs:
             *) base_sha="" ;;
           esac
           if [ -z "$base_sha" ] || [ "$base_sha" = "0000000000000000000000000000000000000000" ]; then
-            base_sha="$(git rev-parse HEAD^)"
+            # A root commit (fresh repository) has no parent: compare HEAD
+            # with itself so the non-regression gate is a no-op.
+            base_sha="$(git rev-parse -q --verify 'HEAD^' || git rev-parse HEAD)"
           fi
           git cat-file -e "${base_sha}^{commit}"
           echo "sha=$base_sha" >> "$GITHUB_OUTPUT"

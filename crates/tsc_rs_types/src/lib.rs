@@ -2567,6 +2567,9 @@ pub struct TypeChecker {
     jump_function_depth: u32,
     /// Statements whose grammar error is already consumed by TS1036.
     ambient_statement_starts: rustc_hash::FxHashSet<u32>,
+    /// Start offsets of the file's parse diagnostics (TS2371 excluded),
+    /// sorted. Used to skip checks on expressions built by parser recovery.
+    syntax_error_starts: Vec<u32>,
     /// How many of the enclosing functions (`fn_nesting_depth`) are arrows;
     /// equal counts mean `this` still belongs to the outer context.
     arrow_nesting_depth: u32,
@@ -2900,6 +2903,7 @@ impl Clone for TypeChecker {
             jump_targets: self.jump_targets.clone(),
             jump_function_depth: self.jump_function_depth,
             ambient_statement_starts: self.ambient_statement_starts.clone(),
+            syntax_error_starts: self.syntax_error_starts.clone(),
             arrow_nesting_depth: self.arrow_nesting_depth,
             in_super_call_args: self.in_super_call_args,
             binder_dup_suppressed: self.binder_dup_suppressed.clone(),
@@ -3086,6 +3090,7 @@ impl TypeChecker {
             jump_targets: Vec::new(),
             jump_function_depth: 0,
             ambient_statement_starts: rustc_hash::FxHashSet::default(),
+            syntax_error_starts: Vec::new(),
             arrow_nesting_depth: 0,
             in_super_call_args: false,
             binder_dup_suppressed: rustc_hash::FxHashSet::default(),
@@ -9298,6 +9303,16 @@ impl TypeChecker {
             .diagnostics
             .iter()
             .all(|diagnostic| diagnostic.code == 2371);
+        self.syntax_error_starts = {
+            let mut starts: Vec<u32> = file
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code != 2371)
+                .filter_map(|diagnostic| diagnostic.span.map(|span| span.start))
+                .collect();
+            starts.sort_unstable();
+            starts
+        };
         self.check_index_grammar = !tsc_rs_parser::has_syntax_errors(&file.diagnostics);
         self.ambient_statement_starts = file
             .diagnostics
@@ -9516,6 +9531,16 @@ impl TypeChecker {
             .diagnostics
             .iter()
             .all(|diagnostic| diagnostic.code == 2371);
+        self.syntax_error_starts = {
+            let mut starts: Vec<u32> = file
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code != 2371)
+                .filter_map(|diagnostic| diagnostic.span.map(|span| span.start))
+                .collect();
+            starts.sort_unstable();
+            starts
+        };
         self.check_index_grammar = !tsc_rs_parser::has_syntax_errors(&file.diagnostics);
         self.ambient_statement_starts = file
             .diagnostics
@@ -10402,6 +10427,226 @@ impl TypeChecker {
             type_param_defaults: Vec::new(),
             type_predicate: None,
         })
+    }
+
+    /// Whether the lib declares the iteration protocol (`Symbol.iterator`).
+    fn lib_has_iterable(&self) -> bool {
+        let lib = &self.compiler_options.lib;
+        lib.is_empty()
+            || lib.iter().any(|entry| {
+                let entry = entry.to_ascii_lowercase();
+                let entry = entry.trim_start_matches("lib.").trim_end_matches(".d.ts");
+                !matches!(
+                    entry,
+                    "es5" | "es3" | "dom" | "webworker" | "scripthost" | "webworker.importscripts"
+                ) && !entry.starts_with("es5.")
+            })
+    }
+
+    /// tsc uses the iteration protocol (TS2488) for ES2015+ targets whose
+    /// lib declares `Symbol.iterator`; otherwise array-like rules apply.
+    fn iteration_uses_protocol(&self) -> bool {
+        self.compiler_options.target.unwrap_or(ScriptTarget::ES2015) >= ScriptTarget::ES2015
+            && self.lib_has_iterable()
+    }
+
+    /// Conservative tsc getIteratedTypeOrElementType failure: true only for
+    /// types that certainly lack a `[Symbol.iterator]()` method.
+    pub(crate) fn definitely_not_iterable(&self, ty: &Type) -> bool {
+        fn has_iterator(info: &ObjectTypeInfo) -> bool {
+            info.properties.iter().any(|(name, property)| {
+                name.trim_end_matches('?') == "[Symbol.iterator]"
+                    && !name.ends_with('?')
+                    && !matches!(property.as_ref(), Type::Optional(_))
+            })
+        }
+        match ty {
+            Type::Number
+            | Type::Boolean
+            | Type::BigInt
+            | Type::NumberLiteral(_)
+            | Type::BooleanLiteral(_) => true,
+            Type::Null | Type::Undefined => self.strict_null_checks,
+            Type::Function(_) | Type::Constructor(_) => true,
+            Type::ObjectType(info) => {
+                !has_iterator(info)
+                    && info.index_signature.is_none()
+                    && !info
+                        .properties
+                        .iter()
+                        .any(|(name, _)| name.trim_end_matches('?') == "length")
+            }
+            Type::TypeReference(name, args) if args.is_empty() => {
+                // A user class whose whole extends chain is user classes.
+                let mut current = name.clone();
+                for _ in 0..8 {
+                    let Some(info) = self.class_info.get(current.as_str()) else {
+                        return false;
+                    };
+                    if !info.type_params.is_empty() {
+                        return false;
+                    }
+                    match info.extends.clone() {
+                        Some(base) => current = base,
+                        None => break,
+                    }
+                }
+                match self.get_class_instance_type(name) {
+                    Type::ObjectType(info) => !has_iterator(&info),
+                    _ => false,
+                }
+            }
+            Type::Union(members) => members.iter().any(|m| self.definitely_not_iterable(m)),
+            _ => false,
+        }
+    }
+
+    /// TS2488 (or the ES5 array-like TS2495/TS2461) on a non-iterable
+    /// iterated (`for_of`) or destructured type.
+    ///
+    /// ES5 with `downlevelIteration` (and an iterable lib): TS2548/TS2549.
+    /// Otherwise `for-of` allows arrays and strings (TS2495, or TS2461 on the
+    /// non-string rest of a union with a string member) and destructuring
+    /// reports TS2461.
+    pub(crate) fn report_not_iterable(&mut self, ty: &Type, span: Span, for_of: bool) -> bool {
+        if self.compiler_options.no_lib == Some(true) || !self.definitely_not_iterable(ty) {
+            return false;
+        }
+        let (code, message) = if self.iteration_uses_protocol() {
+            let display = ty.display_string_single_line();
+            (
+                2488,
+                format!(
+                    "Type '{display}' must have a '[Symbol.iterator]()' method that returns an iterator."
+                ),
+            )
+        } else if self.compiler_options.down_level_iteration == Some(true)
+            && self.lib_has_iterable()
+        {
+            let display = ty.display_string_single_line();
+            if for_of {
+                (
+                    2549,
+                    format!(
+                        "Type '{display}' is not an array type or a string type or does not have a '[Symbol.iterator]()' method that returns an iterator."
+                    ),
+                )
+            } else {
+                (
+                    2548,
+                    format!(
+                        "Type '{display}' is not an array type or does not have a '[Symbol.iterator]()' method that returns an iterator."
+                    ),
+                )
+            }
+        } else if for_of {
+            let is_string = |m: &Type| {
+                matches!(
+                    m,
+                    Type::String | Type::StringLiteral(_) | Type::TemplateLiteral { .. }
+                )
+            };
+            match ty {
+                Type::Union(members) if members.iter().any(is_string) => {
+                    let rest: Vec<Type> =
+                        members.iter().filter(|m| !is_string(m)).cloned().collect();
+                    let rest = if rest.len() == 1 {
+                        rest.into_iter().next().unwrap_or(Type::Never)
+                    } else {
+                        Type::Union(rest.into())
+                    };
+                    let display = rest.display_string_single_line();
+                    (2461, format!("Type '{display}' is not an array type."))
+                }
+                _ => {
+                    let display = ty.display_string_single_line();
+                    (
+                        2495,
+                        format!("Type '{display}' is not an array type or a string type."),
+                    )
+                }
+            }
+        } else {
+            let display = ty.display_string_single_line();
+            (2461, format!("Type '{display}' is not an array type."))
+        };
+        self.diagnostics.push(Diagnostic {
+            code,
+            message,
+            category: DiagnosticCategory::Error,
+            file_name: None,
+            span: Some(span),
+            related: None,
+        });
+        true
+    }
+
+    /// Array binding patterns destructure through the iteration protocol:
+    /// check the pattern's source type and nested array patterns.
+    pub(crate) fn check_array_pattern_iterable(&mut self, pat: &Pat, ty: &Type) {
+        use tsc_rs_ast::{ArrayPatElem, PatKind};
+        match &pat.kind {
+            PatKind::Array(elements) => {
+                if matches!(ty, Type::Any | Type::Unknown) {
+                    return;
+                }
+                // A pattern rebuilt by parser recovery is not tsc's.
+                let idx = self
+                    .syntax_error_starts
+                    .partition_point(|&d| d < pat.span.start);
+                if self
+                    .syntax_error_starts
+                    .get(idx)
+                    .is_some_and(|&d| d <= pat.span.end)
+                {
+                    return;
+                }
+                if self.report_not_iterable(ty, pat.span, false) {
+                    return;
+                }
+                for (index, element) in elements.iter().enumerate() {
+                    if let Some(ArrayPatElem::Pat(inner)) = element {
+                        // Array literals under a pattern are tuples in tsc; our
+                        // element union is not positional, so skip unions.
+                        let element_ty = self.extract_element_type(ty, index);
+                        if !matches!(element_ty, Type::Union(_)) {
+                            self.check_array_pattern_iterable(inner, &element_ty);
+                        }
+                    }
+                }
+            }
+            PatKind::Assign(inner, _) => {
+                if matches!(inner.kind, PatKind::Array(_)) && !matches!(ty, Type::Undefined) {
+                    let without_undefined = match ty {
+                        Type::Union(members) => Type::Union(
+                            members
+                                .iter()
+                                .filter(|m| !matches!(m, Type::Undefined))
+                                .cloned()
+                                .collect(),
+                        ),
+                        other => other.clone(),
+                    };
+                    self.check_array_pattern_iterable(inner, &without_undefined);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Element type produced by iterating `ty` (arrays, tuples, strings).
+    pub(crate) fn iterated_element_type(&self, ty: &Type) -> Option<Type> {
+        match ty {
+            Type::Array(elem) => Some(Type::clone(elem)),
+            Type::Tuple(elems) if !elems.is_empty() => Some(Type::Union(elems.clone())),
+            Type::String | Type::StringLiteral(_) => Some(Type::String),
+            Type::TypeReference(name, args)
+                if matches!(name.as_str(), "Array" | "ReadonlyArray") && args.len() == 1 =>
+            {
+                Some(args[0].clone())
+            }
+            _ => None,
+        }
     }
 
     /// Extract the type of an element at an index from an array/tuple.
@@ -15166,12 +15411,57 @@ impl TypeChecker {
         !target_has_signatures
     }
 
+    /// tsc names a class that declares no instance members, no constructor
+    /// and no type parameters by its base class in "Property 'x' is missing in
+    /// type 'S'" lines (`class D extends A {}` relates as `A`); the top-level
+    /// "Type 'D' is not assignable" line keeps the class's own name.
+    fn memberless_class_base_display(&self, source: &Type) -> Option<std::string::String> {
+        let Type::TypeReference(name, args) = source else {
+            return None;
+        };
+        if !args.is_empty() {
+            return None;
+        }
+        let mut current = name.clone();
+        let mut result = None;
+        for _ in 0..8 {
+            let Some(info) = self.class_info.get(current.as_str()) else {
+                break;
+            };
+            let Some(base) = info.extends.clone() else {
+                break;
+            };
+            let declares_instance_member = info.member_locations.keys().any(|member| {
+                !info.static_properties.iter().any(|(n, _)| n == member)
+                    && !info.static_methods.iter().any(|(n, _)| n == member)
+            });
+            if declares_instance_member
+                || info.has_explicit_constructor
+                || !info.type_params.is_empty()
+                || !info.extends_type_args.is_empty()
+                || info
+                    .index_signatures
+                    .iter()
+                    .any(|(_, _, is_static)| !is_static)
+                || !self.class_info.contains_key(base.as_str())
+            {
+                break;
+            }
+            result = Some(base.clone());
+            current = base;
+        }
+        result
+    }
+
     fn push_not_assignable(&mut self, source: &Type, target: &Type, span: Span) {
         let stripped_target = Self::strip_nullable_union_target(source, target);
         let target = stripped_target.as_ref().unwrap_or(target);
         let src_disp = self
             .elaboration_display_type(&self.display_type_through_primitive_alias(source), target)
             .display_string();
+        let missing_src_disp = self
+            .memberless_class_base_display(source)
+            .unwrap_or_else(|| src_disp.clone());
         let tgt_disp = self
             .display_type_through_primitive_alias(target)
             .display_string();
@@ -15191,14 +15481,17 @@ impl TypeChecker {
                     .collect();
                 if missing.len() > 1 {
                     self.diagnostics.push(diagnostics::error_missing_properties(
-                        &missing, &src_disp, &tgt_disp, span,
+                        &missing,
+                        &missing_src_disp,
+                        &tgt_disp,
+                        span,
                     ));
                     return;
                 } else if missing.len() == 1 {
                     {
                         let mut diagnostic = diagnostics::error_property_missing_single(
-                            &missing[0],
-                            &src_disp,
+                            &self.member_name_as_written(target, &missing[0]),
+                            &missing_src_disp,
                             &tgt_disp,
                             span,
                         );
@@ -15298,8 +15591,8 @@ impl TypeChecker {
                         if missing.len() == 1 {
                             {
                                 let mut diagnostic = diagnostics::error_property_missing_single(
-                                    &missing[0],
-                                    &src_disp,
+                                    &self.member_name_as_written(target, &missing[0]),
+                                    &missing_src_disp,
                                     &tgt_disp,
                                     span,
                                 );
@@ -15310,7 +15603,10 @@ impl TypeChecker {
                             return;
                         } else if missing.len() > 1 {
                             self.diagnostics.push(diagnostics::error_missing_properties(
-                                &missing, &src_disp, &tgt_disp, span,
+                                &missing,
+                                &missing_src_disp,
+                                &tgt_disp,
+                                span,
                             ));
                             return;
                         }
@@ -15324,8 +15620,8 @@ impl TypeChecker {
             if missing.len() == 1 {
                 {
                     let mut diagnostic = diagnostics::error_property_missing_single(
-                        &missing[0],
-                        &src_disp,
+                        &self.member_name_as_written(target, &missing[0]),
+                        &missing_src_disp,
                         &tgt_disp,
                         span,
                     );
@@ -15334,7 +15630,10 @@ impl TypeChecker {
                 }
             } else {
                 self.diagnostics.push(diagnostics::error_missing_properties(
-                    &missing, &src_disp, &tgt_disp, span,
+                    &missing,
+                    &missing_src_disp,
+                    &tgt_disp,
+                    span,
                 ));
             }
         } else {
@@ -15771,6 +16070,39 @@ impl TypeChecker {
             match info.extends.clone() {
                 Some(b) => cur = b,
                 None => break,
+            }
+        }
+        out
+    }
+
+    /// Private members an interface inherits by extending a class
+    /// (`interface I extends C {}` carries `C`'s private members with `C`'s
+    /// declaration as their origin), as (member name -> declaring class).
+    fn interface_private_member_origins(
+        &self,
+        interface_name: &str,
+    ) -> Vec<(std::string::String, std::string::String)> {
+        let mut out: Vec<(std::string::String, std::string::String)> = Vec::new();
+        let mut pending = vec![interface_name.to_string()];
+        let mut seen: Vec<std::string::String> = Vec::new();
+        while let Some(name) = pending.pop() {
+            if seen.contains(&name) || seen.len() > 16 {
+                continue;
+            }
+            seen.push(name.clone());
+            let Some(info) = self.interface_info.get(&name) else {
+                continue;
+            };
+            for (base, _) in &info.extends {
+                if self.class_info.contains_key(base.as_str()) {
+                    for (member, origin) in self.private_member_origins(base) {
+                        if !out.iter().any(|(n, _)| *n == member) {
+                            out.push((member, origin));
+                        }
+                    }
+                } else {
+                    pending.push(base.clone());
+                }
             }
         }
         out
@@ -18085,11 +18417,26 @@ impl TypeChecker {
                 && self.class_info.contains_key(tn.as_str())
                 && !self.private_member_origins(tn).is_empty()
             {
-                fn class_instance_like(checker: &TypeChecker, source: &Type) -> bool {
+                fn class_instance_like(checker: &TypeChecker, source: &Type, tn: &str) -> bool {
                     match source {
                         Type::TypeReference(sn, _) => {
-                            !sn.starts_with("typeof ")
-                                && checker.class_info.contains_key(sn.as_str())
+                            if sn.starts_with("typeof ") {
+                                return false;
+                            }
+                            if checker.class_info.contains_key(sn.as_str()) {
+                                return true;
+                            }
+                            // An interface extending the class inherits its
+                            // private members with the same origin.
+                            if checker.interface_info.contains_key(sn.as_str()) {
+                                let inherited = checker.interface_private_member_origins(sn);
+                                let required = checker.private_member_origins(tn);
+                                return !inherited.is_empty()
+                                    && required.iter().all(|(name, origin)| {
+                                        inherited.iter().any(|(n, o)| n == name && o == origin)
+                                    });
+                            }
+                            false
                         }
                         Type::This
                         | Type::Instance(_)
@@ -18101,11 +18448,11 @@ impl TypeChecker {
                         // is judged member by member below.
                         Type::Union(members) => members
                             .iter()
-                            .all(|member| class_instance_like(checker, member)),
+                            .all(|member| class_instance_like(checker, member, tn)),
                         _ => false,
                     }
                 }
-                if !class_instance_like(self, source) {
+                if !class_instance_like(self, source, tn) {
                     return false;
                 }
                 // Each union member must satisfy the nominal target on its
@@ -21537,6 +21884,9 @@ impl TypeChecker {
                             self.record_object_literal_member_locations(&ty, props);
                         }
                     }
+                    if decl.init.is_some() || decl.type_ann.is_some() {
+                        self.check_array_pattern_iterable(&decl.name, &ty);
+                    }
                     self.declare_pattern_vars_with_defaults(
                         &decl.name,
                         ty,
@@ -22068,7 +22418,22 @@ impl TypeChecker {
                         self.check_for_in_of_target(expression);
                     }
                 }
-                self.check_expr(&fo.right);
+                let iterated = self.check_expr(&fo.right);
+                // A literal `undefined`/`null` operand gets TS18050 instead.
+                let nullish_literal = matches!(&fo.right.kind, ExprKind::NullLit)
+                    || matches!(&fo.right.kind, ExprKind::Ident(name) if name == "undefined");
+                if !fo.is_await
+                    && !nullish_literal
+                    && !self.report_not_iterable(&iterated, fo.right.span, true)
+                {
+                    if let (ForInOfLeft::Var(vs), Some(element)) =
+                        (&fo.left, self.iterated_element_type(&iterated))
+                    {
+                        for decl in &vs.declarations {
+                            self.check_array_pattern_iterable(&decl.name, &element);
+                        }
+                    }
+                }
                 self.check_stmt(&fo.body);
                 self.pop_scope();
             }
@@ -25964,14 +26329,35 @@ impl TypeChecker {
                 .get(target)
                 .and_then(|locations| locations.get(property).cloned());
         };
-        self.interface_info
-            .get(name.as_str())
-            .and_then(|info| info.member_locations.get(property).cloned())
-            .or_else(|| {
-                self.class_info
-                    .get(name.as_str())
-                    .and_then(|info| info.member_locations.get(property).cloned())
-            })
+        self.inherited_member_location(name, property, 0)
+    }
+
+    /// Declaration site of `property` on a named interface or class, falling
+    /// back through `extends` (interfaces may extend classes).
+    fn inherited_member_location(
+        &self,
+        name: &str,
+        property: &str,
+        depth: usize,
+    ) -> Option<(std::string::String, Span)> {
+        if depth > 8 {
+            return None;
+        }
+        if let Some(info) = self.interface_info.get(name) {
+            if let Some(location) = info.member_locations.get(property) {
+                return Some(location.clone());
+            }
+            return info
+                .extends
+                .iter()
+                .find_map(|(base, _)| self.inherited_member_location(base, property, depth + 1));
+        }
+        let info = self.class_info.get(name)?;
+        if let Some(location) = info.member_locations.get(property) {
+            return Some(location.clone());
+        }
+        let base = info.extends.as_deref()?;
+        self.inherited_member_location(base, property, depth + 1)
     }
 
     /// Replace type parameters given as `Type::TypeParameter` OR as bare
@@ -26618,6 +27004,9 @@ impl TypeChecker {
         let src_disp = self
             .elaboration_display_type(source, target)
             .display_string_single_line();
+        let missing_src_disp = self
+            .memberless_class_base_display(source)
+            .unwrap_or_else(|| src_disp.clone());
         let tgt_disp = target.display_string_single_line();
         // A callable/constructable target and a source with no signature at
         // all: "Type 'S' provides no match for the signature '(x: T): R'."
@@ -26717,14 +27106,19 @@ impl TypeChecker {
                 .named_member_location(target, &missing[0])
                 .map(|(file, span)| RelatedDiagnostic {
                     code: 2728,
-                    message: format!("'{}' is declared here.", missing[0]),
+                    message: format!(
+                        "'{}' is declared here.",
+                        self.member_name_as_written(target, &missing[0])
+                    ),
                     file_name: Some(file),
                     span: Some(span),
                 });
             return Some((
                 format!(
                     "Property '{}' is missing in type '{}' but required in type '{}'.",
-                    missing[0], src_disp, tgt_disp
+                    self.member_name_as_written(target, &missing[0]),
+                    missing_src_disp,
+                    tgt_disp
                 ),
                 related,
             ));
@@ -26733,7 +27127,7 @@ impl TypeChecker {
             return Some((
                 diagnostics::error_missing_properties(
                     &missing,
-                    &src_disp,
+                    &missing_src_disp,
                     &tgt_disp,
                     Span::new(0, 0),
                 )
@@ -31063,11 +31457,22 @@ impl TypeChecker {
             .map(|(file, span)| {
                 vec![RelatedDiagnostic {
                     code: 2728,
-                    message: format!("'{member}' is declared here."),
+                    message: format!(
+                        "'{}' is declared here.",
+                        self.member_name_as_written(target, member)
+                    ),
                     file_name: Some(file),
                     span: Some(span),
                 }]
             })
+    }
+
+    /// A member name as tsc's symbolToString writes it: string-literal
+    /// declarations keep their quotes (`''1''`, `'"a b"'`).
+    fn member_name_as_written(&self, target: &Type, member: &str) -> std::string::String {
+        self.heritage_member_metadata(target, member, &mut HashSet::new())
+            .map(|(spelling, _)| spelling)
+            .unwrap_or_else(|| member.to_string())
     }
 
     fn top_level_declared_names(stmts: &[Stmt]) -> rustc_hash::FxHashSet<std::string::String> {

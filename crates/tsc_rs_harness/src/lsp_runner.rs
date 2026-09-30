@@ -1853,6 +1853,11 @@ impl LspRunner {
                             .map(|s| s.as_str())
                             .collect();
                         if !missing.is_empty() {
+                            if std::env::var_os("TSC_RS_LSP_DEBUG").is_some() {
+                                let mut labels: Vec<&str> = actual_labels.iter().copied().collect();
+                                labels.sort_unstable();
+                                eprintln!("actual labels: {labels:?}");
+                            }
                             cmd_passed = false;
                             expected_desc = format!("includes: [{}]", includes.join(", "));
                             actual_desc = format!(

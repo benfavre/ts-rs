@@ -1623,7 +1623,15 @@ impl TypeChecker {
                     .get(index)
                     .and_then(|source| source.as_deref()),
             );
-            let base_props = self.get_interface_required_properties_inner(&lookup_name, seen);
+            let base_props = if !self.interface_info.contains_key(lookup_name.as_str())
+                && self.class_info.contains_key(lookup_name.as_str())
+            {
+                // An interface extending a class inherits all its instance
+                // members, private and protected ones included.
+                self.class_required_instance_members(&lookup_name)
+            } else {
+                self.get_interface_required_properties_inner(&lookup_name, seen)
+            };
             for (name, ty) in base_props {
                 if !all_props.iter().any(|(n, _)| n == &name) {
                     all_props.push((name, ty));
@@ -1632,6 +1640,40 @@ impl TypeChecker {
         }
 
         all_props
+    }
+
+    /// Required instance members of a class and its base classes, own members
+    /// first.
+    fn class_required_instance_members(
+        &self,
+        class_name: &str,
+    ) -> Vec<(std::string::String, Type)> {
+        let mut out: Vec<(std::string::String, Type)> = Vec::new();
+        let mut current = class_name.to_string();
+        for _ in 0..8 {
+            let Some(info) = self.class_info.get(current.as_str()) else {
+                break;
+            };
+            for (name, ty) in &info.instance_properties {
+                if info.optional_instance_properties.contains(name)
+                    || matches!(ty, Type::Optional(_))
+                    || out.iter().any(|(n, _)| n == name)
+                {
+                    continue;
+                }
+                out.push((name.clone(), ty.clone()));
+            }
+            for (name, function) in &info.instance_methods {
+                if !out.iter().any(|(n, _)| n == name) {
+                    out.push((name.clone(), Type::Function(function.clone())));
+                }
+            }
+            match info.extends.clone() {
+                Some(base) => current = base,
+                None => break,
+            }
+        }
+        out
     }
 
     /// Check that a class correctly implements all of its `implements` interfaces.
@@ -1665,7 +1707,30 @@ impl TypeChecker {
         name: &str,
         diagnostic: Diagnostic,
     ) {
-        let mut spans = Self::class_member_spans(class, name).peekable();
+        let mut spans: Vec<Span> = Self::class_member_spans(class, name).collect();
+        if spans.is_empty() {
+            // Computed names (`[Symbol.toPrimitive]`) match by their
+            // rendered property name.
+            spans = class
+                .members
+                .iter()
+                .filter_map(|member| {
+                    let (prop, modifiers) = match &member.kind {
+                        ClassMemberKind::Property(p) => (&p.name, p.modifiers),
+                        ClassMemberKind::Method(m) => (&m.name, m.modifiers),
+                        ClassMemberKind::GetAccessor(a) | ClassMemberKind::SetAccessor(a) => {
+                            (&a.name, a.modifiers)
+                        }
+                        _ => return None,
+                    };
+                    (modifiers & MOD_STATIC == 0
+                        && matches!(prop, tsc_rs_ast::PropName::Computed(..))
+                        && self.prop_name_to_string(prop) == name)
+                        .then(|| prop.span())
+                })
+                .collect();
+        }
+        let mut spans = spans.into_iter().peekable();
         if spans.peek().is_none() {
             self.diagnostics.push(diagnostic);
         } else {
@@ -1745,9 +1810,6 @@ impl TypeChecker {
         let ExprKind::Ident(ref base_name) = extends.kind else {
             return false;
         };
-        if !self.class_info.contains_key(base_name.as_str()) {
-            return false;
-        }
         let substitutions = self.heritage_type_parameters(class_decl);
         let class_display = Self::instance_class_display(class_decl);
         let base_args: Vec<_> = class_decl
@@ -1757,11 +1819,40 @@ impl TypeChecker {
             .iter()
             .map(|t| Self::substitute(&self.resolve_type_node(t), &substitutions))
             .collect();
-        let base_display = Type::TypeReference(base_name.to_string(), base_args.clone().into())
-            .display_string_single_line();
-        let base_ty = self
-            .resolve_type_reference_to_object(base_name, &base_args)
-            .unwrap_or_else(|| self.get_class_instance_type(base_name));
+        let (base_display, base_ty) = if self.class_info.contains_key(base_name.as_str()) {
+            (
+                Type::TypeReference(base_name.to_string(), base_args.clone().into())
+                    .display_string_single_line(),
+                self.resolve_type_reference_to_object(base_name, &base_args)
+                    .unwrap_or_else(|| self.get_class_instance_type(base_name)),
+            )
+        } else {
+            // `declare var A: { new(): A }`: the base instance type is the
+            // non-generic construct signature's return type.
+            let instance = match self.lookup_var(base_name) {
+                Some(Type::ObjectType(info)) if base_args.is_empty() => {
+                    match info.construct_signatures.as_slice() {
+                        [signature] if signature.type_params.is_empty() => {
+                            Some(signature.return_type.as_ref().clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some(Type::TypeReference(instance_name, instance_args)) = instance else {
+                return false;
+            };
+            if !instance_args.is_empty()
+                || !self.interface_info.contains_key(instance_name.as_str())
+            {
+                return false;
+            }
+            let Some(resolved) = self.resolve_type_reference_to_object(&instance_name, &[]) else {
+                return false;
+            };
+            (instance_name, resolved)
+        };
         let base_methods = match &base_ty {
             Type::ObjectType(info) => info.method_names.clone(),
             _ => Vec::new(),
@@ -2143,7 +2234,8 @@ impl TypeChecker {
                                     diagnostic.message.push_str("\n  ");
                                     diagnostic.message.push_str(&line.replace('\n', "\n  "));
                                     if diagnostic.related.is_none() {
-                                        diagnostic.related = self.last_leaf_related.take().map(|note| vec![note]);
+                                        diagnostic.related =
+                                            self.last_leaf_related.take().map(|note| vec![note]);
                                     }
                                 }
                                 self.push_instance_member_diagnostic(class_decl, name, diagnostic);
@@ -2184,7 +2276,8 @@ impl TypeChecker {
                             diagnostic.message.push_str("\n  ");
                             diagnostic.message.push_str(&line.replace('\n', "\n  "));
                             if diagnostic.related.is_none() {
-                                diagnostic.related = self.last_leaf_related.take().map(|note| vec![note]);
+                                diagnostic.related =
+                                    self.last_leaf_related.take().map(|note| vec![note]);
                             }
                         }
                         self.push_instance_member_diagnostic(class_decl, prop_name, diagnostic);
@@ -2196,6 +2289,40 @@ impl TypeChecker {
             }
             missing.extend(base_missing);
             if issued_member_error {
+                continue;
+            }
+            // TS2559 (tsc isWeakType): every interface member is optional and
+            // the class shares none of them.
+            let strip = |name: &str| name.trim_end_matches('?').to_string();
+            let weak_interface = missing.is_empty()
+                && !required_props.is_empty()
+                && class_base_members.is_empty()
+                && required_props
+                    .iter()
+                    .all(|(_, ty)| matches!(ty, Type::Optional(_)))
+                && self
+                    .interface_info
+                    .get(iface_name.as_str())
+                    .is_some_and(|info| {
+                        info.index_signatures.is_empty()
+                            && info.object_type.index_signature.is_none()
+                            && info.object_type.call_signatures.is_empty()
+                            && info.object_type.construct_signatures.is_empty()
+                    });
+            if weak_interface
+                && !class_props.is_empty()
+                && !class_props.iter().any(|(class_name, _)| {
+                    required_props
+                        .iter()
+                        .any(|(iface_prop, _)| strip(iface_prop) == strip(class_name))
+                })
+            {
+                self.diagnostics
+                    .push(crate::diagnostics::error_no_properties_in_common(
+                        &class_display_name,
+                        &iface_display_name,
+                        err_span,
+                    ));
                 continue;
             }
             // Whole-class TS2420 with tsc's first structural failure.
@@ -2214,8 +2341,22 @@ impl TypeChecker {
                 ),
                 _ => class_display_name.clone(),
             };
+            let missing_class_display = self
+                .memberless_class_base_display(&Type::TypeReference(
+                    class_name.clone(),
+                    Arc::from(Vec::<Type>::new()),
+                ))
+                .unwrap_or_else(|| class_display.clone());
             let mut related: Option<RelatedDiagnostic> = None;
             let elaboration = if missing.len() == 1 {
+                let missing_written = self
+                    .heritage_member_metadata(
+                        &Type::TypeReference(iface_name.clone(), Arc::from(Vec::<Type>::new())),
+                        &missing[0],
+                        &mut HashSet::new(),
+                    )
+                    .map(|(spelling, _)| spelling)
+                    .unwrap_or_else(|| missing[0].clone());
                 related = self
                     .interface_info
                     .get(iface_name.as_str())
@@ -2233,19 +2374,19 @@ impl TypeChecker {
                     })
                     .map(|(file, span)| RelatedDiagnostic {
                         code: 2728,
-                        message: format!("'{}' is declared here.", missing[0]),
+                        message: format!("'{}' is declared here.", missing_written),
                         file_name: Some(file),
                         span: Some(span),
                     });
                 Some(format!(
                     "Property '{}' is missing in type '{}' but required in type '{}'.",
-                    missing[0], class_display, iface_display
+                    missing_written, missing_class_display, iface_display
                 ))
             } else if missing.len() > 1 {
                 Some(
                     crate::diagnostics::error_missing_properties(
                         &missing,
-                        &class_display,
+                        &missing_class_display,
                         &iface_display,
                         err_span,
                     )

@@ -124,6 +124,44 @@ pub fn parse_with_jsx(file_name: &str, source: &str, jsx_enabled: bool) -> Sourc
         }
         diagnostics.sort_by_key(|diagnostic| diagnostic.span.map_or(0, |span| span.start));
     }
+    // TS1160: the scanner ends an unterminated template at EOF without
+    // complaint; tsc reports it at the end of the file.
+    if let Some(last) = p
+        .tokens
+        .iter()
+        .rev()
+        .find(|token| token.kind != TokenKind::EndOfFile)
+    {
+        let text = &source[last.span.start as usize..last.span.end as usize];
+        let terminated = || {
+            let bytes = text.as_bytes();
+            bytes.len() >= 2
+                && bytes[bytes.len() - 1] == b'`'
+                && bytes[..bytes.len() - 1]
+                    .iter()
+                    .rev()
+                    .take_while(|&&b| b == b'\\')
+                    .count()
+                    % 2
+                    == 0
+        };
+        if matches!(
+            last.kind,
+            TokenKind::NoSubstitutionTemplate | TokenKind::TemplateTail
+        ) && last.span.end as usize == source.len()
+            && !terminated()
+        {
+            let end = source.len() as u32;
+            diagnostics.push(Diagnostic {
+                code: 1160,
+                message: "Unterminated template literal.".to_string(),
+                category: DiagnosticCategory::Error,
+                file_name: Some(file_name.to_string()),
+                span: Some(Span::new(end, end)),
+                related: None,
+            });
+        }
+    }
     // These grammar checks run only after a syntactically valid parse.
     // Keep parser recovery errors and semantic diagnostics independent.
     if has_syntax_errors(&diagnostics) {
@@ -7970,12 +8008,29 @@ impl<'a> Parser<'a> {
                     }
                     // Consume `async` before type-only declarations so it doesn't
                     // leak as a standalone expression statement (e.g. `async interface`).
+                    // tsc parses it as a modifier and reports TS1042.
                     if self.peek_is(TokenKind::Interface)
                         || self.peek_is(TokenKind::Namespace)
                         || self.peek_is(TokenKind::Module)
                     {
-                        self.bump();
+                        let span = self.bump();
+                        self.grammar_error_at_span(
+                            1042,
+                            "'async' modifier cannot be used here.".into(),
+                            span,
+                        );
                         flags |= MOD_ASYNC;
+                        continue;
+                    }
+                    if (self.peek_is(TokenKind::Class) || self.peek_is(TokenKind::Enum))
+                        && !self.peek_is_on_new_line()
+                    {
+                        let span = self.bump();
+                        self.grammar_error_at_span(
+                            1042,
+                            "'async' modifier cannot be used here.".into(),
+                            span,
+                        );
                         continue;
                     }
                     break;
