@@ -1410,3 +1410,37 @@ testing; the fresh run against the final source passes including doctests.
 The complete LSP run retains 1,800 passes, 563 failures, and 3,957 skips; its
 complete failure set matches a rerun of the prior inventory executable.
 Evidence is in `/tmp/ts-rs-forward-symbols-20260930/` on the verification host.
+
+## 2026-09-30: member ownership and precise navigation spans
+
+Symbol baselines qualify class, interface, and enum members with their owners
+and use the occurrence's recorded lexical scope to shorten namespace paths.
+Quoted member names retain their source labels and bracketed display names;
+quoted import specifiers retain the local binding label. Declaration lists
+follow TypeScript's five-location limit and report the remaining count.
+
+Interface and enum member navigation spans now cover the name while retaining
+the full declaration start. The binder visits enum initializers, recording
+references to other enum members. JSX intrinsic attribute navigation reads the
+parsed property annotation instead of assuming the navigation span includes
+the entire type. This also prevents a nested property with the same name from
+capturing the attribute's definition.
+
+| Suite | Baseline | Before | After | Gain | Lost passes |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Compiler | Symbols | 1,176 | 1,709 | 533 | 0 |
+| Conformance | Symbols | 1,210 | 1,534 | 324 | 0 |
+
+The symbol comparisons add 857 whole-case passes, with compiler skips still
+95 and conformance skips still 290. All eight cache-free compiler/conformance
+symbol, type, diagnostic, and JavaScript comparisons preserve cases, oracles,
+and skips and lose no passes; the other six matrices are unchanged.
+Five new regressions cover owner names,
+enum initializer references, name spans, overload lists, namespace scope
+selection, import labels, and JSX attribute lookup. All 3,618 workspace tests
+pass with 37 ignored, and `make ci` passes.
+The upstream `tsxGoToDefinitionIntrinsics` case passes
+all three markers after adapting navigation to the precise member spans.
+The complete LSP comparison retains 1,800 passes, 563 failures, and 3,957
+skips with an identical failure set.
+Evidence is in `/tmp/ts-rs-symbol-owners-20260930/` on the verification host.

@@ -12748,6 +12748,7 @@ pub fn definition_at(
 
     // JSX attribute resolution: `<Tag attr="..." />` → navigate to attribute's type definition
     if let Some(result) = resolve_jsx_attribute_definition(
+        sf,
         source_text,
         effective_offset,
         &token,
@@ -14240,6 +14241,7 @@ fn resolve_jsdoc_reference(
 /// MyClass's props interface, or for `<div name="x" />` to the `name` property
 /// in JSX.IntrinsicElements.div.
 fn resolve_jsx_attribute_definition(
+    source_file: &SourceFile,
     source_text: &str,
     offset: u32,
     attr_name: &str,
@@ -14300,6 +14302,7 @@ fn resolve_jsx_attribute_definition(
                     if te < token_start {
                         // Resolve the attribute in the tag's props type
                         return resolve_jsx_tag_attribute(
+                            source_file,
                             tag_name,
                             attr_name,
                             sym_table,
@@ -14322,6 +14325,7 @@ fn resolve_jsx_attribute_definition(
 /// Given a JSX tag name and attribute, find the attribute's property declaration
 /// in the tag's props type.
 fn resolve_jsx_tag_attribute(
+    source_file: &SourceFile,
     tag_name: &str,
     attr_name: &str,
     sym_table: &SymbolTable,
@@ -14340,18 +14344,18 @@ fn resolve_jsx_tag_attribute(
                 // Find the tag member in IntrinsicElements
                 if let Some(&tag_member_id) = sym.members.get(tag_name) {
                     if let Some(tag_sym) = sym_table.get_symbol(tag_member_id) {
-                        // The tag member's type is an object type literal.
-                        // Find the attribute in that type by looking for `attr_name` in the
-                        // source text within the member's declaration span.
+                        // Navigation spans cover the member name only. Use its
+                        // parsed annotation to locate the attribute, preserving
+                        // the distinction between outer and nested properties.
                         for decl in &tag_sym.declarations {
-                            if let Some(result) = find_property_in_type_literal(
-                                source_text,
-                                decl.span.start as usize,
-                                decl.span.end as usize,
-                                attr_name,
-                                file_name,
-                            ) {
-                                return Some(result);
+                            if let Some(annotation) =
+                                interface_property_annotation_at(source_file, decl.span.start)
+                            {
+                                if let Some(span) =
+                                    property_name_in_annotation(annotation, attr_name)
+                                {
+                                    return Some((file_name.to_string(), span));
+                                }
                             }
                         }
                     }
@@ -14399,6 +14403,77 @@ fn resolve_jsx_tag_attribute(
     }
 
     None
+}
+
+fn interface_property_annotation_at(
+    file: &SourceFile,
+    name_start: u32,
+) -> Option<&tsc_rs_ast::TypeNode> {
+    let mut statements: Vec<_> = file.statements.iter().collect();
+    while let Some(statement) = statements.pop() {
+        match &statement.kind {
+            StmtKind::InterfaceDecl(interface) => {
+                for member in &interface.members {
+                    if let tsc_rs_ast::TypeMemberKind::PropertySig(property) = &member.kind {
+                        if property.name.span().start == name_start {
+                            return property.type_ann.as_ref();
+                        }
+                    }
+                }
+            }
+            StmtKind::ModuleDecl(module) => {
+                let mut body = module.body.as_ref();
+                while let Some(current) = body {
+                    match current {
+                        tsc_rs_ast::ModuleBody::Block(block) => {
+                            statements.extend(block);
+                            break;
+                        }
+                        tsc_rs_ast::ModuleBody::Module(inner) => body = inner.body.as_ref(),
+                    }
+                }
+            }
+            StmtKind::Export(export) => match &export.kind {
+                ExportDeclKind::Decl(inner) | ExportDeclKind::DefaultDecl(inner) => {
+                    statements.push(inner);
+                }
+                _ => {}
+            },
+            StmtKind::Block(block) => statements.extend(block),
+            StmtKind::FnDecl(function) => {
+                if let Some(body) = &function.body {
+                    statements.extend(body);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn property_name_in_annotation(annotation: &tsc_rs_ast::TypeNode, name: &str) -> Option<Span> {
+    match &annotation.kind {
+        tsc_rs_ast::TypeNodeKind::TypeLit(members) => members.iter().find_map(|member| {
+            let property_name = match &member.kind {
+                tsc_rs_ast::TypeMemberKind::PropertySig(property) => &property.name,
+                tsc_rs_ast::TypeMemberKind::MethodSig(method) => &method.name,
+                _ => return None,
+            };
+            match property_name {
+                PropName::Ident(text, span) | PropName::String(text, span)
+                    if text.as_str() == name =>
+                {
+                    Some(*span)
+                }
+                _ => None,
+            }
+        }),
+        tsc_rs_ast::TypeNodeKind::Paren(inner) => property_name_in_annotation(inner, name),
+        tsc_rs_ast::TypeNodeKind::Intersection(types) => types
+            .iter()
+            .find_map(|ty| property_name_in_annotation(ty, name)),
+        _ => None,
+    }
 }
 
 /// Find a property name in a type literal (object type) within a span of source text.
@@ -33828,6 +33903,30 @@ mod tests {
         // result may be null if symbol not found at exact position; that's OK
         // The key is that we got a well-formed response
         assert!(resp.get("result").is_some());
+    }
+
+    #[test]
+    fn jsx_attribute_definition_uses_the_outer_type_property() {
+        let source = "declare namespace JSX { interface IntrinsicElements { div: { nested: { name?: number }; readonly name?: string; }; span: { name: boolean }; } } const view = <div name='hello' />;";
+        let file = tsc_rs_parser::parse_with_jsx("view.tsx", source, true);
+        assert!(file.diagnostics.is_empty());
+        let symbols = tsc_rs_symbols::bind(&file);
+        let engine = QueryEngine::new();
+        let usage = source.rfind("name=").unwrap() as u32;
+        let expected = source.find("name?: string").unwrap() as u32;
+        let definition = resolve_jsx_attribute_definition(
+            &file,
+            source,
+            usage + 2,
+            "name",
+            &symbols,
+            &engine,
+            "view.tsx",
+        );
+        assert_eq!(
+            definition,
+            Some(("view.tsx".to_string(), Span::new(expected, expected + 4)))
+        );
     }
 
     #[test]

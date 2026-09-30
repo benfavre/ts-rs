@@ -985,10 +985,19 @@ impl Binder {
                         PropName::Ident(ref n, _) | PropName::String(ref n, _) => n,
                         _ => continue,
                     };
-                    let mem_id = self.declare(name, SYM_ENUM_MEMBER, file_name, member.span);
+                    let mem_id = self.declare_node(
+                        name,
+                        SYM_ENUM_MEMBER,
+                        file_name,
+                        member.name.span(),
+                        member.span.start,
+                    );
                     self.table.symbols[enum_sym as usize]
                         .members
                         .insert(name.to_string(), mem_id);
+                    if let Some(initializer) = &member.initializer {
+                        self.bind_expr(initializer, file_name);
+                    }
                 }
                 self.pop_scope();
             }
@@ -2303,7 +2312,13 @@ impl Binder {
             }
             TypeMemberKind::PropertySig(prop) => {
                 if let PropName::Ident(ref name, _) | PropName::String(ref name, _) = prop.name {
-                    let id = self.declare(name, SYM_PROPERTY, file_name, member.span);
+                    let id = self.declare_node(
+                        name,
+                        SYM_PROPERTY,
+                        file_name,
+                        prop.name.span(),
+                        member.span.start,
+                    );
                     self.table.symbols[iface_sym as usize]
                         .members
                         .insert(name.to_string(), id);
@@ -2314,7 +2329,13 @@ impl Binder {
             }
             TypeMemberKind::MethodSig(method) => {
                 if let PropName::Ident(ref name, _) | PropName::String(ref name, _) = method.name {
-                    let id = self.declare(name, SYM_METHOD, file_name, member.span);
+                    let id = self.declare_node(
+                        name,
+                        SYM_METHOD,
+                        file_name,
+                        method.name.span(),
+                        member.span.start,
+                    );
                     self.table.symbols[iface_sym as usize]
                         .members
                         .insert(name.to_string(), id);
@@ -2332,7 +2353,13 @@ impl Binder {
             }
             TypeMemberKind::GetAccessorSig(acc) => {
                 if let PropName::Ident(ref name, _) | PropName::String(ref name, _) = acc.name {
-                    let id = self.declare(name, SYM_GET_ACCESSOR, file_name, member.span);
+                    let id = self.declare_node(
+                        name,
+                        SYM_GET_ACCESSOR,
+                        file_name,
+                        acc.name.span(),
+                        member.span.start,
+                    );
                     self.table.symbols[iface_sym as usize]
                         .members
                         .insert(name.to_string(), id);
@@ -2348,7 +2375,13 @@ impl Binder {
             }
             TypeMemberKind::SetAccessorSig(acc) => {
                 if let PropName::Ident(ref name, _) | PropName::String(ref name, _) = acc.name {
-                    let id = self.declare(name, SYM_SET_ACCESSOR, file_name, member.span);
+                    let id = self.declare_node(
+                        name,
+                        SYM_SET_ACCESSOR,
+                        file_name,
+                        acc.name.span(),
+                        member.span.start,
+                    );
                     self.table.symbols[iface_sym as usize]
                         .members
                         .insert(name.to_string(), id);
