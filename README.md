@@ -368,7 +368,7 @@ cases (one thread, no cache); the method and raw timings are in
 
 - [Webdesign29](https://www.webdesign29.net/), a web and mobile agency based in
   Brest, France.
-- [Inklura](https://www.inklura.com/), all-in-one business management software.
+- [Inklura](https://www.inklura.fr/), all-in-one business management software.
 
 We are looking for more sponsors. Sponsorship pays for the time spent closing
 the gaps in the tables above: type-checker parity, declaration emit and the
