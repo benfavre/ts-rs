@@ -8,7 +8,8 @@
 [Documentation](https://ts-rs.bext.dev/docs) ·
 [Playground](https://ts-rs.bext.dev/playground) ·
 [Conformance report](https://ts-rs.bext.dev/conformance) ·
-[Progress](https://ts-rs.bext.dev/progress)
+[Progress](https://ts-rs.bext.dev/progress) ·
+[Sponsor](#sponsors)
 
 [![CI](https://github.com/benfavre/ts-rs/actions/workflows/rust-ci.yml/badge.svg)](https://github.com/benfavre/ts-rs/actions/workflows/rust-ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -360,6 +361,22 @@ cases (one thread, no cache); the method and raw timings are in
   advanced code; hover types can differ from `tsc`. The tables above quantify
   this.
 - `.d.ts` emit and the symbol baselines are the least mature lanes.
+
+## Sponsors
+
+`tsc-rs` is sponsored by:
+
+- [Webdesign29](https://www.webdesign29.net/), a web and mobile agency based in
+  Brest, France.
+- [Inklura](https://www.inklura.com/), all-in-one business management software.
+
+We are looking for more sponsors. Sponsorship pays for the time spent closing
+the gaps in the tables above: type-checker parity, declaration emit and the
+language server. If your company depends on fast TypeScript tooling, you can
+sponsor the project through
+[GitHub Sponsors](https://github.com/sponsors/benfavre), or
+[open an issue](https://github.com/benfavre/ts-rs/issues/new) to talk about
+other arrangements.
 
 ## More documentation
 
