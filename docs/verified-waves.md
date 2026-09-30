@@ -1322,3 +1322,34 @@ These are inventory measurements, not claims that this diagnostic wave
 improves emit or LSP behavior. Skips remain separate from passes. The default
 diagnostic matrices still have 4,021 failing cases; expanded JavaScript has
 972 and declarations have 1,657. The 100% goal remains open.
+
+## 2026-09-30: ES5 bodyless accessors and empty class elements
+
+Concrete bodyless getters and setters now emit empty descriptor functions
+under ES5. Abstract and ambient bodyless accessors remain erased. Getter/setter
+pairs retain one descriptor, static descriptors stay on the constructor, and
+computed keys execute once in source order. Empty class elements emit their
+standalone semicolon in the lowered class body.
+
+The expanded `abstractPropertyNegative(target=es5)` JavaScript baseline now
+passes, increasing expanded compiler JavaScript passes from 6,446 to 6,447
+and reducing its failures from 258 to 257. All eight cache-free comparisons
+(the four default diagnostic/JavaScript matrices plus four expanded
+JavaScript/declaration matrices) show zero losses and unchanged skips, cases,
+and oracles. All 250 focused ES5 tests and `make ci`, including all 776 emitter
+tests, pass. Three new regressions check runtime descriptor behavior,
+computed-key evaluation, abstract erasure, and empty-element ordering.
+
+The remaining supported symbol and type lanes were also measured without
+the result cache. These are inventory measurements, not gains from the ES5
+change:
+
+| Suite | Baseline | Passed | Failed | Skipped |
+| --- | --- | ---: | ---: | ---: |
+| Compiler | Symbols | 185 | 6,249 | 95 |
+| Conformance | Symbols | 293 | 5,324 | 290 |
+| Compiler | Types | 108 | 6,326 | 95 |
+| Conformance | Types | 63 | 5,554 | 290 |
+
+The 100% goal includes these lanes. Missing or ambiguous oracles stay separate
+from passes, and upstream cases and reference baselines remain unchanged.

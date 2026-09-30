@@ -10426,6 +10426,77 @@ fn test_es5_class_expression_does_not_use_declaration_only_lowering() {
 }
 
 #[test]
+fn es5_bodyless_concrete_accessors_emit_descriptors_but_abstract_accessors_are_erased() {
+    let js = emit_ts_with(
+        "abstract class C { abstract get erased(): number; get value(): number; set value(v: number) {} static get answer(): number; set only(v: number); }\n\
+         const value = Object.getOwnPropertyDescriptor(C.prototype, 'value');\n\
+         const only = Object.getOwnPropertyDescriptor(C.prototype, 'only');\n\
+         const answer = Object.getOwnPropertyDescriptor(C, 'answer');\n\
+         console.log(typeof value.get, typeof value.set, value.enumerable, value.configurable, typeof only.set, typeof answer.get, 'erased' in C.prototype);",
+        CompilerOptions {
+            target: Some(ScriptTarget::ES5),
+            ..Default::default()
+        },
+    );
+    assert_node_syntax(&js);
+    assert_eq!(
+        execute_with_node(&js),
+        "function function false true function function false"
+    );
+    assert!(js.contains("get: function () { },"), "{js}");
+    assert!(js.contains("set: function (v) { },"), "{js}");
+    assert_eq!(
+        js.matches("Object.defineProperty(C.prototype, \"value\"")
+            .count(),
+        1,
+        "{js}"
+    );
+    assert!(!js.contains("class C"), "{js}");
+}
+
+#[test]
+fn es5_class_empty_elements_keep_their_order_around_accessors() {
+    let js = emit_ts_with(
+        "class C { ; get x(): number; ; set y(v: number) {} ; }",
+        CompilerOptions {
+            target: Some(ScriptTarget::ES5),
+            ..Default::default()
+        },
+    );
+    assert_node_syntax(&js);
+    assert_eq!(
+        js.lines().filter(|line| line.trim() == ";").count(),
+        3,
+        "{js}"
+    );
+    assert!(
+        js.contains("    ;\n    Object.defineProperty(C.prototype, \"x\""),
+        "{js}"
+    );
+    assert!(
+        js.contains("    ;\n    Object.defineProperty(C.prototype, \"y\""),
+        "{js}"
+    );
+    assert!(js.contains("    ;\n    return C;"), "{js}");
+}
+
+#[test]
+fn es5_bodyless_computed_accessors_evaluate_each_key_once() {
+    let js = emit_ts_with(
+        "const order: string[] = []; function key(value: string) { order.push(value); return value; }\n\
+         class C { get [key('read')](): number; set [key('write')](v: number); }\n\
+         console.log(order.join(','), typeof Object.getOwnPropertyDescriptor(C.prototype, 'read').get, typeof Object.getOwnPropertyDescriptor(C.prototype, 'write').set);",
+        CompilerOptions {
+            target: Some(ScriptTarget::ES5),
+            ..Default::default()
+        },
+    );
+    assert_node_syntax(&js);
+    assert_eq!(execute_with_node(&js), "read,write function function");
+    assert!(!js.contains("class C"), "{js}");
+}
+
+#[test]
 fn test_es5_legacy_class_lowers_public_methods_and_accessors() {
     let js = emit_ts_with(
          "class Base { base() { return 1; } }\n\

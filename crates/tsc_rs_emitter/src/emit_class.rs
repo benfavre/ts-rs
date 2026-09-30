@@ -3471,6 +3471,10 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    fn legacy_es5_accessor_is_erased(accessor: &ClassAccessor) -> bool {
+        accessor.body.is_none() && accessor.modifiers & (MOD_ABSTRACT | MOD_DECLARE) != 0
+    }
+
     fn legacy_es5_class_shape_can_lower(class_decl: &ClassDecl) -> bool {
         let Some(class_name) = class_decl.name.as_deref() else {
             return false;
@@ -3520,7 +3524,7 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 ClassMemberKind::GetAccessor(accessor) => {
-                    if accessor.body.is_none() {
+                    if Self::legacy_es5_accessor_is_erased(accessor) {
                         continue;
                     }
                     if !accessor.decorators.is_empty()
@@ -3533,7 +3537,7 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 ClassMemberKind::SetAccessor(accessor) => {
-                    if accessor.body.is_none() {
+                    if Self::legacy_es5_accessor_is_erased(accessor) {
                         continue;
                     }
                     if !accessor.decorators.is_empty()
@@ -4834,7 +4838,7 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 ClassMemberKind::GetAccessor(accessor) | ClassMemberKind::SetAccessor(accessor) => {
-                    if accessor.body.is_none() {
+                    if Self::legacy_es5_accessor_is_erased(accessor) {
                         self.advance_comment_pos(member.span.end);
                         continue;
                     }
@@ -4852,7 +4856,7 @@ impl<'a> Emitter<'a> {
                             for candidate in &class_decl.members {
                                 match &candidate.kind {
                                     ClassMemberKind::GetAccessor(other)
-                                        if other.body.is_some()
+                                        if !Self::legacy_es5_accessor_is_erased(other)
                                             && (other.modifiers & MOD_STATIC != 0) == is_static
                                             && Self::legacy_es5_literal_member_key(&other.name)
                                                 .as_ref()
@@ -4861,7 +4865,7 @@ impl<'a> Emitter<'a> {
                                         getter = Some((other, candidate.span));
                                     }
                                     ClassMemberKind::SetAccessor(other)
-                                        if other.body.is_some()
+                                        if !Self::legacy_es5_accessor_is_erased(other)
                                             && (other.modifiers & MOD_STATIC != 0) == is_static
                                             && Self::legacy_es5_literal_member_key(&other.name)
                                                 .as_ref()
@@ -4939,6 +4943,11 @@ impl<'a> Emitter<'a> {
                     // type-only. Consume them before a later computed member
                     // asks for its own leading comments.
                     self.advance_comment_pos(member.span.end);
+                }
+                ClassMemberKind::SemicolonClassElement => {
+                    self.emit_leading_comments(member.span.start);
+                    self.writeln(";");
+                    self.append_trailing_comment(member.span);
                 }
                 _ => {}
             }
