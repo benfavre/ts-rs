@@ -1248,3 +1248,26 @@ from 2,785 to 2,782. Newly passing cases are `exportDefaultClassInNamespace`,
 
 All four cache-free comparisons preserve skip counts. All 1,207 checker
 tests, including six new regressions, and `make ci` passed.
+
+## 2026-09-30: reserved syntax in `.mts` and `.cts` files
+
+Angle-bracket assertions now report TS7059 in `.mts` and `.cts` files.
+Single-parameter generic arrows report TS7060 unless a trailing comma or
+explicit constraint disambiguates them. Defaults, `const` modifiers, and
+commas inside comments do not exempt an arrow. Contextual arrows follow the
+same rule; ordinary `.ts` files and `as` assertions remain valid.
+
+All 64 expected TS7059 and 32 expected TS7060 diagnostics match across the
+expanded conformance variants, with no false positives. Total conformance
+matches increase from 18,605 to 18,701; false positives remain 2,782.
+`nodeModulesForbidenSyntax` now passes its complete errors baseline.
+
+| Suite | Baseline | Before | After | Lost passes |
+| --- | --- | ---: | ---: | ---: |
+| Compiler | Diagnostics | 4,783 | 4,783 | 0 |
+| Conformance | Diagnostics | 3,626 | 3,627 | 0 |
+| Compiler | JavaScript | 6,032 | 6,032 | 0 |
+| Conformance | JavaScript | 5,388 | 5,388 | 0 |
+
+All four cache-free comparisons preserve skip counts, cases, and oracles.
+All 1,214 checker tests, including seven new regressions, and `make ci` passed.

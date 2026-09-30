@@ -4015,6 +4015,66 @@ impl TypeChecker {
         }
     }
 
+    /// `.mts` and `.cts` reserve syntax that is ambiguous with JSX, even
+    /// though these files themselves do not parse JSX.
+    fn check_node_module_reserved_syntax(&mut self, expression: &Expr) {
+        if !self.check_expression_grammar
+            || !self
+                .current_file_name
+                .as_deref()
+                .is_some_and(|name| name.ends_with(".mts") || name.ends_with(".cts"))
+        {
+            return;
+        }
+        let (code, message, span) = match &expression.kind {
+            ExprKind::TypeAssertion(_) => (
+                7059,
+                "This syntax is reserved in files with the .mts or .cts extension. Use an `as` expression instead.",
+                expression.span,
+            ),
+            ExprKind::Arrow(arrow) => {
+                let Some([parameter]) = arrow.type_params.as_deref() else {
+                    return;
+                };
+                if parameter.constraint.is_some() {
+                    return;
+                }
+                // The AST keeps parameter spans but not the list's trailing
+                // comma. Scan the following token so commas in comments do
+                // not accidentally make an ambiguous arrow valid.
+                let Some(tail) = self.current_source.as_deref().and_then(|source| {
+                    source.get(parameter.span.end as usize..expression.span.end as usize)
+                }) else {
+                    return;
+                };
+                let mut scanner = tsc_rs_scanner::TsScanner::new(tail);
+                if scanner.scan() == tsc_rs_scanner::TokenKind::Comma {
+                    return;
+                }
+                (
+                    7060,
+                    "This syntax is reserved in files with the .mts or .cts extension. Add a trailing comma or explicit constraint.",
+                    parameter.span,
+                )
+            }
+            _ => return,
+        };
+        if !self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == code && diagnostic.span == Some(span))
+        {
+            self.diagnostics.push(Diagnostic {
+                code,
+                message: message.to_string(),
+                category: DiagnosticCategory::Error,
+                file_name: None,
+                span: Some(span),
+                related: None,
+            });
+        }
+    }
+
     /// Validate flags in source order, matching the scanner's precedence:
     /// unknown, duplicate, conflicting Unicode mode, then target availability.
     fn check_regexp_flag_diagnostics(&mut self, flags: &str, start: u32, subpattern: bool) {
@@ -5036,6 +5096,7 @@ impl TypeChecker {
 
         match &expr.kind {
             ExprKind::Arrow(arrow) => {
+                self.check_node_module_reserved_syntax(expr);
                 self.push_scope();
                 if let Some(type_params) = &arrow.type_params {
                     for type_param in type_params {
@@ -9532,6 +9593,7 @@ impl TypeChecker {
                 })
             }
             ExprKind::Arrow(arrow) => {
+                self.check_node_module_reserved_syntax(expr);
                 self.push_scope();
                 self.fn_nesting_depth += 1;
                 self.jump_function_depth += 1;
@@ -9939,6 +10001,7 @@ impl TypeChecker {
                 self.remove_null_undefined(&ty)
             }
             ExprKind::TypeAssertion(ta) => {
+                self.check_node_module_reserved_syntax(expr);
                 if Self::is_const_assertion_expr(expr) {
                     self.check_expr(&ta.expr);
                     return self.infer_const_asserted_expr(&ta.expr);
