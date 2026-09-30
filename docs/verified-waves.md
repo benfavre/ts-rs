@@ -1353,3 +1353,35 @@ change:
 
 The 100% goal includes these lanes. Missing or ambiguous oracles stay separate
 from passes, and upstream cases and reference baselines remain unchanged.
+
+## 2026-09-30: declaration positions and symbol/type annotation layout
+
+The binder now records declaration starts including leading trivia separately
+from identifier navigation spans. Export wrappers, declaration modifiers,
+comments, and rest parameters retain their full starts. Symbol locations count
+UTF-16 columns and all ECMAScript line terminators. Symbol and type baselines
+share the source/annotation spacing used by the pinned TypeScript harness;
+type annotation underlines also count UTF-16 code units.
+
+| Suite | Baseline | Before | After | Gain | Lost passes |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Compiler | Symbols | 185 | 1,155 | 970 | 0 |
+| Conformance | Symbols | 293 | 1,207 | 914 | 0 |
+| Compiler | Types | 108 | 184 | 76 | 0 |
+| Conformance | Types | 63 | 128 | 65 | 0 |
+
+The four cache-free symbol/type comparisons add 2,025 whole-case passes.
+Compiler symbol/type skips remain 95 each; conformance skips remain 290 each.
+The four default JavaScript/diagnostic matrices are unchanged. All eight
+comparisons preserve cases and oracles and lose no passes. The full workspace
+passes 3,609 tests with 37 ignored, and `make ci` passes. Three new regression
+tests check independently verified declaration positions, navigation spans,
+annotation spacing, Unicode columns, and line endings. The final symbol tests
+and all four symbol/type reports also pass after adding assertions against
+invalid or unordered annotation locations.
+
+The first conformance symbol report exited with SIGSEGV while eight reports
+ran concurrently. The same report completed under the debugger and in five
+ordinary reruns with identical manifests; the final report also completed.
+The initial crash remains unexplained and is not claimed fixed. Evidence is
+in `/tmp/ts-rs-symbol-positions-20260930/` on the verification host.

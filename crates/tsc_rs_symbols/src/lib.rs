@@ -481,6 +481,9 @@ pub struct Binder {
     current_scope: usize,
     /// Tracks whether we are inside an export statement
     in_export: bool,
+    /// Leading trivia is part of a declaration's full start, but not its
+    /// navigation span. Keys are the first byte after a trivia run.
+    full_starts: rustc_hash::FxHashMap<u32, u32>,
 }
 
 impl Default for Binder {
@@ -502,10 +505,46 @@ impl Binder {
             scopes: vec![global_scope],
             current_scope: 0,
             in_export: false,
+            full_starts: rustc_hash::FxHashMap::default(),
         }
     }
 
     pub fn bind(mut self, file: &SourceFile) -> SymbolTable {
+        let mut offset = 0usize;
+        let mut comments = file.comments.iter().peekable();
+        while offset < file.text.len() {
+            let start = offset;
+            loop {
+                while comments
+                    .peek()
+                    .is_some_and(|comment| comment.end as usize <= offset)
+                {
+                    comments.next();
+                }
+                if let Some(comment) = comments
+                    .peek()
+                    .filter(|comment| comment.pos as usize == offset)
+                {
+                    offset = comment.end as usize;
+                    comments.next();
+                    continue;
+                }
+                let Some(ch) = file.text.get(offset..).and_then(|tail| tail.chars().next()) else {
+                    break;
+                };
+                if (ch.is_whitespace() && ch != '\u{0085}') || ch == '\u{feff}' {
+                    offset += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if offset > start {
+                self.full_starts.insert(offset as u32, start as u32);
+            }
+            if let Some(ch) = file.text.get(offset..).and_then(|tail| tail.chars().next()) {
+                offset += ch.len_utf8();
+            }
+        }
         self.scopes[0].span = file.span;
         for stmt in &file.statements {
             self.bind_stmt(stmt, &file.file_name);
@@ -546,7 +585,36 @@ impl Binder {
     /// Declare a symbol in the current scope with declaration merging and
     /// duplicate detection. Returns the symbol ID (either new or existing).
     fn declare(&mut self, name: &str, flags: SymbolFlags, file_name: &str, span: Span) -> SymbolId {
-        self.declare_with_full_start(name, flags, file_name, span, span.start)
+        self.declare_node(name, flags, file_name, span, span.start)
+    }
+
+    fn full_start(&self, start: u32) -> u32 {
+        self.full_starts.get(&start).copied().unwrap_or(start)
+    }
+
+    fn declare_node(
+        &mut self,
+        name: &str,
+        flags: SymbolFlags,
+        file_name: &str,
+        name_span: Span,
+        start: u32,
+    ) -> SymbolId {
+        self.declare_with_full_start(name, flags, file_name, name_span, self.full_start(start))
+    }
+
+    fn bind_parameter(&mut self, parameter: &Param, file_name: &str) {
+        if let PatKind::Ident(name) = &parameter.name.kind {
+            self.declare_node(
+                name,
+                SYM_PARAMETER,
+                file_name,
+                parameter.name.span,
+                parameter.span.start,
+            );
+        } else {
+            self.bind_pattern(&parameter.name, SYM_PARAMETER, file_name);
+        }
     }
 
     fn declare_with_full_start(
@@ -742,7 +810,13 @@ impl Binder {
             StmtKind::FnDecl(fn_decl) => {
                 if let Some(ref name) = fn_decl.name {
                     let decl_span = fn_decl.name_span.unwrap_or(fn_decl.span);
-                    let sym_id = self.declare(name, SYM_FUNCTION, file_name, decl_span);
+                    let sym_id = self.declare_node(
+                        name,
+                        SYM_FUNCTION,
+                        file_name,
+                        decl_span,
+                        fn_decl.span.start,
+                    );
                     // If the declaration has no body, it is an overload signature.
                     if fn_decl.body.is_none() {
                         self.record_overload_signature(sym_id, fn_decl);
@@ -753,7 +827,7 @@ impl Binder {
                     self.declare_type_params(type_params, file_name);
                 }
                 for param in &fn_decl.params {
-                    self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                    self.bind_parameter(param, file_name);
                     if let Some(ref type_ann) = param.type_ann {
                         self.bind_type_node(type_ann, file_name);
                     }
@@ -771,7 +845,13 @@ impl Binder {
             StmtKind::ClassDecl(class_decl) => {
                 if let Some(ref name) = class_decl.name {
                     let decl_span = class_decl.name_span.unwrap_or(class_decl.span);
-                    let class_sym = self.declare(name, SYM_CLASS, file_name, decl_span);
+                    let class_sym = self.declare_node(
+                        name,
+                        SYM_CLASS,
+                        file_name,
+                        decl_span,
+                        class_decl.span.start,
+                    );
                     self.push_scope(ScopeKind::Class, class_decl.span);
                     if let Some(ref type_params) = class_decl.type_params {
                         self.declare_type_params(type_params, file_name);
@@ -804,7 +884,13 @@ impl Binder {
             }
             StmtKind::InterfaceDecl(iface) => {
                 let decl_span = iface.name_span.unwrap_or(iface.span);
-                let iface_sym = self.declare(&iface.name, SYM_INTERFACE, file_name, decl_span);
+                let iface_sym = self.declare_node(
+                    &iface.name,
+                    SYM_INTERFACE,
+                    file_name,
+                    decl_span,
+                    iface.span.start,
+                );
                 // Bind extends clauses (type references) and record in extends_map
                 for ext_type in &iface.extends {
                     self.bind_type_node(ext_type, file_name);
@@ -833,7 +919,13 @@ impl Binder {
             }
             StmtKind::TypeAlias(ta) => {
                 let decl_span = ta.name_span.unwrap_or(ta.span);
-                self.declare(&ta.name, SYM_TYPE_ALIAS, file_name, decl_span);
+                self.declare_node(
+                    &ta.name,
+                    SYM_TYPE_ALIAS,
+                    file_name,
+                    decl_span,
+                    ta.span.start,
+                );
                 // Bind type parameters
                 if let Some(ref type_params) = ta.type_params {
                     self.push_scope(ScopeKind::TypeAlias, ta.span);
@@ -850,7 +942,13 @@ impl Binder {
                 if enum_decl.is_const {
                     enum_flags |= SYM_CONST;
                 }
-                let enum_sym = self.declare(&enum_decl.name, enum_flags, file_name, decl_span);
+                let enum_sym = self.declare_node(
+                    &enum_decl.name,
+                    enum_flags,
+                    file_name,
+                    decl_span,
+                    enum_decl.span.start,
+                );
                 self.push_scope(ScopeKind::Enum, enum_decl.span);
                 for member in &enum_decl.members {
                     let name = match &member.name {
@@ -986,8 +1084,11 @@ impl Binder {
                 let was_export = self.in_export;
                 self.in_export = true;
                 match &export_decl.kind {
-                    ExportDeclKind::Decl(decl) => self.bind_stmt(decl, file_name),
-                    ExportDeclKind::DefaultDecl(decl) => self.bind_stmt(decl, file_name),
+                    ExportDeclKind::Decl(decl) | ExportDeclKind::DefaultDecl(decl) => {
+                        self.full_starts
+                            .insert(decl.span.start, self.full_start(export_decl.span.start));
+                        self.bind_stmt(decl, file_name);
+                    }
                     _ => {}
                 }
                 self.in_export = was_export;
@@ -1069,7 +1170,7 @@ impl Binder {
                         self.declare_type_params(type_params, file_name);
                     }
                     for param in &fn_decl.params {
-                        self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                        self.bind_parameter(param, file_name);
                         if let Some(ref type_ann) = param.type_ann {
                             self.bind_type_node(type_ann, file_name);
                         }
@@ -1091,7 +1192,13 @@ impl Binder {
                         // Use name_span if available (points to class name),
                         // otherwise fall back to the full class expression span.
                         let decl_span = class_decl.name_span.unwrap_or(class_decl.span);
-                        let class_sym = self.declare(name, SYM_CLASS, file_name, decl_span);
+                        let class_sym = self.declare_node(
+                            name,
+                            SYM_CLASS,
+                            file_name,
+                            decl_span,
+                            class_decl.span.start,
+                        );
                         if let Some(ref type_params) = class_decl.type_params {
                             self.declare_type_params(type_params, file_name);
                         }
@@ -1118,7 +1225,7 @@ impl Binder {
                         self.declare_type_params(type_params, file_name);
                     }
                     for param in &arrow.params {
-                        self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                        self.bind_parameter(param, file_name);
                         if let Some(ref type_ann) = param.type_ann {
                             self.bind_type_node(type_ann, file_name);
                         }
@@ -1143,7 +1250,7 @@ impl Binder {
                                 // Object method shorthand: `{ foo() {} }`
                                 self.push_scope(ScopeKind::Function, method.span);
                                 for param in &method.params {
-                                    self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                                    self.bind_parameter(param, file_name);
                                 }
                                 for s in &method.body {
                                     self.bind_stmt(s, file_name);
@@ -1160,7 +1267,7 @@ impl Binder {
                             ObjLitProp::Set(acc) => {
                                 self.push_scope(ScopeKind::Function, acc.span);
                                 for param in &acc.params {
-                                    self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                                    self.bind_parameter(param, file_name);
                                 }
                                 for s in &acc.body {
                                     self.bind_stmt(s, file_name);
@@ -1427,7 +1534,13 @@ impl Binder {
                     self.bind_dotted_module(name, &module_decl.body, file_name, module_decl.span);
                 } else {
                     let decl_span = module_decl.name_span.unwrap_or(module_decl.span);
-                    let mod_sym = self.declare(name, SYM_MODULE, file_name, decl_span);
+                    let mod_sym = self.declare_node(
+                        name,
+                        SYM_MODULE,
+                        file_name,
+                        decl_span,
+                        module_decl.span.start,
+                    );
                     if let Some(ref body) = module_decl.body {
                         self.push_scope(ScopeKind::Module, module_decl.span);
                         match body {
@@ -1901,7 +2014,13 @@ impl Binder {
                     }
                     // Use the property name span so goToDefinition points to the
                     // name identifier, not the leading modifier keyword.
-                    let id = self.declare(&name, flags, file_name, prop.name.span());
+                    let id = self.declare_node(
+                        &name,
+                        flags,
+                        file_name,
+                        prop.name.span(),
+                        member.span.start,
+                    );
                     self.table.symbols[class_sym as usize]
                         .members
                         .insert(name.to_string(), id);
@@ -1926,7 +2045,13 @@ impl Binder {
                     if method.modifiers & MOD_STATIC != 0 {
                         flags |= SYM_STATIC;
                     }
-                    let id = self.declare(&name, flags, file_name, method.name.span());
+                    let id = self.declare_node(
+                        &name,
+                        flags,
+                        file_name,
+                        method.name.span(),
+                        member.span.start,
+                    );
                     self.table.symbols[class_sym as usize]
                         .members
                         .insert(name.to_string(), id);
@@ -1940,7 +2065,7 @@ impl Binder {
                     self.declare_type_params(type_params, file_name);
                 }
                 for param in &method.params {
-                    self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                    self.bind_parameter(param, file_name);
                     if let Some(ref type_ann) = param.type_ann {
                         self.bind_type_node(type_ann, file_name);
                     }
@@ -1963,7 +2088,7 @@ impl Binder {
                 }
                 self.push_scope(ScopeKind::Function, member.span);
                 for param in &ctor.params {
-                    self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                    self.bind_parameter(param, file_name);
                     if let Some(ref type_ann) = param.type_ann {
                         self.bind_type_node(type_ann, file_name);
                     }
@@ -1985,14 +2110,20 @@ impl Binder {
                 if let Some(name) = acc_name {
                     // Use the accessor name span so goToDefinition points to the
                     // name identifier, not the leading modifier keyword.
-                    let id = self.declare(&name, SYM_GET_ACCESSOR, file_name, acc.name.span());
+                    let id = self.declare_node(
+                        &name,
+                        SYM_GET_ACCESSOR,
+                        file_name,
+                        acc.name.span(),
+                        member.span.start,
+                    );
                     self.table.symbols[class_sym as usize]
                         .members
                         .insert(name, id);
                 }
                 self.push_scope(ScopeKind::Function, member.span);
                 for param in &acc.params {
-                    self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                    self.bind_parameter(param, file_name);
                     if let Some(ref type_ann) = param.type_ann {
                         self.bind_type_node(type_ann, file_name);
                     }
@@ -2017,14 +2148,20 @@ impl Binder {
                 if let Some(name) = acc_name {
                     // Use the accessor name span so goToDefinition points to the
                     // name identifier, not the leading modifier keyword.
-                    let id = self.declare(&name, SYM_SET_ACCESSOR, file_name, acc.name.span());
+                    let id = self.declare_node(
+                        &name,
+                        SYM_SET_ACCESSOR,
+                        file_name,
+                        acc.name.span(),
+                        member.span.start,
+                    );
                     self.table.symbols[class_sym as usize]
                         .members
                         .insert(name, id);
                 }
                 self.push_scope(ScopeKind::Function, member.span);
                 for param in &acc.params {
-                    self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                    self.bind_parameter(param, file_name);
                     if let Some(ref type_ann) = param.type_ann {
                         self.bind_type_node(type_ann, file_name);
                     }
@@ -2092,7 +2229,7 @@ impl Binder {
         }
         for param in params {
             if declare_params {
-                self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                self.bind_parameter(param, file_name);
             }
             if let Some(ref type_ann) = param.type_ann {
                 self.bind_type_node(type_ann, file_name);

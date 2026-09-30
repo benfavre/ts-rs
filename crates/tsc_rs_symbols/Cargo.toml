@@ -10,3 +10,6 @@ description = "Symbol table and binding for tsc-rs"
 [dependencies]
 tsc_rs_ast = { path = "../tsc_rs_ast" }
 rustc-hash = "2"
+
+[dev-dependencies]
+tsc_rs_parser = { path = "../tsc_rs_parser" }

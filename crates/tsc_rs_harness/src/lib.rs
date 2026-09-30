@@ -6220,20 +6220,23 @@ impl BaselineRunner {
                 entries.sort_by_key(|(col, _, _)| *col);
             }
 
-            for (line_idx, line) in source_lines.iter().enumerate() {
-                output.push_str(line);
-                output.push('\n');
-
+            let mut annotations = Vec::new();
+            for line_idx in 0..source_lines.len() {
                 if let Some(entries) = types_by_line.get(&line_idx) {
                     for (_, expr_text, type_str) in entries {
-                        output.push_str(&format!(">{} : {}\n", expr_text, type_str));
+                        let mut annotation = format!(">{} : {}\n", expr_text, type_str);
                         // Caret line
-                        let prefix_len = expr_text.len() + 1; // +1 for '>'
-                        let carets = "^".repeat(type_str.len());
-                        output.push_str(&format!(">{} : {}\n", " ".repeat(prefix_len - 1), carets));
+                        let prefix_len = expr_text.encode_utf16().count();
+                        let carets = "^".repeat(type_str.encode_utf16().count());
+                        annotation.push_str(&format!(">{} : {}\n", " ".repeat(prefix_len), carets));
+                        annotations.push((line_idx, annotation));
                     }
                 }
             }
+            output.push_str(&tsc_rs_symbols::render_annotated_source(
+                &file.content,
+                annotations,
+            ));
         }
 
         output
