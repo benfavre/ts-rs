@@ -1,17 +1,17 @@
 {
-  "measured_at": "2026-09-07",
-  "source_commit": "aba3839d52cf20108a6effab550d906921ac8fb3",
-  "source_build": "Clean git archive of the source commit; unchanged repository test fixtures; release-fast profile.",
+  "measured_at": "2026-09-30",
+  "source_commit": "7643258e9dc88e3a9dc100209e3d1199240aa3dc",
+  "source_build": "Public main checkout, release profile, cache-free baseline reports; unchanged upstream cases and reference baselines.",
   "pass_rate_definition": "passed / (passed + failed); skipped cases excluded, never counted as passes.",
   "baselines": {
     "compiler": {
       "errors": {
         "total": 6529,
-        "passed": 3833,
-        "failed": 2696,
+        "passed": 4785,
+        "failed": 1744,
         "skipped": 0,
-        "manifest_sha256": "8a2b6fb1b516488562be7da7992468f983d535d7363dc89bbbf5bbee23e1a135",
-        "command": "cargo run --profile release-fast -p tsc_rs_harness --bin baseline-report -- --suite compiler --baseline errors --no-cache --save-manifest /tmp/compiler-errors.json"
+        "manifest_sha256": "8a227d9eebf2d028247481c3c16dedaf8ec85046d898049e1004a7f0de58d553",
+        "command": "target/release/baseline-report --suite compiler --baseline errors --no-cache --save-manifest /tmp/compiler-errors.json"
       },
       "js": {
         "total": 6529,
@@ -19,16 +19,31 @@
         "failed": 0,
         "skipped": 497,
         "manifest_sha256": "3e2499c5ede63b6c16ba3dda0560b4a5b866351748e353fa7368f45839b4c039",
-        "command": "cargo run --profile release-fast -p tsc_rs_harness --bin baseline-report -- --suite compiler --baseline js --no-cache --save-manifest /tmp/compiler-js.json"
+        "command": "target/release/baseline-report --suite compiler --baseline js --no-cache --save-manifest /tmp/compiler-js.json"
+      },
+      "symbols": {
+        "total": 6529,
+        "passed": 1709,
+        "failed": 4725,
+        "skipped": 95,
+        "manifest_sha256": "41a5fc0b5af0bbd323c382ff89e10cd6cbc172be611d8f04147266d197ed18b3",
+        "command": "target/release/baseline-report --suite compiler --baseline symbols --no-cache --save-manifest /tmp/compiler-symbols.json"
+      },
+      "types": {
+        "total": 6529,
+        "passed": 184,
+        "failed": 6250,
+        "skipped": 95,
+        "manifest_sha256": "d1ad64ad737da49dd0faaff160be7a34c39311f5134c2f9b4d5c685b06bd3b8e",
+        "command": "target/release/baseline-report --suite compiler --baseline types --no-cache --save-manifest /tmp/compiler-types.json"
       },
       "js-expanded": {
         "total": 7201,
-        "passed": 6446,
-        "failed": 258,
+        "passed": 6447,
+        "failed": 257,
         "skipped": 497,
-        "manifest_sha256": "5837af72239a1c9e0e5dc3eeb435b6723356d65fb2c098fcd3aa396025789f56",
-        "command": "cargo run --profile release-fast -p tsc_rs_harness --bin baseline-report -- --suite compiler --baseline js --no-cache --save-manifest /tmp/compiler-js-expanded.json --expand-variants --manifest-schema 2",
-        "unsupported_variant_options": 36
+        "manifest_sha256": "1d1bac4723b6125fec9a2784f6364687c3f85665ac2ed744a4a8eb32d0f5b783",
+        "command": "target/release/baseline-report --suite compiler --baseline js --no-cache --save-manifest /tmp/compiler-js-expanded.json --expand-variants --manifest-schema 2"
       },
       "declarations-expanded": {
         "total": 7201,
@@ -36,34 +51,17 @@
         "failed": 870,
         "skipped": 497,
         "manifest_sha256": "ca40efb681ba5dd45a4a7e71185ea0a1cb83d71e1c12113c1bbe43c72957b6a2",
-        "command": "cargo run --profile release-fast -p tsc_rs_harness --bin baseline-report -- --suite compiler --baseline declarations --no-cache --save-manifest /tmp/compiler-declarations-expanded.json --expand-variants --manifest-schema 2",
-        "unsupported_variant_options": 36
-      },
-      "symbols": {
-        "total": 6529,
-        "passed": 185,
-        "failed": 6249,
-        "skipped": 95,
-        "manifest_sha256": "cb6ae5514dd955dd558bf17a0114307bc00f281b7498128df34d9febc53895de",
-        "command": "cargo run --profile release-fast -p tsc_rs_harness --bin baseline-report -- --suite compiler --baseline symbols --no-cache --save-manifest /tmp/compiler-symbols.json"
-      },
-      "declaration_related": {
-        "total": 1321,
-        "passed": 501
-      },
-      "diagnostics_on_js_skips": {
-        "total": 497,
-        "passed": 316
+        "command": "target/release/baseline-report --suite compiler --baseline declarations --no-cache --save-manifest /tmp/compiler-declarations-expanded.json --expand-variants --manifest-schema 2"
       }
     },
     "conformance": {
       "errors": {
         "total": 5907,
-        "passed": 2985,
-        "failed": 2922,
+        "passed": 3639,
+        "failed": 2268,
         "skipped": 0,
-        "manifest_sha256": "9cf4122cc640ccff9567ea73a7d529dbfa30cdedc46abcdfe4f19dfef2bc306e",
-        "command": "cargo run --profile release-fast -p tsc_rs_harness --bin baseline-report -- --suite conformance --baseline errors --no-cache --save-manifest /tmp/conformance-errors.json"
+        "manifest_sha256": "a09fd002a0ecd4381f3acb0f31c5dc576beb2703360fceeb0bbd2f5a47a5d85b",
+        "command": "target/release/baseline-report --suite conformance --baseline errors --no-cache --save-manifest /tmp/conformance-errors.json"
       },
       "js": {
         "total": 5907,
@@ -71,7 +69,23 @@
         "failed": 0,
         "skipped": 519,
         "manifest_sha256": "68a6f7071c275182dd41f968d8fc4cf8f11846850c79cf8c8cb9536814d36491",
-        "command": "cargo run --profile release-fast -p tsc_rs_harness --bin baseline-report -- --suite conformance --baseline js --no-cache --save-manifest /tmp/conformance-js.json"
+        "command": "target/release/baseline-report --suite conformance --baseline js --no-cache --save-manifest /tmp/conformance-js.json"
+      },
+      "symbols": {
+        "total": 5907,
+        "passed": 1534,
+        "failed": 4083,
+        "skipped": 290,
+        "manifest_sha256": "fe2a1fb15ca5220cb12f9e9b8a50869a352405ff132bf2717716d17ca36d0921",
+        "command": "target/release/baseline-report --suite conformance --baseline symbols --no-cache --save-manifest /tmp/conformance-symbols.json"
+      },
+      "types": {
+        "total": 5907,
+        "passed": 128,
+        "failed": 5489,
+        "skipped": 290,
+        "manifest_sha256": "c4faaf06dfb694e7ac1622a9ace5aa70d5bbd04fd00a31313c3007d6018c45cd",
+        "command": "target/release/baseline-report --suite conformance --baseline types --no-cache --save-manifest /tmp/conformance-types.json"
       },
       "js-expanded": {
         "total": 7618,
@@ -79,8 +93,7 @@
         "failed": 714,
         "skipped": 519,
         "manifest_sha256": "1ec3d74403f869f49e0dc4baf3ba8650af2bf93e13d807235bf3ec3aec7c0a65",
-        "command": "cargo run --profile release-fast -p tsc_rs_harness --bin baseline-report -- --suite conformance --baseline js --no-cache --save-manifest /tmp/conformance-js-expanded.json --expand-variants --manifest-schema 2",
-        "unsupported_variant_options": 17
+        "command": "target/release/baseline-report --suite conformance --baseline js --no-cache --save-manifest /tmp/conformance-js-expanded.json --expand-variants --manifest-schema 2"
       },
       "declarations-expanded": {
         "total": 7618,
@@ -88,24 +101,7 @@
         "failed": 787,
         "skipped": 519,
         "manifest_sha256": "62b8961743c62c348ea2b224bdec1c482dd290857ae7720a70b47809cf340b84",
-        "command": "cargo run --profile release-fast -p tsc_rs_harness --bin baseline-report -- --suite conformance --baseline declarations --no-cache --save-manifest /tmp/conformance-declarations-expanded.json --expand-variants --manifest-schema 2",
-        "unsupported_variant_options": 17
-      },
-      "symbols": {
-        "total": 5907,
-        "passed": 293,
-        "failed": 5324,
-        "skipped": 290,
-        "manifest_sha256": "de62ce9d0cc65b3fe5fadbb9c94fd5a66fe32af8af1aec58a241681ddc6d7540",
-        "command": "cargo run --profile release-fast -p tsc_rs_harness --bin baseline-report -- --suite conformance --baseline symbols --no-cache --save-manifest /tmp/conformance-symbols.json"
-      },
-      "declaration_related": {
-        "total": 1033,
-        "passed": 257
-      },
-      "diagnostics_on_js_skips": {
-        "total": 519,
-        "passed": 297
+        "command": "target/release/baseline-report --suite conformance --baseline declarations --no-cache --save-manifest /tmp/conformance-declarations-expanded.json --expand-variants --manifest-schema 2"
       }
     }
   },
@@ -114,70 +110,97 @@
       "suite": "compiler",
       "cases_total": 7257,
       "cases_with_expected": 3512,
-      "cases_perfect": 1153,
+      "cases_perfect": 1825,
       "expected_diagnostics": 14916,
-      "matched": 6870,
-      "false_negatives": 8046,
-      "false_positives": 3500,
-      "recall": 0.46057924376508447,
-      "precision": 0.6624879459980714,
-      "loc_recall": 0.4964467685706624,
-      "loc_precision": 0.7140790742526519,
-      "command": "cargo run --profile release-fast -p tsc_rs_harness --bin typecheck-report -- --suite compiler --json"
+      "matched": 8871,
+      "false_negatives": 6045,
+      "false_positives": 1513,
+      "recall": 0.5947304907481898,
+      "precision": 0.8542950693374423,
+      "loc_recall": 0.6269106999195495,
+      "loc_precision": 0.900520030816641,
+      "report_sha256": "b0f31a1c56ddcda5632a33e13750e19f253ebd3aca0463a1ecee62cb50a775d0",
+      "command": "target/release/typecheck-report --suite compiler --json --top 1000"
     },
     "conformance": {
       "suite": "conformance",
       "cases_total": 7694,
       "cases_with_expected": 4271,
-      "cases_perfect": 1020,
+      "cases_perfect": 1714,
       "expected_diagnostics": 28735,
-      "matched": 13892,
-      "false_negatives": 14843,
-      "false_positives": 5351,
-      "recall": 0.4834522359491909,
-      "precision": 0.7219248557917165,
-      "loc_recall": 0.5299808595789107,
-      "loc_precision": 0.791404666632022,
-      "command": "cargo run --profile release-fast -p tsc_rs_harness --bin typecheck-report -- --suite conformance --json"
+      "matched": 19236,
+      "false_negatives": 9499,
+      "false_positives": 2582,
+      "recall": 0.669427527405603,
+      "precision": 0.8816573471445596,
+      "loc_recall": 0.6968853314772925,
+      "loc_precision": 0.9178201485012375,
+      "report_sha256": "12ee8146dc7d7680548978444d56829fe7f3b22937ace66f089b0283c5cdf763",
+      "command": "target/release/typecheck-report --suite conformance --json --top 1000"
     }
   },
   "lsp": {
     "quickinfo": {
       "total": 539,
-      "passed": 250,
-      "failed": 279,
+      "passed": 298,
+      "failed": 231,
       "skipped": 10,
-      "command": "cargo run --profile release-fast -p tsc_rs_harness --bin lsp-report -- --op quickinfo --json"
+      "report_sha256": "b50ceb4dd01196db6e3206ef10be5d67815df9d8a7ef92883d9a497872e7f04f",
+      "command": "target/release/lsp-report --op quickinfo --json --top 1000 --show-samples 10000"
     },
     "completions": {
       "total": 1131,
-      "passed": 840,
-      "failed": 291,
+      "passed": 859,
+      "failed": 272,
       "skipped": 0,
-      "command": "cargo run --profile release-fast -p tsc_rs_harness --bin lsp-report -- --op completions --json"
+      "report_sha256": "48e2005bbb3a310aa4241fcffa3bdee56c81bacf420b58bb592728ed4ad51d28",
+      "command": "target/release/lsp-report --op completions --json --top 1000 --show-samples 10000"
     },
     "gotodefinition": {
       "total": 213,
-      "passed": 172,
-      "failed": 39,
+      "passed": 191,
+      "failed": 20,
       "skipped": 2,
-      "command": "cargo run --profile release-fast -p tsc_rs_harness --bin lsp-report -- --op gotodefinition --json"
+      "report_sha256": "08e8d24935ee9e97363326c9cc423f189870497abeb54ea711eabde615689c33",
+      "command": "target/release/lsp-report --op gotodefinition --json --top 1000 --show-samples 10000"
     },
     "findallrefs": {
       "total": 347,
-      "passed": 305,
-      "failed": 42,
+      "passed": 329,
+      "failed": 18,
       "skipped": 0,
-      "command": "cargo run --profile release-fast -p tsc_rs_harness --bin lsp-report -- --op findallrefs --json"
+      "report_sha256": "f713031591a14e441f20a75dfa18d54cf32ee55e0b7a36b44c7dac236ad8747e",
+      "command": "target/release/lsp-report --op findallrefs --json --top 1000 --show-samples 10000"
     },
     "signaturehelp": {
       "total": 152,
-      "passed": 122,
-      "failed": 23,
+      "passed": 123,
+      "failed": 22,
       "skipped": 7,
-      "command": "cargo run --profile release-fast -p tsc_rs_harness --bin lsp-report -- --op signaturehelp --json"
+      "report_sha256": "c18759dcd2c72e5c7a43a6d300a1a87ea65a838677d6c2d8d6d3fac63c5f0db0",
+      "command": "target/release/lsp-report --op signaturehelp --json --top 1000 --show-samples 10000"
     }
   },
-  "diagnostic_accuracy_definition": "Full expanded errors inventory; matches file basename, line and TS code with multiplicity, excluding configuration codes TS5101, TS5102, TS5107 and TS5108. Does not require exact diagnostic message or column.",
-  "lsp_total_definition": "Sum of the five listed operation suites; excludes rename and is not a count of unique source files."
+  "lsp_inventory": {
+    "total": 6320,
+    "passed": 1800,
+    "failed": 563,
+    "skipped": 3957,
+    "report_sha256": "c1357d8f2f0b27bab048727ff3833cd2752a300d30fa3e77bf5c5815e4be2573",
+    "command": "target/release/lsp-report --op all --json --top 1000 --show-samples 10000"
+  },
+  "rust_tests": {
+    "total": 3411,
+    "passed": 3374,
+    "failed": 0,
+    "skipped": 37,
+    "report_sha256": "5d8e8661dac4db1c036c61d5d811039c4de4bc9d66e43e5d6614607ae3269908",
+    "command": "cargo test --workspace"
+  },
+  "validation": {
+    "make_ci": "passed",
+    "ci_log_sha256": "c35203878d427f51089c53e5843720d4a355abe9dfb8dae25f62e431c84ee22b"
+  },
+  "diagnostic_accuracy_definition": "Full expanded errors inventory; matches file basename, line and TS code with multiplicity, excluding configuration-deprecation codes. Does not require exact diagnostic message or column.",
+  "lsp_total_definition": "The per-operation tables cover five supported operations. The full inventory includes unsupported cases and reports their skips separately; no skip is a pass."
 }

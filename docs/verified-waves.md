@@ -1485,3 +1485,23 @@ and `make ci` passes. The complete LSP comparison retains 1,800 passes,
 563 failures, and 3,957 skips with an identical failing-case set (bucket labels
 can vary when a case has multiple failure kinds). Evidence is in
 `/tmp/ts-rs-protected-access-20260930/`, using the `final-` manifests and logs.
+
+## 2026-09-30: public compatibility snapshot
+
+Public `main` at `7643258e9` contains all ten verified September 30 compiler,
+checker, and symbol batches. Fresh reports from a release build of the public
+checkout match all twelve default/expanded baseline manifests and both
+precision reports of the preceding protected-access verification. The full
+LSP report retains the same complete failing-case set, and the five supported
+operations were rerun individually.
+
+The public workspace passes 3,374 Rust tests with zero failures and 37 ignored;
+`make ci` passes. The public workspace has fewer crates than the internal
+workspace used in the earlier wave logs, so its Rust count is reported
+separately. `docs/compatibility-metrics.json` now records this public snapshot,
+including source commit, report hashes, skip counts, and reproduction commands.
+The former snapshot remains at `docs/compatibility-metrics-2026-09-07.json`.
+
+Publish code and metrics to `benfavre/ts-rs` on `main` before synchronizing
+https://ts-rs.bext.dev/. The site must consume committed published data and
+must not present working-tree changes as measurements from the public commit.
