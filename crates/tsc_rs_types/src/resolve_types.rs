@@ -685,6 +685,20 @@ impl TypeChecker {
                     }) {
                         return resolved.clone();
                     }
+                    // `typeof C` for a class declared in this scope is the
+                    // class's constructor type, the same value type `C`
+                    // carries (member access then reports TS2339 on
+                    // instance-only members).
+                    if let Some(Type::TypeReference(value_name, value_args)) =
+                        self.lookup_var(&name)
+                    {
+                        if value_args.is_empty()
+                            && value_name.strip_prefix("typeof ") == Some(name.as_str())
+                            && self.class_info.contains_key(name.as_str())
+                        {
+                            return Type::TypeReference(value_name.clone(), Arc::from([]));
+                        }
+                    }
                 }
                 Type::Typeof(name)
             }

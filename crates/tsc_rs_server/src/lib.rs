@@ -3009,10 +3009,9 @@ pub fn resolve_symbol_type(
     // 1. QueryEngine symbol type (scoped to the declaring file)
     qe_sym_id
         .and_then(|qid| match preferred_file.as_deref() {
-            Some(f) => query_engine
-                .get_symbol_type_in_file(qid, f)
-                .or_else(|| query_engine.get_symbol_type(qid)),
-            None => query_engine.get_symbol_type(qid),
+            // An id from a known file is meaningless in any other file's table.
+            Some(f) if !f.is_empty() => query_engine.get_symbol_type_in_file(qid, f),
+            _ => query_engine.get_symbol_type(qid),
         })
         .and_then(|tid| query_engine.type_to_string(tid))
         .or_else(|| {
@@ -3056,9 +3055,8 @@ pub fn resolve_symbol_type(
         .or_else(|| {
             // 5. QueryEngine: try finding symbol by name if qe_sym_id lookup failed
             if qe_sym_id.is_none() {
-                let qe_results = query_engine.find_symbol(&sym.name);
-                for &qe_id in &qe_results {
-                    if let Some(tid) = query_engine.get_symbol_type(qe_id) {
+                for info in query_engine.find_symbol_infos(&sym.name) {
+                    if let Some(tid) = info.type_id {
                         if let Some(ts) = query_engine.type_to_string(tid) {
                             return Some(ts);
                         }
@@ -5789,9 +5787,7 @@ fn resolve_computed_property_override(
     }
 
     // Also try cross-file lookup via QueryEngine
-    let results = query_engine.find_symbol(&parent_name);
-    for &qe_id in &results {
-        let locs = query_engine.get_symbol_locations(qe_id);
+    for locs in query_engine.find_symbol_declarations(&parent_name) {
         for (file, _span) in &locs {
             if let Some(other_source) = query_engine.get_source_file(file) {
                 if let Some(other_st) = query_engine.get_file_symbols(file) {
@@ -8923,11 +8919,10 @@ fn hover_at_impl(
                     .symbols
                     .iter()
                     .any(|s| s.name == *rn && s.flags & tsc_rs_symbols::SYM_ENUM != 0)
-                    || query_engine.find_symbol(rn).iter().any(|&qid| {
-                        query_engine
-                            .get_symbol_info(qid)
-                            .map_or(false, |info| info.kind == SymbolKind::Enum)
-                    })
+                    || query_engine
+                        .find_symbol_infos(rn)
+                        .iter()
+                        .any(|info| info.kind == SymbolKind::Enum)
             });
             let qualified_name = if let Some(ref mh) = member_hover {
                 let after_paren = mh.find(") ").map(|p| &mh[p + 2..]).unwrap_or(mh);
@@ -11560,13 +11555,9 @@ fn find_symbol_at_offset_or_by_name(
         return None;
     }
 
-    // Try QueryEngine find_symbol first (multi-file)
-    let qe_results = query_engine.find_symbol(&token);
-    if let Some(&first) = qe_results.first() {
-        return u32::try_from(first).ok();
-    }
-
-    // SymbolTable name lookup (current file)
+    // SymbolTable name lookup (current file). QueryEngine ids are per-file,
+    // and callers index `sym_table` with the result, so a by-name lookup
+    // across files would return an unrelated symbol.
     if let Some(sid) = find_symbol_by_name(sym_table, &token) {
         return Some(sid);
     }
@@ -13335,8 +13326,21 @@ fn resolve_receiver_type(
             if is_type_decl {
                 return Some(receiver_name.to_string());
             }
-            let qe_syms = query_engine.find_symbol(receiver_name);
-            let qe_id = qe_syms.first().copied();
+            let own_decl = sym.declarations.first();
+            let qe_id = query_engine
+                .find_symbol_infos(receiver_name)
+                .into_iter()
+                .find(|info| {
+                    own_decl.is_some_and(|d| {
+                        info.declarations.iter().any(|(f, sp)| {
+                            sp.start == d.span.start
+                                && (d.file_name.is_empty()
+                                    || normalize_path_for_scope(f)
+                                        == normalize_path_for_scope(&d.file_name))
+                        })
+                    })
+                })
+                .map(|info| info.id);
             if let Some(ty) = resolve_symbol_type(
                 sym,
                 check_out,
@@ -13354,14 +13358,11 @@ fn resolve_receiver_type(
     // Strategy 3: Check QueryEngine for a global type matching the receiver name
     // This handles cases like `JSON`, `Math`, `console` where the variable name
     // matches the interface name
-    let qe_syms = query_engine.find_symbol(receiver_name);
-    for &qe_id in &qe_syms {
-        if let Some(info) = query_engine.get_symbol_info(qe_id) {
-            if let Some(tid) = info.type_id {
-                if let Some(ts) = query_engine.type_to_string(tid) {
-                    if ts != "any" {
-                        return Some(ts);
-                    }
+    for info in query_engine.find_symbol_infos(receiver_name) {
+        if let Some(tid) = info.type_id {
+            if let Some(ts) = query_engine.type_to_string(tid) {
+                if ts != "any" {
+                    return Some(ts);
                 }
             }
         }
@@ -16489,6 +16490,18 @@ fn import_statement_completions(
     if rest.contains("from") || rest.contains('"') || rest.contains('\'') || rest.contains('*') {
         return None;
     }
+    // `import { | } from "m"`: the module is known — that's the specifier
+    // list's job, not an auto-import.
+    let line_after = source[p..].lines().next().unwrap_or("");
+    if let Some(close) = line_after.find('}') {
+        let tail = line_after[close + 1..].trim_start();
+        if tail
+            .strip_prefix("from")
+            .is_some_and(|t| t.trim_start().starts_with(['"', '\'']))
+        {
+            return None;
+        }
+    }
     let mut r = rest.trim_start();
     let type_only = if let Some(after) = r.strip_prefix("type") {
         // `type` must be a completed keyword followed by more input —
@@ -18325,6 +18338,30 @@ pub fn completions_at_with_prefs(
     file_name: &str,
     include_module_exports: bool,
 ) -> Vec<Value> {
+    let prev_async =
+        COMPLETION_IN_ASYNC.with(|c| c.replace(enclosing_function_is_async(source, offset)));
+    let out = completions_at_with_prefs_inner(
+        sym_table,
+        check_out,
+        source,
+        offset,
+        query_engine,
+        file_name,
+        include_module_exports,
+    );
+    COMPLETION_IN_ASYNC.with(|c| c.set(prev_async));
+    out
+}
+
+fn completions_at_with_prefs_inner(
+    sym_table: &SymbolTable,
+    check_out: &TypeCheckOutput,
+    source: &str,
+    offset: u32,
+    query_engine: &QueryEngine,
+    file_name: &str,
+    include_module_exports: bool,
+) -> Vec<Value> {
     let ctx = string_context_at(source, offset);
 
     // `/// <reference path="…"` — file path completions inside the
@@ -18841,7 +18878,7 @@ pub fn completions_at_with_prefs(
 
     // Check if we're in an import/export specifier context
     if let Some(import_export_items) =
-        import_export_specifier_completions(source, offset, sym_table, query_engine)
+        import_export_specifier_completions(source, offset, sym_table, query_engine, file_name)
     {
         return import_export_items;
     }
@@ -18905,6 +18942,19 @@ pub fn completions_at_with_prefs(
     );
     if let Some(entries) = exhaustive_case {
         items.extend(entries);
+    }
+    if !in_type_context {
+        for entry in
+            contextual_literal_value_entries(source, offset, sym_table, check_out, query_engine)
+        {
+            let label = entry.get("label").and_then(|l| l.as_str()).unwrap_or("");
+            if !items
+                .iter()
+                .any(|v| v.get("label").and_then(|l| l.as_str()) == Some(label))
+            {
+                items.push(entry);
+            }
+        }
     }
     // An index-signature's parameter (`[foo: string]: typeof |`) is in
     // scope for its own type annotation but is never bound as a symbol.
@@ -20448,6 +20498,37 @@ fn object_literal_contextual_completions(
         }
     }
 
+    // Arrow-body object literal passed as an argument: `F(() => ({ | }))`.
+    // Its contextual type is the return type of F's parameter function type.
+    if prev == b'(' {
+        let mut q = p - 1;
+        while q > 0 && bytes[q - 1].is_ascii_whitespace() {
+            q -= 1;
+        }
+        if q >= 2 && &bytes[q - 2..q] == b"=>" {
+            if let Some(props) =
+                arrow_return_object_properties(source, q - 2, sym_table, check_out, query_engine)
+            {
+                let already_present = collect_existing_properties(source, open_brace, off);
+                let items: Vec<Value> = props
+                    .into_iter()
+                    .filter(|(n, _)| in_string_name || !already_present.contains(n.as_str()))
+                    .map(|(name, kind)| {
+                        let label = if in_string_name {
+                            name
+                        } else {
+                            quote_prop_label(&name)
+                        };
+                        json!({"label": label, "kind": kind})
+                    })
+                    .collect();
+                if !items.is_empty() {
+                    return Some(items);
+                }
+            }
+        }
+    }
+
     // Nested member position: `outer = { files: { | } }` — resolve the outer
     // object's contextual type, then this member's declared type.
     if prev == b':' {
@@ -20657,14 +20738,540 @@ fn find_param_type_properties(
     None
 }
 
+/// Literal values of the contextual type at an expression position, as
+/// completion entries (`"a"`, `0`): tsc offers them alongside scope names
+/// for `const t: T = |`, `f(|)` and `f({ key: | })` / `f({ key: [|] })`,
+/// with a called generic function's type parameters read as their
+/// constraints.
+fn contextual_literal_value_entries(
+    source: &str,
+    offset: u32,
+    sym_table: &SymbolTable,
+    check_out: &TypeCheckOutput,
+    query_engine: &QueryEngine,
+) -> Vec<Value> {
+    let bytes = source.as_bytes();
+    let mut start = (offset as usize).min(bytes.len());
+    while start > 0 && is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let Some((ty, generic_fn)) = contextual_type_text_at(source, start, sym_table, check_out, 0)
+    else {
+        return Vec::new();
+    };
+    let mut labels: Vec<String> = Vec::new();
+    collect_literal_labels(
+        &ty,
+        generic_fn.as_deref(),
+        source,
+        sym_table,
+        query_engine,
+        0,
+        &mut labels,
+    );
+    labels
+        .into_iter()
+        .map(|l| json!({ "label": l, "kind": 21 }))
+        .collect()
+}
+
+/// Previous non-whitespace byte index before `pos`.
+fn prev_non_ws(bytes: &[u8], pos: usize) -> Option<usize> {
+    let mut k = pos;
+    while k > 0 {
+        k -= 1;
+        if !bytes[k].is_ascii_whitespace() {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// The innermost unmatched `(`, `[` or `{` before `pos`, with the number of
+/// top-level commas between it and `pos`.
+fn enclosing_open_bracket(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let mut depth = 0i32;
+    let mut commas = 0usize;
+    let mut k = pos;
+    while k > 0 {
+        k -= 1;
+        match bytes[k] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' | b'[' | b'{' => {
+                if depth == 0 {
+                    return Some((k, commas));
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => commas += 1,
+            b';' if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Written type of the expression starting at `pos`, plus the name of the
+/// generic function whose parameters it came from (for constraints).
+fn contextual_type_text_at(
+    source: &str,
+    pos: usize,
+    sym_table: &SymbolTable,
+    check_out: &TypeCheckOutput,
+    depth: u32,
+) -> Option<(String, Option<String>)> {
+    if depth > 6 {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let k = prev_non_ws(bytes, pos)?;
+    match bytes[k] {
+        b'=' => {
+            if k > 0
+                && matches!(
+                    bytes[k - 1],
+                    b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/'
+                )
+            {
+                return None;
+            }
+            // `(const|let|var) NAME: TYPE =`
+            let line_start = source[..k].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let head = &source[line_start..k];
+            let head = head.trim_start();
+            let rest = ["const ", "let ", "var "]
+                .iter()
+                .find_map(|kw| head.strip_prefix(kw))?;
+            let colon = rest.find(':')?;
+            let ty = rest[colon + 1..].trim();
+            (!ty.is_empty()).then(|| (ty.to_string(), None))
+        }
+        b'(' | b',' | b'[' => {
+            let (open, commas) = enclosing_open_bracket(bytes, pos)?;
+            match bytes[open] {
+                b'(' => {
+                    let fn_name = extract_token_at(source, open.saturating_sub(1) as u32);
+                    if fn_name.is_empty() {
+                        return None;
+                    }
+                    let fn_ty = sym_table
+                        .symbols
+                        .iter()
+                        .filter(|s| s.name == fn_name)
+                        .flat_map(|s| s.declarations.iter())
+                        .find_map(|d| check_out.expression_types.get(&d.span.start))?;
+                    let param = extract_param_type_from_fn_type(fn_ty, commas)?;
+                    Some((param, Some(fn_name)))
+                }
+                b'[' => {
+                    let (parent, generic) =
+                        contextual_type_text_at(source, open, sym_table, check_out, depth + 1)?;
+                    let parent = parent.trim();
+                    let elem = parent
+                        .strip_suffix("[]")
+                        .map(|e| e.trim().to_string())
+                        .or_else(|| {
+                            parent
+                                .strip_prefix("Array<")
+                                .and_then(|r| r.strip_suffix('>'))
+                                .map(|e| e.trim().to_string())
+                        })?;
+                    let elem = elem
+                        .strip_prefix('(')
+                        .and_then(|r| r.strip_suffix(')'))
+                        .map(str::to_string)
+                        .unwrap_or(elem);
+                    Some((elem, generic))
+                }
+                _ => None,
+            }
+        }
+        b':' => {
+            // Object-literal member value: `{ ..., name: | }`.
+            let mut n_end = k;
+            while n_end > 0 && bytes[n_end - 1].is_ascii_whitespace() {
+                n_end -= 1;
+            }
+            let mut n_start = n_end;
+            while n_start > 0 && is_ident_byte(bytes[n_start - 1]) {
+                n_start -= 1;
+            }
+            let name = &source[n_start..n_end];
+            if name.is_empty() {
+                return None;
+            }
+            let (open, _) = enclosing_open_bracket(bytes, n_start)?;
+            if bytes[open] != b'{' {
+                return None;
+            }
+            let (parent, generic) =
+                contextual_type_text_at(source, open, sym_table, check_out, depth + 1)?;
+            let parent = parent.trim();
+            let member = object_type_member_text(parent, name).or_else(|| {
+                // A named object type: its written interface body.
+                if !parent.bytes().all(is_ident_byte) {
+                    return None;
+                }
+                let body = interface_body_text(source, parent)?;
+                object_type_member_text(&body, name)
+            })?;
+            Some((member, generic))
+        }
+        _ => None,
+    }
+}
+
+/// `{ … }` body of a non-generic `interface NAME { … }` in `source`.
+fn interface_body_text(source: &str, name: &str) -> Option<String> {
+    let pat = format!("interface {}", name);
+    let b = source.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(&pat) {
+        let pos = from + rel;
+        from = pos + pat.len();
+        if pos > 0 && is_ident_byte(b[pos - 1]) {
+            continue;
+        }
+        let after = source[from..].trim_start();
+        if !after.starts_with('{') {
+            continue;
+        }
+        let open = source.len() - after.len();
+        let mut depth = 0i32;
+        for i in open..b.len() {
+            match b[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(source[open..=i].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Written type of member `name` in an object type literal `{ a: T; b?: U }`.
+fn object_type_member_text(ty: &str, name: &str) -> Option<String> {
+    let inner = ty.strip_prefix('{')?.strip_suffix('}')?;
+    let b = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut seg_start = 0;
+    let mut segs: Vec<&str> = Vec::new();
+    for i in 0..b.len() {
+        match b[i] {
+            b'(' | b'[' | b'{' | b'<' => depth += 1,
+            b'>' if i > 0 && b[i - 1] == b'=' => {}
+            b')' | b']' | b'}' | b'>' => depth -= 1,
+            b';' | b',' | b'\n' if depth == 0 => {
+                segs.push(&inner[seg_start..i]);
+                seg_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    segs.push(&inner[seg_start..]);
+    for seg in segs {
+        let seg = seg.trim();
+        let Some(rest) = seg.strip_prefix(name) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix('?').unwrap_or(rest).trim_start();
+        if let Some(t) = rest.strip_prefix(':') {
+            return Some(t.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Declared constraint of type parameter `param` of function `fn_name`,
+/// read from its written declaration `fn_name<…, param extends C, …>`.
+fn type_param_constraint_text(source: &str, fn_name: &str, param: &str) -> Option<String> {
+    let pat = format!("{}<", fn_name);
+    let pos = source.find(&pat)?;
+    let list_start = pos + pat.len();
+    let b = source.as_bytes();
+    let mut depth = 1i32;
+    let mut end = list_start;
+    while end < b.len() {
+        match b[end] {
+            b'<' | b'(' | b'[' | b'{' => depth += 1,
+            b'>' if end > 0 && b[end - 1] == b'=' => {}
+            b'>' | b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        end += 1;
+    }
+    let list = &source[list_start..end.min(source.len())];
+    let lb = list.as_bytes();
+    let mut d = 0i32;
+    let mut seg_start = 0;
+    let mut segs = Vec::new();
+    for i in 0..lb.len() {
+        match lb[i] {
+            b'<' | b'(' | b'[' | b'{' => d += 1,
+            b'>' if i > 0 && lb[i - 1] == b'=' => {}
+            b'>' | b')' | b']' | b'}' => d -= 1,
+            b',' if d == 0 => {
+                segs.push(&list[seg_start..i]);
+                seg_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    segs.push(&list[seg_start..]);
+    for seg in segs {
+        let seg = seg.trim();
+        let Some(rest) = seg.strip_prefix(param) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if let Some(c) = rest.strip_prefix("extends") {
+            let c = c.split(" = ").next().unwrap_or(c).trim();
+            return Some(c.to_string());
+        }
+        return None;
+    }
+    None
+}
+
+/// Literal members of a written type as completion labels: string literals
+/// double-quoted, numeric literals as written.
+fn collect_literal_labels(
+    ty: &str,
+    generic_fn: Option<&str>,
+    source: &str,
+    sym_table: &SymbolTable,
+    query_engine: &QueryEngine,
+    depth: u32,
+    out: &mut Vec<String>,
+) {
+    if depth > 5 {
+        return;
+    }
+    let ty = ty.trim();
+    let ty = ty
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(ty)
+        .trim();
+    let parts = split_union_type(ty);
+    if parts.len() > 1 {
+        for p in parts {
+            collect_literal_labels(
+                &p,
+                generic_fn,
+                source,
+                sym_table,
+                query_engine,
+                depth + 1,
+                out,
+            );
+        }
+        return;
+    }
+    let push = |out: &mut Vec<String>, l: String| {
+        if !out.contains(&l) {
+            out.push(l);
+        }
+    };
+    let first = ty.as_bytes().first().copied();
+    if matches!(first, Some(b'"' | b'\'')) && ty.len() >= 2 && ty.ends_with(first.unwrap() as char)
+    {
+        push(out, format!("\"{}\"", &ty[1..ty.len() - 1]));
+        return;
+    }
+    if !ty.is_empty()
+        && ty
+            .trim_start_matches('-')
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'.')
+        && ty.bytes().any(|b| b.is_ascii_digit())
+    {
+        push(out, ty.to_string());
+        return;
+    }
+    if let Some(target) = ty.strip_prefix("keyof typeof ") {
+        let target = target.trim();
+        for sym in &sym_table.symbols {
+            if sym.name == target && sym.flags & tsc_rs_symbols::SYM_ENUM != 0 {
+                let mut names: Vec<(u32, String)> = sym
+                    .exports
+                    .iter()
+                    .chain(sym.members.iter())
+                    .filter_map(|(n, &id)| {
+                        let m = sym_table.get_symbol(id)?;
+                        let st = m.declarations.first().map(|d| d.span.start).unwrap_or(0);
+                        Some((st, n.clone()))
+                    })
+                    .collect();
+                names.sort();
+                names.dedup();
+                for (_, n) in names {
+                    push(out, format!("\"{}\"", n));
+                }
+                return;
+            }
+        }
+        return;
+    }
+    if let Some(target) = ty.strip_prefix("keyof ") {
+        if let Some(props) =
+            extract_properties_from_type_str(target.trim(), sym_table, query_engine)
+        {
+            for (n, _) in props {
+                push(out, format!("\"{}\"", n));
+            }
+        }
+        return;
+    }
+    if !ty.is_empty() && ty.bytes().all(is_ident_byte) {
+        if let Some(f) = generic_fn {
+            if let Some(c) = type_param_constraint_text(source, f, ty) {
+                collect_literal_labels(&c, None, source, sym_table, query_engine, depth + 1, out);
+                return;
+            }
+        }
+        if let Some(body) = type_alias_body_text(ty, sym_table, query_engine) {
+            collect_literal_labels(&body, None, source, sym_table, query_engine, depth + 1, out);
+        }
+    }
+}
+
+/// For an arrow function whose `=>` starts at `arrow_pos` and which is passed
+/// directly as a call argument (`F(a, () => …)`), the properties of the
+/// return type of F's corresponding function-typed parameter.
+fn arrow_return_object_properties(
+    source: &str,
+    arrow_pos: usize,
+    sym_table: &SymbolTable,
+    check_out: &TypeCheckOutput,
+    query_engine: &QueryEngine,
+) -> Option<Vec<(String, u64)>> {
+    let bytes = source.as_bytes();
+    // Arrow parameters: `(…)` or a bare identifier.
+    let mut s = arrow_pos;
+    while s > 0 && bytes[s - 1].is_ascii_whitespace() {
+        s -= 1;
+    }
+    if s > 0 && bytes[s - 1] == b')' {
+        let mut depth = 0i32;
+        while s > 0 {
+            s -= 1;
+            match bytes[s] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else {
+        while s > 0 && is_ident_byte(bytes[s - 1]) {
+            s -= 1;
+        }
+    }
+    // `async` modifier.
+    let mut t = s;
+    while t > 0 && bytes[t - 1].is_ascii_whitespace() {
+        t -= 1;
+    }
+    if t >= 5 && &source[t - 5..t] == "async" {
+        t -= 5;
+        while t > 0 && bytes[t - 1].is_ascii_whitespace() {
+            t -= 1;
+        }
+    }
+    if t == 0 || !matches!(bytes[t - 1], b'(' | b',') {
+        return None;
+    }
+    // Argument index and the call's open paren.
+    let mut commas = 0usize;
+    let mut depth = 0i32;
+    let mut k = t;
+    let mut paren = None;
+    while k > 0 {
+        k -= 1;
+        match bytes[k] {
+            b')' | b'}' | b']' => depth += 1,
+            b'[' | b'{' => depth -= 1,
+            b'(' => {
+                if depth == 0 {
+                    paren = Some(k);
+                    break;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => commas += 1,
+            _ => {}
+        }
+    }
+    let paren = paren?;
+    let fn_name = extract_token_at(source, paren.saturating_sub(1) as u32);
+    if fn_name.is_empty() {
+        return None;
+    }
+    for sym in &sym_table.symbols {
+        if sym.name != fn_name {
+            continue;
+        }
+        for decl in &sym.declarations {
+            let Some(ty_str) = check_out.expression_types.get(&decl.span.start) else {
+                continue;
+            };
+            let param_ty = extract_param_type_from_fn_type(ty_str, commas)?;
+            let param_ty = param_ty.trim();
+            let param_ty = param_ty
+                .strip_prefix('(')
+                .and_then(|r| r.strip_suffix(')'))
+                .filter(|inner| inner.contains("=>"))
+                .unwrap_or(param_ty);
+            // Return type: after the top-level `=>` of the function type.
+            let pb = param_ty.as_bytes();
+            let mut d = 0i32;
+            let mut ret = None;
+            for i in 0..pb.len() {
+                match pb[i] {
+                    b'(' | b'[' | b'{' | b'<' => d += 1,
+                    b'>' if i > 0 && pb[i - 1] == b'=' => {
+                        if d == 0 {
+                            ret = Some(param_ty[i + 1..].trim());
+                            break;
+                        }
+                    }
+                    b')' | b']' | b'}' | b'>' => d -= 1,
+                    _ => {}
+                }
+            }
+            return extract_properties_from_type_str(ret?, sym_table, query_engine);
+        }
+    }
+    None
+}
+
 /// Extract the type string of the nth parameter from a function type string.
 fn extract_param_type_from_fn_type(fn_type: &str, param_index: usize) -> Option<String> {
     // Pattern: (name1: Type1, name2: Type2) => ReturnType
     let paren_start = fn_type.find('(')?;
     let mut depth = 0i32;
     let mut paren_end = paren_start;
+    let fb = fn_type.as_bytes();
     for (i, b) in fn_type[paren_start..].bytes().enumerate() {
         match b {
+            // The `>` of an arrow `=>` closes nothing.
+            b'>' if fb[paren_start + i - 1] == b'=' => {}
             b'(' | b'<' | b'{' | b'[' => depth += 1,
             b')' | b'>' | b'}' | b']' => {
                 depth -= 1;
@@ -20682,8 +21289,10 @@ fn extract_param_type_from_fn_type(fn_type: &str, param_index: usize) -> Option<
     let mut params = Vec::new();
     let mut start = 0;
     let mut depth = 0i32;
+    let pb = params_str.as_bytes();
     for (i, b) in params_str.bytes().enumerate() {
         match b {
+            b'>' if i > 0 && pb[i - 1] == b'=' => {}
             b'(' | b'<' | b'{' | b'[' => depth += 1,
             b')' | b'>' | b'}' | b']' => depth -= 1,
             b',' if depth == 0 => {
@@ -20903,6 +21512,93 @@ fn extract_properties_from_type_str(
         return Some(props);
     }
 
+    // Non-generic type alias: expand its written body (`type T = { a: 1 }`).
+    if !ty_name.is_empty() && ty_name.bytes().all(is_ident_byte) {
+        thread_local! {
+            static ALIAS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        if ALIAS_DEPTH.with(|d| d.get()) < 4 {
+            if let Some(body) = type_alias_body_text(ty_name, sym_table, query_engine) {
+                ALIAS_DEPTH.with(|d| d.set(d.get() + 1));
+                let out = extract_properties_from_type_str(&body, sym_table, query_engine);
+                ALIAS_DEPTH.with(|d| d.set(d.get() - 1));
+                return out;
+            }
+        }
+    }
+
+    None
+}
+
+/// Written body of a non-generic `type NAME = …` alias declared in any
+/// analyzed file (the current file's binder output first).
+fn type_alias_body_text(
+    name: &str,
+    sym_table: &SymbolTable,
+    query_engine: &QueryEngine,
+) -> Option<String> {
+    let is_alias = |t: &SymbolTable| {
+        t.symbols
+            .iter()
+            .any(|s| s.name == name && s.flags & tsc_rs_symbols::SYM_TYPE_ALIAS != 0)
+    };
+    let mut files = query_engine.source_file_names();
+    files.sort();
+    if !is_alias(sym_table)
+        && !files.iter().any(|f| {
+            query_engine
+                .get_file_symbols(f)
+                .is_some_and(|t| is_alias(t))
+        })
+    {
+        return None;
+    }
+    let pattern = format!("type {}", name);
+    for f in files {
+        let Some(text) = query_engine.get_source_file(&f) else {
+            continue;
+        };
+        let bytes = text.as_bytes();
+        let mut from = 0;
+        while let Some(rel) = text[from..].find(&pattern) {
+            let pos = from + rel;
+            from = pos + pattern.len();
+            if pos > 0 && is_ident_byte(bytes[pos - 1]) {
+                continue;
+            }
+            let after = text[from..].trim_start();
+            // Generic aliases need instantiation — not handled here.
+            let Some(rest) = after.strip_prefix('=') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            let rb = rest.as_bytes();
+            let mut depth = 0i32;
+            let mut end = rest.len();
+            for (i, &b) in rb.iter().enumerate() {
+                match b {
+                    b'(' | b'[' | b'{' | b'<' => depth += 1,
+                    b'>' if i > 0 && rb[i - 1] == b'=' => {}
+                    b')' | b']' | b'}' | b'>' => {
+                        depth -= 1;
+                        if depth == 0 && b == b'}' && rb[0] == b'{' {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    b';' | b'\n' if depth == 0 => {
+                        end = i;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let body = rest[..end].trim();
+            if !body.is_empty() {
+                return Some(body.to_string());
+            }
+        }
+    }
     None
 }
 
@@ -23179,6 +23875,7 @@ fn import_export_specifier_completions(
     offset: u32,
     sym_table: &SymbolTable,
     query_engine: &QueryEngine,
+    file_name: &str,
 ) -> Option<Vec<Value>> {
     let bytes = source.as_bytes();
     let off = offset as usize;
@@ -23290,12 +23987,7 @@ fn import_export_specifier_completions(
             None
         };
 
-        if let Some(_module) = module_path {
-            // For export { ... } from "module", we need the exports of the source module
-            // For import { ... } from "module", we need the exports of the module
-            // Currently we can't resolve cross-file modules, so return a simplified response
-            // that at least doesn't pollute with keywords and local scope variables
-
+        if let Some(module) = module_path {
             // Collect what's already imported/exported in the specifier list
             let specifier_text = &source[open_brace + 1..off.min(close_brace)];
             let already_used: HashSet<&str> = specifier_text
@@ -23316,10 +24008,36 @@ fn import_export_specifier_completions(
                 })
                 .collect();
 
-            // For re-exports (`export { ... } from "mod"`), try to find symbols from the source
-            // For now, return empty to avoid polluting with wrong items
-            // This is better than returning all scope variables + keywords
-            return Some(Vec::new());
+            // The partial name being typed is not "already used".
+            let partial_start = {
+                let mut q = off.min(bytes.len());
+                while q > open_brace + 1 && is_ident_byte(bytes[q - 1]) {
+                    q -= 1;
+                }
+                q
+            };
+            let partial = &source[partial_start..off.min(bytes.len())];
+            let mut entries = ambient_module_export_entries(sym_table, query_engine, module);
+            if entries.is_empty() {
+                entries = module_export_entries(query_engine, module, file_name);
+            }
+            let mut items: Vec<Value> = entries
+                .into_iter()
+                .filter(|(n, _)| n == partial || !already_used.contains(n.as_str()))
+                .map(|(n, k)| json!({ "label": n, "kind": k }))
+                .collect();
+            if !items.is_empty() {
+                let lower = file_name.to_ascii_lowercase();
+                let is_js = [".js", ".jsx", ".mjs", ".cjs"]
+                    .iter()
+                    .any(|e| lower.ends_with(e));
+                // `import type { … }` already carries the modifier.
+                let clause_head = source[..open_brace].trim_end();
+                if !is_js && !clause_head.ends_with("type") {
+                    items.push(json!({ "label": "type", "kind": 14 }));
+                }
+            }
+            return Some(items);
         }
     }
 
@@ -23339,7 +24057,45 @@ fn import_export_specifier_completions(
             })
             .collect();
 
-        // Return local symbols that haven't been used yet
+        // Return module-level local symbols that haven't been used yet
+        // (a block-scoped declaration can't be exported by name).
+        // The exporting container: a namespace/module body the clause sits
+        // directly in, else the file (an export inside any other block is
+        // invalid and tsc still offers the file's declarations).
+        let clause_depth = brace_depth_before(source, open_brace);
+        let target_depth = if clause_depth > 0 {
+            let mut d = 0i32;
+            let mut k = open_brace;
+            let mut enclosing = None;
+            while k > 0 {
+                k -= 1;
+                match bytes[k] {
+                    b'}' => d += 1,
+                    b'{' if d == 0 => {
+                        enclosing = Some(k);
+                        break;
+                    }
+                    b'{' => d -= 1,
+                    _ => {}
+                }
+            }
+            let head = enclosing
+                .map(|e| {
+                    let ls = source[..e].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    source[ls..e].to_string()
+                })
+                .unwrap_or_default();
+            let is_module_body = head
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|w| w == "namespace" || w == "module");
+            if is_module_body {
+                clause_depth
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         let mut items = Vec::new();
         for sym in &sym_table.symbols {
             if sym.name.is_empty() || sym.name.starts_with("__") {
@@ -23348,16 +24104,108 @@ fn import_export_specifier_completions(
             if already_used.contains(sym.name.as_str()) {
                 continue;
             }
+            let top_level = sym.declarations.iter().any(|d| {
+                (d.file_name.is_empty() || d.file_name == file_name)
+                    && brace_depth_before(source, d.span.start as usize) == target_depth
+            });
+            if !top_level {
+                continue;
+            }
             let kind = completion_kind_for_flags(sym.flags);
             items.push(json!({
                 "label": &sym.name,
                 "kind": kind,
             }));
         }
+        let lower = file_name.to_ascii_lowercase();
+        if ![".js", ".jsx", ".mjs", ".cjs"]
+            .iter()
+            .any(|e| lower.ends_with(e))
+        {
+            items.push(json!({ "label": "type", "kind": 14 }));
+        }
         return Some(items);
     }
 
     None
+}
+
+/// `{`/`}` nesting depth at `pos`, skipping string literals and comments.
+fn brace_depth_before(source: &str, pos: usize) -> i32 {
+    let bytes = source.as_bytes();
+    let end = pos.min(bytes.len());
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < end {
+        match bytes[i] {
+            b'/' if i + 1 < end && bytes[i + 1] == b'/' => {
+                while i < end && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if i + 1 < end && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < end && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            q @ (b'"' | b'\'' | b'`') => {
+                i += 1;
+                while i < end && bytes[i] != q {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// Exports of an ambient `declare module "spec" { ... }` block, from the
+/// current file's binder output first, then any other analyzed file.
+fn ambient_module_export_entries(
+    sym_table: &SymbolTable,
+    query_engine: &QueryEngine,
+    spec: &str,
+) -> Vec<(String, u64)> {
+    let collect = |table: &SymbolTable| -> Option<Vec<(String, u64)>> {
+        let &mod_id = table.ambient_modules.get(spec)?;
+        let module = table.get_symbol(mod_id)?;
+        let mut out: Vec<(String, u64)> = Vec::new();
+        for (name, &id) in &module.exports {
+            if name == "default" || name == "export=" {
+                continue;
+            }
+            let Some(sym) = table.get_symbol(id) else {
+                continue;
+            };
+            out.push((name.clone(), completion_kind_for_flags(sym.flags) as u64));
+        }
+        out.sort();
+        Some(out)
+    };
+    if let Some(out) = collect(sym_table) {
+        return out;
+    }
+    let mut files = query_engine.source_file_names();
+    files.sort();
+    for f in files {
+        if let Some(table) = query_engine.get_file_symbols(&f) {
+            if let Some(out) = collect(table) {
+                return out;
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Class body keyword completions (modifiers + member-starters).
@@ -23582,7 +24430,110 @@ fn member_completions(
 }
 
 /// Generate completion items for a given type string.
+thread_local! {
+    /// Set while computing completions at a position inside an async
+    /// function body: member completions on a `Promise<T>` then also offer
+    /// T's members (tsc inserts them as `(await x).member`).
+    static COMPLETION_IN_ASYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the innermost function enclosing `offset` is `async`.
+fn enclosing_function_is_async(source: &str, offset: u32) -> bool {
+    let bytes = source.as_bytes();
+    let mut pos = (offset as usize).min(bytes.len());
+    for _ in 0..64 {
+        // Innermost unmatched `{` before pos.
+        let mut depth = 0i32;
+        let mut open = None;
+        let mut k = pos;
+        while k > 0 {
+            k -= 1;
+            match bytes[k] {
+                b'}' => depth += 1,
+                b'{' => {
+                    if depth == 0 {
+                        open = Some(k);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        let Some(open) = open else {
+            return false;
+        };
+        // Header: text back to the previous statement boundary.
+        let mut h = open;
+        let mut pd = 0i32;
+        while h > 0 {
+            let c = bytes[h - 1];
+            match c {
+                b')' => pd += 1,
+                b'(' => {
+                    if pd == 0 {
+                        break;
+                    }
+                    pd -= 1;
+                }
+                b';' | b'{' | b'}' if pd == 0 => break,
+                _ => {}
+            }
+            h -= 1;
+        }
+        let header = source[h..open].trim();
+        let is_function = header.ends_with("=>")
+            || header.contains("function")
+            || (header.ends_with(')')
+                && !["if", "for", "while", "switch", "catch", "with"]
+                    .iter()
+                    .any(|kw| {
+                        header.starts_with(kw) && header[kw.len()..].trim_start().starts_with('(')
+                    }));
+        if is_function {
+            return header
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|w| w == "async");
+        }
+        pos = open;
+    }
+    false
+}
+
 fn member_completions_for_type(
+    type_str: &str,
+    sym_table: &SymbolTable,
+    query_engine: &QueryEngine,
+) -> Vec<Value> {
+    let mut items = member_completions_for_type_inner(type_str, sym_table, query_engine);
+    let trimmed = type_str.trim();
+    if COMPLETION_IN_ASYNC.with(|c| c.get()) {
+        if let Some(inner) = trimmed
+            .strip_prefix("Promise<")
+            .and_then(|r| r.strip_suffix('>'))
+        {
+            COMPLETION_IN_ASYNC.with(|c| c.set(false));
+            let awaited = member_completions_for_type(inner, sym_table, query_engine);
+            COMPLETION_IN_ASYNC.with(|c| c.set(true));
+            // tsc rewrites the receiver to `(await x)` on accept; that edit
+            // needs the receiver span, which this path doesn't have, so the
+            // entries are offered as plain labels.
+            for item in awaited {
+                let label = item.get("label").and_then(|l| l.as_str()).unwrap_or("");
+                if items
+                    .iter()
+                    .any(|v| v.get("label").and_then(|l| l.as_str()) == Some(label))
+                {
+                    continue;
+                }
+                items.push(item);
+            }
+        }
+    }
+    items
+}
+
+fn member_completions_for_type_inner(
     type_str: &str,
     sym_table: &SymbolTable,
     query_engine: &QueryEngine,
@@ -26434,7 +27385,9 @@ pub fn signature_help_at(
         return Some(sig_help);
     }
 
-    let target = find_signature_target_at(&sf.statements, source_text, offset)?;
+    let Some(target) = find_signature_target_at(&sf.statements, source_text, offset) else {
+        return signature_help_for_contextual_params(source_text, offset, sym_table, query_engine);
+    };
     let active_param = target.active_param(source_text, offset);
     let callee = target.callee();
     let callee_offset = signature_target_offset(callee);
@@ -29046,6 +29999,170 @@ fn overload_param_labels(sig: &tsc_rs_symbols::OverloadSignature) -> Vec<String>
         .collect()
 }
 
+/// Signature help inside the parameter list of a function or arrow
+/// expression that initializes `const x: T = …`: tsc shows the contextual
+/// signature `T(…)` with the parameter being declared active.
+fn signature_help_for_contextual_params(
+    source: &str,
+    offset: u32,
+    sym_table: &SymbolTable,
+    query_engine: &QueryEngine,
+) -> Option<Value> {
+    let bytes = source.as_bytes();
+    let off = (offset as usize).min(bytes.len());
+    // Walk out through enclosing brackets to a `(` that opens a parameter list.
+    let mut pos = off;
+    let (open, close) = loop {
+        let mut depth = 0i32;
+        let mut k = pos;
+        let mut found = None;
+        while k > 0 {
+            k -= 1;
+            match bytes[k] {
+                b')' | b']' | b'}' => depth += 1,
+                b'(' | b'[' | b'{' => {
+                    if depth == 0 {
+                        found = Some(k);
+                        break;
+                    }
+                    depth -= 1;
+                }
+                b';' if depth == 0 => return None,
+                _ => {}
+            }
+        }
+        let o = found?;
+        if bytes[o] == b'(' {
+            // Matching `)`.
+            let mut d = 0i32;
+            let mut c = o;
+            let mut close = None;
+            while c < bytes.len() {
+                match bytes[c] {
+                    b'(' | b'[' | b'{' => d += 1,
+                    b')' | b']' | b'}' => {
+                        d -= 1;
+                        if d == 0 {
+                            close = Some(c);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                c += 1;
+            }
+            let close = close?;
+            let after = source[close + 1..].trim_start();
+            let before = source[..o].trim_end();
+            let is_arrow =
+                after.starts_with("=>") || (after.starts_with(':') && after.contains("=>"));
+            let before_ident_start = before
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let is_function = before.ends_with("function")
+                || source[..before_ident_start]
+                    .trim_end()
+                    .ends_with("function");
+            if is_arrow || is_function {
+                break (o, close);
+            }
+            return None;
+        }
+        pos = o;
+    };
+    if off > close {
+        return None;
+    }
+    // The function expression's start and what it initializes.
+    let before = source[..open].trim_end();
+    let expr_start = if let Some(f) = before.rfind("function") {
+        if before[f..]
+            .trim_start_matches("function")
+            .trim()
+            .bytes()
+            .all(is_ident_byte)
+        {
+            f
+        } else {
+            open
+        }
+    } else {
+        open
+    };
+    let mut head = source[..expr_start].trim_end();
+    if let Some(h) = head.strip_suffix("async") {
+        head = h.trim_end();
+    }
+    let head = head.strip_suffix('=')?.trim_end();
+    if head.ends_with(['=', '!', '<', '>']) {
+        return None;
+    }
+    let line_start = head.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let decl = head[line_start..].trim_start();
+    let rest = ["const ", "let ", "var "]
+        .iter()
+        .find_map(|kw| decl.strip_prefix(kw))?;
+    let type_name = rest[rest.find(':')? + 1..].trim();
+    if type_name.is_empty() || !type_name.bytes().all(is_ident_byte) {
+        return None;
+    }
+    let body = type_alias_body_text(type_name, sym_table, query_engine)?;
+    let arrow = find_top_level_arrow(&body)?;
+    let params_part = body[..arrow].trim();
+    let ret = body[arrow + 2..].trim();
+    let inner = params_part.strip_prefix('(')?.strip_suffix(')')?;
+    // Split the written parameters at top-level commas; untyped ones are `any`.
+    let ib = inner.as_bytes();
+    let mut d = 0i32;
+    let mut seg_start = 0;
+    let mut params: Vec<String> = Vec::new();
+    let mut push_param = |seg: &str, params: &mut Vec<String>| {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            return;
+        }
+        if seg.contains(':') {
+            params.push(seg.to_string());
+        } else if let Some(r) = seg.strip_prefix("...") {
+            params.push(format!("...{}: any[]", r.trim()));
+        } else {
+            params.push(format!("{}: any", seg.trim_end_matches('?')));
+        }
+    };
+    for i in 0..ib.len() {
+        match ib[i] {
+            b'(' | b'[' | b'{' | b'<' => d += 1,
+            b'>' if i > 0 && ib[i - 1] == b'=' => {}
+            b')' | b']' | b'}' | b'>' => d -= 1,
+            b',' if d == 0 => {
+                push_param(&inner[seg_start..i], &mut params);
+                seg_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    push_param(&inner[seg_start..], &mut params);
+    // Active parameter: top-level commas between `(` and the cursor.
+    let mut depth = 0i32;
+    let mut active = 0u32;
+    for &b in &bytes[open + 1..off] {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => active += 1,
+            _ => {}
+        }
+    }
+    if !params.is_empty() {
+        active = active.min(params.len() as u32 - 1);
+    }
+    let joined = params.join(", ");
+    let label = format!("{}({}): {}", type_name, joined, ret);
+    let type_str = format!("({}) => {}", joined, ret);
+    signature_help_from_type_str(label, &type_str, active, None)
+}
+
 fn signature_help_from_type_str(
     label: String,
     type_str: &str,
@@ -31522,9 +32639,8 @@ fn try_jsdoc_identifier_hover(
             }
         }
         // Also try QE
-        let qe_syms = query_engine.find_symbol(token);
-        for &qe_id in &qe_syms {
-            if let Some(info) = query_engine.get_symbol_info(qe_id) {
+        for info in query_engine.find_symbol_infos(token) {
+            {
                 match info.kind {
                     tsc_rs_query::SymbolKind::Class => return Some(format!("class {}", info.name)),
                     tsc_rs_query::SymbolKind::Interface => {
@@ -31727,9 +32843,8 @@ fn try_resolve_identifier_hover(
         }
     }
     // Try QE
-    let qe_syms = query_engine.find_symbol(token);
-    if let Some(&qe_id) = qe_syms.first() {
-        if let Some(info) = query_engine.get_symbol_info(qe_id) {
+    if let Some(info) = query_engine.find_symbol_infos(token).into_iter().next() {
+        {
             let kind_prefix = match info.kind {
                 tsc_rs_query::SymbolKind::Function => "function ",
                 tsc_rs_query::SymbolKind::Class => "class ",

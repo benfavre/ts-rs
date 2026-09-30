@@ -314,6 +314,7 @@ pub(crate) fn effective_compiler_options(test_case: &TestCase) -> CompilerOption
     fill_bool!(no_unused_parameters, "noUnusedParameters");
     fill_bool!(strict_null_checks, "strictNullChecks");
     fill_bool!(strict_function_types, "strictFunctionTypes");
+    fill_bool!(strict_bind_call_apply, "strictBindCallApply");
     fill_bool!(
         strict_property_initialization,
         "strictPropertyInitialization"

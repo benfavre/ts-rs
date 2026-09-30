@@ -4616,7 +4616,7 @@ impl TypeChecker {
                             let key = self.prop_name_to_string(&acc.name);
                             self.push_scope();
                             let saved_var_first_types = std::mem::take(&mut self.var_first_types);
-                            self.declare_var("arguments", Type::Any);
+                            self.declare_var("arguments", self.arguments_object_type());
                             self.declare_var(SUPER_PROPERTY_OK_MARKER, Type::Never);
                             self.declare_var(THIS_OK_MARKER, Type::Never);
                             self.bind_function_this(&[]);
@@ -4653,7 +4653,7 @@ impl TypeChecker {
                             let mut setter_ty = member_ctx.clone().unwrap_or(Type::Any);
                             self.push_scope();
                             let saved_var_first_types = std::mem::take(&mut self.var_first_types);
-                            self.declare_var("arguments", Type::Any);
+                            self.declare_var("arguments", self.arguments_object_type());
                             self.declare_var(SUPER_PROPERTY_OK_MARKER, Type::Never);
                             self.declare_var(THIS_OK_MARKER, Type::Never);
                             self.bind_function_this(&[]);
@@ -5222,7 +5222,7 @@ impl TypeChecker {
                 self.jump_function_depth += 1;
                 let saved_var_first_types = std::mem::take(&mut self.var_first_types);
                 // `arguments` is implicitly available inside all non-arrow functions
-                self.declare_var("arguments", Type::Any);
+                self.declare_var("arguments", self.arguments_object_type());
                 self.declare_var(SUPER_PROPERTY_BARRIER_MARKER, Type::Never);
                 self.declare_var(THIS_OK_MARKER, Type::Never);
                 self.bind_function_this(&fn_decl.params);
@@ -7889,7 +7889,7 @@ impl TypeChecker {
                                                 error_static_member_via_instance(
                                                     &mem.property,
                                                     name,
-                                                    expr.span,
+                                                    property_span,
                                                 ),
                                             );
                                             Type::Error
@@ -8188,6 +8188,13 @@ impl TypeChecker {
                         }
                     }
                     // Function: .length, .name, .bind, .call, .apply
+                    Type::Function(ref function)
+                        if self.strict_bind_call_apply
+                            && function.type_params.is_empty()
+                            && matches!(mem.property.as_str(), "call" | "apply") =>
+                    {
+                        self.strict_call_or_apply_type(function, mem.property.as_str())
+                    }
                     Type::Function(_) => match mem.property.as_str() {
                         "length" => Type::Number,
                         "name" => Type::String,
@@ -9231,7 +9238,7 @@ impl TypeChecker {
                             let saved_var_first_types = std::mem::take(&mut self.var_first_types);
                             self.check_parameter_decorators(&m.params, false);
                             self.check_parameter_runtime_expressions(&m.params, true, false);
-                            self.declare_var("arguments", Type::Any);
+                            self.declare_var("arguments", self.arguments_object_type());
                             self.declare_var(SUPER_PROPERTY_OK_MARKER, Type::Never);
                             self.declare_var(THIS_OK_MARKER, Type::Never);
                             self.bind_function_this(&m.params);
@@ -9325,7 +9332,7 @@ impl TypeChecker {
                                 acc.return_type.as_ref(),
                             );
                             let saved_var_first_types = std::mem::take(&mut self.var_first_types);
-                            self.declare_var("arguments", Type::Any);
+                            self.declare_var("arguments", self.arguments_object_type());
                             self.declare_var(SUPER_PROPERTY_OK_MARKER, Type::Never);
                             self.declare_var(THIS_OK_MARKER, Type::Never);
                             self.bind_function_this(&[]);
@@ -9371,7 +9378,7 @@ impl TypeChecker {
                                 acc.return_type.as_ref(),
                             );
                             let saved_var_first_types = std::mem::take(&mut self.var_first_types);
-                            self.declare_var("arguments", Type::Any);
+                            self.declare_var("arguments", self.arguments_object_type());
                             self.declare_var(SUPER_PROPERTY_OK_MARKER, Type::Never);
                             self.declare_var(THIS_OK_MARKER, Type::Never);
                             self.bind_function_this(&[]);
@@ -9585,7 +9592,7 @@ impl TypeChecker {
                     false,
                 );
                 // `arguments` is implicitly available inside all non-arrow functions
-                self.declare_var("arguments", Type::Any);
+                self.declare_var("arguments", self.arguments_object_type());
                 self.declare_var(SUPER_PROPERTY_BARRIER_MARKER, Type::Never);
                 self.declare_var(THIS_OK_MARKER, Type::Never);
                 self.bind_function_this(&fn_decl.params);
@@ -12673,7 +12680,7 @@ impl TypeChecker {
                 self.fn_nesting_depth += 1;
                 self.jump_function_depth += 1;
                 let saved_var_first_types = std::mem::take(&mut self.var_first_types);
-                self.declare_var("arguments", Type::Any);
+                self.declare_var("arguments", self.arguments_object_type());
                 self.declare_class_member_super_marker();
                 self.declare_var(THIS_OK_MARKER, Type::Never);
                 self.bind_function_this(&method.params);
@@ -12786,7 +12793,7 @@ impl TypeChecker {
                 self.generator_stack.push(false);
                 self.push_scope();
                 let saved_var_first_types = std::mem::take(&mut self.var_first_types);
-                self.declare_var("arguments", Type::Any);
+                self.declare_var("arguments", self.arguments_object_type());
                 self.declare_class_member_super_marker();
                 self.declare_var(THIS_OK_MARKER, Type::Never);
                 self.bind_function_this(&[]);
@@ -12945,7 +12952,7 @@ impl TypeChecker {
                 self.fn_nesting_depth += 1;
                 self.jump_function_depth += 1;
                 let saved_var_first_types = std::mem::take(&mut self.var_first_types);
-                self.declare_var("arguments", Type::Any);
+                self.declare_var("arguments", self.arguments_object_type());
                 self.declare_class_member_super_marker();
                 self.declare_var(THIS_OK_MARKER, Type::Never);
                 self.bind_function_this(&[]);

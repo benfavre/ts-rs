@@ -2468,6 +2468,8 @@ pub struct TypeChecker {
     /// strictFunctionTypes (on unless `strict: false` / the option is false):
     /// parameters of non-method signatures relate contravariantly.
     strict_function_types: bool,
+    /// strictBindCallApply: `f.call` / `f.apply` check arguments against `f`.
+    strict_bind_call_apply: bool,
     /// Nesting depth of `assignability_elaboration` (cycle guard).
     elaboration_depth: u32,
     /// Related note ("'x' is declared here.") of the deepest structural
@@ -2789,6 +2791,11 @@ pub struct TypeChecker {
     /// `current_file_name`, whose per-file checking semantics must not be
     /// changed by donor construction.
     injected_decl_file: Option<String>,
+    /// Interface names this file's own check pass has registered. The first
+    /// own registration REPLACES a same-file entry left by cross-file
+    /// injection (built before this file's imports resolved, so computed
+    /// keys may be `[computed]`); later same-file declarations merge.
+    own_registered_interfaces: std::collections::HashSet<std::string::String>,
     /// Per-file output format selected by Node16/NodeNext package/extension
     /// rules. `None` means the caller could not determine it safely.
     current_file_module_format: Option<ModuleKind>,
@@ -2851,6 +2858,7 @@ impl Clone for TypeChecker {
             no_implicit_any: self.no_implicit_any,
             strict_null_checks: self.strict_null_checks,
             strict_function_types: self.strict_function_types,
+            strict_bind_call_apply: self.strict_bind_call_apply,
             elaboration_depth: 0,
             last_leaf_related: None,
             script_global_kinds: HashMap::new(),
@@ -3022,6 +3030,7 @@ impl Clone for TypeChecker {
             compiler_options: self.compiler_options.clone(),
             current_file_name: self.current_file_name.clone(),
             injected_decl_file: self.injected_decl_file.clone(),
+            own_registered_interfaces: self.own_registered_interfaces.clone(),
             current_file_module_format: self.current_file_module_format,
             current_file_has_lib_reference: self.current_file_has_lib_reference,
             in_constructor: self.in_constructor,
@@ -3069,6 +3078,7 @@ impl TypeChecker {
             no_implicit_any: false,
             strict_null_checks: false,
             strict_function_types: false,
+            strict_bind_call_apply: false,
             elaboration_depth: 0,
             last_leaf_related: None,
             script_global_kinds: HashMap::new(),
@@ -3213,6 +3223,7 @@ impl TypeChecker {
             compiler_options: CompilerOptions::default(),
             current_file_name: None,
             injected_decl_file: None,
+            own_registered_interfaces: std::collections::HashSet::new(),
             current_file_module_format: None,
             current_file_has_lib_reference: false,
             in_constructor: false,
@@ -9486,10 +9497,19 @@ impl TypeChecker {
                 StmtKind::InterfaceDecl(interface) => {
                     let key = format!("{namespace_path}.{}", interface.name);
                     let info = self.build_interface_info(interface);
-                    if self
-                        .interface_info
-                        .get(&key)
-                        .is_some_and(|existing| Self::interface_infos_share_owner(existing, &info))
+                    // Own-file check (not injection): the first registration
+                    // replaces this file's stale injected copy.
+                    let stale_injected_copy = self.injected_decl_file.is_none()
+                        && self.current_file_name.is_some()
+                        && !info.is_global
+                        && self.own_registered_interfaces.insert(key.clone())
+                        && self.interface_info.get(&key).is_some_and(|existing| {
+                            Self::paths_refer_to_same_file(&existing.decl_file, &info.decl_file)
+                        });
+                    if !stale_injected_copy
+                        && self.interface_info.get(&key).is_some_and(|existing| {
+                            Self::interface_infos_share_owner(existing, &info)
+                        })
                     {
                         self.merge_interface_registry_entry(key, info);
                     } else {
@@ -10184,6 +10204,7 @@ impl TypeChecker {
         self.strict_null_checks = strict_option(options.strict_null_checks);
         WIDEN_STRICT_NULL_CHECKS.with(|flag| flag.set(self.strict_null_checks));
         self.strict_function_types = strict_option(options.strict_function_types);
+        self.strict_bind_call_apply = strict_option(options.strict_bind_call_apply);
         if self.strict_null_checks {
             self.enable_control_flow_narrowing();
         }
@@ -11071,7 +11092,7 @@ impl TypeChecker {
         self.check_active_type_param_declarations(method.type_params.as_deref());
         self.check_function_like_future_lib_globals(&method.params, method.return_type.as_ref());
         let saved_var_first_types = std::mem::take(&mut self.var_first_types);
-        self.declare_var("arguments", Type::Any);
+        self.declare_var("arguments", self.arguments_object_type());
         self.declare_var(SUPER_PROPERTY_OK_MARKER, Type::Never);
         self.declare_var(THIS_OK_MARKER, Type::Never);
         self.bind_function_this(&method.params);
@@ -13498,7 +13519,20 @@ impl TypeChecker {
                     .interface_info
                     .get(&iface_decl.name)
                     .is_some_and(|existing| Self::interface_infos_share_owner(existing, &info));
-                if compatible {
+                let first_own = self
+                    .own_registered_interfaces
+                    .insert(iface_decl.name.clone());
+                let stale_injected_copy = first_own
+                    && compatible
+                    && !info.is_global
+                    && self.current_file_name.is_some()
+                    && self
+                        .interface_info
+                        .get(&iface_decl.name)
+                        .is_some_and(|existing| {
+                            Self::paths_refer_to_same_file(&existing.decl_file, &info.decl_file)
+                        });
+                if compatible && !stale_injected_copy {
                     self.merge_interface_registry_entry(iface_decl.name.clone(), info);
                 } else {
                     Arc::make_mut(&mut self.interface_info).insert(iface_decl.name.clone(), info);
@@ -21861,10 +21895,24 @@ impl TypeChecker {
                 _ => return, // getters/setters/computed — bail rather than guess
             }
         }
+        // A literal's apparent type includes the `Object.prototype` members
+        // (tsc falls back to globalObjectType), so they are never missing.
         let missing: Vec<std::string::String> = required
             .iter()
             .map(|n| n.trim_end_matches('?').to_string())
             .filter(|n| !keys.iter().any(|k| k == n))
+            .filter(|n| {
+                !matches!(
+                    n.as_str(),
+                    "toString"
+                        | "toLocaleString"
+                        | "valueOf"
+                        | "hasOwnProperty"
+                        | "isPrototypeOf"
+                        | "propertyIsEnumerable"
+                        | "constructor"
+                )
+            })
             .collect();
         if missing.is_empty() {
             return;
@@ -21878,9 +21926,23 @@ impl TypeChecker {
         // In ARGUMENT position tsc reports TS2345, not the TS2741/2739
         // missing-property refinement it uses for declarations.
         if as_argument {
-            self.diagnostics.push(diagnostics::error_arg_not_assignable(
-                &src_disp, &tgt_disp, span,
-            ));
+            let mut diagnostic = diagnostics::error_arg_not_assignable(&src_disp, &tgt_disp, span);
+            // tsc's chain names the missing members, like the declaration
+            // refinement below.
+            if missing.len() == 1 {
+                let written = self.member_name_as_written(target, &missing[0]);
+                diagnostic.message.push_str(&format!(
+                    "\n  Property '{written}' is missing in type '{src_disp}' but required in type '{tgt_disp}'."
+                ));
+                diagnostic.related = self.missing_member_note(target, &tgt_disp, &missing[0]);
+            } else {
+                let line =
+                    diagnostics::error_missing_properties(&missing, &src_disp, &tgt_disp, span)
+                        .message;
+                diagnostic.message.push_str("\n  ");
+                diagnostic.message.push_str(&line);
+            }
+            self.diagnostics.push(diagnostic);
             return;
         }
         if missing.len() == 1 {
@@ -23398,7 +23460,7 @@ impl TypeChecker {
                 // Save and reset var_first_types for this function scope
                 let saved_var_first_types = std::mem::take(&mut self.var_first_types);
                 // `arguments` is implicitly available inside all non-arrow functions
-                self.declare_var("arguments", Type::Any);
+                self.declare_var("arguments", self.arguments_object_type());
                 self.declare_var(SUPER_PROPERTY_BARRIER_MARKER, Type::Never);
                 self.declare_var(THIS_OK_MARKER, Type::Never);
                 self.bind_function_this(&fn_decl.params);
@@ -28139,6 +28201,31 @@ impl TypeChecker {
                     format!("Type '{src_disp}' provides no match for the signature '{signature}'."),
                     None,
                 ));
+            }
+        }
+        // A function source has the `Function` apparent members but no index
+        // signature: against an indexed target whose named members a function
+        // provides (`ArrayLike<T>`), tsc reports the missing index signature.
+        if let Type::Function(_) = source {
+            if let Some(target_info) = self.structural_object_info(target) {
+                if let Some((key, _)) = &target_info.index_signature {
+                    let function_members = target_info.properties.iter().all(|(name, _)| {
+                        matches!(
+                            name.trim_start_matches('?'),
+                            "length" | "name" | "prototype" | "arguments" | "caller"
+                        ) || name.starts_with('?')
+                    });
+                    if function_members {
+                        return Some((
+                            format!(
+                                "Index signature for type '{}' is missing in type '{}'.",
+                                key.display_string_single_line(),
+                                src_disp
+                            ),
+                            None,
+                        ));
+                    }
+                }
             }
         }
         let source_info = self.structural_object_info(source)?;

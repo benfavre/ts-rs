@@ -4917,7 +4917,11 @@ impl BaselineRunner {
             .map(|file| file.name.clone())
             .collect();
         let mut ambiguous_root_entries: Vec<(String, String)> = Vec::new();
-        let mut checker_donor = tsc_rs_types::TypeChecker::new();
+        let mut checker_donor = if lib_injection_enabled() {
+            lib_injected_donor(&effective_options)
+        } else {
+            tsc_rs_types::TypeChecker::new()
+        };
         // Error baselines consume diagnostics only. Building a display string
         // for every expression is both unused and potentially exponential for
         // persistent generic type graphs such as long Omit/merge chains.
@@ -7374,6 +7378,83 @@ pub(crate) use transforms::*;
 /// Whether errors baselines seed the donor checker with every program
 /// file's declarations (`inject_external_types`), so multi-file imports get
 /// real types. On by default; `TSC_RS_HARNESS_CROSS_FILE=0` turns it off.
+/// Seed the donor with TypeScript lib declarations so lib interfaces such
+/// as `IArguments`, `ArrayLike` or `TemplateStringsArray` are visible to
+/// the relation. Default: only `LIB_INJECT_ALLOWLIST`.
+/// `TSC_RS_HARNESS_LIB_INJECT=0` disables it; `=1` injects every lib
+/// declaration (experimental: measured net negative, Sep 30 2026).
+pub(crate) fn lib_injection_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("TSC_RS_HARNESS_LIB_INJECT")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
+fn lib_injection_allowlist_only() -> bool {
+    std::env::var("TSC_RS_HARNESS_LIB_INJECT").as_deref() != Ok("1")
+}
+
+/// Lib declarations with no hand-written checker model.
+const LIB_INJECT_ALLOWLIST: &[&str] = &[
+    "TemplateStringsArray",
+    "IArguments",
+    "ArrayLike",
+    "ReadonlyArray",
+    "ConcatArray",
+    "PropertyKey",
+];
+
+/// A donor checker with the selected lib files injected, cached per worker
+/// thread and per (target, lib, noLib) selection.
+fn lib_injected_donor(options: &tsc_rs_ast::CompilerOptions) -> tsc_rs_types::TypeChecker {
+    thread_local! {
+        static CACHE: std::cell::RefCell<HashMap<String, tsc_rs_types::TypeChecker>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let key = format!(
+        "{:?}\0{:?}\0{}",
+        options.target,
+        options.no_lib,
+        options.lib.join("\0").to_ascii_lowercase()
+    );
+    CACHE.with(|cache| {
+        if let Some(donor) = cache.borrow().get(&key) {
+            return donor.clone();
+        }
+        let mut donor = tsc_rs_types::TypeChecker::new();
+        donor.disable_expression_types();
+        let sources = tsc_rs_types::load_stdlib_sources(options);
+        // By default keep only lib declarations the checker has no
+        // hand-written model for.
+        let allowlist_only = lib_injection_allowlist_only();
+        let parsed: Vec<_> = sources
+            .iter()
+            .map(|library| {
+                let mut file = tsc_rs_parser::parse(&library.file_name, &library.source);
+                if allowlist_only {
+                    file.statements.retain(|stmt| {
+                        let name = match &stmt.kind {
+                            StmtKind::InterfaceDecl(decl) => decl.name.as_str(),
+                            StmtKind::TypeAlias(decl) => decl.name.as_str(),
+                            _ => return false,
+                        };
+                        LIB_INJECT_ALLOWLIST.contains(&name)
+                    });
+                }
+                file
+            })
+            .collect();
+        let references: Vec<_> = parsed.iter().collect();
+        donor.inject_external_types(&references);
+        donor.take_diagnostics();
+        donor.reset_alias_cycle_index();
+        cache.borrow_mut().insert(key, donor.clone());
+        donor
+    })
+}
+
 pub(crate) fn cross_file_injection_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {

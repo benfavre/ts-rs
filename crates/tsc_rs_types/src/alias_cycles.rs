@@ -788,6 +788,64 @@ impl TypeChecker {
         self.alias_cycle_diagnostics = Some(Arc::new(diagnostics));
     }
 
+    /// strictBindCallApply (tsc CallableFunction): `f.call(thisArg, ...params)`
+    /// and `f.apply(thisArg, args?: [...params])` for a non-generic `f`.
+    pub(crate) fn strict_call_or_apply_type(&self, function: &FunctionType, member: &str) -> Type {
+        let params: Vec<(std::string::String, Type)> = function
+            .params
+            .iter()
+            .filter(|(name, _)| name != "this")
+            .cloned()
+            .collect();
+        let params = if member == "call" {
+            let mut all = vec![("thisArg".to_string(), Type::Any)];
+            all.extend(params);
+            all
+        } else {
+            let elements: Vec<Type> = params
+                .iter()
+                .map(|(name, ty)| {
+                    if name.starts_with("...") {
+                        Type::Rest(Arc::new(ty.clone()))
+                    } else if name.starts_with('?') {
+                        Type::Optional(Arc::new(ty.clone()))
+                    } else {
+                        ty.clone()
+                    }
+                })
+                .collect();
+            vec![
+                ("thisArg".to_string(), Type::Any),
+                ("?args".to_string(), Type::Tuple(Arc::from(elements))),
+            ]
+        };
+        Type::Function(FunctionType {
+            type_param_constraints: Vec::new(),
+            params,
+            return_type: function.return_type.clone(),
+            type_params: Vec::new(),
+            type_param_defaults: Vec::new(),
+            type_predicate: None,
+        })
+    }
+
+    /// The type of a function's `arguments` object: the lib `IArguments`
+    /// interface when it is loaded, else `any`.
+    pub(crate) fn arguments_object_type(&self) -> Type {
+        if self.interface_info.contains_key("IArguments") {
+            Type::TypeReference("IArguments".to_string(), Arc::from([]))
+        } else {
+            Type::Any
+        }
+    }
+
+    /// Forget the alias-cycle index built by an injection pass over files
+    /// that are not the program (e.g. lib files seeded into a donor), so
+    /// the program's own files get indexed.
+    pub fn reset_alias_cycle_index(&mut self) {
+        self.alias_cycle_diagnostics = None;
+    }
+
     pub(crate) fn check_alias_cycles(&mut self, file: &SourceFile) {
         if self.alias_cycle_diagnostics.is_none() {
             self.index_alias_cycles(&[file]);
