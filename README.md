@@ -60,23 +60,24 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-Measured on 2026-09-30 at `f21e5c7e1`, with the result cache disabled. A case
-passes only when the output matches what `tsc` produced. Pass rates are
-`passed / (passed + failed)`; skipped cases are never counted as passes.
+All results below were measured on 2026-09-30 at `7643258e9`, with the
+result cache disabled. Pass rates are `passed / (passed + failed)`; skipped
+cases are never counted as passes.
 
 | Lane | Compiler suite | Conformance suite | What it measures |
 |---|---:|---:|---|
 | JavaScript emit | 6,032 / 6,032 (100%) | 5,388 / 5,388 (100%) | Byte-for-byte match with the `tsc` `.js` baseline (one configuration per case) |
-| Diagnostics | 4,779 / 6,529 (73.2%) | 3,621 / 5,907 (61.3%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
-| Type-check recall / precision | 58.2% / 85.1% | 64.0% / 86.8% | Per-diagnostic `(file, line, code)` match over every option variant |
-| Symbols | 185 / 6,434 (2.9%) | 293 / 5,617 (5.2%) | Match with the `tsc` `.symbols` baseline |
+| Diagnostics | 4,785 / 6,529 (73.3%) | 3,639 / 5,907 (61.6%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
+| Symbols | 1,709 / 6,434 (26.6%) | 1,534 / 5,617 (27.3%) | Match with the `tsc` `.symbols` baseline |
+| Types | 184 / 6,434 (2.9%) | 128 / 5,617 (2.3%) | Match with the `tsc` `.types` baseline |
+| Type-check recall / precision | 59.5% / 85.4% | 66.9% / 88.2% | Per-diagnostic `(file, line, code)` match over every option variant |
 
-JavaScript emit skips 497 compiler and 519 conformance cases that have no `.js`
-oracle (mostly `noEmit`); the diagnostics lane exercises all of them instead.
-The symbols lane skips 95 and 290 cases without a uniquely selected oracle.
+JavaScript emit skips 497 compiler and 519 conformance cases without a `.js`
+oracle (mostly `noEmit`); diagnostics exercises all of them. Symbols and types
+skip 95 compiler and 290 conformance cases without a uniquely selected oracle.
 
-Workspace tests at the same commit: **3,304 Rust tests passed**, zero failed, and
-37 ignored.
+Public workspace validation: **3,374 Rust tests passed**, zero failed, and
+37 ignored; `make ci` passes.
 
 Language server, against the `fourslash` suite:
 
@@ -87,22 +88,27 @@ Language server, against the `fourslash` suite:
 | Go-to-definition | 191 | 20 | 2 | 90.5% |
 | Find-all-references | 329 | 18 | 0 | 94.8% |
 | Signature help | 123 | 22 | 7 | 84.8% |
-| **Total** | **1,800** | **563** | **19** | **76.2%** |
+| **Supported operations** | **1,800** | **563** | **19** | **76.2%** |
 
-Where the work is:
+The full inventory contains 6,320 cases: 1,800 pass, 563 fail, and 3,957 are
+skipped, including unsupported operations.
 
-- **Default emit matches** every case with a JavaScript oracle. An opt-in
-  report that expands every stored option variant (14,819 identities, last
-  measured 2026-09-07 at `aba3839d5`) passed 93.0% of JavaScript variants and
-  88.0% of declaration-projection variants; the failures are mostly ES5
-  downlevel transforms and `.d.ts` emit.
-- **Diagnostics are the active front.** A whole-case pass requires every
-  message and column to match, which is where the remaining 1,750 compiler and
-  2,286 conformance failures come from.
-- **Language-server gaps are type inference**: hover misses are contextual
-  typing, generics, JSDoc type tags and cross-file aliases; completion misses
-  are auto-imports and cross-file members.
-- **Symbols and declaration emit** are early.
+Expanded option variants (14,819 identities, 1,016 skips per lane):
+
+| Lane | Passed | Failed | Pass rate |
+|---|---:|---:|---:|
+| JavaScript | 12,832 | 971 | 93.0% |
+| Declarations | 12,146 | 1,657 | 88.0% |
+
+Remaining diagnostic mismatches: 1,744 compiler cases and 2,268 conformance
+cases. Expanded emit failures are mainly ES5 transforms and declarations;
+LSP gaps include contextual typing, generics, JSDoc and cross-file information.
+Symbol and type baselines still have substantial gaps.
+
+[docs/compatibility-metrics.json](docs/compatibility-metrics.json) contains the
+current counts, measurement commit, report hashes and reproduction commands.
+The [September 7 snapshot](docs/compatibility-metrics-2026-09-07.json) remains
+available as historical evidence.
 
 Reproduce any row:
 
@@ -396,7 +402,7 @@ In this repository:
 - [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md): diagnostics
 - [docs/ANALYZE.md](docs/ANALYZE.md): monorepo analysis tools
 - [docs/verified-waves.md](docs/verified-waves.md): verified changes, regression checks and measured performance
-- [docs/compatibility-metrics.json](docs/compatibility-metrics.json): historical metrics snapshot at `aba3839d5`
+- [docs/compatibility-metrics.json](docs/compatibility-metrics.json): current verified compatibility snapshot
 
 ## License
 
