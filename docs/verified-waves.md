@@ -1128,3 +1128,37 @@ positives in either full corpus.
 | --- | --- | ---: | ---: | ---: |
 | Compiler | Diagnostics | 4,731 | 4,732 | 0 |
 | Conformance | Diagnostics | 3,559 | 3,566 | 0 |
+
+## 2026-09-30: cross-file types, checker waves 92-100, language server rounds
+
+Five rounds of checker and language-server work between 2026-09-29 and
+2026-09-30, merged as `c0949af47` through `f21e5c7e1`. Every batch was gated on
+failing-case lists (not totals): no compiler or conformance diagnostics case
+regressed, JavaScript emit stayed at zero failures, and no language-server
+operation lost a passing case.
+
+Checker highlights: multi-file tests now see real imported types (cross-file
+injection, on by default; `TSC_RS_HARNESS_CROSS_FILE=0` disables it), dotted
+namespace bodies are checked, unannotated method returns are inferred,
+iteration diagnostics (TS2488, TS2495, TS2461, TS2548, TS2549),
+`strictBindCallApply` for `call`/`apply`, and an allowlist of lib interfaces
+(`TemplateStringsArray`, `IArguments`, `ArrayLike`, ...) is visible to the
+checker. The new `call`/`apply` rule adds no spurious TS2345 in either suite.
+
+Language server: generic call-site instantiation in hovers, JSDoc types in
+JavaScript, namespace qualification, find-all-references through
+export/import aliases, go-to-definition by name no longer mixes per-file symbol
+ids, contextual literal completions, and signature help inside contextually
+typed parameter lists. Fourslash runs strict, like the TypeScript 6 language
+service.
+
+| Suite | Baseline | Before | After |
+|---|---|---:|---:|
+| Compiler | Diagnostics | 4,732 | 4,779 |
+| Conformance | Diagnostics | 3,566 | 3,621 |
+| Compiler | JavaScript | 6,032 | 6,032 |
+| Conformance | JavaScript | 5,388 | 5,388 |
+
+Language server (fourslash) before and after: QuickInfo 250 to 298,
+completions 839 to 859, go-to-definition 172 to 191, find-all-references 305
+to 329, signature help 121 to 123.
