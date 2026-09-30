@@ -1444,3 +1444,44 @@ all three markers after adapting navigation to the precise member spans.
 The complete LSP comparison retains 1,800 passes, 563 failures, and 3,957
 skips with an identical failure set.
 Evidence is in `/tmp/ts-rs-symbol-owners-20260930/` on the verification host.
+
+## 2026-09-30: protected member access and class object rest
+
+The checker reports TS2445 for protected members accessed outside an eligible
+class and TS2446 for instance receivers that do not derive from the accessing
+subclass. It accounts for static members, nested lexical classes/functions,
+explicit and contextual `this` parameters, generic constraints, public
+replacements, and distinct getter/setter visibility. Assignments and updates
+select setter visibility. Class ancestry walks detect cycles instead of
+stopping after sixteen classes. First-declaration visibility prevents a later
+duplicate parameter property from making an earlier public field protected.
+
+Class object-rest bindings copy public data members, excluding private and
+protected members, methods, and accessors. Generic bindings retain an `Omit`
+source type; property lookup respects the source class's public keys. This
+removes incorrect accessibility errors on the copied object while reporting
+missing properties, including 32 previously missed TS2339 diagnostics.
+
+| Suite | Diagnostic passes before | After | Gain | Lost passes |
+| --- | ---: | ---: | ---: | ---: |
+| Compiler | 4,783 | 4,785 | 2 | 0 |
+| Conformance | 3,632 | 3,639 | 7 | 0 |
+
+Cache-free comparisons preserve every prior pass, case, oracle, and skip
+across the eight default compiler/conformance diagnostic, JavaScript, symbol,
+and type matrices, plus all four expanded JavaScript/declaration matrices.
+The other ten matrices are unchanged. Separate precision reports increase
+matched diagnostics from 8,790 to 8,871 for compiler and from 19,159 to 19,236
+for conformance: 158 additional matches, with no lost matches or new spurious
+diagnostics in any code category. Compiler false positives fall from 1,517 to
+1,513; conformance remains 2,582. All 35 expected TS2446 diagnostics match;
+TS2445 matches 91 of 109, with remaining gaps including interface heritage,
+JSDoc visibility, mixins, destructuring, and class/namespace merges.
+
+Thirteen new regressions cover access contexts, generic messages, static
+members, getter/setter writes, bracket access, deep inheritance, duplicate
+visibility, and class rest. All 3,631 workspace tests pass with 37 ignored,
+and `make ci` passes. The complete LSP comparison retains 1,800 passes,
+563 failures, and 3,957 skips with an identical failing-case set (bucket labels
+can vary when a case has multiple failure kinds). Evidence is in
+`/tmp/ts-rs-protected-access-20260930/`, using the `final-` manifests and logs.

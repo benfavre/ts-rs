@@ -6424,7 +6424,12 @@ impl TypeChecker {
                     return Type::Number;
                 }
                 let readonly_write = self.report_readonly_property_write(&up.argument);
+                let saved_target = self.assignment_target_span;
+                if matches!(up.argument.kind, ExprKind::Member(_)) {
+                    self.assignment_target_span = Some(up.argument.span);
+                }
                 let operand = self.check_expr(&up.argument);
+                self.assignment_target_span = saved_target;
                 if self.update_operand_has_unknown(&operand) {
                     if let Some(path) = Self::simple_expression_path(&up.argument) {
                         self.diagnostics
@@ -7514,6 +7519,13 @@ impl TypeChecker {
                     self.check_nullable_access(&obj_ty, &mem.object);
                 }
                 self.check_private_member_access(&obj_ty, &mem.property, property_span);
+                self.check_protected_member_access(
+                    &obj_ty,
+                    &mem.property,
+                    property_span,
+                    matches!(mem.object.kind, ExprKind::Super),
+                    self.assignment_target_span == Some(expr.span),
+                );
                 // TS2729: `this.x` directly in an instance initializer where
                 // `x` is an own instance property not yet initialized.
                 if matches!(mem.object.kind, ExprKind::This)
@@ -7642,6 +7654,7 @@ impl TypeChecker {
                 let lazy_alias_member = match &member_obj {
                     Type::TypeReference(_, _) => self
                         .lazy_object_merge_property(&member_obj, &mem.property)
+                        .or_else(|| self.class_omit_property(&member_obj, &mem.property))
                         .map(|member| match member {
                             LazyAliasProperty::Present(value) => value,
                             LazyAliasProperty::Missing => {
@@ -8860,7 +8873,9 @@ impl TypeChecker {
                 // right-hand side still is (`x = x.concat([])`), so the
                 // binding leaves the unassigned set only after the RHS check.
                 let saved_assignment_target = self.assignment_target_span;
-                if assign.op == AssignOp::Assign && matches!(assign.left.kind, ExprKind::Ident(_)) {
+                if (assign.op == AssignOp::Assign && matches!(assign.left.kind, ExprKind::Ident(_)))
+                    || matches!(assign.left.kind, ExprKind::Member(_))
+                {
                     self.assignment_target_span = Some(assign.left.span);
                 }
                 // For an Ident LHS, use the DECLARED type (vars), not the

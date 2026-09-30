@@ -27,6 +27,7 @@ mod interface_heritage;
 mod jump_targets;
 pub mod narrowing;
 mod overload_compatibility;
+mod protected_access;
 mod reserved_type_names;
 mod resolve_types;
 mod static_overrides;
@@ -914,6 +915,11 @@ struct ClassInfo {
     static_methods: Vec<(std::string::String, FunctionType)>,
     /// Static declarations in source order, including accessor visibility.
     static_member_modifiers: Vec<(String, u32)>,
+    /// First declaration controls visibility, including duplicate parameter properties.
+    instance_member_modifiers: Vec<(String, u32)>,
+    /// Getter/setter accessibility can differ; the selected accessor depends
+    /// on whether a property occurrence reads or writes the member.
+    accessor_modifiers: rustc_hash::FxHashMap<(String, bool), (Option<u32>, Option<u32>)>,
     /// Callable static overloads, excluding implementation signatures.
     overloaded_static_methods: rustc_hash::FxHashMap<String, Type>,
     /// Whether the class is abstract
@@ -2601,8 +2607,9 @@ pub struct TypeChecker {
     /// is resolved like a value (TS2304 / suggestions apply) but it is not a
     /// read, so definite-assignment (TS2454) does not.
     type_query_depth: u32,
-    /// Span of the identifier currently being assigned (`x = ...`): the
-    /// target itself is not a read for TS2454.
+    /// Span of the current assignment target. An identifier in a simple
+    /// assignment is not a read for TS2454; member writes select the setter's
+    /// accessibility without suppressing reads of their receiver.
     assignment_target_span: Option<Span>,
     /// Whether TS2454 definite assignment checking is active.
     /// Defaults to true; disabled when `strict: false` or `strictNullChecks: false`.
@@ -6020,7 +6027,7 @@ impl TypeChecker {
                             );
                         }
                         tsc_rs_ast::ObjPatProp::Rest(nested) => {
-                            let rest_ty = Self::object_rest_binding_type(&ty, &consumed);
+                            let rest_ty = self.object_rest_binding_type(&ty, &consumed);
                             self.collect_pattern_binding_types(
                                 file,
                                 nested,
@@ -6211,7 +6218,76 @@ impl TypeChecker {
             .collect()
     }
 
-    fn object_rest_binding_type(ty: &Type, consumed: &HashSet<String>) -> Type {
+    fn object_rest_binding_type(&self, ty: &Type, consumed: &HashSet<String>) -> Type {
+        let apparent = self.typeparam_constraint_apparent(ty);
+        let class_type = match apparent.as_ref().unwrap_or(ty) {
+            Type::This => self
+                .enclosing_class_names
+                .last()
+                .map(|name| Type::TypeReference(name.clone(), Arc::from([]))),
+            Type::TypeReference(name, _) if self.class_info.contains_key(name) => {
+                Some(apparent.as_ref().unwrap_or(ty).clone())
+            }
+            _ => None,
+        };
+        if let Some(Type::TypeReference(name, args)) = class_type {
+            let mut excluded = consumed.clone();
+            let mut current = Some(name.clone());
+            let mut seen_classes = rustc_hash::FxHashSet::default();
+            let mut seen_members = rustc_hash::FxHashSet::default();
+            let mut prototype_names = Vec::new();
+            while let Some(class) = current.take() {
+                if !seen_classes.insert(class.clone()) {
+                    break;
+                }
+                let Some(info) = self.class_info.get(&class) else {
+                    break;
+                };
+                let mut members: Vec<_> = info.instance_member_modifiers.iter().collect();
+                // The structural class shape lists data/accessor properties
+                // before methods; retain that order in the omitted key union.
+                members.sort_by_key(|(member, _)| {
+                    info.instance_methods.iter().any(|(name, _)| name == member)
+                });
+                for (member, flags) in members {
+                    if !seen_members.insert(member.clone()) {
+                        continue;
+                    }
+                    let nonpublic = flags & (tsc_rs_ast::MOD_PRIVATE | tsc_rs_ast::MOD_PROTECTED)
+                        != 0
+                        || member.starts_with('#');
+                    let prototype = info.instance_methods.iter().any(|(name, _)| name == member)
+                        || info
+                            .accessor_modifiers
+                            .contains_key(&(member.clone(), false))
+                        || info.accessor_props.contains(member);
+                    if nonpublic || prototype {
+                        excluded.insert(member.clone());
+                    }
+                    if prototype && !nonpublic && !consumed.contains(member) {
+                        prototype_names.push(Type::StringLiteral(member.clone()));
+                    }
+                }
+                current = info.extends.clone();
+            }
+            // Generic rest retains the source type parameter, so derived fields
+            // remain available when the function is instantiated.
+            if apparent.is_some() || matches!(ty, Type::This) {
+                let mut keys: Vec<_> = consumed.iter().cloned().collect();
+                keys.sort();
+                let mut keys: Vec<_> = keys.into_iter().map(Type::StringLiteral).collect();
+                keys.extend(prototype_names);
+                return Type::TypeReference(
+                    "Omit".into(),
+                    Arc::from([ty.clone(), Type::flatten_union(keys)]),
+                );
+            }
+            if let Some(shape) = self.resolve_type_reference_to_object(&name, &args) {
+                if matches!(shape, Type::ObjectType(_)) {
+                    return self.object_rest_binding_type(&shape, &excluded);
+                }
+            }
+        }
         match ty {
             Type::ObjectType(object) => Type::ObjectType(ObjectTypeInfo {
                 properties: object
@@ -6235,11 +6311,62 @@ impl TypeChecker {
             Type::Intersection(members) => Type::Intersection(
                 members
                     .iter()
-                    .map(|member| Self::object_rest_binding_type(member, consumed))
+                    .map(|member| self.object_rest_binding_type(member, consumed))
                     .collect(),
             ),
             _ => ty.clone(),
         }
+    }
+
+    /// Omit uses public keys, including when its source is a class constraint.
+    /// Keep the generic display type while resolving individual properties.
+    fn class_omit_property(&self, ty: &Type, property: &str) -> Option<LazyAliasProperty> {
+        let Type::TypeReference(name, args) = ty else {
+            return None;
+        };
+        if name != "Omit" || args.len() != 2 {
+            return None;
+        }
+        let apparent = self.typeparam_constraint_apparent(&args[0]);
+        let base = apparent.as_ref().unwrap_or(&args[0]);
+        let (class, class_args) = match base {
+            Type::This => (self.enclosing_class_names.last()?.as_str(), &[][..]),
+            Type::TypeReference(name, args) if self.class_info.contains_key(name) => {
+                (name.as_str(), args.as_ref())
+            }
+            _ => return None,
+        };
+        if self.key_type_contains_property(&args[1], property)? {
+            return Some(LazyAliasProperty::Missing);
+        }
+        let mut current = Some(class.to_string());
+        let mut seen = rustc_hash::FxHashSet::default();
+        while let Some(name) = current.take() {
+            if !seen.insert(name.clone()) {
+                return None;
+            }
+            let info = self.class_info.get(&name)?;
+            if let Some((_, flags)) = info
+                .instance_member_modifiers
+                .iter()
+                .find(|(name, _)| name == property)
+            {
+                if flags & (tsc_rs_ast::MOD_PRIVATE | tsc_rs_ast::MOD_PROTECTED) != 0
+                    || property.starts_with('#')
+                {
+                    return Some(LazyAliasProperty::Missing);
+                }
+                let shape = self.resolve_type_reference_to_object(class, class_args)?;
+                return self
+                    .extract_member_type_opt(&shape, property)
+                    .map(LazyAliasProperty::Present);
+            }
+            current = info.extends.clone();
+        }
+        self.builtins
+            .lookup_instance_property("Object", property)
+            .map(LazyAliasProperty::Present)
+            .or(Some(LazyAliasProperty::Missing))
     }
 
     fn array_rest_binding_type(ty: &Type, start: usize) -> Type {
@@ -10815,7 +10942,7 @@ impl TypeChecker {
                             );
                         }
                         ObjPatProp::Rest(p) => {
-                            let rest_ty = Self::object_rest_binding_type(&ty, &consumed);
+                            let rest_ty = self.object_rest_binding_type(&ty, &consumed);
                             self.declare_pattern_vars_with_defaults(
                                 p,
                                 rest_ty,
@@ -36399,7 +36526,8 @@ impl TypeChecker {
     /// `class_name` is `base` or extends it (transitively).
     pub(crate) fn class_derives_from(&self, class_name: &str, base: &str) -> bool {
         let mut current = class_name.to_string();
-        for _ in 0..16 {
+        let mut seen = rustc_hash::FxHashSet::default();
+        while seen.insert(current.clone()) {
             if current == base {
                 return true;
             }

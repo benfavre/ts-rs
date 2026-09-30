@@ -589,8 +589,24 @@ impl TypeChecker {
         let mut static_methods = Vec::new();
         let mut static_method_has_body: Vec<Option<Span>> = Vec::new();
         let mut static_member_modifiers = Vec::new();
+        let mut instance_member_modifiers = Vec::new();
+        let mut accessor_modifiers = rustc_hash::FxHashMap::default();
 
         for member in &class_decl.members {
+            if let ClassMemberKind::GetAccessor(accessor) | ClassMemberKind::SetAccessor(accessor) =
+                &member.kind
+            {
+                let key = (
+                    self.prop_name_to_string(&accessor.name),
+                    accessor.modifiers & MOD_STATIC != 0,
+                );
+                let flags = accessor_modifiers.entry(key).or_insert((None, None));
+                if matches!(member.kind, ClassMemberKind::GetAccessor(_)) {
+                    flags.0 = Some(accessor.modifiers);
+                } else {
+                    flags.1 = Some(accessor.modifiers);
+                }
+            }
             let declaration = match &member.kind {
                 ClassMemberKind::Property(p) => Some((&p.name, p.modifiers)),
                 ClassMemberKind::Method(m) => Some((&m.name, m.modifiers)),
@@ -600,6 +616,12 @@ impl TypeChecker {
                 _ => None,
             };
             if let Some((name, modifiers)) = declaration {
+                if modifiers & MOD_STATIC == 0 {
+                    let name = self.prop_name_to_string(name);
+                    if !instance_member_modifiers.iter().any(|(n, _)| n == &name) {
+                        instance_member_modifiers.push((name, modifiers));
+                    }
+                }
                 // `#name` accessors are private instance members too.
                 if modifiers & MOD_STATIC == 0 && matches!(name, PropName::Private(..)) {
                     own_private_members.insert(self.prop_name_to_string(name));
@@ -682,6 +704,9 @@ impl TypeChecker {
                             & (MOD_PUBLIC | MOD_PRIVATE | MOD_PROTECTED | MOD_READONLY)
                             != 0;
                         if is_param_prop {
+                            if !instance_member_modifiers.iter().any(|(n, _)| n == &pname) {
+                                instance_member_modifiers.push((pname.clone(), param.modifiers));
+                            }
                             if (param.modifiers & MOD_PRIVATE) != 0 {
                                 own_private_members.insert(pname.clone());
                             }
@@ -1177,6 +1202,8 @@ impl TypeChecker {
             static_properties,
             static_methods,
             static_member_modifiers,
+            instance_member_modifiers,
+            accessor_modifiers,
             overloaded_static_methods,
             is_abstract,
             extends,
