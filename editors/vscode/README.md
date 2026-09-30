@@ -28,7 +28,7 @@ If you open a nested folder such as `editors/vscode`, the extension also walks u
    npm install
    npm run compile
    npm run package
-   code --install-extension tsc-rs-0.1.0.vsix
+   code --install-extension tsc-rs-0.4.1.vsix
    ```
 
 2. Open a TypeScript or JavaScript project in VSCode.

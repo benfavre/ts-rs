@@ -11,13 +11,14 @@ host's `process.platform`/`process.arch`.
 
 ## Compatibility and validation
 
-The source compiler is still progressing toward TypeScript compatibility. The
-2026-09-08 constructor-overload wave matches all 11,420 default JavaScript
-baselines with an oracle (1,016 cases have no JavaScript oracle). Diagnostic
-baselines pass 8,035 of 12,436 cases; 4,401 remain mismatched. Expanded option
-variants and declaration output are not yet at parity.
+The source compiler is still progressing toward TypeScript compatibility. As
+of 2026-09-30 it matches all 11,420 default JavaScript baselines with an
+oracle (1,016 cases have no JavaScript oracle). Diagnostic baselines pass
+8,361 of 12,436 cases; 4,075 remain mismatched. Expanded option variants and
+declaration output are not yet at parity.
 
-See the [repository README](https://github.com/benfavre/ts-rs#status-at-a-glance)
+See the [website](https://ts-rs.bext.dev/), the
+[repository README](https://github.com/benfavre/ts-rs#status-at-a-glance)
 and [verified waves](https://github.com/benfavre/ts-rs/blob/main/docs/verified-waves.md)
 for validation and performance measurements. These figures describe the source
 wave; installed npm binaries depend on the published package version. No npm

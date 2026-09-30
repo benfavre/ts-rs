@@ -1,65 +1,103 @@
+<div align="center">
+
 # tsc-rs
 
-`tsc-rs` is a TypeScript compiler written in Rust: scanner, parser, binder,
-type checker, JavaScript/declaration emitter, and a Language Server, all in one
-Cargo workspace. It is measured continuously against the upstream TypeScript
-test suites (`compiler`, `conformance`, `fourslash`) using the real `tsc`
+**A TypeScript compiler, type checker and language server, written in Rust.**
+
+[Website](https://ts-rs.bext.dev/) ·
+[Documentation](https://ts-rs.bext.dev/docs) ·
+[Playground](https://ts-rs.bext.dev/playground) ·
+[Conformance report](https://ts-rs.bext.dev/conformance) ·
+[Progress](https://ts-rs.bext.dev/progress)
+
+[![CI](https://github.com/benfavre/ts-rs/actions/workflows/rust-ci.yml/badge.svg)](https://github.com/benfavre/ts-rs/actions/workflows/rust-ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![npm](https://img.shields.io/npm/v/@bext-stack/tsc-rs?label=npm)](https://www.npmjs.com/package/@bext-stack/tsc-rs)
+
+</div>
+
+`tsc-rs` implements the TypeScript compiler end to end: scanner, parser,
+binder, type checker, JavaScript/declaration emitter and a language server, in
+one Cargo workspace. Every change is measured against the upstream TypeScript
+test suites (`compiler`, `conformance`, `fourslash`), with the real `tsc`
 baselines as the oracle.
 
-It is a tooling-first compiler. Beyond standard `tsc`-compatible output it can
-keep type annotations, comments, and whitespace in the emitted JavaScript for
-downstream tools, and it ships an LSP server with a VS Code extension.
+- **Emit matches `tsc` byte for byte** on all 11,420 JavaScript baselines.
+- **Diagnostics reproduce `tsc`'s messages, positions and codes**; two thirds
+  of the upstream cases match in full, and the rest is the active front.
+- **Language server and VS Code extension**: hover, go-to-definition,
+  references, completions, signature help, rename, formatting.
+- **Tooling modes**: a persistent transpile pipe, a type-check daemon, preserve
+  modes that keep types and comments in the output, and a WebAssembly build.
+- **In production**: it is the TypeScript front end of the
+  [bext](https://bext.dev) engine.
+
+You can try it without installing anything in the
+[browser playground](https://ts-rs.bext.dev/playground).
+
+## A quick look
+
+```console
+$ cat user.ts
+interface User {
+  id: number;
+  name: string;
+}
+
+function greet(user: User): string {
+  return "Hello, " + user.nmae;
+}
+
+const total: number = "42";
+
+$ tsc-rs --noEmit --strict user.ts
+user.ts(7,27): error TS2339: Property 'nmae' does not exist on type 'User'.
+user.ts(10,7): error TS2322: Type 'string' is not assignable to type 'number'.
+
+Found 2 errors in 1 file.
+```
 
 ## Status at a glance
 
-JavaScript and diagnostic baselines below were measured on 2026-09-08 for the
-[public constructor overload wave](docs/verified-waves.md#2026-09-08-public-constructor-overloads),
-with cache disabled. Pass rates are `passed / (passed + failed)`; skipped
-cases are never counted as passes.
+Measured on 2026-09-30 at `c3c3940e9`, with the result cache disabled. A case
+passes only when the output matches what `tsc` produced. Pass rates are
+`passed / (passed + failed)`; skipped cases are never counted as passes.
 
 | Lane | Compiler suite | Conformance suite | What it measures |
 |---|---:|---:|---|
 | JavaScript emit | 6,032 / 6,032 (100%) | 5,388 / 5,388 (100%) | Byte-for-byte match with the `tsc` `.js` baseline (one configuration per case) |
-| Diagnostics | 4,617 / 6,529 (70.7%) | 3,418 / 5,907 (57.9%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
-
-The following measurements are retained from the earlier `65efe57e8` README
-snapshot and have not been rerun for this wave:
-
-| Lane | Compiler suite | Conformance suite | What it measures |
-|---|---:|---:|---|
-| Type-check recall / precision | 53.8% / 83.3% | 60.5% / 86.3% | Per-diagnostic `(file, line, code)` match over every option variant |
+| Diagnostics | 4,752 / 6,529 (72.8%) | 3,609 / 5,907 (61.1%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
+| Type-check recall / precision | 57.9% / 85.1% | 63.4% / 86.7% | Per-diagnostic `(file, line, code)` match over every option variant |
 | Symbols | 185 / 6,434 (2.9%) | 293 / 5,617 (5.2%) | Match with the `tsc` `.symbols` baseline |
 
-Skips per lane: JavaScript emit skips 497 compiler and 519 conformance cases
-that have no `.js` oracle (mostly `noEmit`); the diagnostics lane exercises all
-of them instead. The earlier symbols measurement skips 95 and 290 cases
-without a uniquely selected oracle.
+JavaScript emit skips 497 compiler and 519 conformance cases that have no `.js`
+oracle (mostly `noEmit`); the diagnostics lane exercises all of them instead.
+The symbols lane skips 95 and 290 cases without a uniquely selected oracle.
 
-Last recorded language-server results against `fourslash` (not rerun in this wave):
+Language server, against the `fourslash` suite:
 
 | Operation | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| QuickInfo (hover) | 250 | 279 | 10 | 47.3% |
-| Completions | 839 | 292 | 0 | 74.2% |
-| Go-to-definition | 172 | 39 | 2 | 81.5% |
+| QuickInfo (hover) | 293 | 236 | 10 | 55.4% |
+| Completions | 841 | 290 | 0 | 74.4% |
+| Go-to-definition | 186 | 25 | 2 | 88.2% |
 | Find-all-references | 305 | 42 | 0 | 87.9% |
-| Signature help | 120 | 25 | 7 | 82.8% |
-| **Total** | **1,686** | **677** | **19** | **71.3%** |
+| Signature help | 122 | 23 | 7 | 84.1% |
+| **Total** | **1,747** | **616** | **19** | **73.9%** |
 
 Where the work is:
 
-- **Default emit matches** every case with a JavaScript oracle.
-  The opt-in report that expands every stored option variant (14,819
-  identities, measured 2026-09-07 at `aba3839d5`) passes 93.0% of JavaScript
-  variants and 88.0% of declaration-projection variants; the failures are
-  mostly ES5 downlevel transforms and `.d.ts` emit.
-- **Diagnostics are the active front.** Whole-case passes require every
-  message and column to match, which is where the
-  remaining 1,912 compiler and 2,489 conformance failures come from
-  (4,401 diagnostic mismatches in total).
-- **LSP gaps are type inference**: hover misses are contextual typing,
-  generics, JSDoc type tags, and cross-file aliases; completion misses are
-  auto-imports and cross-file members.
+- **Default emit matches** every case with a JavaScript oracle. An opt-in
+  report that expands every stored option variant (14,819 identities, last
+  measured 2026-09-07 at `aba3839d5`) passed 93.0% of JavaScript variants and
+  88.0% of declaration-projection variants; the failures are mostly ES5
+  downlevel transforms and `.d.ts` emit.
+- **Diagnostics are the active front.** A whole-case pass requires every
+  message and column to match, which is where the remaining 1,777 compiler and
+  2,298 conformance failures come from.
+- **Language-server gaps are type inference**: hover misses are contextual
+  typing, generics, JSDoc type tags and cross-file aliases; completion misses
+  are auto-imports and cross-file members.
 - **Symbols and declaration emit** are early.
 
 Reproduce any row:
@@ -77,26 +115,39 @@ target/release/typecheck-report --suite compiler --json
 target/release/lsp-report --op all --json
 ```
 
-[docs/verified-waves.md](docs/verified-waves.md) records the latest wave results
-and validation. `docs/compatibility-metrics.json` retains the historical
-2026-09-07 snapshot at `aba3839d5`, including expanded-variant measurements;
-those lanes have not been rerun for the current wave.
-
-Local validation for this wave: **3,514 Rust tests passed**, zero failed, and
-37 ignored; `make ci` and workspace Clippy succeeded (existing warnings).
-GitHub Actions jobs on the preceding main commit could not start because of
-the account billing/spending limit, so these are local validation results.
+The [conformance report](https://ts-rs.bext.dev/conformance) and
+[progress page](https://ts-rs.bext.dev/progress) track these numbers over time.
+[docs/verified-waves.md](docs/verified-waves.md) records each change with its
+regression checks.
 
 ## Installation
 
+Build from source with a stable Rust toolchain:
+
 ```bash
-cargo install --path crates/tsc_rs_cli      # installs `tsc-rs`
+git clone https://github.com/benfavre/ts-rs.git
+cd ts-rs
+cargo install --path crates/tsc_rs_cli      # installs `tsc-rs` into ~/.cargo/bin
 # or
 cargo build --release                        # target/release/tsc-rs
 ```
 
-Pre-built Linux, macOS, and Windows binaries are on the
-[GitHub Releases](https://github.com/benfavre/ts-rs/releases) page.
+On Linux x86-64 the workspace links with `clang` and `lld` (see
+`.cargo/config.toml`), so install both first, for example
+`sudo apt install clang lld`. The repository vendors the TypeScript test corpus
+under `tests/`, so the clone is large; that corpus is what makes the numbers
+above reproducible.
+
+A prebuilt Linux x64 binary is published on npm. It follows its own release
+schedule and can be behind the source tree:
+
+```bash
+npm install --save-dev @bext-stack/tsc-rs
+npx tsc-rs --version
+```
+
+See the [installation guide](https://ts-rs.bext.dev/docs/installation) for
+details.
 
 ## Usage
 
@@ -105,21 +156,59 @@ tsc-rs file.ts                  # compile one file
 tsc-rs -p tsconfig.json         # compile a project
 tsc-rs -w -p tsconfig.json      # watch mode
 tsc-rs -b tsconfig.json         # build project references
+tsc-rs --noEmit --strict file.ts  # type-check only
 tsc-rs --init                   # write a starter tsconfig.json
 tsc-rs --lsp                    # language server over stdio
 tsc-rs --help
 ```
 
+Full flag list: [CLI reference](https://ts-rs.bext.dev/docs/cli).
+
+### Transpile only
+
+`--transpileOnly` skips type checking and only parses and emits. Parser errors
+are still reported, so a broken file fails the build. `--fast-emit` also skips
+formatting normalization: the output is valid JavaScript but not laid out the
+way `tsc` would, and it runs two to four times faster.
+
+```bash
+tsc-rs --transpileOnly --jsx react-jsx --module esnext button.tsx
+```
+
+### Pipe and daemon modes
+
+For bundlers, editors and agents, `tsc-rs` can stay alive and answer
+newline-delimited JSON requests on stdin:
+
+```console
+$ echo '{"id":"1","file":"b.tsx","source":"export const Save = () => <Button label=\"Save\" />;","options":{"module":"esnext","jsx":"react-jsx"}}' | tsc-rs --pipe
+{"ready":true,"pid":12345}
+{"id":"1","ok":true,"output":"import { jsx as _jsx } from \"react/jsx-runtime\";\nexport const Save = () => _jsx(Button, { label: \"Save\" });\n","elapsed_ms":0,"exports":["Save"]}
+```
+
+`tsc-rs --check-pipe -p tsconfig.json` is the type-checking equivalent. See
+[Transpile pipe](https://ts-rs.bext.dev/docs/pipe) and
+[Type-check daemon](https://ts-rs.bext.dev/docs/check-pipe).
+
 ### Preserve modes
 
 `tsc` strips all type information. `tsc-rs` can keep some of it in the output
-for runtime type libraries, documentation tools, and refactoring tools:
+for runtime type libraries, documentation tools and refactoring tools:
 
 ```bash
 tsc-rs --preserveTypeAnnotations file.ts   # keep `as`, `satisfies`, `<Type>`
 tsc-rs --preserveComments --removeComments file.ts
 tsc-rs --preserveWhitespace file.ts        # keep original layout (partial)
 ```
+
+### Monorepo analysis
+
+```bash
+tsc-rs analyze dep-graph      # dependency fan-out from entry files
+tsc-rs analyze externals      # audit serverExternalPackages against the import graph
+```
+
+See [docs/ANALYZE.md](docs/ANALYZE.md).
 
 ### tsconfig support
 
@@ -143,27 +232,26 @@ codes (TS5052, TS5095, TS5109, TS5110, and others).
 
 ## Language server
 
-Start it with `tsc-rs --lsp` from any LSP-capable editor. Supported:
+Start it with `tsc-rs --lsp` from any LSP-capable editor. It supports:
 
-| Feature | Status |
-|---|---|
-| Diagnostics on open and edit | Working |
-| Hover, go-to-definition, find references (single and cross-file) | Working |
-| Completions: scope, members, module paths, auto-import statements, JSX, JSDoc | Working |
-| Signature help | Working |
-| Rename, document symbols, workspace symbol search | Working |
-| Code actions (remove unused variable) | Working |
-| Formatting (via the emitter) | Working |
-| Incremental text sync, per-file parse/bind/check cache | Working |
-| tsconfig / jsconfig project awareness, multi-root workspaces, watched-file refresh | Working |
-| Built-in `lib.d.ts` fallback stubs | Working |
+- diagnostics on open and edit
+- hover, go-to-definition and find references, within a file and across files
+- completions: scope, members, module paths, auto-import statements, JSX, JSDoc
+- signature help
+- rename, document symbols and workspace symbol search
+- code actions (remove unused variable) and formatting (via the emitter)
+- incremental text sync with a per-file parse/bind/check cache
+- tsconfig / jsconfig project awareness, multi-root workspaces and
+  watched-file refresh
+
+How closely each operation matches `tsc` is in the table above.
 
 ### VS Code extension
 
 ```bash
 cd editors/vscode
 npm install && npm run compile && npx vsce package
-code --install-extension tsc-rs-0.1.0.vsix
+code --install-extension tsc-rs-0.4.1.vsix
 ```
 
 The extension auto-detects `target/debug/tsc-rs` or `target/release/tsc-rs` in
@@ -173,6 +261,12 @@ restart with `tsc-rs: Restart Language Server`. It watches TS/JS sources and
 `tsconfig*.json` / `jsconfig.json` and logs to the `tsc-rs` output channel.
 
 ## Workspace layout
+
+The compiler is a plain pipeline, one crate per stage:
+
+```
+.ts/.tsx ─▶ scanner ─▶ parser ─▶ symbols ─▶ types ─▶ emitter ─▶ .js / .d.ts / .js.map
+```
 
 | Crate | Role |
 |---|---|
@@ -194,6 +288,9 @@ restart with `tsc-rs: Restart Language Server`. It watches TS/JS sources and
 | `tsc_rs_analyze` | Static analysis tools for TypeScript monorepos |
 | `tsc_rs_constraints`, `tsc_rs_control_flow` | Experimental constraint-graph and control-flow-graph primitives |
 | `editors/vscode` | VS Code extension (language client) |
+
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes how the crates fit
+together.
 
 ## Development
 
@@ -234,40 +331,58 @@ Harness notes:
 - Some type-check cases trigger unbounded type expansion; if a
   multi-threaded `typecheck-report` run is OOM-killed, rerun with
   `RAYON_NUM_THREADS=1`.
+- The standard-library tests need the TypeScript 6.0.3 `lib.*.d.ts` files; see
+  [CONTRIBUTING.md](CONTRIBUTING.md) for `TSC_RS_TYPESCRIPT_LIB_DIR`.
 
 ## Performance
 
-The latest constructor wave was compared with `f9d5802a9` using 1,000 compiler
-diagnostic cases, release-fast builds, one thread, no cache, and three measured
-pairs after warmup. Median wall time was 14.55 → 14.74 seconds (+1.3%), CPU
-14.62 → 14.81 seconds (+1.3%), and peak RSS 48,232 → 48,732 KiB (+1.0%).
-Timing ranges overlap. One pair with detected background Cargo activity was
-replaced; the [wave log](docs/verified-waves.md#2026-09-08-public-constructor-overloads)
-records the method and limitations.
+The parser is competitive with the fastest native TypeScript parsers. In one
+same-session comparison on the 7.8 MB `typescript.js` fixture:
 
-The parser is competitive with the fastest native TypeScript parsers. On the
-7.8 MB `typescript.js` fixture, in one same-session comparison, `tsc-rs` parsed
-in 44.5 ms against 35.2 ms for oxc, and parse plus semantic analysis was
-96.0 ms against 97.9 ms. `tsc-rs` beats SWC on every benchmark file. Benchmarks live in
-`crates/tsc_rs_bench`.
+| | tsc-rs | oxc |
+|---|---:|---:|
+| Parse | 44.5 ms | 35.2 ms |
+| Parse and semantic analysis | 96.0 ms | 97.9 ms |
 
-Transpile-only emit (`--fast-emit`) skips type checking and runs two to four
-times faster than the structured path.
+oxc parses faster; `tsc-rs` is ahead once binding and symbol resolution are
+included, and it parses faster than SWC on every file in the benchmark set.
+The benchmarks live in `crates/tsc_rs_bench` (`make bench`, `make bench-vs-oxc`).
 
-## Limitations and non-goals
+Checker changes are measured before and after on 1,000 compiler diagnostic
+cases (one thread, no cache); the method and raw timings are in
+[docs/verified-waves.md](docs/verified-waves.md).
 
-- Not a drop-in `tsc` replacement yet: diagnostics, declaration emit, and
+## Limitations
+
+- Not a drop-in `tsc` replacement yet: diagnostics, declaration emit and
   expanded option variants are not at parity, and the CLI surface is a subset.
-- The type checker is incomplete; hover types and some diagnostics differ from
-  `tsc`, as the tables above quantify.
-- `.d.ts` emit and symbol baselines are early.
+- The type checker is incomplete. Expect missing errors and some false ones on
+  advanced code; hover types can differ from `tsc`. The tables above quantify
+  this.
+- `.d.ts` emit and the symbol baselines are the least mature lanes.
 
 ## More documentation
 
+The [website](https://ts-rs.bext.dev/docs) has the guides: quick start, CLI
+reference, tsconfig support, JSX, the language server, the pipe and daemon
+protocols, WebAssembly, the Rust library API and the npm package.
+
+In this repository:
+
 - [CONTRIBUTING.md](CONTRIBUTING.md): local workflow
+- [CHANGELOG.md](CHANGELOG.md): release notes
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): architecture
 - [docs/QUERY_API_REFERENCE.md](docs/QUERY_API_REFERENCE.md): query API
 - [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md): diagnostics
 - [docs/ANALYZE.md](docs/ANALYZE.md): monorepo analysis tools
-- [docs/verified-waves.md](docs/verified-waves.md): verified changes, regression checks, and measured performance
+- [docs/verified-waves.md](docs/verified-waves.md): verified changes, regression checks and measured performance
 - [docs/compatibility-metrics.json](docs/compatibility-metrics.json): historical metrics snapshot at `aba3839d5`
+
+## License
+
+MIT; see [LICENSE](LICENSE). The vendored TypeScript test corpus and the ports
+listed in [NOTICE](NOTICE) are under Apache-2.0
+([LICENSE-APACHE-2.0](LICENSE-APACHE-2.0)).
+
+`tsc-rs` is an independent project. TypeScript is a trademark of Microsoft
+Corporation.

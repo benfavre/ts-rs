@@ -25,7 +25,7 @@ edition = "2021"
 license = "MIT"
 version = "0.4.1"
 repository = "https://github.com/benfavre/ts-rs"
-homepage = "https://github.com/benfavre/ts-rs"
+homepage = "https://ts-rs.bext.dev/"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

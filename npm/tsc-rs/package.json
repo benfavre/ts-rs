@@ -7,7 +7,7 @@
     "type": "git",
     "url": "https://github.com/benfavre/ts-rs"
   },
-  "homepage": "https://github.com/benfavre/ts-rs",
+  "homepage": "https://ts-rs.bext.dev/",
   "keywords": [
     "typescript",
     "compiler",

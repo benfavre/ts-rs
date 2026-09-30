@@ -1,8 +1,38 @@
 # Changelog
 
-## 0.1.0 (Unreleased)
+Day-to-day changes are recorded per wave in
+[`docs/verified-waves.md`](docs/verified-waves.md) and on the
+[progress page](https://ts-rs.bext.dev/progress). This file summarizes
+versions.
 
-Initial public release of tsc-rs, a TypeScript-to-JavaScript compiler written in Rust.
+## 0.4.1
+
+First version published as a public repository (2026-09-29). Figures measured
+on 2026-09-30 at `c3c3940e9`, cache disabled:
+
+- **JavaScript emit**: 11,420 of 11,420 `tsc` `.js` baselines match byte for
+  byte across the compiler and conformance suites (1,016 cases have no `.js`
+  oracle and are skipped).
+- **Diagnostics**: 8,361 of 12,436 cases match every message, position and
+  code (compiler 4,752 / 6,529, conformance 3,609 / 5,907).
+- **Language server**: 1,747 of 2,363 `fourslash` checks pass across hover,
+  completions, go-to-definition, find-all-references and signature help.
+- **Transpile modes**: `--transpileOnly`, `--fast-emit`, the persistent
+  `--pipe` transpile pipe and the `--check-pipe` type-check daemon.
+- **Monorepo analysis**: `tsc-rs analyze dep-graph` and `analyze externals`.
+- **WebAssembly build** (`crates/tsc_rs_wasm`) and a browser
+  [playground](https://ts-rs.bext.dev/playground).
+- The emit gaps listed under 0.1.0 below (class decorators, `__esDecorate`,
+  private field compound assignment) are closed: every default emit baseline
+  passes.
+
+Known limitations: declaration (`.d.ts`) emit and symbol baselines are early,
+the type checker is incomplete, and the CLI surface is a subset of `tsc`.
+
+## 0.1.0
+
+Historical notes from the first internal milestone, kept for reference. The
+figures and limitations below describe that milestone, not the current tree.
 
 ### Highlights
 
