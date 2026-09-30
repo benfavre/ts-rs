@@ -1805,6 +1805,7 @@ impl TypeChecker {
             ExprKind::ObjectLit(props) => {
                 let mut method_names: Vec<std::string::String> = Vec::new();
                 let mut properties = Vec::new();
+                let mut any_spread = false;
                 for prop in props {
                     match prop {
                         ObjLitProp::Property(p) => {
@@ -1825,7 +1826,7 @@ impl TypeChecker {
                             // contributed by `state`, tripping downstream
                             // TS2322 / TS2339 against the declared shape.
                             let spread_ty = self.infer_expr_type(e);
-                            let _ = self
+                            any_spread |= self
                                 .merge_spread_into_object_properties(&spread_ty, &mut properties);
                         }
                         ObjLitProp::Method(m) => {
@@ -1882,6 +1883,11 @@ impl TypeChecker {
                         }
                         _ => {}
                     }
+                }
+                // tsc getSpreadType: spreading `any` makes the literal `any`
+                // (the check pass does the same).
+                if any_spread {
+                    return Type::Any;
                 }
                 Type::ObjectType(ObjectTypeInfo {
                     properties,

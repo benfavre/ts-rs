@@ -7373,13 +7373,13 @@ pub(crate) use transforms::*;
 
 /// Whether errors baselines seed the donor checker with every program
 /// file's declarations (`inject_external_types`), so multi-file imports get
-/// real types. Controlled by `TSC_RS_HARNESS_CROSS_FILE` (`1` on, `0` off).
+/// real types. On by default; `TSC_RS_HARNESS_CROSS_FILE=0` turns it off.
 pub(crate) fn cross_file_injection_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("TSC_RS_HARNESS_CROSS_FILE")
-            .map(|value| value == "1")
-            .unwrap_or(false)
+            .map(|value| value != "0")
+            .unwrap_or(true)
     })
 }
 

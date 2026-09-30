@@ -9678,8 +9678,31 @@ impl TypeChecker {
                         // `inject_external_types`, this stops mocks /
                         // test doubles in regular source files from
                         // shadowing authoritative typed declarations.
-                        if self.lookup_var(name).is_some() {
-                            continue;
+                        // A cross-file name placeholder (`any`) yields to a
+                        // `const` unique symbol or literal: its value keys
+                        // computed members (`[Key]: string`) of later
+                        // declarations.
+                        let literal_initializer = |init: &Expr| {
+                            matches!(
+                                &init.kind,
+                                ExprKind::StrLit(_)
+                                    | ExprKind::NumLit(_)
+                                    | ExprKind::NoSubstTemplate(_)
+                            )
+                        };
+                        let declares_key_constant = var_stmt.kind == VarKind::Const
+                            && (decl
+                                .type_ann
+                                .as_ref()
+                                .is_some_and(|ann| Self::type_node_is_unique_symbol(ann))
+                                || (decl.type_ann.is_none()
+                                    && decl.init.as_deref().is_some_and(|init| {
+                                        literal_initializer(init) || self.symbol_factory_call(init)
+                                    })));
+                        match self.lookup_var(name) {
+                            Some(Type::Any) if declares_key_constant => {}
+                            Some(_) => continue,
+                            None => {}
                         }
                         let ty = decl
                             .type_ann
@@ -9926,6 +9949,28 @@ impl TypeChecker {
                             if !self.type_aliases.contains_key(exported_name.as_str()) {
                                 Arc::make_mut(&mut self.type_aliases)
                                     .insert(exported_name.clone(), entry);
+                            }
+                        } else if self.class_info.contains_key(spec.local.as_str())
+                            && !self.class_info.contains_key(exported_name.as_str())
+                            && !self.interface_info.contains_key(exported_name.as_str())
+                            && !self.type_aliases.contains_key(exported_name.as_str())
+                        {
+                            // `export { C as D }` renames the class itself:
+                            // `D` names the same declaration (and keeps its
+                            // private-member identity), not a new class.
+                            let generic = self
+                                .class_info
+                                .get(spec.local.as_str())
+                                .is_some_and(|info| !info.type_params.is_empty());
+                            if !generic {
+                                Arc::make_mut(&mut self.type_aliases).insert(
+                                    exported_name.clone(),
+                                    (
+                                        Vec::new(),
+                                        Type::TypeReference(spec.local.clone(), Arc::from([])),
+                                        0,
+                                    ),
+                                );
                             }
                         }
                     }
@@ -16880,6 +16925,25 @@ impl TypeChecker {
         }
     }
 
+    /// The class a non-generic type alias created by a renaming export
+    /// (`export { C as D }`) stands for.
+    fn renamed_class_alias(&self, name: &str) -> Option<std::string::String> {
+        if self.class_info.contains_key(name) {
+            return None;
+        }
+        match self.type_aliases.get(name) {
+            Some((params, Type::TypeReference(target, args), _))
+                if params.is_empty()
+                    && args.is_empty()
+                    && target != name
+                    && self.class_info.contains_key(target.as_str()) =>
+            {
+                Some(target.clone())
+            }
+            _ => None,
+        }
+    }
+
     fn private_member_origins(
         &self,
         class_name: &str,
@@ -19273,6 +19337,14 @@ impl TypeChecker {
                             }
                             if checker.class_info.contains_key(sn.as_str()) {
                                 return true;
+                            }
+                            // `export { C as D }`: `D` aliases the class.
+                            if let Some(aliased) = checker.renamed_class_alias(sn) {
+                                return class_instance_like(
+                                    checker,
+                                    &Type::TypeReference(aliased, Arc::from([])),
+                                    tn,
+                                );
                             }
                             // An interface extending the class inherits its
                             // private members with the same origin.

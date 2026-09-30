@@ -835,8 +835,35 @@ pub(crate) fn eval_single_conditional(
         }
     } else if is_type_assignable(check, extends) {
         true_type.clone()
+    } else if contains_value_query(check) || contains_value_query(extends) {
+        // A `typeof value` the static evaluator cannot expand: "not
+        // assignable" is not a decision, so keep the conditional deferred.
+        Type::Conditional {
+            check: Arc::new(check.clone()),
+            extends: Arc::new(extends.clone()),
+            true_type: Arc::new(true_type.clone()),
+            false_type: Arc::new(false_type.clone()),
+        }
     } else {
         false_type.clone()
+    }
+}
+
+/// Whether `ty` still contains an unexpanded `typeof value` query.
+fn contains_value_query(ty: &Type) -> bool {
+    match ty {
+        Type::Typeof(_) => true,
+        Type::Union(members) | Type::Intersection(members) => {
+            members.iter().any(contains_value_query)
+        }
+        Type::TypeReference(_, args) => args.iter().any(contains_value_query),
+        Type::Array(inner) => contains_value_query(inner),
+        Type::Tuple(elements) => elements.iter().any(contains_value_query),
+        Type::Keyof(inner) => contains_value_query(inner),
+        Type::IndexedAccess(object, index) => {
+            contains_value_query(object) || contains_value_query(index)
+        }
+        _ => false,
     }
 }
 

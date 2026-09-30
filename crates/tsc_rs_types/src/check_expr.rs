@@ -797,6 +797,62 @@ impl TypeChecker {
     /// namespace, function (tsc's precedence) — and a constant reports
     /// TS2588. The target then has the error type, so no assignability
     /// diagnostic follows. JS files keep their expando leniency.
+    /// The built-in `import.meta` shape (standard + runtime properties).
+    fn import_meta_builtin_shape(&self) -> Type {
+        Type::ObjectType(ObjectTypeInfo {
+            properties: vec![
+                ("url".to_string(), Arc::new(Type::String)),
+                // Bun/Deno/Node extensions
+                ("dir".to_string(), Arc::new(Type::String)),
+                ("file".to_string(), Arc::new(Type::String)),
+                ("path".to_string(), Arc::new(Type::String)),
+                ("dirname".to_string(), Arc::new(Type::String)),
+                ("filename".to_string(), Arc::new(Type::String)),
+                (
+                    "env".to_string(),
+                    Arc::new(Type::ObjectType(ObjectTypeInfo {
+                        properties: Vec::new(),
+                        call_signatures: Vec::new(),
+                        construct_signatures: Vec::new(),
+                        index_signature: Some((
+                            Arc::new(Type::String),
+                            Arc::new(Type::Union(vec![Type::String, Type::Undefined].into())),
+                        )),
+                        index_signature_name: None,
+                        method_names: Vec::new(),
+                    })),
+                ),
+                (
+                    "resolve".to_string(),
+                    Arc::new(Type::Function(FunctionType {
+                        type_param_constraints: Vec::new(),
+                        params: vec![("specifier".to_string(), Type::String)],
+                        return_type: Arc::new(Type::String),
+                        type_params: Vec::new(),
+                        type_param_defaults: Vec::new(),
+                        type_predicate: None,
+                    })),
+                ),
+                (
+                    "resolve".to_string(),
+                    Arc::new(Type::Function(FunctionType {
+                        type_param_constraints: Vec::new(),
+                        params: vec![("specifier".to_string(), Type::String)],
+                        return_type: Arc::new(Type::String),
+                        type_params: Vec::new(),
+                        type_param_defaults: Vec::new(),
+                        type_predicate: None,
+                    })),
+                ),
+            ],
+            call_signatures: Vec::new(),
+            construct_signatures: Vec::new(),
+            index_signature: None,
+            index_signature_name: None,
+            method_names: Vec::new(),
+        })
+    }
+
     fn report_invalid_assignment_target(&mut self, target: &Expr) -> bool {
         // tsc's getAssignmentTarget walks through parentheses and non-null
         // assertions only: `(Foo as any) = null` is not an assignment to the
@@ -807,6 +863,20 @@ impl TypeChecker {
                 ExprKind::Paren(e) | ExprKind::NonNull(e) => e,
                 _ => break,
             };
+        }
+        // `import.meta = x` / `new.target = x`: a meta-property is not a
+        // reference (tsc checkReferenceExpression, TS2364); the value is not
+        // checked against it.
+        if matches!(inner.kind, ExprKind::MetaProp(_)) {
+            self.diagnostics.push(Diagnostic {
+                code: 2364,
+                message: "The left-hand side of an assignment expression must be a variable or a property access.".to_string(),
+                category: DiagnosticCategory::Error,
+                file_name: None,
+                span: Some(target.span),
+                related: None,
+            });
+            return true;
         }
         let ExprKind::Ident(name) = &inner.kind else {
             return false;
@@ -7650,16 +7720,20 @@ impl TypeChecker {
                         // qualified entry holds a single declaration's members
                         // (merged declarations aren't combined), so it is only
                         // used when it has the accessed member.
-                        let qualified_enum_key = if self.enum_info.contains_key(name.as_str()) {
-                            None
-                        } else {
-                            Self::simple_expression_path(&mem.object).filter(|path| {
-                                path.rsplit('.').next() == Some(name.as_str())
+                        // A qualified receiver (`ns.Foo.X`) names that
+                        // namespace's enum even when an unrelated `Foo` is
+                        // registered under the bare name (another module's).
+                        let qualified_enum_key = Self::simple_expression_path(&mem.object)
+                            .filter(|path| {
+                                path.as_str() != name.as_str()
+                                    && path.rsplit('.').next() == Some(name.as_str())
                                     && self.enum_info.get(path.as_str()).is_some_and(|members| {
                                         members.iter().any(|(n, _)| n == mem.property.as_str())
                                     })
-                            })
-                        };
+                                    && self.enum_info.get(name.as_str()).is_none_or(|members| {
+                                        !members.iter().any(|(n, _)| n == mem.property.as_str())
+                                    })
+                            });
                         let enum_key = qualified_enum_key.as_deref().unwrap_or(name.as_str());
                         if let Some(members) = self.enum_info.get(enum_key) {
                             let primitive_member = self
@@ -10035,60 +10109,21 @@ impl TypeChecker {
             ExprKind::MetaProp(mp) => {
                 match (mp.meta.as_str(), mp.property.as_str()) {
                     // import.meta returns an object type with standard + runtime properties
-                    ("import", "meta") => Type::ObjectType(ObjectTypeInfo {
-                        properties: vec![
-                            ("url".to_string(), Arc::new(Type::String)),
-                            // Bun/Deno/Node extensions
-                            ("dir".to_string(), Arc::new(Type::String)),
-                            ("file".to_string(), Arc::new(Type::String)),
-                            ("path".to_string(), Arc::new(Type::String)),
-                            ("dirname".to_string(), Arc::new(Type::String)),
-                            ("filename".to_string(), Arc::new(Type::String)),
-                            (
-                                "env".to_string(),
-                                Arc::new(Type::ObjectType(ObjectTypeInfo {
-                                    properties: Vec::new(),
-                                    call_signatures: Vec::new(),
-                                    construct_signatures: Vec::new(),
-                                    index_signature: Some((
-                                        Arc::new(Type::String),
-                                        Arc::new(Type::Union(
-                                            vec![Type::String, Type::Undefined].into(),
-                                        )),
-                                    )),
-                                    index_signature_name: None,
-                                    method_names: Vec::new(),
-                                })),
-                            ),
-                            (
-                                "resolve".to_string(),
-                                Arc::new(Type::Function(FunctionType {
-                                    type_param_constraints: Vec::new(),
-                                    params: vec![("specifier".to_string(), Type::String)],
-                                    return_type: Arc::new(Type::String),
-                                    type_params: Vec::new(),
-                                    type_param_defaults: Vec::new(),
-                                    type_predicate: None,
-                                })),
-                            ),
-                            (
-                                "resolve".to_string(),
-                                Arc::new(Type::Function(FunctionType {
-                                    type_param_constraints: Vec::new(),
-                                    params: vec![("specifier".to_string(), Type::String)],
-                                    return_type: Arc::new(Type::String),
-                                    type_params: Vec::new(),
-                                    type_param_defaults: Vec::new(),
-                                    type_predicate: None,
-                                })),
-                            ),
-                        ],
-                        call_signatures: Vec::new(),
-                        construct_signatures: Vec::new(),
-                        index_signature: None,
-                        index_signature_name: None,
-                        method_names: Vec::new(),
-                    }),
+                    ("import", "meta") => {
+                        let mut meta = self.import_meta_builtin_shape();
+                        // Program `ImportMeta` declarations (global
+                        // augmentations) add members to `import.meta`.
+                        if let (Type::ObjectType(shape), Some(info)) =
+                            (&mut meta, self.interface_info.get("ImportMeta"))
+                        {
+                            for (name, ty) in &info.object_type.properties {
+                                if !shape.properties.iter().any(|(n, _)| n == name) {
+                                    shape.properties.push((name.clone(), ty.clone()));
+                                }
+                            }
+                        }
+                        meta
+                    }
                     // new.target returns a function or undefined
                     ("new", "target") => Type::Any,
                     _ => Type::Any,

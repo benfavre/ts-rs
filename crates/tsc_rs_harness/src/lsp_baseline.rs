@@ -319,6 +319,17 @@ pub fn find_all_refs_baseline_path(baselines_dir: &Path, test_name: &str) -> std
 }
 
 /// Load a findAllReferences baseline and extract the expected reference count.
+/// A top-level `// === <operation> ===` line (not a file-path header).
+fn is_operation_header(line: &str) -> bool {
+    let Some(inner) = line
+        .strip_prefix("// === ")
+        .and_then(|rest| rest.strip_suffix(" ==="))
+    else {
+        return false;
+    };
+    !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_alphabetic())
+}
+
 pub fn load_find_all_refs_baseline(path: &Path) -> Result<Vec<FindAllRefsEntry>, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("cannot read baseline: {e}"))?;
@@ -340,6 +351,12 @@ pub fn load_find_all_refs_baseline(path: &Path) -> Result<Vec<FindAllRefsEntry>,
                 let t = lines[i].trim();
                 if t == "// === findAllReferences ===" {
                     break; // next section
+                }
+                // Another operation's section (`// === findRenameLocations ===`,
+                // `// === documentHighlights ===`, ...) ends this entry; file
+                // headers (`// === /a.ts ===`) and indented sub-sections don't.
+                if is_operation_header(lines[i]) {
+                    break;
                 }
                 // Count [| occurrences in source lines
                 if t.starts_with("// ") {

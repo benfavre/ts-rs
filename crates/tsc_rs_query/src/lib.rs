@@ -873,6 +873,74 @@ impl QueryEngine {
         ids
     }
 
+    /// `SymbolInfo` of every symbol named `name`, each read from its own
+    /// file's table (unlike `find_symbol` + `get_symbol_info`, which look a
+    /// per-file id up in whichever file has that index first). Ordered by
+    /// file path, then declaration position.
+    pub fn find_symbol_infos(&self, name: &str) -> Vec<SymbolInfo> {
+        let mut files: Vec<&String> = self.analyses.keys().collect();
+        files.sort();
+        let mut out = Vec::new();
+        for file in files {
+            let analysis = &self.analyses[file];
+            for symbol in &analysis.symbols.symbols {
+                if symbol.name != name {
+                    continue;
+                }
+                let declarations = symbol
+                    .declarations
+                    .iter()
+                    .map(|d| (normalize_path(&d.file_name), d.span))
+                    .collect::<Vec<_>>();
+                let type_id = symbol.declarations.first().and_then(|d| {
+                    let ty = type_for_span(analysis, d.span)?;
+                    Some(resolve_stable_type_id(analysis, ty))
+                });
+                out.push(SymbolInfo {
+                    id: u64::from(symbol.id),
+                    name: symbol.name.clone(),
+                    kind: symbol_kind_from_flags(symbol.flags),
+                    type_id,
+                    declarations,
+                    is_exported: symbol.flags & SYM_EXPORT != 0,
+                });
+            }
+        }
+        out
+    }
+
+    /// Declaration locations of every symbol named `name`, across files.
+    ///
+    /// Symbol ids are per-file, so `find_symbol` + `get_symbol_locations`
+    /// mixes up same-numbered symbols of different files; this pairs each
+    /// declaration with the table it came from. Grouped per symbol in
+    /// (file, first declaration) order.
+    pub fn find_symbol_declarations(&self, name: &str) -> Vec<Vec<(String, Span)>> {
+        let mut groups: Vec<Vec<(String, Span)>> = Vec::new();
+        for analysis in self.analyses.values() {
+            for symbol in &analysis.symbols.symbols {
+                if symbol.name != name || symbol.declarations.is_empty() {
+                    continue;
+                }
+                let mut locs: Vec<(String, Span)> = symbol
+                    .declarations
+                    .iter()
+                    .map(|decl| (normalize_path(&decl.file_name), decl.span))
+                    .collect();
+                locs.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.start.cmp(&b.1.start)));
+                locs.dedup();
+                groups.push(locs);
+            }
+        }
+        groups.sort_by(|a, b| {
+            a[0].0
+                .cmp(&b[0].0)
+                .then_with(|| a[0].1.start.cmp(&b[0].1.start))
+        });
+        groups.dedup();
+        groups
+    }
+
     /// Get declaration locations for a symbol.
     pub fn get_symbol_locations(&self, symbol_id: u64) -> Vec<(String, Span)> {
         let Some(symbol_id) = as_u32(symbol_id) else {

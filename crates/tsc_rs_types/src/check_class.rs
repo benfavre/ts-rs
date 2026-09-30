@@ -1048,7 +1048,14 @@ impl TypeChecker {
         // constructor, method bodies, and arrow property initializers
         // declare instance properties — AFTER declared members, so explicit
         // declarations always win the name.
-        let js_file = self.current_file_is_js();
+        // During cross-file injection the declaring file is the injected one.
+        let js_file = self.current_file_is_js()
+            || (self.current_file_name.is_none()
+                && self.injected_decl_file.as_deref().is_some_and(|file| {
+                    [".js", ".jsx", ".mjs", ".cjs"]
+                        .iter()
+                        .any(|extension| file.ends_with(extension))
+                }));
         for member in &class_decl.members {
             match &member.kind {
                 ClassMemberKind::Constructor(ctor) => {

@@ -750,9 +750,7 @@ impl Binder {
                 }
                 self.push_scope(ScopeKind::Function, fn_decl.span);
                 if let Some(ref type_params) = fn_decl.type_params {
-                    for tp in type_params {
-                        self.declare(&tp.name, SYM_TYPE_PARAMETER, file_name, tp.span);
-                    }
+                    self.declare_type_params(type_params, file_name);
                 }
                 for param in &fn_decl.params {
                     self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
@@ -776,9 +774,7 @@ impl Binder {
                     let class_sym = self.declare(name, SYM_CLASS, file_name, decl_span);
                     self.push_scope(ScopeKind::Class, class_decl.span);
                     if let Some(ref type_params) = class_decl.type_params {
-                        for tp in type_params {
-                            self.declare(&tp.name, SYM_TYPE_PARAMETER, file_name, tp.span);
-                        }
+                        self.declare_type_params(type_params, file_name);
                     }
                     // Bind extends expression (the base class identifier) and record in extends_map
                     if let Some(ref extends) = class_decl.extends {
@@ -828,9 +824,7 @@ impl Binder {
                 self.push_scope(ScopeKind::Interface, iface.span);
                 // Bind type parameters
                 if let Some(ref type_params) = iface.type_params {
-                    for tp in type_params {
-                        self.declare(&tp.name, SYM_TYPE_PARAMETER, file_name, tp.span);
-                    }
+                    self.declare_type_params(type_params, file_name);
                 }
                 for member in &iface.members {
                     self.bind_type_member(member, iface_sym, file_name);
@@ -843,9 +837,7 @@ impl Binder {
                 // Bind type parameters
                 if let Some(ref type_params) = ta.type_params {
                     self.push_scope(ScopeKind::TypeAlias, ta.span);
-                    for tp in type_params {
-                        self.declare(&tp.name, SYM_TYPE_PARAMETER, file_name, tp.span);
-                    }
+                    self.declare_type_params(type_params, file_name);
                 }
                 self.bind_type_node(&ta.type_ann, file_name);
                 if ta.type_params.is_some() {
@@ -1074,9 +1066,7 @@ impl Binder {
                         self.declare(name, SYM_FUNCTION, file_name, fn_decl.span);
                     }
                     if let Some(ref type_params) = fn_decl.type_params {
-                        for tp in type_params {
-                            self.declare(&tp.name, SYM_TYPE_PARAMETER, file_name, tp.span);
-                        }
+                        self.declare_type_params(type_params, file_name);
                     }
                     for param in &fn_decl.params {
                         self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
@@ -1103,9 +1093,7 @@ impl Binder {
                         let decl_span = class_decl.name_span.unwrap_or(class_decl.span);
                         let class_sym = self.declare(name, SYM_CLASS, file_name, decl_span);
                         if let Some(ref type_params) = class_decl.type_params {
-                            for tp in type_params {
-                                self.declare(&tp.name, SYM_TYPE_PARAMETER, file_name, tp.span);
-                            }
+                            self.declare_type_params(type_params, file_name);
                         }
                         for member in &class_decl.members {
                             self.bind_class_member(member, class_sym, file_name);
@@ -1127,9 +1115,7 @@ impl Binder {
                 ExprKind::Arrow(arrow) => {
                     self.push_scope(ScopeKind::Function, arrow.span);
                     if let Some(ref type_params) = arrow.type_params {
-                        for tp in type_params {
-                            self.declare(&tp.name, SYM_TYPE_PARAMETER, file_name, tp.span);
-                        }
+                        self.declare_type_params(type_params, file_name);
                     }
                     for param in &arrow.params {
                         self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
@@ -1313,6 +1299,23 @@ impl Binder {
                     for t in types.iter().rev() {
                         stack.push(t);
                     }
+                }
+                TypeNodeKind::Function(fn_type) | TypeNodeKind::Constructor(fn_type)
+                    if fn_type
+                        .type_params
+                        .as_ref()
+                        .is_some_and(|tps| !tps.is_empty()) =>
+                {
+                    // `<T extends I>(p: T) => T`: the signature's own type
+                    // parameters shadow outer ones.
+                    self.bind_signature_types(
+                        fn_type.type_params.as_ref(),
+                        &fn_type.params,
+                        Some(&fn_type.return_type),
+                        node.span,
+                        file_name,
+                        false,
+                    );
                 }
                 TypeNodeKind::Function(fn_type) | TypeNodeKind::Constructor(fn_type) => {
                     stack.push(&fn_type.return_type);
@@ -1903,6 +1906,9 @@ impl Binder {
                         .members
                         .insert(name.to_string(), id);
                 }
+                if let Some(ref type_ann) = prop.type_ann {
+                    self.bind_type_node(type_ann, file_name);
+                }
                 if let Some(ref init) = prop.initializer {
                     self.bind_expr(init, file_name);
                 }
@@ -1931,12 +1937,16 @@ impl Binder {
                 }
                 self.push_scope(ScopeKind::Function, member.span);
                 if let Some(ref type_params) = method.type_params {
-                    for tp in type_params {
-                        self.declare(&tp.name, SYM_TYPE_PARAMETER, file_name, tp.span);
-                    }
+                    self.declare_type_params(type_params, file_name);
                 }
                 for param in &method.params {
                     self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                    if let Some(ref type_ann) = param.type_ann {
+                        self.bind_type_node(type_ann, file_name);
+                    }
+                }
+                if let Some(ref return_type) = method.return_type {
+                    self.bind_type_node(return_type, file_name);
                 }
                 if let Some(ref body) = method.body {
                     for s in body {
@@ -1954,6 +1964,9 @@ impl Binder {
                 self.push_scope(ScopeKind::Function, member.span);
                 for param in &ctor.params {
                     self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                    if let Some(ref type_ann) = param.type_ann {
+                        self.bind_type_node(type_ann, file_name);
+                    }
                 }
                 if let Some(ref body) = ctor.body {
                     for s in body {
@@ -1980,6 +1993,12 @@ impl Binder {
                 self.push_scope(ScopeKind::Function, member.span);
                 for param in &acc.params {
                     self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                    if let Some(ref type_ann) = param.type_ann {
+                        self.bind_type_node(type_ann, file_name);
+                    }
+                }
+                if let Some(ref return_type) = acc.return_type {
+                    self.bind_type_node(return_type, file_name);
                 }
                 if let Some(ref body) = acc.body {
                     for s in body {
@@ -2006,6 +2025,12 @@ impl Binder {
                 self.push_scope(ScopeKind::Function, member.span);
                 for param in &acc.params {
                     self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+                    if let Some(ref type_ann) = param.type_ann {
+                        self.bind_type_node(type_ann, file_name);
+                    }
+                }
+                if let Some(ref return_type) = acc.return_type {
+                    self.bind_type_node(return_type, file_name);
                 }
                 if let Some(ref body) = acc.body {
                     for s in body {
@@ -2026,14 +2051,102 @@ impl Binder {
     }
 
     /// Bind interface type members into the interface symbol's members map.
+    /// Declare a type-parameter list in the current scope, then record the
+    /// type references in its constraints and defaults (which may mention
+    /// sibling parameters, so all names are declared first).
+    fn declare_type_params<'t>(
+        &mut self,
+        type_params: impl IntoIterator<Item = &'t TypeParam>,
+        file_name: &str,
+    ) {
+        let tps: Vec<&TypeParam> = type_params.into_iter().collect();
+        for tp in &tps {
+            self.declare(&tp.name, SYM_TYPE_PARAMETER, file_name, tp.span);
+        }
+        for tp in &tps {
+            if let Some(ref constraint) = tp.constraint {
+                self.bind_type_node(constraint, file_name);
+            }
+            if let Some(ref default) = tp.default {
+                self.bind_type_node(default, file_name);
+            }
+        }
+    }
+
+    /// Record type references inside a signature (parameter annotations and
+    /// return type), with the signature's own type parameters in scope.
+    fn bind_signature_types(
+        &mut self,
+        type_params: Option<&Vec<TypeParam>>,
+        params: &[Param],
+        return_type: Option<&TypeNode>,
+        span: Span,
+        file_name: &str,
+        declare_params: bool,
+    ) {
+        let scoped = type_params.is_some_and(|tps| !tps.is_empty())
+            || (declare_params && !params.is_empty());
+        if scoped {
+            self.push_scope(ScopeKind::Function, span);
+            self.declare_type_params(type_params.into_iter().flatten(), file_name);
+        }
+        for param in params {
+            if declare_params {
+                self.bind_pattern(&param.name, SYM_PARAMETER, file_name);
+            }
+            if let Some(ref type_ann) = param.type_ann {
+                self.bind_type_node(type_ann, file_name);
+            }
+        }
+        if let Some(return_type) = return_type {
+            self.bind_type_node(return_type, file_name);
+        }
+        if scoped {
+            self.pop_scope();
+        }
+    }
+
     fn bind_type_member(&mut self, member: &TypeMember, iface_sym: SymbolId, file_name: &str) {
         match &member.kind {
+            TypeMemberKind::CallSig(sig) => {
+                self.bind_signature_types(
+                    sig.type_params.as_ref(),
+                    &sig.params,
+                    sig.return_type.as_ref(),
+                    member.span,
+                    file_name,
+                    true,
+                );
+            }
+            TypeMemberKind::ConstructSig(sig) => {
+                self.bind_signature_types(
+                    sig.type_params.as_ref(),
+                    &sig.params,
+                    sig.return_type.as_ref(),
+                    member.span,
+                    file_name,
+                    true,
+                );
+            }
+            TypeMemberKind::IndexSig(idx) => {
+                self.bind_signature_types(
+                    None,
+                    &idx.params,
+                    idx.type_ann.as_ref(),
+                    member.span,
+                    file_name,
+                    false,
+                );
+            }
             TypeMemberKind::PropertySig(prop) => {
                 if let PropName::Ident(ref name, _) | PropName::String(ref name, _) = prop.name {
                     let id = self.declare(name, SYM_PROPERTY, file_name, member.span);
                     self.table.symbols[iface_sym as usize]
                         .members
                         .insert(name.to_string(), id);
+                }
+                if let Some(ref type_ann) = prop.type_ann {
+                    self.bind_type_node(type_ann, file_name);
                 }
             }
             TypeMemberKind::MethodSig(method) => {
@@ -2045,6 +2158,14 @@ impl Binder {
                     // Record interface method signature as overload
                     self.record_interface_method_overload_signature(id, method);
                 }
+                self.bind_signature_types(
+                    method.type_params.as_ref(),
+                    &method.params,
+                    method.return_type.as_ref(),
+                    member.span,
+                    file_name,
+                    true,
+                );
             }
             TypeMemberKind::GetAccessorSig(acc) => {
                 if let PropName::Ident(ref name, _) | PropName::String(ref name, _) = acc.name {
@@ -2053,6 +2174,14 @@ impl Binder {
                         .members
                         .insert(name.to_string(), id);
                 }
+                self.bind_signature_types(
+                    None,
+                    &acc.params,
+                    acc.return_type.as_ref(),
+                    member.span,
+                    file_name,
+                    true,
+                );
             }
             TypeMemberKind::SetAccessorSig(acc) => {
                 if let PropName::Ident(ref name, _) | PropName::String(ref name, _) = acc.name {
@@ -2061,6 +2190,14 @@ impl Binder {
                         .members
                         .insert(name.to_string(), id);
                 }
+                self.bind_signature_types(
+                    None,
+                    &acc.params,
+                    acc.return_type.as_ref(),
+                    member.span,
+                    file_name,
+                    true,
+                );
             }
             _ => {}
         }

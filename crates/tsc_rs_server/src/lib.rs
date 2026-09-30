@@ -23,6 +23,7 @@ use tsc_rs_symbols::{
 use tsc_rs_types::TypeCheckOutput;
 
 mod lib_stubs;
+mod ref_aliases;
 
 /// Public API for the LSP test harness — exposes internal functions without
 /// going through the JSON-RPC transport layer.
@@ -5133,7 +5134,12 @@ fn find_type_param_parent_with_generics(source_text: &str, offset: u32) -> Optio
     while name_start > 0 && is_ident_byte(bytes[name_start - 1]) {
         name_start -= 1;
     }
-    if name_start >= name_end {
+    // A call signature (`<U>(a: U): U` in an interface or type literal) or a
+    // generic arrow has no name before `<`.
+    let unnamed = name_start >= name_end
+        && (name_end == 0
+            || matches!(bytes[name_end - 1], b'{' | b';' | b',' | b'(' | b'=' | b':'));
+    if name_start >= name_end && !unnamed {
         return None;
     }
     let name = &source_text[name_start..name_end];
@@ -5155,7 +5161,7 @@ fn find_type_param_parent_with_generics(source_text: &str, offset: u32) -> Optio
     // For functions, include the parameter list and return type after the type params
     // e.g. foo4<T extends Date>(test: T): T
     let mut suffix = String::new();
-    if matches!(keyword, "function" | "") {
+    if matches!(keyword, "function" | "") || unnamed || name == "new" {
         // Check if there's a '(' after the closing '>'
         let mut scan = angle_end;
         while scan < bytes.len() && bytes[scan].is_ascii_whitespace() {
@@ -5204,7 +5210,49 @@ fn find_type_param_parent_with_generics(source_text: &str, offset: u32) -> Optio
             }
         }
     }
+    if unnamed {
+        if suffix.is_empty() {
+            return None;
+        }
+        return Some(format!("{}{}", type_params, suffix));
+    }
+    // Construct signature: tsc prints `new <U>(a: U): U`.
+    if name == "new" && !suffix.is_empty() {
+        return Some(format!("new {}{}", type_params, suffix));
+    }
     Some(format!("{}{}{}{}", prefix, name, type_params, suffix))
+}
+
+/// The `<…>` type-parameter list written right after `name` in the
+/// declaration starting at `decl_start` (`method<U extends I<string>>(…)`).
+fn declared_type_params_text(source_text: &str, decl_start: u32, name: &str) -> Option<String> {
+    let start = decl_start as usize;
+    let rest = source_text.get(start..)?;
+    let name_rel = rest.find(name)?;
+    let bytes = source_text.as_bytes();
+    let mut k = start + name_rel + name.len();
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if bytes.get(k) != Some(&b'<') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (j, &b) in bytes.iter().enumerate().skip(k) {
+        match b {
+            b'<' => depth += 1,
+            b'>' if j > 0 && bytes[j - 1] == b'=' => {}
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(source_text[k..=j].to_string());
+                }
+            }
+            b'{' | b';' | b'\n' => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The innermost class or interface whose body contains `offset`, displayed
@@ -9079,9 +9127,8 @@ fn hover_at_impl(
                 } else if local_unusable {
                     // Last resort: project-wide by-name lookup (collision-prone,
                     // but better than reporting `any`).
-                    let qe_results = query_engine.find_symbol(&sym.name);
-                    for &qe_id in &qe_results {
-                        if let Some(tid) = query_engine.get_symbol_type(qe_id) {
+                    for info in query_engine.find_symbol_infos(&sym.name) {
+                        if let Some(tid) = info.type_id {
                             if let Some(ts) = query_engine.type_to_string(tid) {
                                 if ts != "any" && !ts.is_empty() {
                                     type_str = Some(ts);
@@ -9404,7 +9451,22 @@ fn hover_at_impl(
                         } else {
                             String::new()
                         };
-                        format!("(method) {}({}): {}{}", qualified, params, ret, extra)
+                        let decl = sym
+                            .declarations
+                            .get(overload_idx)
+                            .or(sym.declarations.first());
+                        let tps = if sig.type_params.is_empty() {
+                            String::new()
+                        } else {
+                            decl.and_then(|d| {
+                                declared_type_params_text(source_text, d.span.start, &sym.name)
+                            })
+                            .unwrap_or_else(|| format!("<{}>", sig.type_params.join(", ")))
+                        };
+                        format!(
+                            "(method) {}{}({}): {}{}",
+                            qualified, tps, params, ret, extra
+                        )
                     } else if let Some(ref ts) = type_str {
                         if is_fn_type_str(ts) {
                             format!("(method) {}", format_fn_decl(&qualified, ts))
@@ -9804,13 +9866,17 @@ fn hover_at_impl(
                 // checked type of the function symbol named before `<`.
                 let decl_offset = sym.declarations.first().map(|d| d.span.start);
                 let parent_with_generics = parent_with_generics.map(|p| {
-                    if !p.ends_with(')') {
+                    if !p.contains(')') {
                         return p;
                     }
                     let Some(lt) = p.find('<') else {
                         return p;
                     };
                     let fn_name = &p[..lt];
+                    // Call/construct signatures are shown bare.
+                    if fn_name.is_empty() || fn_name.starts_with("new") {
+                        return p;
+                    }
                     // A method's type parameter: tsc qualifies the method
                     // with its class/interface (`c<T>.method<U>(…): U`).
                     let owner = decl_offset.and_then(|decl| {
@@ -9856,6 +9922,9 @@ fn hover_at_impl(
                             None => format!("{owner}.{p}"),
                         };
                     }
+                    if p.rfind(')').is_some_and(|i| i + 1 < p.len()) {
+                        return p;
+                    }
                     let ret = sym_table
                         .symbols
                         .iter()
@@ -9884,9 +9953,8 @@ fn hover_at_impl(
                 // Pure import — try to resolve the target symbol's kind
                 // by looking up the imported name in the query engine
                 let mut resolved_kind = None;
-                let qe_results = query_engine.find_symbol(&sym.name);
-                for &qe_id in &qe_results {
-                    if let Some(info) = query_engine.get_symbol_info(qe_id) {
+                for info in query_engine.find_symbol_infos(&sym.name) {
+                    {
                         use tsc_rs_query::SymbolKind;
                         match info.kind {
                             SymbolKind::Interface => {
@@ -10078,9 +10146,9 @@ fn hover_at_impl(
     }
 
     // Try QueryEngine global lookup (lib stubs)
-    let qe_by_name = query_engine.find_symbol(&token);
-    if let Some(&qe_id) = qe_by_name.first() {
-        if let Some(info) = query_engine.get_symbol_info(qe_id) {
+    let qe_by_name = query_engine.find_symbol_infos(&token);
+    if let Some(info) = qe_by_name.into_iter().next() {
+        {
             let kind_prefix = match info.kind {
                 tsc_rs_query::SymbolKind::Function => "function ",
                 tsc_rs_query::SymbolKind::Class => "class ",
@@ -11979,6 +12047,82 @@ fn new_target_assignment_chain_definition(
     })
 }
 
+/// `import name = require("m")` / `import name = Other` in `source_text`:
+/// the span of `name` in its declaration when the alias target does not
+/// resolve (tsc then stops at the alias instead of following it).
+fn unresolved_import_equals_alias(
+    source_text: &str,
+    file_name: &str,
+    name: &str,
+    project: Option<&ProjectState>,
+    depth: u32,
+) -> Option<Span> {
+    if name.is_empty() || depth > 4 {
+        return None;
+    }
+    let bytes = source_text.as_bytes();
+    for kw in find_identifier_occurrences(source_text, "import") {
+        let mut i = kw.end as usize;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if !source_text[i..].starts_with(name) {
+            continue;
+        }
+        let name_start = i;
+        let name_end = i + name.len();
+        if name_end < bytes.len() && is_ident_byte(bytes[name_end]) {
+            continue;
+        }
+        let mut j = name_end;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if bytes.get(j) != Some(&b'=') {
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let rhs = &source_text[j..];
+        let name_span = Span::new(name_start as u32, name_end as u32);
+        if let Some(after) = rhs.strip_prefix("require") {
+            let after = after.trim_start().strip_prefix('(')?.trim_start();
+            let quote = after.chars().next()?;
+            if quote != '"' && quote != '\'' {
+                return None;
+            }
+            let spec = &after[1..after[1..].find(quote)? + 1];
+            let mut files: Vec<(&str, &str)> = vec![(file_name, source_text)];
+            if let Some(project) = project {
+                for (path, pf) in &project.files {
+                    if path != file_name && path != "__lib__.d.ts" {
+                        files.push((path.as_str(), pf.source.as_str()));
+                    }
+                }
+            }
+            let resolved = ref_aliases::resolve_spec(file_name, spec, &files).is_some()
+                || files
+                    .iter()
+                    .any(|(f, _)| f.contains(&format!("/node_modules/{spec}/")));
+            return (!resolved).then_some(name_span);
+        }
+        // `import a2 = a1` — an alias of an unresolved alias.
+        let first: String = rhs
+            .bytes()
+            .take_while(|b| is_ident_byte(*b))
+            .map(char::from)
+            .collect();
+        if first.is_empty() || first == name {
+            return None;
+        }
+        return unresolved_import_equals_alias(source_text, file_name, &first, project, depth + 1)
+            .map(|_| name_span);
+    }
+    None
+}
+
 pub fn definition_at(
     query_engine: &QueryEngine,
     sym_table: &SymbolTable,
@@ -11993,6 +12137,16 @@ pub fn definition_at(
     // Filter keywords and string literals
     let mut token = extract_token_at(source_text, offset);
     let mut effective_offset = offset;
+
+    if !token.is_empty() && !KEYWORDS.contains(&token.as_str()) {
+        if let Some(span) =
+            unresolved_import_equals_alias(source_text, &sf.file_name, &token, project, 0)
+        {
+            if !(span.start <= offset && offset <= span.end) {
+                return Some((sf.file_name.clone(), span));
+            }
+        }
+    }
 
     // Special case: `this` keyword — navigate to the `this` parameter declaration
     // in the enclosing function, or to the enclosing class if no `this` parameter.
@@ -12648,9 +12802,7 @@ pub fn definition_at(
                 }
 
                 // Fallback: search QueryEngine for the symbol by name in other files
-                let qe_results = query_engine.find_symbol(&sym.name);
-                for &qe_id in &qe_results {
-                    let locations = query_engine.get_symbol_locations(qe_id);
+                for locations in query_engine.find_symbol_declarations(&sym.name) {
                     for (file, span) in locations {
                         if file != sf.file_name && !file.is_empty() {
                             return Some((file, span));
@@ -12861,19 +13013,18 @@ pub fn definition_at(
     // Step 2: Cross-file fallback — search QueryEngine for the token by name.
     // This handles global symbols used in script files (no imports) and
     // globals like Response, Request, URL from lib stubs.
-    let qe_results = query_engine.find_symbol(&token);
-    for &qe_id in &qe_results {
-        let locations = query_engine.get_symbol_locations(qe_id);
-        // Prefer definitions in other files (cross-file go-to-definition)
-        for (file, span) in &locations {
+    let groups = query_engine.find_symbol_declarations(&token);
+    // Prefer definitions in other files (cross-file go-to-definition)
+    for locations in &groups {
+        for (file, span) in locations {
             if *file != sf.file_name && !file.is_empty() {
                 return Some((file.clone(), *span));
             }
         }
-        // Fall back to same-file or any file
-        if let Some((file, span)) = locations.into_iter().next() {
-            return Some((file, span));
-        }
+    }
+    // Fall back to same-file or any file
+    if let Some((file, span)) = groups.into_iter().flatten().next() {
+        return Some((file, span));
     }
 
     // Step 3: Check if this looks like a property declaration in an object literal.
@@ -14026,19 +14177,18 @@ fn resolve_jsdoc_reference(
     }
 
     // Try QueryEngine
-    let qe_results = query_engine.find_symbol(token);
-    for &qe_id in &qe_results {
-        let locations = query_engine.get_symbol_locations(qe_id);
-        // Prefer same-file definitions for JSDoc references
-        for (file, span) in &locations {
+    let groups = query_engine.find_symbol_declarations(token);
+    // Prefer same-file definitions for JSDoc references
+    for locations in &groups {
+        for (file, span) in locations {
             if *file == sf.file_name {
                 return Some((file.clone(), *span));
             }
         }
-        // Fall back to any file
-        if let Some((file, span)) = locations.into_iter().next() {
-            return Some((file, span));
-        }
+    }
+    // Fall back to any file
+    if let Some((file, span)) = groups.into_iter().flatten().next() {
+        return Some((file, span));
     }
 
     // Text-based fallback: search for JSDoc @typedef definitions.
@@ -15160,6 +15310,111 @@ fn resolve_import_specifier_definition(
 
 /// Given a symbol name that might be an import, resolve it to its original
 /// definition in the source file via the project's module resolver.
+/// Where module `path` really declares its export `name`, following
+/// `export { a as name } from`, local `export { a as name }` and
+/// `export * from` chains.
+fn resolve_exported_name(
+    project: &ProjectState,
+    path: &str,
+    name: &str,
+    depth: u32,
+) -> Option<(String, Span)> {
+    if depth > 8 {
+        return None;
+    }
+    let file = project.get_file(path)?;
+    let decl_of = |local: &str, exported_only: bool| {
+        file.sym_table
+            .symbols
+            .iter()
+            .find(|s| {
+                s.name == local
+                    && !s.declarations.is_empty()
+                    && (!exported_only || s.flags & SYM_EXPORT != 0)
+            })
+            .map(|s| {
+                let d = &s.declarations[0];
+                let f = if d.file_name.is_empty() {
+                    path.to_string()
+                } else {
+                    d.file_name.clone()
+                };
+                (f, d.span)
+            })
+    };
+    if name != "default" {
+        if let Some(found) = decl_of(name, true) {
+            return Some(found);
+        }
+    } else if let Some(local) = default_export_local_name(&file.source) {
+        if let Some(found) = decl_of(&local, false) {
+            return Some(found);
+        }
+    }
+    let (edges, stars) = ref_aliases::module_exports(&file.source);
+    for (from_spec, src_name, exported) in &edges {
+        if exported != name {
+            continue;
+        }
+        match from_spec {
+            None => {
+                if let Some(found) = decl_of(src_name, false) {
+                    return Some(found);
+                }
+            }
+            Some(spec) => {
+                if let Some(target) = project.resolve_import(spec, path) {
+                    if let Some(found) =
+                        resolve_exported_name(project, &target, src_name, depth + 1)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+    }
+    if name != "default" {
+        for spec in &stars {
+            if let Some(target) = project.resolve_import(spec, path) {
+                if let Some(found) = resolve_exported_name(project, &target, name, depth + 1) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The local name behind a module's default export: `export default Name;`,
+/// `export default [abstract] class Name`, `export default [async] function* Name`.
+fn default_export_local_name(source: &str) -> Option<String> {
+    for kw in find_identifier_occurrences(source, "export") {
+        let rest = source[kw.end as usize..].trim_start();
+        let Some(mut rest) = rest.strip_prefix("default") else {
+            continue;
+        };
+        if rest.bytes().next().is_some_and(is_ident_byte) {
+            continue;
+        }
+        loop {
+            let t = rest.trim_start();
+            let word: String = t
+                .bytes()
+                .take_while(|b| is_ident_byte(*b))
+                .map(char::from)
+                .collect();
+            match word.as_str() {
+                "async" | "function" | "class" | "abstract" => {
+                    rest = t[word.len()..].trim_start_matches('*');
+                }
+                "" | "extends" | "implements" => return None,
+                _ => return Some(word),
+            }
+        }
+    }
+    None
+}
+
 fn resolve_import_definition(
     sf: &SourceFile,
     symbol_name: &str,
@@ -15229,6 +15484,31 @@ fn resolve_import_definition(
                                 }
                             }
                         }
+                        // `export default Name;` / `export default class Name`:
+                        // the binder has no `default` symbol, follow the name.
+                        if remote_name == "default" {
+                            if let Some(local) = default_export_local_name(&target_file.source) {
+                                if let Some(target_sym) = target_file
+                                    .sym_table
+                                    .symbols
+                                    .iter()
+                                    .find(|s| s.name == local && !s.declarations.is_empty())
+                                {
+                                    let d = &target_sym.declarations[0];
+                                    let file = if d.file_name.is_empty() {
+                                        resolved_path.clone()
+                                    } else {
+                                        d.file_name.clone()
+                                    };
+                                    return Some((file, d.span));
+                                }
+                            }
+                        }
+                    }
+                    if let Some(found) =
+                        resolve_exported_name(project, &resolved_path, &remote_name, 0)
+                    {
+                        return Some(found);
                     }
                 }
             }
@@ -25268,6 +25548,23 @@ pub fn references_at(
 ) -> Vec<(String, Span)> {
     let source_text = query_engine.get_source_file(file_name).unwrap_or("");
 
+    // `default` inside `export { default } from "./c"` / `{ foo as default }`:
+    // the references of the module's original declaration.
+    if let Some(project) = project {
+        if extract_token_at(source_text, offset) == "default" {
+            let mut files: Vec<(&str, &str)> = vec![(file_name, source_text)];
+            for (path, pf) in &project.files {
+                if path != file_name && path != "__lib__.d.ts" {
+                    files.push((path.as_str(), pf.source.as_str()));
+                }
+            }
+            if let Some(origin) = ref_aliases::reexport_origin(&files, file_name, "default", false)
+            {
+                return name_references(file_name, source_text, &origin, Some(project));
+            }
+        }
+    }
+
     let target_id_opt = query_engine
         .get_symbol_at(file_name, offset)
         .and_then(|id| u32::try_from(id).ok())
@@ -25478,6 +25775,18 @@ pub fn references_at(
                     }
                 }
             }
+            // Names that re-bind an identifier with no symbol here (the `foo`
+            // of `export { foo as bar } from "./a"`).
+            if project.is_some() && token.bytes().all(is_ascii_ident_byte) {
+                for (f, span) in name_references(file_name, source_text, &token, project) {
+                    if !refs
+                        .iter()
+                        .any(|(rf, sp)| *rf == f && sp.start == span.start)
+                    {
+                        refs.push((f, span));
+                    }
+                }
+            }
             if !refs.is_empty() {
                 refs.sort_by_key(|(f, sp)| (f.clone(), sp.start));
                 return refs;
@@ -25488,6 +25797,31 @@ pub fn references_at(
     }
 
     let target_id = target_id_opt.unwrap();
+
+    // The binder maps some positions to a different name's symbol (the
+    // `foo` of `export { foo as bar } from "./a"` resolves to `bar`); search
+    // for the identifier actually under the cursor.
+    let token = extract_token_at(source_text, offset);
+    let mismatched = sym_table
+        .get_symbol(target_id)
+        .is_some_and(|sym| !token.is_empty() && sym.name != token)
+        && !KEYWORDS.contains(&token.as_str())
+        && token.bytes().all(is_ascii_ident_byte);
+    if mismatched {
+        if let Some(sid) = find_symbol_by_name(sym_table, &token) {
+            return references_at_with_target(
+                query_engine,
+                sym_table,
+                file_name,
+                source_text,
+                sid,
+                project,
+                false,
+            );
+        }
+        return name_references(file_name, source_text, &token, project);
+    }
+
     references_at_with_target(
         query_engine,
         sym_table,
@@ -25497,6 +25831,40 @@ pub fn references_at(
         project,
         false,
     )
+}
+
+/// Identifier occurrences of `name` in this file and every project file,
+/// plus the names that re-bind it (`ref_aliases`).
+fn name_references(
+    file_name: &str,
+    source_text: &str,
+    name: &str,
+    project: Option<&ProjectState>,
+) -> Vec<(String, Span)> {
+    let mut files: Vec<(&str, &str)> = vec![(file_name, source_text)];
+    if let Some(project) = project {
+        for (path, pf) in &project.files {
+            if path != file_name && path != "__lib__.d.ts" {
+                files.push((path.as_str(), pf.source.as_str()));
+            }
+        }
+    }
+    let mut refs: Vec<(String, Span)> = Vec::new();
+    for (f, src) in &files {
+        for span in find_identifier_occurrences(src, name) {
+            refs.push((f.to_string(), span));
+        }
+    }
+    for (f, span) in ref_aliases::alias_reference_spans(&files, name) {
+        if !refs
+            .iter()
+            .any(|(rf, sp)| *rf == f && sp.start == span.start)
+        {
+            refs.push((f, span));
+        }
+    }
+    refs.sort_by_key(|(f, sp)| (f.clone(), sp.start));
+    refs
 }
 
 /// Inner helper for references_at once we have a target symbol ID.
@@ -25597,6 +25965,38 @@ fn references_at_with_target(
                     .any(|(f, existing)| existing.start == span.start && f == proj_path);
                 if !already {
                     refs.push((proj_path.clone(), span));
+                }
+            }
+        }
+    }
+
+    // Follow re-bindings under other names (`export { x as y }`, default
+    // exports/imports, `export =`, require destructuring).
+    if let Some(project) = project {
+        let mut files: Vec<(&str, &str)> = vec![(file_name, source_text)];
+        for (proj_path, pf) in &project.files {
+            if proj_path != file_name && proj_path != "__lib__.d.ts" {
+                files.push((proj_path.as_str(), pf.source.as_str()));
+            }
+        }
+        for (f, span) in ref_aliases::alias_reference_spans(&files, &target_name) {
+            let already = refs
+                .iter()
+                .any(|(rf, existing)| existing.start == span.start && *rf == f);
+            if !already {
+                refs.push((f, span));
+            }
+        }
+        // A default import also refers to the module's original declaration.
+        if let Some(origin) = ref_aliases::default_import_origin(&files, file_name, &target_name) {
+            if origin != target_name {
+                for (f, span) in name_references(file_name, source_text, &origin, Some(project)) {
+                    let already = refs
+                        .iter()
+                        .any(|(rf, existing)| existing.start == span.start && *rf == f);
+                    if !already {
+                        refs.push((f, span));
+                    }
                 }
             }
         }
