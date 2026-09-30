@@ -302,3 +302,41 @@ fn object_rest_copies_public_data_properties() {
         (2339, 304, "Property 'value' does not exist on type 'Omit<T, \"value\" | \"method\">'."),
     ]);
 }
+
+#[test]
+fn protected_interface_inherited() {
+    check("class B { protected p=1; } interface I extends B {} interface J extends I {} declare const j:J; j.p; interface Public extends I { p:number; } declare const pub:Public; pub.p;", &[
+        (2445, 98, 1, "Property 'p' is protected and only accessible within class 'B' and its subclasses."),
+    ]);
+}
+
+#[test]
+fn protected_interface_multiple() {
+    check("class A { protected a=1; protected same=1; } class B { protected b=1; protected same=1; } interface I extends A,B {} declare const i:I; i.a; i.b; i.same; interface Public { same:number; } interface First extends Public,A {} declare const f:First; f.same;", &[
+        (2445, 138, 1, "Property 'a' is protected and only accessible within class 'A' and its subclasses."),
+        (2445, 143, 1, "Property 'b' is protected and only accessible within class 'B' and its subclasses."),
+        (2445, 148, 4, "Property 'same' is protected and only accessible within class 'A' and its subclasses."),
+    ]);
+}
+
+#[test]
+fn protected_interface_receiver() {
+    check("class B { protected p=1; f(i:I) { i.p; } } interface I extends B {} class D extends B { g(i:J,b:I) { i.p; b.p; } } interface J extends D {}", &[
+        (2446, 108, 1, "Property 'p' is protected and only accessible through an instance of class 'D'. This is an instance of class 'I'."),
+    ]);
+}
+
+#[test]
+fn protected_interface_cycle() {
+    check(
+        "interface A extends B {} interface B extends A {} declare const a:A; a.absent;",
+        &[],
+    );
+}
+
+#[test]
+fn protected_interface_this_parameter() {
+    check("class B { protected p=1; } interface I extends B {} function f(this:I,b:B,i:I) { this.p; b.p; i.p; }", &[
+        (2446, 91, 1, "Property 'p' is protected and only accessible through an instance of class 'I'. This is an instance of class 'B'."),
+    ]);
+}

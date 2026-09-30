@@ -27,15 +27,35 @@ impl TypeChecker {
             _ => return,
         };
 
-        let mut current = Some(receiver_class.clone());
+        let mut pending = vec![receiver_class.clone()];
         let mut seen = rustc_hash::FxHashSet::default();
         let declaring = loop {
-            let Some(class) = current.take() else { return };
+            let Some(class) = pending.pop() else { return };
             if !seen.insert(class.clone()) {
-                return;
+                continue;
             }
             let Some(info) = self.class_info.get(&class) else {
-                return;
+                if !is_static {
+                    if let Some(info) = self.interface_info.get(&class) {
+                        // Own interface members are public, even when the
+                        // heritage checker diagnoses an incompatible override.
+                        if info.member_names.contains_key(property) {
+                            return;
+                        }
+                        // Resolve conflicting inherited members in source order.
+                        pending.extend(info.extends.iter().enumerate().rev().map(
+                            |(index, (name, _))| {
+                                self.interface_lookup_name_for_source(
+                                    name,
+                                    info.extends_sources
+                                        .get(index)
+                                        .and_then(|source| source.as_deref()),
+                                )
+                            },
+                        ));
+                    }
+                }
+                continue;
             };
             let accessor_flags = info
                 .accessor_modifiers
@@ -81,7 +101,7 @@ impl TypeChecker {
             if declared {
                 return;
             }
-            current = info.extends.clone();
+            pending.extend(info.extends.iter().cloned());
         };
 
         // Nested functions/classes retain access afforded by an enclosing class.
@@ -105,7 +125,9 @@ impl TypeChecker {
                 let this_type = self.lookup_var("this")?;
                 let apparent = self.typeparam_constraint_apparent(this_type);
                 match apparent.as_ref().unwrap_or(this_type) {
-                    Type::TypeReference(name, _) if self.class_derives_from(name, &declaring) => {
+                    Type::TypeReference(name, _)
+                        if self.protected_receiver_derives_from(name, &declaring) =>
+                    {
                         Some(name.clone())
                     }
                     _ => None,
@@ -113,7 +135,7 @@ impl TypeChecker {
             });
 
         let (code, message) = if let Some(enclosing) = enclosing {
-            if is_static || self.class_derives_from(&receiver_class, &enclosing) {
+            if is_static || self.protected_receiver_derives_from(&receiver_class, &enclosing) {
                 return;
             }
             (2446, format!(
@@ -141,12 +163,44 @@ impl TypeChecker {
         }
     }
 
+    // An interface extending a class retains the class's protected identity.
+    // Walk heritage rather than structural assignability: a public lookalike
+    // must not gain access to a protected member.
+    fn protected_receiver_derives_from(&self, receiver: &str, base: &str) -> bool {
+        let mut pending = vec![receiver.to_string()];
+        let mut seen = rustc_hash::FxHashSet::default();
+        while let Some(name) = pending.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if name == base {
+                return true;
+            }
+            if let Some(info) = self.class_info.get(&name) {
+                pending.extend(info.extends.iter().cloned());
+            } else if let Some(info) = self.interface_info.get(&name) {
+                pending.extend(info.extends.iter().enumerate().map(|(index, (name, _))| {
+                    self.interface_lookup_name_for_source(
+                        name,
+                        info.extends_sources
+                            .get(index)
+                            .and_then(|source| source.as_deref()),
+                    )
+                }));
+            }
+        }
+        false
+    }
+
     fn protected_class_display(&self, class: &str) -> String {
         let name = class.rsplit('.').next().unwrap_or(class);
-        match self.class_info.get(class) {
-            Some(info) if !info.type_params.is_empty() => {
-                format!("{name}<{}>", info.type_params.join(", "))
-            }
+        let params = self
+            .class_info
+            .get(class)
+            .map(|info| &info.type_params)
+            .or_else(|| self.interface_info.get(class).map(|info| &info.type_params));
+        match params {
+            Some(params) if !params.is_empty() => format!("{name}<{}>", params.join(", ")),
             _ => name.to_string(),
         }
     }

@@ -1505,3 +1505,29 @@ The former snapshot remains at `docs/compatibility-metrics-2026-09-07.json`.
 Publish code and metrics to `benfavre/ts-rs` on `main` before synchronizing
 https://ts-rs.bext.dev/. The site must consume committed published data and
 must not present working-tree changes as measurements from the public commit.
+
+## 2026-09-30: protected visibility through interface heritage
+
+Interfaces extending classes retain the declaring class's protected visibility.
+Member lookup follows interface heritage in source order, respects public
+redeclarations, and terminates on cycles. Receiver checks also recognize
+interfaces extending the enclosing class, including an explicit interface-typed
+`this` parameter. Five regressions verify messages and spans against TypeScript
+6.0.3, multiple inheritance, legal access contexts, and cyclic heritage.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,785 | 4,785 |
+| Conformance | 3,639 | 3,640 |
+
+All twelve cache-free default and expanded baseline comparisons retain every
+previous pass, case, oracle, and skip count. One conformance diagnostic case
+now passes. Conformance diagnostic matches increase from 19,236 to 19,239;
+false positives remain 2,582. Compiler precision results are unchanged. No
+code category loses matched diagnostics or gains spurious diagnostics.
+
+All 3,636 internal workspace tests pass with 37 ignored, and `make ci` passes.
+The complete LSP inventory retains 1,800 passes, 563 failures, and 3,957 skips,
+with an identical failing-case set. Evidence is in
+`/tmp/ts-rs-interface-access-20260930/`; the separate `namespace-trial/` records
+a rejected candidate and is not the accepted result.
