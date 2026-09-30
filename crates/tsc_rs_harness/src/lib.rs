@@ -4892,24 +4892,24 @@ impl BaselineRunner {
         let mut parsed_program_files = Vec::new();
         let mut program_has_jsx_intrinsic_elements = false;
         let jsx_option_set = effective_options.jsx.is_some();
-        if test_case.files.len() > 1 {
-            for file in &test_case.files {
-                if file.name.to_ascii_lowercase().ends_with(".json") {
-                    continue;
-                }
-                let lower = file.name.to_ascii_lowercase();
-                let is_jsx = lower.ends_with(".tsx")
-                    || lower.ends_with(".jsx")
-                    || (jsx_option_set
-                        && (lower.ends_with(".js")
-                            || lower.ends_with(".mjs")
-                            || lower.ends_with(".cjs")));
-                let parsed = tsc_rs_parser::parse_with_jsx(&file.name, &file.content, is_jsx);
-                collect_top_level_names(&parsed, &mut cross_file_names);
-                program_has_jsx_intrinsic_elements |=
-                    tsc_rs_types::TypeChecker::source_file_declares_jsx_intrinsic_elements(&parsed);
-                parsed_program_files.push(parsed);
+        for file in &test_case.files {
+            if file.name.to_ascii_lowercase().ends_with(".json") {
+                continue;
             }
+            let lower = file.name.to_ascii_lowercase();
+            let is_jsx = lower.ends_with(".tsx")
+                || lower.ends_with(".jsx")
+                || (jsx_option_set
+                    && (lower.ends_with(".js")
+                        || lower.ends_with(".mjs")
+                        || lower.ends_with(".cjs")));
+            let parsed = tsc_rs_parser::parse_with_jsx(&file.name, &file.content, is_jsx);
+            if test_case.files.len() > 1 {
+                collect_top_level_names(&parsed, &mut cross_file_names);
+            }
+            program_has_jsx_intrinsic_elements |=
+                tsc_rs_types::TypeChecker::source_file_declares_jsx_intrinsic_elements(&parsed);
+            parsed_program_files.push(parsed);
         }
         let available_file_names: Vec<String> = test_case
             .files
@@ -4935,8 +4935,10 @@ impl BaselineRunner {
         checker_donor.register_available_files(&available_file_names);
         if !parsed_program_files.is_empty() {
             let parsed_refs: Vec<_> = parsed_program_files.iter().collect();
-            checker_donor.register_external_export_names(&parsed_refs);
-            checker_donor.register_external_top_level_bindings(&parsed_refs);
+            if test_case.files.len() > 1 {
+                checker_donor.register_external_export_names(&parsed_refs);
+                checker_donor.register_external_top_level_bindings(&parsed_refs);
+            }
             // Resolve every static import specifier through the virtual
             // program (tsconfig paths/baseUrl/rootDirs, node_modules walk,
             // package self-names, `@link` aliases) so TS2307 only fires for
@@ -5023,7 +5025,17 @@ impl BaselineRunner {
                 && path_ctx.tsconfig_dir.is_none();
             for (file, parsed) in program_sources.iter().zip(parsed_program_files.iter()) {
                 let importer = normalize_header_path(&file.name);
-                let specifiers = collect_project_module_specifiers(parsed);
+                let mut specifiers = collect_project_module_specifiers(parsed);
+                specifiers.extend(dynamic_import_literal_specifiers(&parsed.text));
+                for statement in &parsed.statements {
+                    if let StmtKind::Import(import) = &statement.kind {
+                        if import.type_only {
+                            specifiers.push(import.source.clone());
+                        }
+                    }
+                }
+                specifiers.sort();
+                specifiers.dedup();
                 let require_form = collect_require_form_specifiers(parsed);
                 if report_ambiguous_root {
                     for specifier in &specifiers {
@@ -5069,19 +5081,17 @@ impl BaselineRunner {
                     // tsc (node16+, ESM usage): a dot-relative specifier
                     // without an extension never resolves; it reports TS2835
                     // with the sibling file's emitted extension, or TS2834.
+                    // Record ESM resolution independently of each use's mode:
+                    // the same path may occur in both import and require forms,
+                    // and dynamic imports use ESM resolution even in CJS files.
                     // Bare directory forms (`./`, `.`) keep TS2307.
                     let trimmed = specifier.trim();
-                    let dot_relative = trimmed.starts_with("./") || trimmed.starts_with("../");
+                    let dot_relative = trimmed.starts_with("./")
+                        || trimmed.starts_with("../")
+                        || matches!(trimmed, "." | "..");
                     let base_name = trimmed.rsplit('/').next().unwrap_or(trimmed);
                     let has_extension = base_name.len() > 1 && base_name[1..].contains('.');
-                    if importer_is_esm
-                        && dot_relative
-                        && !has_extension
-                        && !trimmed.ends_with('/')
-                        && trimmed != "."
-                        && trimmed != ".."
-                        && !require_form.contains(&specifier)
-                    {
+                    if node_format_option && dot_relative && !has_extension {
                         let base =
                             normalize_path_segments(&join_path(&dirname(&importer), trimmed));
                         let suggested = [
@@ -5091,15 +5101,24 @@ impl BaselineRunner {
                             (".mjs", ".mjs"),
                             (".js", ".js"),
                             (".cjs", ".cjs"),
-                            (".tsx", ".js"),
-                            (".jsx", ".js"),
+                            (
+                                ".tsx",
+                                if effective_options.jsx == Some(JsxEmit::Preserve) {
+                                    ".jsx"
+                                } else {
+                                    ".js"
+                                },
+                            ),
+                            (".jsx", ".jsx"),
                             (".json", ".json"),
                         ]
                         .iter()
                         .find(|(actual, _)| path_to_idx.contains_key(&format!("{base}{actual}")))
                         .map(|(_, emitted)| format!("{trimmed}{emitted}"));
                         esm_extensionless.push((specifier.clone(), suggested));
-                        continue;
+                        if importer_is_esm && !require_form.contains(&specifier) {
+                            continue;
+                        }
                     }
                     let Some(idx) = resolve_module_specifier_for_diagnostics(
                         &importer,
@@ -5237,7 +5256,7 @@ impl BaselineRunner {
                 checker_donor.register_esm_specifiers(&importer, &esm_resolved);
                 checker_donor.register_esm_extensionless_specifiers(&importer, &esm_extensionless);
             }
-            if cross_file_injection_enabled() {
+            if cross_file_injection_enabled() && test_case.files.len() > 1 {
                 // Seed the donor with every program file's declarations so
                 // imports resolve to real types instead of `any`. The
                 // injection pass's own diagnostics are program-wide and
@@ -9879,6 +9898,148 @@ var x = 1;
         assert!(tc.options.module.is_some());
         assert_eq!(tc.files.len(), 1);
         assert!(tc.files[0].content.contains("var x = 1;"));
+    }
+
+    #[test]
+    fn node_resolution_uses_the_mode_of_each_import_occurrence() {
+        let source = r#"// @module: node16
+// @target: es2022
+// @filename: dep.ts
+export const x = 1;
+// @filename: folder/index.ts
+export const x = 1;
+// @filename: main.mts
+import req = require("./dep");
+import { x } from "./dep";
+import("./dep");
+import("./folder/");
+import("./");
+// @filename: common.cts
+import { x } from "./dep";
+import("./dep");
+import(`./missing`);
+// @filename: types.mts
+import type { x } from "./dep";
+"#;
+        let case = parse_test_case("resolution.ts", source);
+        let actual = BaselineRunner::new(".").generate_errors_baseline(
+            &case,
+            "tests/cases/compiler/resolution.ts",
+            source,
+        );
+        let headers: Vec<_> = actual.lines().take_while(|line| !line.is_empty()).collect();
+        for expected in [
+            "main.mts(2,19): error TS2835:",
+            "main.mts(3,8): error TS2835:",
+            "main.mts(4,8): error TS2834:",
+            "main.mts(5,8): error TS2307:",
+            "common.cts(2,8): error TS2835:",
+            "common.cts(3,8): error TS2834:",
+            "types.mts(1,24): error TS2835:",
+        ] {
+            assert!(
+                headers.iter().any(|line| line.starts_with(expected)),
+                "{actual}"
+            );
+        }
+        assert_eq!(headers.len(), 7, "{actual}");
+    }
+
+    #[test]
+    fn node_resolution_checks_dynamic_imports_in_single_file_programs() {
+        for extension in ["mts", "cts"] {
+            let source = format!(
+                r#"// @module: node16
+// @target: es2022
+// @filename: /src/index.{extension}
+import("./missing").then(x => x);
+"#
+            );
+            let case = parse_test_case("resolution.ts", &source);
+            let actual = BaselineRunner::new(".").generate_errors_baseline(
+                &case,
+                "tests/cases/compiler/resolution.ts",
+                &source,
+            );
+            assert!(
+                actual.starts_with(&format!("/src/index.{extension}(1,8): error TS2834:")),
+                "{actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_resolution_distinguishes_virtual_root_from_filesystem_root() {
+        let source = r#"// @module: node16
+// @target: es2022
+// @filename: package.json
+{ "type": "module" }
+// @filename: index.ts
+export const x = 1;
+// @filename: common.cts
+import { x } from "./";
+import req = require("./");
+import("./");
+"#;
+        let case = parse_test_case("resolution.ts", source);
+        let actual = BaselineRunner::new(".").generate_errors_baseline(
+            &case,
+            "tests/cases/compiler/resolution.ts",
+            source,
+        );
+        let headers: Vec<_> = actual.lines().take_while(|line| !line.is_empty()).collect();
+        for expected in [
+            "common.cts(1,19): error TS1479:",
+            "common.cts(2,22): error TS1471:",
+            "common.cts(3,8): error TS2307:",
+        ] {
+            assert!(
+                headers.iter().any(|line| line.starts_with(expected)),
+                "{actual}"
+            );
+        }
+        assert_eq!(headers.len(), 3, "{actual}");
+        for module in ["node20", "nodenext"] {
+            let source = source.replace("@module: node16", &format!("@module: {module}"));
+            let case = parse_test_case("resolution.ts", &source);
+            let actual = BaselineRunner::new(".").generate_errors_baseline(
+                &case,
+                "tests/cases/compiler/resolution.ts",
+                &source,
+            );
+            let headers: Vec<_> = actual.lines().take_while(|line| !line.is_empty()).collect();
+            assert_eq!(headers.len(), 1, "{actual}");
+            assert!(
+                headers[0].starts_with("common.cts(3,8): error TS2307:"),
+                "{actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_resolution_extension_suggestions_follow_jsx_emit() {
+        for (jsx, extension) in [("preserve", ".jsx"), ("react", ".js")] {
+            let source = format!(
+                r#"// @module: nodenext
+// @target: es2022
+// @jsx: {jsx}
+// @filename: view.tsx
+export const x = 1;
+// @filename: index.mts
+import {{ x }} from "./view";
+"#
+            );
+            let case = parse_test_case("resolution.ts", &source);
+            let actual = BaselineRunner::new(".").generate_errors_baseline(
+                &case,
+                "tests/cases/compiler/resolution.ts",
+                &source,
+            );
+            assert!(
+                actual.contains(&format!("Did you mean './view{extension}'?")),
+                "{actual}"
+            );
+        }
     }
 
     #[test]

@@ -1271,3 +1271,54 @@ matches increase from 18,605 to 18,701; false positives remain 2,782.
 
 All four cache-free comparisons preserve skip counts, cases, and oracles.
 All 1,214 checker tests, including seven new regressions, and `make ci` passed.
+
+## 2026-09-30: Node import resolution by occurrence and version
+
+ESM extension diagnostics now distinguish each import occurrence from
+`require` uses of the same specifier. Dynamic imports use ESM resolution in
+CommonJS files, including template literals and directory paths. Single-file
+programs register resolution facts, type-only imports participate, and `.tsx`
+suggestions honor JSX preservation. Relative `./` resolution retains the
+virtual program's root directory. TS1471 and TS1479 apply to Node16/Node18;
+Node20/NodeNext permit synchronous loading of ESM.
+
+Conformance diagnostic matches increase from 18,701 to 19,159 (+458), while
+false positives decrease from 2,782 to 2,582 (-200). Compiler precision and
+recall are unchanged. Every expected TS2834 matches with no false positives;
+167 of 169 expected TS2835 match with no false positives. The two remaining
+TS2835 misses involve explicit Node module resolution with an incompatible
+module setting (`extensionLoadingPriority`). No diagnostic code loses a match
+or gains a false positive.
+
+| Suite | Baseline | Before | After | Lost passes |
+| --- | --- | ---: | ---: | ---: |
+| Compiler | Diagnostics | 4,783 | 4,783 | 0 |
+| Conformance | Diagnostics | 3,627 | 3,632 | 0 |
+| Compiler | JavaScript | 6,032 | 6,032 | 0 |
+| Conformance | JavaScript | 5,388 | 5,388 | 0 |
+
+Newly passing cases: `moduleResolutionWithoutExtension3`,
+`moduleResolutionWithoutExtension5`, `moduleResolutionWithoutExtension8`,
+`nodeModulesAllowJs1`, and `nodeModules1`. All four cache-free comparisons
+preserve cases, oracles, and skip counts. All 1,214 checker tests, 100 harness
+unit tests (four new regressions), and `make ci` pass. The pre-change full
+workspace run passed 3,599 tests with 37 ignored; ignored tests are not passes.
+
+## 2026-09-30: expanded inventory for the 100% goal
+
+The goal includes expanded emit variants, declarations, and LSP, beyond the
+default compiler and conformance matrices. Cache-free schema-2 reports and a
+complete `lsp-report --op all` run establish the following remaining work:
+
+| Suite | Baseline | Passed | Failed | Skipped |
+| --- | --- | ---: | ---: | ---: |
+| Compiler, expanded | JavaScript | 6,446 | 258 | 497 |
+| Conformance, expanded | JavaScript | 6,385 | 714 | 519 |
+| Compiler, expanded | Declarations | 5,834 | 870 | 497 |
+| Conformance, expanded | Declarations | 6,312 | 787 | 519 |
+| LSP, all operations | LSP | 1,800 | 563 | 3,957 |
+
+These are inventory measurements, not claims that this diagnostic wave
+improves emit or LSP behavior. Skips remain separate from passes. The default
+diagnostic matrices still have 4,021 failing cases; expanded JavaScript has
+972 and declarations have 1,657. The 100% goal remains open.

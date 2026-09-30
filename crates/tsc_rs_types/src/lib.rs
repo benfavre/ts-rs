@@ -2741,7 +2741,7 @@ pub struct TypeChecker {
     /// `"type": "module"` package). A CommonJS-format importer cannot
     /// `require` those (TS1479).
     esm_specifiers: Arc<std::collections::HashMap<String, HashSet<String>>>,
-    /// Per ESM-format importer (node16+): dot-relative specifiers WITHOUT an
+    /// Per importer (node16+): dot-relative specifiers WITHOUT an
     /// extension, mapped to tsc's suggested spelling when a sibling file
     /// exists (`./index` → `./index.js`), else `None` (TS2835 / TS2834).
     esm_extensionless_specifiers:
@@ -24456,6 +24456,8 @@ impl TypeChecker {
                     }
                 }
                 if self.check_module_resolution
+                    && !matches!(_import_decl.specifiers, ImportClause::Require(_))
+                    && self.current_file_module_format == Some(ModuleKind::ESNext)
                     && self.report_extensionless_esm_import(
                         &_import_decl.source,
                         _import_decl.source_span,
@@ -25189,6 +25191,10 @@ impl TypeChecker {
             return false;
         };
         let (code, message) = match suggestion {
+            _ if matches!(specifier, "." | ".." | "./" | "../") => (
+                2307,
+                format!("Cannot find module '{specifier}' or its corresponding type declarations."),
+            ),
             Some(fixed) => (
                 2835,
                 format!(
@@ -25200,6 +25206,13 @@ impl TypeChecker {
                 "Relative import paths need explicit file extensions in ECMAScript imports when '--moduleResolution' is 'node16' or 'nodenext'. Consider adding an extension to the import path.".to_string(),
             ),
         };
+        if self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == code && diagnostic.span == Some(span))
+        {
+            return true;
+        }
         self.diagnostics.push(Diagnostic {
             code,
             message,
@@ -25216,10 +25229,7 @@ impl TypeChecker {
     fn report_require_of_esm(&mut self, specifier: &str, span: Span) {
         if !matches!(
             self.compiler_options.module,
-            Some(ModuleKind::Node16)
-                | Some(ModuleKind::Node18)
-                | Some(ModuleKind::Node20)
-                | Some(ModuleKind::NodeNext)
+            Some(ModuleKind::Node16) | Some(ModuleKind::Node18)
         ) {
             return;
         }
@@ -25252,10 +25262,7 @@ impl TypeChecker {
         if self.current_file_module_format != Some(ModuleKind::CommonJS)
             || !matches!(
                 self.compiler_options.module,
-                Some(ModuleKind::Node16)
-                    | Some(ModuleKind::Node18)
-                    | Some(ModuleKind::Node20)
-                    | Some(ModuleKind::NodeNext)
+                Some(ModuleKind::Node16) | Some(ModuleKind::Node18)
             )
         {
             return;

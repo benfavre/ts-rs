@@ -151,7 +151,13 @@ pub(crate) fn resolve_module_specifier_with_conditions(
     let dot_relative =
         spec == "." || spec == ".." || spec.starts_with("./") || spec.starts_with("../");
     if dot_relative {
-        let base = normalize_path_segments(&join_path(&importer_dir, spec));
+        // The empty virtual directory is relative, whereas join_path's
+        // empty-path convention denotes the filesystem root.
+        let base = if importer_dir.is_empty() && matches!(spec, "." | "./") {
+            String::new()
+        } else {
+            normalize_path_segments(&join_path(&importer_dir, spec))
+        };
         // `./x.mjs` / `./x.cjs` name emitted files; their sources or
         // declarations sit next to them (`x.mts` / `x.d.mts`, `x.cts` /
         // `x.d.cts`). Diagnostics-only: the emit resolver keeps program

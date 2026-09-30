@@ -6450,6 +6450,17 @@ impl TypeChecker {
                 }
                 // Dynamic import: import("module") → Promise<any>
                 if matches!(&call.callee.kind, ExprKind::Ident(name) if name == "import") {
+                    if self.check_module_resolution {
+                        if let Some(argument) = call.args.first() {
+                            match &argument.kind {
+                                ExprKind::StrLit(specifier)
+                                | ExprKind::NoSubstTemplate(specifier) => {
+                                    self.report_extensionless_esm_import(specifier, argument.span);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     for arg in &call.args {
                         self.check_expr(arg);
                     }
