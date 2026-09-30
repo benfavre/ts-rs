@@ -60,15 +60,15 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-Measured on 2026-09-30 at `c3c3940e9`, with the result cache disabled. A case
+Measured on 2026-09-30 at `f21e5c7e1`, with the result cache disabled. A case
 passes only when the output matches what `tsc` produced. Pass rates are
 `passed / (passed + failed)`; skipped cases are never counted as passes.
 
 | Lane | Compiler suite | Conformance suite | What it measures |
 |---|---:|---:|---|
 | JavaScript emit | 6,032 / 6,032 (100%) | 5,388 / 5,388 (100%) | Byte-for-byte match with the `tsc` `.js` baseline (one configuration per case) |
-| Diagnostics | 4,752 / 6,529 (72.8%) | 3,609 / 5,907 (61.1%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
-| Type-check recall / precision | 57.9% / 85.1% | 63.4% / 86.7% | Per-diagnostic `(file, line, code)` match over every option variant |
+| Diagnostics | 4,779 / 6,529 (73.2%) | 3,621 / 5,907 (61.3%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
+| Type-check recall / precision | 58.2% / 85.1% | 64.0% / 86.8% | Per-diagnostic `(file, line, code)` match over every option variant |
 | Symbols | 185 / 6,434 (2.9%) | 293 / 5,617 (5.2%) | Match with the `tsc` `.symbols` baseline |
 
 JavaScript emit skips 497 compiler and 519 conformance cases that have no `.js`
@@ -79,12 +79,12 @@ Language server, against the `fourslash` suite:
 
 | Operation | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| QuickInfo (hover) | 293 | 236 | 10 | 55.4% |
-| Completions | 841 | 290 | 0 | 74.4% |
-| Go-to-definition | 186 | 25 | 2 | 88.2% |
-| Find-all-references | 305 | 42 | 0 | 87.9% |
-| Signature help | 122 | 23 | 7 | 84.1% |
-| **Total** | **1,747** | **616** | **19** | **73.9%** |
+| QuickInfo (hover) | 298 | 231 | 10 | 56.3% |
+| Completions | 859 | 272 | 0 | 76.0% |
+| Go-to-definition | 191 | 20 | 2 | 90.5% |
+| Find-all-references | 329 | 18 | 0 | 94.8% |
+| Signature help | 123 | 22 | 7 | 84.8% |
+| **Total** | **1,800** | **563** | **19** | **76.2%** |
 
 Where the work is:
 
@@ -94,8 +94,8 @@ Where the work is:
   88.0% of declaration-projection variants; the failures are mostly ES5
   downlevel transforms and `.d.ts` emit.
 - **Diagnostics are the active front.** A whole-case pass requires every
-  message and column to match, which is where the remaining 1,777 compiler and
-  2,298 conformance failures come from.
+  message and column to match, which is where the remaining 1,750 compiler and
+  2,286 conformance failures come from.
 - **Language-server gaps are type inference**: hover misses are contextual
   typing, generics, JSDoc type tags and cross-file aliases; completion misses
   are auto-imports and cross-file members.
