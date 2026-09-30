@@ -1,0 +1,20 @@
+{
+  "name": "ts-rs-prism",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "sync:wasm": "bash scripts/build-wasm.sh",
+    "sync": "bun scripts/sync.ts",
+    "build:client": "bun build src/lib/highlight.ts --format=esm --minify --outfile public/highlight.js"
+  },
+  "dependencies": {
+    "@bext-stack/framework": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -128,7 +128,9 @@ target/release/lsp-report --op all --json
 The [conformance report](https://ts-rs.bext.dev/conformance) and
 [progress page](https://ts-rs.bext.dev/progress) track these numbers over time.
 [docs/verified-waves.md](docs/verified-waves.md) records each change with its
-regression checks.
+regression checks. [website/](website/) contains the site source and its
+publishing procedure: push code and metrics to public `main` before syncing
+the site from that published snapshot.
 
 ## Installation
 

@@ -1,0 +1,12 @@
+/node_modules/
+/.bext/
+/public/playground/pkg/
+/public/highlight.js
+/src/lib/repo.generated.ts
+/public/search-index.json
+/public/sitemap.xml
+/public/llms.txt
+/public/feed.xml
+*.br
+*.gz
+*.sync-tmp

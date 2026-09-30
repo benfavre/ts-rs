@@ -1,0 +1,28 @@
+# ts-rs-prism: ts-rs.bext.dev, the project site for tsc-rs
+# (https://github.com/benfavre/ts-rs), the TypeScript compiler written in Rust.
+# Marketing pages, the conformance report, the docs (Markdown in content/docs,
+# read at render time) and a WebAssembly playground (public/playground).
+[server]
+app_dir = "."
+# site.js, playground.js, the wasm package, fonts, robots.txt, sitemap.xml.
+static_dir = "public"
+
+[framework]
+type = "prism"
+
+[build]
+watch_dirs = ["src/app", "src/lib", "src/sections", "content"]
+live_reload = true
+
+[build.css]
+route_css = true
+
+[compile]
+on_demand = true
+
+[rendering]
+mode = "isr"
+revalidate = 3600
+
+[perf]
+continuous_profiling = false
