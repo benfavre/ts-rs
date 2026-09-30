@@ -44,14 +44,13 @@ https://ts-rs.bext.dev by the bext masquerade (root mode, vhost
 - **Removing a route file** briefly breaks every route (the bundle still requires it). Do it
   in a quiet moment and check the site afterwards.
 
-Pages are ISR-cached for an hour. After an edit, drop the cached renders:
-
-```bash
-D=/home/infra-sj278/bext/sites/ts-rs-prism
-curl -s -X POST http://127.0.0.1/__bext/sdk/site/invalidate \
-  -H 'x-bext-app-id: ts-rs-prism' -H 'Content-Type: application/json' \
-  -d "{\"worktree\":\"$D\",\"paths\":[\"$D/src/app/layout.tsx\"]}"
-```
+The source watcher reloads changes in the configured `watch_dirs`. Copy a
+complete reviewed batch, then fetch the public pages and verify their
+`data-build` attribute and visible metrics match the published source.
+Pages use ISR caching, so a successful file copy alone is not deployment
+verification. The September 30 update refreshed through the watcher without a
+service restart. Administrative cache invalidation requires authentication;
+the old unauthenticated SDK/purge examples return HTTP 401 on this host.
 
 ## Authoring rules
 
