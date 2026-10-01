@@ -5235,6 +5235,7 @@ impl TypeChecker {
                             }
                         }
                         self.record_pattern_types(&p.name, &pty);
+                        self.check_binding_pattern_access(&p.name, &pty);
                         self.declare_pattern_vars(&p.name, pty.clone());
                         self.completion_mark_parameter(p);
                         self.mark_optional_parameter(p);
@@ -5509,6 +5510,7 @@ impl TypeChecker {
                             }
                         }
                         self.record_pattern_types(&p.name, &pty);
+                        self.check_binding_pattern_access(&p.name, &pty);
                         self.declare_pattern_vars(&p.name, pty.clone());
                         self.completion_mark_parameter(p);
                         self.mark_optional_parameter(p);
@@ -9466,6 +9468,7 @@ impl TypeChecker {
                                         .map(|t| self.resolve_type_node(t))
                                         .unwrap_or(Type::Any);
                                     let pty = self.declared_optional_param_type(p, pty);
+                                    self.check_binding_pattern_access(&p.name, &pty);
                                     self.declare_pattern_vars(&p.name, pty.clone());
                                     self.completion_mark_parameter(p);
                                     self.mark_optional_parameter(p);
@@ -9588,6 +9591,7 @@ impl TypeChecker {
                                     .as_ref()
                                     .map(|t| self.resolve_type_node(t))
                                     .unwrap_or(Type::Any);
+                                self.check_binding_pattern_access(&param.name, &pty);
                                 self.declare_pattern_vars(&param.name, pty);
                                 self.completion_mark_parameter(param);
                             }
@@ -9666,6 +9670,7 @@ impl TypeChecker {
                             .map(|t| self.resolve_type_node(t))
                             .unwrap_or(Type::Any);
                         self.record_pattern_types(&p.name, &pty);
+                        self.check_binding_pattern_access(&p.name, &pty);
                         self.declare_pattern_vars(&p.name, pty.clone());
                         self.completion_mark_parameter(p);
                         self.mark_optional_parameter(p);
@@ -9827,6 +9832,7 @@ impl TypeChecker {
                             .map(|t| self.resolve_type_node(t))
                             .unwrap_or(Type::Any);
                         self.record_pattern_types(&p.name, &pty);
+                        self.check_binding_pattern_access(&p.name, &pty);
                         self.declare_pattern_vars(&p.name, pty.clone());
                         self.completion_mark_parameter(p);
                         self.mark_optional_parameter(p);
@@ -12924,6 +12930,7 @@ impl TypeChecker {
                                 .map(|init| self.infer_expr_type(init))
                         })
                         .unwrap_or(Type::Any);
+                    self.check_binding_pattern_access(&param.name, &pty);
                     self.declare_pattern_vars(&param.name, pty);
                     self.completion_mark_parameter(param);
                 }
@@ -13040,6 +13047,7 @@ impl TypeChecker {
                                 .map(|init| self.infer_expr_type(init))
                         })
                         .unwrap_or(Type::Any);
+                    self.check_binding_pattern_access(&param.name, &pty);
                     self.declare_pattern_vars(&param.name, pty);
                     self.completion_mark_parameter(param);
                 }
@@ -13182,6 +13190,7 @@ impl TypeChecker {
                         .map(|t| self.resolve_type_node(t))
                         .or_else(|| if !is_getter { pair_ty.clone() } else { None })
                         .unwrap_or(Type::Any);
+                    self.check_binding_pattern_access(&param.name, &pty);
                     self.declare_pattern_vars(&param.name, pty);
                     self.completion_mark_parameter(param);
                 }

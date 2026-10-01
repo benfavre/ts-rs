@@ -1,6 +1,51 @@
 use super::*;
 
 impl TypeChecker {
+    /// Destructuring reads named properties even when the local binding has a
+    /// different name. Object rest copies only public properties.
+    pub(crate) fn check_binding_pattern_access(&mut self, pattern: &Pat, ty: &Type) {
+        use tsc_rs_ast::{ArrayPatElem, ObjPatProp};
+        match &pattern.kind {
+            PatKind::Object(properties) => {
+                for property in properties {
+                    match property {
+                        ObjPatProp::Shorthand(name, span)
+                        | ObjPatProp::ShorthandAssign(name, _, span) => {
+                            self.check_destructured_member_access(ty, name, *span);
+                        }
+                        ObjPatProp::KeyValue(key, nested) => {
+                            if let Some(name) = self.pattern_property_name(key) {
+                                self.check_destructured_member_access(ty, &name, key.span());
+                                let member = self.extract_member_type(ty, &name);
+                                self.check_binding_pattern_access(nested, &member);
+                            }
+                        }
+                        ObjPatProp::Rest(_) => {}
+                    }
+                }
+            }
+            PatKind::Array(elements) => {
+                for (index, element) in elements.iter().enumerate() {
+                    if let Some(ArrayPatElem::Pat(nested)) = element {
+                        let member = self.extract_element_type(ty, index);
+                        self.check_binding_pattern_access(nested, &member);
+                    }
+                }
+            }
+            PatKind::Assign(nested, _) | PatKind::Rest(nested) => {
+                self.check_binding_pattern_access(nested, ty);
+            }
+            PatKind::Ident(_) => {}
+        }
+    }
+
+    fn check_destructured_member_access(&mut self, ty: &Type, name: &str, span: Span) {
+        let apparent = self.typeparam_constraint_apparent(ty);
+        let receiver = apparent.as_ref().unwrap_or(ty);
+        self.check_private_member_access(receiver, name, span);
+        self.check_protected_member_access(receiver, name, span, false, false);
+    }
+
     pub(crate) fn check_protected_member_access(
         &mut self,
         receiver: &Type,

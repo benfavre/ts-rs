@@ -11242,6 +11242,7 @@ impl TypeChecker {
                     Type::Any
                 };
                 self.record_pattern_types(&p.name, &pty);
+                self.check_binding_pattern_access(&p.name, &pty);
                 self.declare_pattern_vars(&p.name, pty.clone());
                 self.completion_mark_parameter(p);
                 (pname, pty)
@@ -23024,6 +23025,7 @@ impl TypeChecker {
                     if decl.init.is_some() || decl.type_ann.is_some() {
                         self.check_array_pattern_iterable(&decl.name, &ty);
                     }
+                    self.check_binding_pattern_access(&decl.name, &ty);
                     self.declare_pattern_vars_with_defaults(
                         &decl.name,
                         ty,
@@ -23568,6 +23570,7 @@ impl TypeChecker {
                     {
                         for decl in &vs.declarations {
                             self.check_array_pattern_iterable(&decl.name, &element);
+                            self.check_binding_pattern_access(&decl.name, &element);
                         }
                     }
                 }
@@ -23683,6 +23686,7 @@ impl TypeChecker {
                         pty.clone()
                     };
                     self.record_pattern_types(&param.name, &hover_ty);
+                    self.check_binding_pattern_access(&param.name, &pty);
                     self.declare_pattern_vars(&param.name, pty);
                     self.completion_mark_parameter(param);
                     self.mark_optional_parameter(param);
