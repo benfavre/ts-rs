@@ -1,16 +1,16 @@
 {
   "measured_at": "2026-10-01",
-  "source_commit": "13486afcb752e105d8c3cfe40e4705b4ccf18d60",
+  "source_commit": "42a1feda8cc0eda0a1a8f8475aeba0e629c533e9",
   "source_build": "Public main checkout, release profile, cache-free baseline reports; unchanged upstream cases and reference baselines.",
   "pass_rate_definition": "passed / (passed + failed); skipped cases excluded, never counted as passes.",
   "baselines": {
     "compiler": {
       "errors": {
         "total": 6529,
-        "passed": 4786,
-        "failed": 1743,
+        "passed": 4785,
+        "failed": 1744,
         "skipped": 0,
-        "manifest_sha256": "afd54c97701e282c9e2733011f369ee2dd7f4e1cb722d7610ee47dab563ad394",
+        "manifest_sha256": "e3eeff351bd4a8a85ee3bafa1e8baf55ffb18c6cc602099315ae2f90a8a06667",
         "command": "target/release/baseline-report --suite compiler --baseline errors --no-cache --save-manifest /tmp/compiler-errors.json"
       },
       "js": {
@@ -57,10 +57,10 @@
     "conformance": {
       "errors": {
         "total": 5907,
-        "passed": 3642,
-        "failed": 2265,
+        "passed": 3641,
+        "failed": 2266,
         "skipped": 0,
-        "manifest_sha256": "9a9c36c2c8e55649e8b1d18f17963ff50a64417f476c6c41f0ccbf320fb1f1fa",
+        "manifest_sha256": "ad3885110977b442d0c8973a12c37935820a146477a447ec5123d5b84ddfb5bb",
         "command": "target/release/baseline-report --suite conformance --baseline errors --no-cache --save-manifest /tmp/conformance-errors.json"
       },
       "js": {
@@ -110,32 +110,32 @@
       "suite": "compiler",
       "cases_total": 7257,
       "cases_with_expected": 3512,
-      "cases_perfect": 1826,
+      "cases_perfect": 1825,
       "expected_diagnostics": 14916,
-      "matched": 8878,
-      "false_negatives": 6038,
+      "matched": 8874,
+      "false_negatives": 6042,
       "false_positives": 1509,
-      "recall": 0.5951997854652722,
-      "precision": 0.8547222489650524,
-      "loc_recall": 0.6273799946366319,
-      "loc_precision": 0.9009338596322326,
-      "report_sha256": "0edf3cbc8c9eeaaf12c190f341f4ae3cd15d1c7bcdb6a662898a5161aea63574",
+      "recall": 0.5949316170555109,
+      "precision": 0.8546662814215544,
+      "loc_recall": 0.6271118262268705,
+      "loc_precision": 0.9008956948858712,
+      "report_sha256": "182e2145af07b8f2ed821faab15a287d686a391940f808741c181982db3baae4",
       "command": "target/release/typecheck-report --suite compiler --json --top 1000"
     },
     "conformance": {
       "suite": "conformance",
       "cases_total": 7694,
       "cases_with_expected": 4271,
-      "cases_perfect": 1718,
+      "cases_perfect": 1717,
       "expected_diagnostics": 28735,
-      "matched": 19256,
-      "false_negatives": 9479,
+      "matched": 19246,
+      "false_negatives": 9489,
       "false_positives": 2582,
-      "recall": 0.6701235427179398,
-      "precision": 0.881765729462405,
-      "loc_recall": 0.6975813467896294,
-      "loc_precision": 0.9178954116677351,
-      "report_sha256": "4e5f22e575a4c2409a273d4ec891c8241a57f2f6b3797dcf1113bf9a2e8ddce3",
+      "recall": 0.6697755350617713,
+      "precision": 0.8817115631299248,
+      "loc_recall": 0.697233339133461,
+      "loc_precision": 0.9178577973245373,
+      "report_sha256": "40921f109aae88043b74b0f150c4971e8517a580eacf91b9ccb81c08c7a6b925",
       "command": "target/release/typecheck-report --suite conformance --json --top 1000"
     }
   },
@@ -145,7 +145,7 @@
       "passed": 299,
       "failed": 230,
       "skipped": 10,
-      "report_sha256": "9eb718360ddb85bd2807225909a6ab6966d21ea97e87236645b76cbae46ac415",
+      "report_sha256": "63e6e607a34283b540409591c5f12c764fea7ea0fcfe8a4d1beb09356990fcd4",
       "command": "target/release/lsp-report --op quickinfo --json --top 1000 --show-samples 10000"
     },
     "completions": {
@@ -186,20 +186,20 @@
     "passed": 1801,
     "failed": 562,
     "skipped": 3957,
-    "report_sha256": "48d18c68b2c49fbc1845953368200f815c74eb327336b0011c5b0dc0523bfe6d",
+    "report_sha256": "37eea9098b43b7a146f33cc6fb72d6ccf0ac080e702e4c80e760df17aabe409e",
     "command": "target/release/lsp-report --op all --json --top 1000 --show-samples 10000"
   },
   "rust_tests": {
-    "total": 3430,
-    "passed": 3393,
+    "total": 3423,
+    "passed": 3386,
     "failed": 0,
     "skipped": 37,
-    "report_sha256": "1f31028b498dc3b559ca1797b5835ea2bed222f729c7325e76158af9eec524d1",
+    "report_sha256": "07beb2cb7692c7bc23fd561ceb56ed0842c58916ff33544d02c600259efdd920",
     "command": "cargo test --workspace"
   },
   "validation": {
     "make_ci": "passed",
-    "ci_log_sha256": "dcc1f8c24855e0f79bf34cd82d13012a6cf47dda3fb030e7cf785b6dd82c5b7b"
+    "ci_log_sha256": "db166770036f15f430c2898fa787d4041c23deb540d955b9542f46e5d9a1175c"
   },
   "diagnostic_accuracy_definition": "Full expanded errors inventory; matches file basename, line and TS code with multiplicity, excluding configuration-deprecation codes. Does not require exact diagnostic message or column.",
   "lsp_total_definition": "The per-operation tables cover five supported operations. The full inventory includes unsupported cases and reports their skips separately; no skip is a pass."

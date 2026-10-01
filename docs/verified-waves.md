@@ -1598,3 +1598,48 @@ compiler diagnostics. The preceding public snapshot is retained at
 
 Evidence is in `/tmp/ts-rs-public-clodule-20261001/`. Publish this code and
 snapshot to public `main` before updating the live website.
+
+## 2026-10-01: visibility checks for destructuring bindings
+
+Object destructuring now checks private and protected member visibility at the
+property being read, including renamed bindings, defaults, computed keys,
+nested patterns, function parameters, and for-of declarations. Checks run in
+the actual lexical access context, preserving legal reads inside classes and
+subclasses. Generic constraints retain their class visibility, while object
+rest continues to copy only public data properties.
+
+Seven regressions verify diagnostic messages and byte spans against TypeScript
+6.0.3.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,785 | 4,786 |
+| Conformance | 3,641 | 3,642 |
+
+Accuracy reports match 14 additional diagnostics
+(four compiler, ten conformance), with no lost matches or new false positives
+in any diagnostic code category.
+
+All twelve cache-free default and expanded comparisons preserve every prior
+pass, case, oracle, and skip count; the other ten matrices are unchanged.
+All 3,650 internal workspace tests pass with 37 ignored, and `make ci` passes.
+The complete LSP inventory remains at 1,801 passes, 562 failures, and 3,957
+skips, with the identical complete failing-case set. Evidence is in
+`/tmp/ts-rs-destructuring-access-20261001/` on the verification host.
+
+## 2026-10-01: public verification of destructuring visibility
+
+Public `main` at `13486afcb7` matches all twelve cache-free baseline manifests
+and both diagnostic-accuracy reports from the verified destructuring batch.
+The complete LSP inventory and each supported operation retain their prior
+counts and complete failing-case sets: 1,801 passes, 562 failures, and 3,957
+skips overall.
+
+All 3,393 public Rust tests pass with 37 ignored, and `make ci` passes.
+The structured snapshot and README report 4,786 compiler and 3,642 conformance
+diagnostic passes, with 14 additional matching diagnostics and unchanged
+false-positive counts. The preceding public snapshot is retained at
+`docs/compatibility-metrics-2026-10-01-42a1feda8.json`.
+
+Evidence is in `/tmp/ts-rs-public-destructuring-access-20261001/`. Publish this
+code and snapshot to public `main` before updating the live website.
