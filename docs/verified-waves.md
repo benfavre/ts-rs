@@ -1580,3 +1580,21 @@ The complete LSP inventory gains `cloduleTypeOf1`: 1,801 passes, 562 failures,
 and 3,957 skips, with no new failing cases. Evidence is in
 `/tmp/ts-rs-clodule-20261001/`; the final reports are separate from the
 `before-enum/` intermediate candidate.
+
+## 2026-10-01: public verification of merged constructors and enum relations
+
+Public `main` at `42a1feda8c` passes all twelve cache-free comparisons against
+the verified merged-constructor and enum batch. Both diagnostic-accuracy
+reports match exactly. The full LSP inventory and each supported operation
+have no new failing cases; QuickInfo gains `cloduleTypeOf1`, reaching 299
+passes and 230 failures. Overall LSP totals are 1,801 passed, 562 failed, and
+3,957 skipped.
+
+All 3,386 public Rust tests pass with 37 ignored, and `make ci` passes.
+The structured snapshot and README report 4,785 compiler and 3,641 conformance
+diagnostic passes, 28,120 matched diagnostics overall, and four fewer spurious
+compiler diagnostics. The preceding public snapshot is retained at
+`docs/compatibility-metrics-2026-10-01-72469af31.json`.
+
+Evidence is in `/tmp/ts-rs-public-clodule-20261001/`. Publish this code and
+snapshot to public `main` before updating the live website.
