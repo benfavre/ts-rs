@@ -6188,49 +6188,64 @@ impl BaselineRunner {
             let is_jsx = lower.ends_with(".tsx") || lower.ends_with(".jsx");
             let parsed = tsc_rs_parser::parse_with_jsx(&file.name, &file.content, is_jsx);
             let symbols = tsc_rs_symbols::bind(&parsed);
-            let check_output = tsc_rs_types::TypeChecker::new().check_with_options(
-                &parsed,
-                &symbols,
-                &effective_options,
-            );
+            let mut checker = tsc_rs_types::TypeChecker::new();
+            checker.enable_expression_type_spans();
+            let check_output = checker.check_with_options(&parsed, &symbols, &effective_options);
 
             let display_name = basename(&file.name);
             output.push_str(&format!("\n=== {} ===\n", display_name));
 
             // Build sorted list of (line, col, expr_text, type_str)
             let line_starts = compute_line_starts(&file.content);
-            let source_lines: Vec<&str> = file.content.lines().collect();
 
-            // Group expression types by line
-            let mut types_by_line: HashMap<usize, Vec<(usize, String, String)>> = HashMap::new();
-            for (&pos, type_str) in &check_output.expression_types {
-                let line_idx = line_index_from_starts(&line_starts, pos as usize);
-                let line_start = line_starts[line_idx];
-                let col = (pos as usize).saturating_sub(line_start);
-                // Extract expression text from source
-                let expr_text = extract_expression_at(&file.content, pos as usize);
-                types_by_line
-                    .entry(line_idx)
-                    .or_default()
-                    .push((col, expr_text, type_str.clone()));
+            // Preserve full syntax spans and preorder when several expressions
+            // share a start position. The hover map intentionally keeps only one.
+            let expression_starts: HashSet<_> = check_output
+                .expression_type_spans
+                .keys()
+                .map(|span| span.0)
+                .collect();
+            let mut entries: Vec<_> = check_output
+                .expression_type_spans
+                .iter()
+                // Upstream's isPartOfTypeNode excludes the null keyword,
+                // including a literal used as a value. Named properties remain.
+                .filter(|(_, entry)| entry.kind != tsc_rs_types::TypeSpanKind::NullLiteral)
+                .map(|(&(start, end), entry)| (start, end, entry.type_string.clone()))
+                .collect();
+            let tokens = tsc_rs_scanner::Scanner::new(&file.content).scan_all();
+            for (&start, ty) in &check_output.expression_types {
+                if expression_starts.contains(&start) {
+                    continue;
+                }
+                if let Ok(index) = tokens.binary_search_by_key(&start, |token| token.span.start) {
+                    entries.push((start, tokens[index].span.end, ty.clone()));
+                }
             }
-
-            // Sort types within each line by column
-            for entries in types_by_line.values_mut() {
-                entries.sort_by_key(|(col, _, _)| *col);
+            entries.sort_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
+            let mut types_by_line: std::collections::BTreeMap<usize, Vec<(String, String)>> =
+                std::collections::BTreeMap::new();
+            for (start, end, ty) in entries {
+                let line = line_index_from_starts(&line_starts, start as usize);
+                let text = file
+                    .content
+                    .get(start as usize..end as usize)
+                    .expect("checked expression span must lie within the source");
+                types_by_line
+                    .entry(line)
+                    .or_default()
+                    .push((text.replace(['\r', '\n'], ""), ty));
             }
 
             let mut annotations = Vec::new();
-            for line_idx in 0..source_lines.len() {
-                if let Some(entries) = types_by_line.get(&line_idx) {
-                    for (_, expr_text, type_str) in entries {
-                        let mut annotation = format!(">{} : {}\n", expr_text, type_str);
-                        // Caret line
-                        let prefix_len = expr_text.encode_utf16().count();
-                        let carets = "^".repeat(type_str.encode_utf16().count());
-                        annotation.push_str(&format!(">{} : {}\n", " ".repeat(prefix_len), carets));
-                        annotations.push((line_idx, annotation));
-                    }
+            for (line, entries) in types_by_line {
+                for (expr_text, type_str) in entries {
+                    let mut annotation = format!(">{} : {}\n", expr_text, type_str);
+                    // Caret line
+                    let prefix_len = expr_text.encode_utf16().count();
+                    let carets = "^".repeat(type_str.encode_utf16().count());
+                    annotation.push_str(&format!(">{} : {}\n", " ".repeat(prefix_len), carets));
+                    annotations.push((line, annotation));
                 }
             }
             output.push_str(&tsc_rs_symbols::render_annotated_source(
@@ -6322,73 +6337,6 @@ fn line_index_from_starts(line_starts: &[usize], offset: usize) -> usize {
     match line_starts.binary_search(&offset) {
         Ok(idx) => idx,
         Err(idx) => idx.saturating_sub(1),
-    }
-}
-
-/// Extract a reasonable expression text starting at the given offset.
-/// This is a simple heuristic: grab word characters, dots, brackets, parens.
-fn extract_expression_at(source: &str, offset: usize) -> String {
-    let rest = &source[offset..];
-    let mut end = 0;
-    let mut depth_paren = 0i32;
-    let mut depth_bracket = 0i32;
-    let mut chars = rest.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '(' => {
-                depth_paren += 1;
-                end += ch.len_utf8();
-            }
-            ')' => {
-                depth_paren -= 1;
-                end += ch.len_utf8();
-                if depth_paren < 0 {
-                    end -= ch.len_utf8();
-                    break;
-                }
-            }
-            '[' => {
-                depth_bracket += 1;
-                end += ch.len_utf8();
-            }
-            ']' => {
-                depth_bracket -= 1;
-                end += ch.len_utf8();
-                if depth_bracket < 0 {
-                    end -= ch.len_utf8();
-                    break;
-                }
-            }
-            '.' if depth_paren == 0 && depth_bracket == 0 => {
-                // Include member access dots
-                end += ch.len_utf8();
-            }
-            _ if ch.is_alphanumeric() || ch == '_' || ch == '$' || ch == '#' => {
-                end += ch.len_utf8();
-            }
-            '<' | '>' if depth_paren > 0 || depth_bracket > 0 => {
-                end += ch.len_utf8();
-            }
-            ' ' | '\t' | '\n' | '\r' | ';' | ',' | ':' | '{' | '}' | '=' | '+' | '-' | '*'
-            | '/' | '!' | '?' | '&' | '|' | '^' | '~' | '%' => {
-                break;
-            }
-            _ => {
-                if depth_paren == 0 && depth_bracket == 0 {
-                    break;
-                }
-                end += ch.len_utf8();
-            }
-        }
-    }
-    if end == 0 {
-        // Fallback: just grab the first token-like thing
-        let token_end = rest
-            .find(|c: char| c.is_whitespace() || ";,:{".contains(c))
-            .unwrap_or(rest.len());
-        rest[..token_end].to_string()
-    } else {
-        rest[..end].to_string()
     }
 }
 

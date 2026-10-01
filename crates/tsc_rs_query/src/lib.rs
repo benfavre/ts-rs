@@ -1508,6 +1508,7 @@ impl QueryEngine {
         Some(tsc_rs_types::TypeCheckOutput {
             diagnostics: Vec::new(),
             expression_types: analysis.expression_types.clone(),
+            expression_type_spans: HashMap::new(),
             selected_overload_indices: analysis.selected_overload_indices.clone(),
             stable_types: analysis
                 .type_ids_by_display

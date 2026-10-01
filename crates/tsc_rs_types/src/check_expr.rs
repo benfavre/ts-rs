@@ -4656,6 +4656,12 @@ impl TypeChecker {
         expr: &Expr,
         contextual_type: Option<&Type>,
     ) -> Type {
+        let ty = self.check_expr_contextual_inner(expr, contextual_type);
+        self.record_checked_expression_type(expr, &ty);
+        ty
+    }
+
+    fn check_expr_contextual_inner(&mut self, expr: &Expr, contextual_type: Option<&Type>) -> Type {
         match &expr.kind {
             ExprKind::Arrow(_) | ExprKind::FnExpr(_) => {
                 let ty = self.check_arrow_or_fn_contextual(expr, contextual_type);
@@ -5589,6 +5595,7 @@ impl TypeChecker {
             return Type::Any;
         }
         let result = self.check_expr_inner(expr);
+        self.record_checked_expression_type(expr, &result);
         self.exit_recursion();
         result
     }

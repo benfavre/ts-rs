@@ -2501,13 +2501,14 @@ impl<'a> Parser<'a> {
             let keyword_span = self.bump();
             // `for (var of X)` / `for (var in X)`: `of`/`in` directly after `var`
             // is the loop keyword, not a binding name. Create an error binding.
-            // Only for `var` — `let` is treated as an identifier in `for (let of ...)`.
+            // `const` has the same recovery; `let` is ambiguous with an identifier
+            // in `for (let of ...)`.
             // Only when the token AFTER `of`/`in` is NOT one of `of`, `in`, `;`,
             // `,`, `=`, `)` — those indicate `of`/`in` is a binding name:
             //   `for (var of;;)`  → binding=of, regular for-loop
             //   `for (var of of of)` → binding=of, for-of with iterable `of`
             //   `for (var of = 0 in of)` → binding=of with init, for-in
-            if kind == VarKind::Var
+            if matches!(kind, VarKind::Var | VarKind::Const)
                 && matches!(self.cur(), TokenKind::Of | TokenKind::In)
                 && !self.peek_is(TokenKind::Semicolon)
                 && !self.peek_is(TokenKind::Comma)

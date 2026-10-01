@@ -1913,11 +1913,27 @@ struct ConditionAlias {
 // Type check output
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeSpanKind {
+    Expression,
+    Declaration,
+    NullLiteral,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeAtSpan {
+    pub type_string: String,
+    pub kind: TypeSpanKind,
+}
+
 #[derive(Debug, Clone)]
 pub struct TypeCheckOutput {
     pub diagnostics: Vec<Diagnostic>,
     /// Map from source position to resolved type string (for .types baseline)
     pub expression_types: HashMap<u32, std::string::String>,
+    /// Optional exact syntax spans and their types, including expressions that
+    /// start at the same position (for example `obj`, `obj.x`, and `obj.x()`).
+    pub expression_type_spans: HashMap<(u32, u32), TypeAtSpan>,
     /// Map from call/new callee position to the overload index selected by the checker.
     pub selected_overload_indices: HashMap<u32, usize>,
     /// Stable content-addressed types discovered while checking this file.
@@ -2164,6 +2180,7 @@ impl TypeCheckOutput {
         Self {
             diagnostics: Vec::new(),
             expression_types: HashMap::new(),
+            expression_type_spans: HashMap::new(),
             selected_overload_indices: HashMap::new(),
             stable_types: HashMap::new(),
         }
@@ -2237,6 +2254,7 @@ pub struct TypeChecker {
     /// expression checked; FxHash for the same speedup rationale as
     /// `dedup_map`.
     expression_types: rustc_hash::FxHashMap<u32, std::string::String>,
+    expression_type_spans: Option<rustc_hash::FxHashMap<(u32, u32), TypeAtSpan>>,
     /// Completion facts are captured while lexical bindings are still active,
     /// independently of optional expression-type tracking for editor features.
     completion_never_calls: rustc_hash::FxHashSet<u32>,
@@ -2857,6 +2875,7 @@ impl Clone for TypeChecker {
         Self {
             arena: self.arena.clone(),
             expression_types: self.expression_types.clone(),
+            expression_type_spans: self.expression_type_spans.clone(),
             completion_never_calls: rustc_hash::FxHashSet::default(),
             completion_exhaustive_switches: rustc_hash::FxHashSet::default(),
             diagnostics: self.diagnostics.clone(),
@@ -3077,6 +3096,7 @@ impl TypeChecker {
                 Type::Error,     // 12 = TYPE_ERROR
             ],
             expression_types: rustc_hash::FxHashMap::default(),
+            expression_type_spans: None,
             completion_never_calls: rustc_hash::FxHashSet::default(),
             completion_exhaustive_switches: rustc_hash::FxHashSet::default(),
             diagnostics: Vec::new(),
@@ -3449,6 +3469,66 @@ impl TypeChecker {
     /// LSP / hover queries via `QueryEngine` keep tracking on (default).
     pub fn disable_expression_types(&mut self) {
         self.track_expression_types = false;
+    }
+
+    /// Collect exact expression and declaration spans for type inspection.
+    /// Disabled by default so ordinary compilation and hover keep their cost.
+    pub fn enable_expression_type_spans(&mut self) {
+        self.expression_type_spans = Some(rustc_hash::FxHashMap::default());
+    }
+
+    fn record_expression_type_span(&mut self, span: Span, ty: &Type) {
+        if let Some(spans) = &mut self.expression_type_spans {
+            spans.insert(
+                (span.start, span.end),
+                TypeAtSpan {
+                    type_string: ty.display_string(),
+                    kind: TypeSpanKind::Declaration,
+                },
+            );
+        }
+    }
+
+    fn record_checked_expression_type(&mut self, expr: &Expr, ty: &Type) {
+        if self.expression_type_spans.is_none() {
+            return;
+        }
+        let missing = |expr: &Expr| matches!(&expr.kind, ExprKind::Ident(name) if name.is_empty() || name == "<error>");
+        let mut span = expr.span;
+        if missing(expr) {
+            span.end = span.start;
+        } else {
+            let operand = match &expr.kind {
+                ExprKind::Unary(unary) => Some(unary.argument.as_ref()),
+                ExprKind::Void(operand)
+                | ExprKind::Typeof(operand)
+                | ExprKind::Delete(operand)
+                | ExprKind::Await(operand) => Some(operand.as_ref()),
+                ExprKind::Update(update) => Some(update.argument.as_ref()),
+                _ => None,
+            };
+            if let Some(operand) = operand.filter(|operand| missing(operand)) {
+                if let Some(prefix) = self
+                    .current_source
+                    .as_deref()
+                    .and_then(|source| source.get(span.start as usize..operand.span.start as usize))
+                {
+                    span.end = span.start + prefix.trim_end().len() as u32;
+                }
+            }
+        }
+        let kind = if matches!(expr.kind, ExprKind::NullLit) {
+            TypeSpanKind::NullLiteral
+        } else {
+            TypeSpanKind::Expression
+        };
+        self.expression_type_spans.as_mut().unwrap().insert(
+            (span.start, span.end),
+            TypeAtSpan {
+                type_string: ty.display_string(),
+                kind,
+            },
+        );
     }
 
     /// Record a type display string for an expression position, but only
@@ -10244,6 +10324,11 @@ impl TypeChecker {
             // the output type. Single allocation; the fast hasher was only
             // for the build-up phase during checking.
             expression_types: self.expression_types.into_iter().collect(),
+            expression_type_spans: self
+                .expression_type_spans
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             selected_overload_indices: self.selected_overload_indices.into_iter().collect(),
             stable_types,
         }
@@ -10533,6 +10618,11 @@ impl TypeChecker {
             // the output type. Single allocation; the fast hasher was only
             // for the build-up phase during checking.
             expression_types: self.expression_types.into_iter().collect(),
+            expression_type_spans: self
+                .expression_type_spans
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             selected_overload_indices: self.selected_overload_indices.into_iter().collect(),
             stable_types,
         }
@@ -10867,6 +10957,9 @@ impl TypeChecker {
         use tsc_rs_ast::{ArrayPatElem, ObjPatProp, PatKind};
         match &pat.kind {
             PatKind::Ident(name) => {
+                if !pat.span.is_empty() && !name.is_empty() && name != "<error>" {
+                    self.record_expression_type_span(pat.span, &ty);
+                }
                 self.declare_var(name, ty);
             }
             PatKind::Object(props) => {
@@ -23753,6 +23846,21 @@ impl TypeChecker {
             StmtKind::ClassDecl(class_decl) => {
                 if let Some(name) = &class_decl.name {
                     self.check_reserved_type_name(name, class_decl.name_span, 2414, "Class");
+                }
+                if self.expression_type_spans.is_some() {
+                    if let (Some(name), Some(span)) = (&class_decl.name, class_decl.name_span) {
+                        let params = class_decl
+                            .type_params
+                            .as_deref()
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|p| Type::TypeReference(p.name.clone(), Arc::from([])))
+                            .collect();
+                        self.record_expression_type_span(
+                            span,
+                            &Type::TypeReference(name.clone(), params),
+                        );
+                    }
                 }
                 self.check_static_property_name_conflicts(class_decl, None);
                 let pushed_type_param_names =
