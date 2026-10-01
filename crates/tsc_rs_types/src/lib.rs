@@ -13400,8 +13400,8 @@ impl TypeChecker {
     }
 
     /// Fold namespace VALUE exports onto a merged class binding as
-    /// static-like members, regardless of declaration order. `new C()` keeps
-    /// working (the New arm resolves constructors by NAME via class_info).
+    /// static-like members, retaining the nominal constructor regardless of
+    /// declaration order.
     fn fold_namespace_class_merges(&mut self, stmts: &[Stmt]) {
         for stmt in stmts {
             let inner: &Stmt = match &stmt.kind {
@@ -13424,37 +13424,14 @@ impl TypeChecker {
             if namespace.exports.is_empty() {
                 continue;
             }
-            let mut props: Vec<(std::string::String, Arc<Type>)> = match self.lookup_var(name) {
-                Some(Type::ObjectType(info)) => info.properties.clone(),
-                _ => {
-                    let mut v: Vec<(std::string::String, Arc<Type>)> = Vec::new();
-                    if let Some(info) = self.class_info.get(name.as_str()) {
-                        for (n, t) in &info.static_properties {
-                            v.push((n.clone(), Arc::new(t.clone())));
-                        }
-                        for (n, ft) in &info.static_methods {
-                            v.push((n.clone(), Arc::new(Type::Function(ft.clone()))));
-                        }
-                    }
-                    v
-                }
-            };
-            for (n, t) in namespace.exports {
-                if !props.iter().any(|(pn, _)| pn == &n) {
-                    props.push((n, Arc::new(t)));
-                }
+            let mut value = self
+                .lookup_var(name)
+                .cloned()
+                .filter(Self::value_absorbs_namespace)
+                .unwrap_or_else(|| Type::TypeReference(format!("typeof {name}"), Arc::from([])));
+            if Self::fold_namespace_into_value(&mut value, namespace).is_ok() {
+                self.declare_var(name, value);
             }
-            self.declare_var(
-                name,
-                Type::ObjectType(ObjectTypeInfo {
-                    properties: props,
-                    call_signatures: Vec::new(),
-                    construct_signatures: Vec::new(),
-                    index_signature: None,
-                    index_signature_name: None,
-                    method_names: Vec::new(),
-                }),
-            );
         }
     }
 
@@ -13776,51 +13753,16 @@ impl TypeChecker {
                             Self::merge_namespace_exports(&mut ns, namespace);
                             self.declare_var(name, Type::Namespace(ns));
                         }
-                        // Namespace merged with a CLASS: fold the namespace's
-                        // exports onto the class VALUE as static-like members
-                        // (augmentedTypesModule4/5: `m3d.y` where `namespace
-                        // m3d { export var y }` merges `class m3d`). `new
-                        // m3d()` keeps working — the New arm resolves the
-                        // constructor by NAME through class_info, not through
-                        // the value binding.
-                        Some(existing)
+                        // Retain the nominal constructor when adding namespace
+                        // exports, so static accessibility and aliases continue
+                        // to see the declaring class.
+                        Some(mut existing)
                             if !namespace.exports.is_empty()
                                 && self.class_info.contains_key(name.as_str()) =>
                         {
-                            let mut props: Vec<(std::string::String, Arc<Type>)> = match &existing {
-                                Type::ObjectType(info) => info.properties.clone(),
-                                _ => {
-                                    let mut v: Vec<(std::string::String, Arc<Type>)> = Vec::new();
-                                    if let Some(info) = self.class_info.get(name.as_str()) {
-                                        for (n, t) in &info.static_properties {
-                                            v.push((n.clone(), Arc::new(t.clone())));
-                                        }
-                                        for (n, ft) in &info.static_methods {
-                                            v.push((
-                                                n.clone(),
-                                                Arc::new(Type::Function(ft.clone())),
-                                            ));
-                                        }
-                                    }
-                                    v
-                                }
-                            };
-                            for (n, t) in namespace.exports {
-                                if !props.iter().any(|(pn, _)| pn == &n) {
-                                    props.push((n, Arc::new(t)));
-                                }
+                            if Self::fold_namespace_into_value(&mut existing, namespace).is_ok() {
+                                self.declare_var(name, existing);
                             }
-                            self.declare_var(
-                                name,
-                                Type::ObjectType(ObjectTypeInfo {
-                                    properties: props,
-                                    call_signatures: Vec::new(),
-                                    construct_signatures: Vec::new(),
-                                    index_signature: None,
-                                    index_signature_name: None,
-                                    method_names: Vec::new(),
-                                }),
-                            );
                         }
                         Some(_) => {}
                     }
@@ -19164,6 +19106,14 @@ impl TypeChecker {
             Type::ObjectType(info) if !info.construct_signatures.is_empty() => {
                 Some(info.construct_signatures.clone())
             }
+            Type::Intersection(members) => {
+                let signatures: Vec<_> = members
+                    .iter()
+                    .filter_map(|member| self.direct_constructor_signatures(member))
+                    .flatten()
+                    .collect();
+                (!signatures.is_empty()).then_some(signatures)
+            }
             _ => None,
         }
     }
@@ -19231,6 +19181,27 @@ impl TypeChecker {
                 Some(resolved) => self.direct_constructor_static_members(resolved),
                 None => class_members(name),
             },
+            Type::Intersection(parts) => {
+                let mut members = Vec::new();
+                for part in parts.iter() {
+                    let properties = match part {
+                        Type::ObjectType(info) => info
+                            .properties
+                            .iter()
+                            .map(|(name, ty)| (name.clone(), Type::clone(ty)))
+                            .collect(),
+                        _ => self
+                            .direct_constructor_static_members(part)
+                            .unwrap_or_default(),
+                    };
+                    for (name, ty) in properties {
+                        if !members.iter().any(|(existing, _)| existing == &name) {
+                            members.push((name, ty));
+                        }
+                    }
+                }
+                Some(members)
+            }
             _ => None,
         }
     }
@@ -19446,6 +19417,29 @@ impl TypeChecker {
             return false;
         }
 
+        // A constructor augmented by a namespace supplies both sets of
+        // properties to a structural target. Comparing either intersection
+        // constituent alone loses the members contributed by the other.
+        if matches!(source, Type::Intersection(_))
+            && matches!(target, Type::ObjectType(_))
+            && self.direct_constructor_signatures(source).is_some()
+        {
+            if let Some(members) = self.direct_constructor_static_members(source) {
+                let surface = Type::ObjectType(ObjectTypeInfo {
+                    properties: members
+                        .into_iter()
+                        .map(|(name, ty)| (name, Arc::new(ty)))
+                        .collect(),
+                    call_signatures: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signature: None,
+                    index_signature_name: None,
+                    method_names: Vec::new(),
+                });
+                return self.is_assignable_to(&surface, target);
+            }
+        }
+
         // Private-member nominality: separately-declared private members are
         // never compatible, and a private member never satisfies a public
         // one (classImplementsClass5).
@@ -19593,6 +19587,36 @@ impl TypeChecker {
                         .iter()
                         .any(|value| matches!(value, Type::String | Type::StringLiteral(_)));
                     match target {
+                        // Enum references are known types. Distribute the
+                        // relation before the unresolved-reference fallback,
+                        // which cannot decide a union/intersection target.
+                        Type::Union(members) => {
+                            // A whole enum may be covered by different union
+                            // members (E { A=0, B=1 } fits 0 | 1). Retain each
+                            // member's enum identity during that comparison.
+                            if values.len() > 1 {
+                                if let Some(variants) = self.enum_info.get(source_name) {
+                                    return variants.iter().all(|(variant, _)| {
+                                        let member = Type::TypeReference(
+                                            format!("{source_name}.{variant}"),
+                                            Arc::from([]),
+                                        );
+                                        members
+                                            .iter()
+                                            .any(|target| self.is_assignable_to(&member, target))
+                                    });
+                                }
+                            }
+                            return members
+                                .iter()
+                                .any(|member| self.is_assignable_to(source, member));
+                        }
+                        Type::Intersection(members) => {
+                            return members
+                                .iter()
+                                .all(|member| self.is_assignable_to(source, member));
+                        }
+
                         Type::String | Type::StringLiteral(_) if !stringy => return false,
                         Type::Number | Type::NumberLiteral(_) if !numeric => return false,
                         Type::Boolean | Type::BooleanLiteral(_) => return false,
@@ -20618,7 +20642,11 @@ impl TypeChecker {
             let Some(resolved) = self.lookup_var(name) else {
                 continue;
             };
-            let concrete = Self::is_concrete_typeof_target(resolved);
+            // A merged class/namespace is an intersection of its constructor
+            // identity and exported properties. Resolve that value for the
+            // relation while retaining `typeof C` for diagnostic display.
+            let concrete = Self::is_concrete_typeof_target(resolved)
+                || matches!(resolved, Type::Intersection(_));
             if concrete {
                 let resolved = resolved.clone();
                 return if is_source {

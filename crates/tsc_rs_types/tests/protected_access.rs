@@ -340,3 +340,18 @@ fn protected_interface_this_parameter() {
         (2446, 91, 1, "Property 'p' is protected and only accessible through an instance of class 'I'. This is an instance of class 'B'."),
     ]);
 }
+
+#[test]
+fn protected_merged_class_namespace() {
+    check("class C { protected static p=1; static visible=2; } namespace C { export const x=C.p; export const y=C.visible; } C.p;", &[
+        (2445, 83, 1, "Property 'p' is protected and only accessible within class 'C' and its subclasses."),
+        (2445, 116, 1, "Property 'p' is protected and only accessible within class 'C' and its subclasses."),
+    ]);
+}
+
+#[test]
+fn protected_merged_constructor_alias() {
+    check("class C { protected static p=1; static ok=2; } namespace C { export const a=1; } namespace C { export const b=2; } const Alias=C; Alias.p; Alias.a; Alias.b; new Alias(); class D extends C { f() { C.p; D.p; } }", &[
+        (2445, 136, 1, "Property 'p' is protected and only accessible within class 'C' and its subclasses."),
+    ]);
+}

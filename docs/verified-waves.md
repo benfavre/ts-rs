@@ -1547,3 +1547,36 @@ at `docs/compatibility-metrics-2026-09-30-7643258e9.json`.
 
 Evidence is in `/tmp/ts-rs-public-interface-20260930/`. Publish this code and
 snapshot to public `main` before synchronizing the live website.
+
+## 2026-10-01: preserve merged class constructors and check enum relations
+
+Class/namespace merges retain the constructor identity alongside namespace
+exports. Protected static access now uses that identity, constructor aliases
+remain constructable, and structural assignments see both the class statics
+and the namespace members. `typeof` relations inspect merged intersections
+without discarding the original diagnostic display name. Enum relations check
+union and intersection members while preserving coverage of a whole enum by
+multiple union alternatives.
+
+Seven oracle-backed regressions cover protected access and aliases, ambient
+merge order, construct signatures, combined static properties, property/index
+constraints, and enum union coverage. TypeScript 6.0.3 verifies their semantic
+diagnostics, messages, and spans under matching options.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,785 | 4,785 |
+| Conformance | 3,640 | 3,641 |
+
+All twelve cache-free default and expanded baseline comparisons retain every
+previous pass, case, oracle, and skip count. One conformance diagnostic case
+now passes. Matched diagnostics increase from 8,871 to 8,874 for compiler and
+from 19,239 to 19,246 for conformance. Compiler false positives decrease from
+1,513 to 1,509; conformance remains 2,582. No diagnostic code loses matches or
+gains spurious diagnostics. All 3,643 internal workspace tests pass with 37
+ignored, and `make ci` passes.
+
+The complete LSP inventory gains `cloduleTypeOf1`: 1,801 passes, 562 failures,
+and 3,957 skips, with no new failing cases. Evidence is in
+`/tmp/ts-rs-clodule-20261001/`; the final reports are separate from the
+`before-enum/` intermediate candidate.

@@ -14,6 +14,23 @@ impl TypeChecker {
         if is_super || property.starts_with('#') {
             return;
         }
+        // Class/namespace merges retain a nominal constructor alongside
+        // the namespace's exported properties.
+        if let Type::Intersection(members) = receiver {
+            if members.len() == 2 && matches!(members[0], Type::ObjectType(_)) {
+                if matches!(&members[1], Type::TypeReference(name, _) if name.starts_with("typeof "))
+                {
+                    self.check_protected_member_access(
+                        &members[1],
+                        property,
+                        span,
+                        is_super,
+                        writing,
+                    );
+                }
+            }
+            return;
+        }
         let (receiver_class, is_static) = match receiver {
             Type::This => match self.enclosing_class_names.last() {
                 Some(name) => (name.clone(), false),
