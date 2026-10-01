@@ -1531,3 +1531,19 @@ The complete LSP inventory retains 1,800 passes, 563 failures, and 3,957 skips,
 with an identical failing-case set. Evidence is in
 `/tmp/ts-rs-interface-access-20260930/`; the separate `namespace-trial/` records
 a rejected candidate and is not the accepted result.
+
+## 2026-10-01: public verification of interface visibility
+
+Public `main` at `72469af31` passes all twelve cache-free baseline comparisons
+against the verified interface-heritage batch. Both diagnostic-accuracy reports
+match exactly. The complete LSP inventory and all five supported operations
+retain their previous counts and complete failing-case sets.
+
+The public workspace passes 3,379 Rust tests with zero failures and 37 ignored;
+`make ci` passes. The structured metrics and README now report 4,785 compiler
+and 3,640 conformance diagnostic passes, with 19,239 conformance diagnostic
+matches and 2,582 false positives. The preceding public snapshot is retained
+at `docs/compatibility-metrics-2026-09-30-7643258e9.json`.
+
+Evidence is in `/tmp/ts-rs-public-interface-20260930/`. Publish this code and
+snapshot to public `main` before synchronizing the live website.
