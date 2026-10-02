@@ -1643,3 +1643,26 @@ false-positive counts. The preceding public snapshot is retained at
 
 Evidence is in `/tmp/ts-rs-public-destructuring-access-20261001/`. Publish this
 code and snapshot to public `main` before updating the live website.
+
+## 2026-10-02: exact type-expression baseline spans
+
+Type baselines now retain complete expression spans and syntax order when
+expressions share a start position. Declaration names preserve their metadata,
+and malformed for-loop bindings retain parser recovery without fabricating
+expression text. Hover consumers retain their existing position map.
+
+| Lane | Compiler passes before | After | Conformance passes before | After |
+|---|---:|---:|---:|---:|
+| Types | 184 | 601 | 128 | 531 |
+
+The twelve cache-free baseline comparisons gain 820 whole type-baseline
+passes, with zero lost passes and unchanged cases, oracles, and skip counts.
+All diagnostic, JavaScript, expanded declaration, symbol, accuracy, and LSP
+results remain unchanged. No upstream tests or reference baselines changed.
+
+The implementation is internal `1c32e8bf8` and public `8470e4a298`. Public
+reports reproduce every internal matrix. All 3,662 internal and 3,405 public
+Rust tests pass, with 37 ignored in each workspace; both `make ci` checks pass.
+Measurements were collected on October 1; this entry publishes those results
+on October 2. Evidence is in `/tmp/ts-rs-type-baselines-20261001/` and
+`/tmp/ts-rs-public-type-baselines-20261001/`.
