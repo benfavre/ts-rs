@@ -6134,12 +6134,8 @@ impl BaselineRunner {
 
         for file in &test_case.files {
             let lower = file.name.to_ascii_lowercase();
-            if lower.ends_with(".d.ts")
-                || lower.ends_with(".d.tsx")
-                || lower.ends_with(".d.mts")
-                || lower.ends_with(".d.cts")
-                || lower.ends_with(".json")
-            {
+            // Declaration files are source inputs for semantic baselines too.
+            if lower.ends_with(".json") {
                 continue;
             }
 
@@ -6176,12 +6172,8 @@ impl BaselineRunner {
 
         for file in &test_case.files {
             let lower = file.name.to_ascii_lowercase();
-            if lower.ends_with(".d.ts")
-                || lower.ends_with(".d.tsx")
-                || lower.ends_with(".d.mts")
-                || lower.ends_with(".d.cts")
-                || lower.ends_with(".json")
-            {
+            // Declaration files are source inputs for semantic baselines too.
+            if lower.ends_with(".json") {
                 continue;
             }
 
