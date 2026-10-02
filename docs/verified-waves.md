@@ -1666,3 +1666,34 @@ Rust tests pass, with 37 ignored in each workspace; both `make ci` checks pass.
 Measurements were collected on October 1; this entry publishes those results
 on October 2. Evidence is in `/tmp/ts-rs-type-baselines-20261001/` and
 `/tmp/ts-rs-public-type-baselines-20261001/`.
+
+## 2026-10-02: declaration files in symbol and type baselines
+
+Symbol and type reports now include declaration-file source inputs, matching
+the upstream oracle. They retain declarations alongside implementation files
+and continue to omit JSON inputs. Three regressions cover declaration symbol
+positions, type annotations, module extensions, and mixed input files.
+
+| Lane | Compiler passes before | After | Conformance passes before | After |
+|---|---:|---:|---:|---:|
+| Symbols | 1,709 | 1,722 | 1,534 | 1,568 |
+| Types | 601 | 603 | 531 | 557 |
+
+All twelve cache-free comparisons retain every previous pass and all case,
+oracle, and skip identities. The wave gains 75 complete baseline passes:
+47 symbol cases and 28 type cases. Diagnostics, diagnostic accuracy,
+JavaScript, and expanded declarations are unchanged. Upstream test cases and
+reference baselines remain unchanged.
+
+The implementation is internal `ca5c94c01` and public `59cbf453d7`. All public
+baseline matrices and diagnostic accuracy reports reproduce the internal
+results. All 3,665 internal and 3,408 public Rust tests pass with 37 ignored
+in each workspace, and both `make ci` runs pass. LSP counts and complete
+failing-case sets are unchanged across the inventory and supported operations.
+Evidence is in `/tmp/ts-rs-declaration-baselines-20261002/` and
+`/tmp/ts-rs-public-declaration-baselines-20261002/`.
+
+The preceding 820-pass type-expression wave was published at `57f6b9d9cc`.
+All 26 live routes, the search index, and desktop/mobile rendering verified
+that build and its updated metrics; evidence is in
+`/tmp/ts-rs-site-types-20261002/`.
