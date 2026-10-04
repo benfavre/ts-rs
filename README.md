@@ -150,11 +150,14 @@ On Linux x86-64 the workspace links with `clang` and `lld` (see
 under `tests/`, so the clone is large; that corpus is what makes the numbers
 above reproducible.
 
-A prebuilt Linux x64 binary is published on npm. It follows its own release
-schedule and can be behind the source tree:
+Version 0.4.2 is available as [GitHub release downloads](https://github.com/benfavre/ts-rs/releases/tag/v0.4.2)
+for Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64. Each release
+includes SHA256 checksums and the VS Code extension.
+
+The npm package ships the Linux x64 compiler:
 
 ```bash
-npm install --save-dev @bext-stack/tsc-rs
+npm install --save-dev @bext-stack/tsc-rs@0.4.2
 npx tsc-rs --version
 ```
 
@@ -263,7 +266,7 @@ How closely each operation matches `tsc` is in the table above.
 ```bash
 cd editors/vscode
 npm install && npm run compile && npx vsce package
-code --install-extension tsc-rs-0.4.1.vsix
+code --install-extension tsc-rs-0.4.2.vsix
 ```
 
 The extension auto-detects `target/debug/tsc-rs` or `target/release/tsc-rs` in

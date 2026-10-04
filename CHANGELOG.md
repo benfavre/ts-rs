@@ -5,6 +5,21 @@ Day-to-day changes are recorded per wave in
 [progress page](https://ts-rs.bext.dev/progress). This file summarizes
 versions.
 
+## 0.4.2 (2026-10-04)
+
+Public distribution update based on the October 2 source snapshot:
+
+- GitHub release binaries for Linux x64/ARM64, macOS Intel/Apple Silicon,
+  and Windows x64, with SHA256 checksums and the VS Code extension.
+- Linux x64 npm packages `@bext-stack/tsc-rs` and
+  `@bext-stack/tsc-rs-linux-x64` updated to 0.4.2.
+- Browser playground WebAssembly package rebuilt at 0.4.2.
+- Release workflow uses a native Linux ARM runner and supports rebuilding an
+  existing tag without moving it.
+
+This release updates version and distribution metadata. Compatibility figures
+remain the measured October 2 snapshot in `docs/compatibility-metrics.json`.
+
 ## 0.4.1
 
 First version published as a public repository (2026-09-29). Figures measured

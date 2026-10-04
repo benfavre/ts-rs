@@ -42,7 +42,7 @@ Probably not. The type checker is incomplete and has false positives: on the las
 
 ## Are there prebuilt binaries?
 
-Not as GitHub releases yet. Today you [build from source](/docs/installation), or install the [npm package](/docs/npm), which ships a Linux x64 binary and follows its own release schedule.
+Yes. The [0.4.2 GitHub release](https://github.com/benfavre/ts-rs/releases/tag/v0.4.2) provides Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64 binaries with SHA256 checksums. The [npm package](/docs/npm) ships Linux x64.
 
 ## Which platforms does it build on?
 

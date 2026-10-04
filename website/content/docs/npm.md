@@ -6,11 +6,11 @@ title: npm package
 `@bext-stack/tsc-rs` ships a prebuilt `tsc-rs` binary through npm, so a JavaScript project can use the compiler without a Rust toolchain.
 
 ```bash
-npm install --save-dev @bext-stack/tsc-rs
+npm install --save-dev @bext-stack/tsc-rs@0.4.2
 ```
 
 :::note
-The npm package is released separately from the source tree. A commit on `main` does not imply a new npm release, so the installed binary can be older than the numbers on this site. Check with `npx tsc-rs --version`.
+The published npm package currently ships tsc-rs 0.4.2 on Linux x64. Check with `npx tsc-rs --version`. Source commits and package releases remain separate.
 :::
 
 ## Use as a CLI
@@ -45,7 +45,7 @@ The binary comes from a per-platform optional dependency. npm, pnpm and yarn ins
 | macOS | arm64 | `@bext-stack/tsc-rs-darwin-arm64` | Planned |
 | Windows | x64 | `@bext-stack/tsc-rs-win32-x64` | Planned |
 
-On a platform without a prebuilt binary the shim fails with a clear error. [Build from source](/docs/installation) and use the override below.
+On a platform without an npm binary the shim fails with a clear error. Download the matching compiler from the [0.4.2 GitHub release](https://github.com/benfavre/ts-rs/releases/tag/v0.4.2), or [build from source](/docs/installation), and use the override below.
 
 ## Override the binary
 

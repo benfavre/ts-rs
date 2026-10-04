@@ -41,16 +41,23 @@ tsc-rs --version
 tsc-rs --help
 ```
 
+## Prebuilt downloads
+
+[The 0.4.2 GitHub release](https://github.com/benfavre/ts-rs/releases/tag/v0.4.2)
+includes binaries for Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64,
+plus the VS Code extension and SHA256 checksums. Verify the archive against
+`SHA256SUMS.txt`, extract it, and put the executable on `PATH`.
+
 ## npm
 
 A prebuilt Linux x64 binary is published as `@bext-stack/tsc-rs`:
 
 ```bash
-npm install --save-dev @bext-stack/tsc-rs
+npm install --save-dev @bext-stack/tsc-rs@0.4.2
 npx tsc-rs --version
 ```
 
-The npm package follows its own release schedule and can be behind the source tree. See [npm package](/docs/npm) for platform support and the `TSCRS_PATH` override.
+The npm package currently ships tsc-rs 0.4.2 for Linux x64. See [npm package](/docs/npm) for platform support and the `TSCRS_PATH` override.
 
 ## Editor
 
