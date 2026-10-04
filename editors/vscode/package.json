@@ -2,7 +2,7 @@
   "name": "tsc-rs",
   "displayName": "tsc-rs TypeScript",
   "description": "TypeScript language support powered by tsc-rs",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "publisher": "tsc-rs",
   "license": "MIT",
   "homepage": "https://ts-rs.bext.dev/",

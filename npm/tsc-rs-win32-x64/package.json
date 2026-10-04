@@ -1,6 +1,6 @@
 {
   "name": "@tsc-rs/win32-x64",
-  "version": "0.1.1",
+  "version": "0.4.2",
   "description": "tsc-rs binary for Windows x64",
   "license": "MIT",
   "repository": {
@@ -15,5 +15,6 @@
   ],
   "files": [
     "tsc-rs.exe"
-  ]
+  ],
+  "homepage": "https://ts-rs.bext.dev/"
 }
