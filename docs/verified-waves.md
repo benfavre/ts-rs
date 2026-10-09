@@ -1697,3 +1697,36 @@ The preceding 820-pass type-expression wave was published at `57f6b9d9cc`.
 All 26 live routes, the search index, and desktop/mobile rendering verified
 that build and its updated metrics; evidence is in
 `/tmp/ts-rs-site-types-20261002/`.
+
+## 2026-10-09: checker correctness and speed sync
+
+Public `main` takes 54 internal commits of checker work: classes, interfaces
+and type aliases bind per file, so same-named declarations in different
+modules no longer shadow each other; tRPC procedures and Prisma client calls
+resolve end to end; `@ts-ignore` and `@ts-expect-error` suppress diagnostics;
+expression nesting has its own depth budget. Checker speed work replaces
+deep-copied project-wide tables with frozen shared bases plus per-file
+overlays and copy-on-write object types, and one-shot runs cache filesystem
+probes.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,786 | 4,793 |
+| Conformance | 3,642 | 3,646 |
+
+| Lane | Compiler before | After | Conformance before | After |
+|---|---:|---:|---:|---:|
+| Types | 603 | 604 | 557 | 558 |
+
+Diagnostic accuracy matches 6 more compiler and 8 more conformance
+diagnostics, with 22 and 48 fewer false positives. QuickInfo gains two
+passes (301), so the supported LSP operations reach 1,803 passes and 560
+failures. JavaScript emit stays at 100% in both suites; symbols and the
+expanded JavaScript and declaration lanes are unchanged.
+
+The measured commit is public `cb31e5f25c`. All twelve baseline matrices
+were run cache-free. All 3,429 public Rust tests pass with 37 ignored, and
+`make ci` passes. Harness project tests now pin `"types": []`, so typings
+installed above the temporary directory cannot enter their programs. The
+preceding snapshot is retained at
+`docs/compatibility-metrics-2026-10-02-59cbf453d.json`.
