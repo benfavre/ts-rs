@@ -596,7 +596,7 @@ export class Plain {
             "exports.Plain = void 0;\n",
             "var db_1 = require(\"./db\");\n",
             "var Plain = /** @class */ (function () {\n",
-            "    function Plain(db) { this.db = db_1.db; }\n",
+            "    function Plain(db) { this.db = db; }\n",
             "    return Plain;\n",
             "}());\n",
             "exports.Plain = Plain;\n",

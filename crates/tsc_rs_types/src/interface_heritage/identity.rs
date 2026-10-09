@@ -174,6 +174,7 @@ impl TypeChecker {
         }
         match self.heritage_apparent_type(ty) {
             Type::ObjectType(object) => object
+                .into_data()
                 .properties
                 .into_iter()
                 .map(|(name, _)| name)

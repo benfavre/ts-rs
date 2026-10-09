@@ -25,6 +25,7 @@ mod index_signatures;
 pub mod inference;
 mod interface_heritage;
 mod jump_targets;
+mod layered_map;
 pub mod narrowing;
 mod overload_compatibility;
 mod protected_access;
@@ -102,6 +103,13 @@ use tsc_rs_symbols::SymbolTable;
 
 /// Maximum recursion depth for type operations (matches TypeScript's limit).
 const MAX_RECURSION_DEPTH: u32 = 50;
+
+/// Maximum nesting of `check_expr`. Expression nesting follows the source,
+/// where each link of a call chain is two levels (the call and its member):
+/// sharing `MAX_RECURSION_DEPTH` turned anything past ~25 links
+/// (`s.replace(…)` ×30) into `any`, and spent the type operations' budget
+/// on syntax. 200 levels stay well inside the 32 MB worker stack.
+const MAX_EXPR_DEPTH: u32 = 200;
 
 /// Cumulative type-instantiation budget per top-level type operation. Mirrors
 /// tsc's instantiation-count limit. A pure depth limit cannot stop types that
@@ -576,8 +584,9 @@ type OverloadImplementations =
 /// Member name -> (file, name span) of its declaration.
 type MemberLocations = rustc_hash::FxHashMap<std::string::String, (std::string::String, Span)>;
 
+/// The members of an object type. Held behind [`ObjectTypeInfo`].
 #[derive(Debug, Clone)]
-pub struct ObjectTypeInfo {
+pub struct ObjectTypeData {
     pub properties: Vec<(std::string::String, Arc<Type>)>,
     pub call_signatures: Vec<FunctionType>,
     pub construct_signatures: Vec<ConstructorType>,
@@ -591,7 +600,7 @@ pub struct ObjectTypeInfo {
     pub method_names: Vec<std::string::String>,
 }
 
-impl PartialEq for ObjectTypeInfo {
+impl PartialEq for ObjectTypeData {
     fn eq(&self, other: &Self) -> bool {
         self.properties == other.properties
             && self.call_signatures == other.call_signatures
@@ -601,15 +610,59 @@ impl PartialEq for ObjectTypeInfo {
     }
 }
 
-impl Eq for ObjectTypeInfo {}
+impl Eq for ObjectTypeData {}
 
-impl std::hash::Hash for ObjectTypeInfo {
+impl std::hash::Hash for ObjectTypeData {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.properties.hash(state);
         self.call_signatures.hash(state);
         self.construct_signatures.hash(state);
         self.index_signature.hash(state);
         self.index_signature_name.hash(state);
+    }
+}
+
+/// An object type: a shared, copy-on-write handle to its
+/// [`ObjectTypeData`].
+///
+/// PERF: object types used to be stored by value, so cloning a type (every
+/// variable lookup clones one) copied the property list and allocated each
+/// property name again, and dropping it freed them: over half the CPU of a
+/// project check was `memmove`/`clone`/`drop` of these. A clone is now a
+/// refcount bump; a write through `DerefMut` copies the data only when it
+/// is shared.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ObjectTypeInfo(Arc<ObjectTypeData>);
+
+impl ObjectTypeInfo {
+    pub fn new(data: ObjectTypeData) -> Self {
+        Self(Arc::new(data))
+    }
+
+    /// The members by value: moved out when this handle is the only one,
+    /// copied otherwise.
+    pub fn into_data(self) -> ObjectTypeData {
+        Arc::try_unwrap(self.0).unwrap_or_else(|shared| (*shared).clone())
+    }
+}
+
+impl From<ObjectTypeData> for ObjectTypeInfo {
+    fn from(data: ObjectTypeData) -> Self {
+        Self::new(data)
+    }
+}
+
+impl std::ops::Deref for ObjectTypeInfo {
+    type Target = ObjectTypeData;
+
+    fn deref(&self) -> &ObjectTypeData {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ObjectTypeInfo {
+    fn deref_mut(&mut self) -> &mut ObjectTypeData {
+        Arc::make_mut(&mut self.0)
     }
 }
 
@@ -1437,9 +1490,9 @@ impl Type {
                     args[0].display_into(buf);
                     buf.push_str("[]");
                 } else if args.is_empty() {
-                    buf.push_str(name);
+                    buf.push_str(scoped_interface_display_name(name));
                 } else {
-                    buf.push_str(name);
+                    buf.push_str(scoped_interface_display_name(name));
                     buf.push('<');
                     for (i, a) in args.iter().enumerate() {
                         if i > 0 {
@@ -1657,7 +1710,9 @@ impl Type {
                 buf.push('}');
             }
             Type::This => buf.push_str("this"),
-            Type::TypeParameter(name) => buf.push_str(opaque_type_param_display(name)),
+            Type::TypeParameter(name) => buf.push_str(scoped_interface_display_name(
+                opaque_type_param_display(name),
+            )),
             Type::Conditional {
                 check,
                 extends,
@@ -2190,6 +2245,88 @@ impl TypeCheckOutput {
 /// TypeScript only recognizes `@ts-nocheck` in leading single-line comment
 /// trivia. Keeping this decision at the checker boundary makes every caller
 /// preserve parse diagnostics while consistently skipping semantic work.
+/// `// @ts-ignore` and `// @ts-expect-error` (tsc's comment directives):
+/// errors of this file that start on the line after such a comment are
+/// dropped. A block comment counts by its last line.
+fn apply_comment_directives(file: &SourceFile, diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Directive {
+        Ignore,
+        ExpectError,
+    }
+    let text = file.text.as_str();
+    let mut directives: Vec<(u32, u32, Directive, bool)> = Vec::new();
+    for comment in &file.comments {
+        let Some(raw) = text.get(comment.pos as usize..comment.end as usize) else {
+            continue;
+        };
+        if !raw.contains("@ts-") {
+            continue;
+        }
+        let body = if comment.is_multiline {
+            // The directive must open the comment's last line.
+            raw.trim_end_matches("*/")
+                .rsplit('\n')
+                .next()
+                .unwrap_or("")
+                .trim_start()
+                .trim_start_matches("/*")
+                .trim_start_matches('*')
+                .trim_start()
+        } else {
+            raw.trim_start_matches('/').trim_start()
+        };
+        let directive = if body.starts_with("@ts-expect-error") {
+            Directive::ExpectError
+        } else if body.starts_with("@ts-ignore") {
+            Directive::Ignore
+        } else {
+            continue;
+        };
+        directives.push((comment.pos, comment.end, directive, false));
+    }
+    if directives.is_empty() {
+        return diagnostics;
+    }
+    let line_starts: Vec<u32> = std::iter::once(0)
+        .chain(
+            text.bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .map(|(index, _)| index as u32 + 1),
+        )
+        .collect();
+    let line_of = |offset: u32| line_starts.partition_point(|start| *start <= offset) - 1;
+    let targets: Vec<usize> = directives
+        .iter()
+        .map(|(_, end, _, _)| line_of(end.saturating_sub(1)) + 1)
+        .collect();
+    let mut kept = Vec::with_capacity(diagnostics.len());
+    for diagnostic in diagnostics {
+        let own_file = diagnostic
+            .file_name
+            .as_deref()
+            .is_none_or(|name| name == file.file_name);
+        let suppressed_by = match (&diagnostic.span, own_file, diagnostic.category) {
+            (Some(span), true, DiagnosticCategory::Error) => {
+                let line = line_of(span.start);
+                targets.iter().position(|target| *target == line)
+            }
+            _ => None,
+        };
+        match suppressed_by {
+            Some(index) => directives[index].3 = true,
+            None => kept.push(diagnostic),
+        }
+    }
+    // tsc also reports an `@ts-expect-error` that suppressed nothing
+    // (TS2578). We do not: this checker still misses errors tsc finds, and
+    // each such miss under a directive would turn into a false "unused
+    // directive" error.
+    let _ = directives;
+    kept
+}
+
 pub fn source_file_has_ts_nocheck(file: &SourceFile) -> bool {
     let first_statement_start = file
         .statements
@@ -2246,10 +2383,137 @@ struct CheckerScope {
 // Type checker
 // ---------------------------------------------------------------------------
 
+/// The names a module exports, read from the checker's export tables: the
+/// known and type name sets when either exists, else the typed exports.
+struct KnownExportNames<'a> {
+    known: Option<&'a rustc_hash::FxHashSet<std::string::String>>,
+    types: Option<&'a rustc_hash::FxHashSet<std::string::String>>,
+    values: Option<Vec<(std::string::String, Type)>>,
+}
+
+impl KnownExportNames<'_> {
+    fn has(&self, name: &str) -> bool {
+        self.known.is_some_and(|names| names.contains(name))
+            || self.types.is_some_and(|names| names.contains(name))
+            || self
+                .values
+                .as_ref()
+                .is_some_and(|exports| exports.iter().any(|(export, _)| export == name))
+    }
+
+    /// Whether the module exports `name` (the internal module marker is
+    /// not an export).
+    fn contains(&self, name: &str) -> bool {
+        name != MODULE_MARKER_EXPORT && self.has(name)
+    }
+}
+
+thread_local! {
+    /// Levels of members `deep_expand_for_conditional` may still descend,
+    /// when a conditional's `extends` pattern bounds the useful depth.
+    static EXPAND_LEVELS_LEFT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pops what `type_params_in_resolution` pushed.
+pub(crate) struct TypeParamsInResolution(usize);
+
+impl Drop for TypeParamsInResolution {
+    fn drop(&mut self) {
+        MAPPED_PARAMS_IN_RESOLUTION.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let len = stack.len().saturating_sub(self.0);
+            stack.truncate(len);
+        });
+    }
+}
+
+/// While the returned guard lives, the type parameters of the signature
+/// being resolved (`K` in `<K extends keyof M>(key: K) => M[K]`) shadow any
+/// type of that name declared elsewhere in the program.
+pub(crate) fn type_params_in_resolution(
+    type_params: Option<&[tsc_rs_ast::TypeParam]>,
+) -> TypeParamsInResolution {
+    let names = type_params.unwrap_or(&[]);
+    MAPPED_PARAMS_IN_RESOLUTION.with(|stack| {
+        stack
+            .borrow_mut()
+            .extend(names.iter().map(|param| param.name.to_string()));
+    });
+    TypeParamsInResolution(names.len())
+}
+
+thread_local! {
+    /// Parameters of the mapped types whose bodies are being resolved on
+    /// this thread (`K` in `{ [K in keyof T]: T[K] }`), innermost last.
+    pub(crate) static MAPPED_PARAMS_IN_RESOLUTION: std::cell::RefCell<Vec<std::string::String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const FILE_INTERFACE_KEY_PREFIX: &str = "__tsrs_file_interface__:";
+/// Stands for the `.`s of the file path inside a file-scoped interface key.
+const FILE_INTERFACE_KEY_DOT: &str = "\u{2024}";
+
+/// What a module re-exports: `named[exported] = (source specifier, name in
+/// the source)` for `export { a as b } from "m"` and for an import that is
+/// exported again; `stars` for `export * from "m"`.
+#[derive(Debug, Default, Clone)]
+struct FileReexports {
+    named: rustc_hash::FxHashMap<std::string::String, (std::string::String, std::string::String)>,
+    stars: Vec<std::string::String>,
+}
+
+/// The name to show for a type reference: a file-scoped interface key
+/// (`TypeChecker::file_interface_registry_key`) reads as the interface's
+/// own name.
+fn scoped_interface_display_name(name: &str) -> &str {
+    name.strip_prefix(FILE_INTERFACE_KEY_PREFIX)
+        .and_then(|rest| rest.rsplit_once("::"))
+        .map_or(name, |(_, declared)| declared)
+}
+
+type ModulePathMemo = std::sync::RwLock<
+    rustc_hash::FxHashMap<
+        u64,
+        rustc_hash::FxHashMap<
+            std::string::String,
+            rustc_hash::FxHashMap<std::string::String, Option<std::string::String>>,
+        >,
+    >,
+>;
+
+/// Program file names with their normalized paths computed once, for
+/// matching relative specifiers against the program's own files.
+#[derive(Debug, Default)]
+struct ProgramFileIndex {
+    keys: Vec<std::string::String>,
+    /// Normalized path → position of the first key with that path.
+    by_normalized: rustc_hash::FxHashMap<std::string::String, usize>,
+    /// Every normalized path, sorted, for prefix scans.
+    sorted_normalized: Vec<std::string::String>,
+}
+
+impl ProgramFileIndex {
+    fn new(keys: Vec<std::string::String>) -> Self {
+        let mut by_normalized = rustc_hash::FxHashMap::default();
+        let mut sorted_normalized = Vec::with_capacity(keys.len());
+        for (position, key) in keys.iter().enumerate() {
+            let normalized = TypeChecker::normalize_module_path(Path::new(key));
+            by_normalized.entry(normalized.clone()).or_insert(position);
+            sorted_normalized.push(normalized);
+        }
+        sorted_normalized.sort_unstable();
+        Self {
+            keys,
+            by_normalized,
+            sorted_normalized,
+        }
+    }
+}
+
 pub struct TypeChecker {
     /// Type arena: stores all interned types. Pre-populated with common primitives
     /// at well-known indices (TYPE_ANY, TYPE_STRING, etc.).
-    arena: Vec<Type>,
+    arena: layered_map::LayeredArena<Type>,
     /// Expression-position → resolved type display string. Hit on every
     /// expression checked; FxHash for the same speedup rationale as
     /// `dedup_map`.
@@ -2335,14 +2599,17 @@ pub struct TypeChecker {
     /// bump instead of a deep `HashMap::clone`. Writes go through
     /// `Arc::make_mut` — only the first per-file write triggers the
     /// underlying copy.
-    class_info: Arc<rustc_hash::FxHashMap<std::string::String, ClassInfo>>,
+    class_info: layered_map::LayeredMap<ClassInfo>,
     /// Interface metadata for implements-clause validation. `Arc`-shared
     /// across per-file clones — see `class_info` for rationale.
-    interface_info: Arc<rustc_hash::FxHashMap<std::string::String, InterfaceInfo>>,
+    interface_info: layered_map::LayeredMap<InterfaceInfo>,
     /// Type alias registry: name → (type_params, resolved_type). `Arc`-
     /// shared across per-file clones — see `class_info`.
-    type_aliases:
-        Arc<rustc_hash::FxHashMap<std::string::String, (Vec<std::string::String>, Type, usize)>>,
+    type_aliases: layered_map::LayeredMap<(Vec<std::string::String>, Type, usize)>,
+    /// Type-parameter defaults of generic aliases, by the alias's registry
+    /// key(s): `type A<X = D> = …` → `[Some(D)]`. Only aliases with at
+    /// least one default are recorded.
+    alias_type_param_defaults: layered_map::LayeredMap<Vec<Option<Type>>>,
     /// Type names (interface / class / type-alias) defined more than once
     /// across the injected program. Excess-property checking resolves a named
     /// target to its member names ONLY when the name is unambiguous — name
@@ -2369,7 +2636,7 @@ pub struct TypeChecker {
     type_resolution_namespace: Option<std::string::String>,
     /// Enum metadata: name → list of (member_name, optional_value_type).
     /// `Arc`-shared across per-file clones — see `class_info`.
-    enum_info: Arc<rustc_hash::FxHashMap<std::string::String, Vec<(std::string::String, Type)>>>,
+    enum_info: layered_map::LayeredMap<Vec<(std::string::String, Type)>>,
     /// Imported namespace-like bindings (`import * as ns`, `import x = require(...)`).
     imported_namespace_bindings: rustc_hash::FxHashSet<std::string::String>,
     /// Per-file namespace import binding → statically known exported names.
@@ -2402,6 +2669,59 @@ pub struct TypeChecker {
     /// from genuinely missing exports without claiming runtime availability.
     module_known_exports:
         Arc<rustc_hash::FxHashMap<std::string::String, rustc_hash::FxHashSet<std::string::String>>>,
+    /// Normalized view of the three export maps' keys, built on first use by
+    /// `program_file_for_relative_specifier` and reset whenever a map is
+    /// replaced. Normalizing every key per lookup made each relative import
+    /// cost one `realpath` per program file.
+    program_file_index: Arc<std::sync::OnceLock<ProgramFileIndex>>,
+    /// How many stdlib value alias markers (`const M = Math`) were declared.
+    /// While zero, `stdlib_value_alias_path` answers without scanning a
+    /// scope's keys (the global scope holds thousands).
+    stdlib_alias_marker_count: usize,
+    /// The object expression (by address) a member access last checked, with
+    /// its type: the call arm of `check_expr` takes it for a method call's
+    /// receiver instead of checking the receiver a second time.
+    checked_member_object: Option<(usize, Type)>,
+    /// File-scoped registry keys of the module interfaces whose name some
+    /// other file of the program also declares (as any kind of type): the
+    /// bare-name registries cannot tell those declarations apart. Built by
+    /// `inject_external_types` from the files' top-level declarations.
+    ambiguous_interface_keys: Arc<rustc_hash::FxHashSet<std::string::String>>,
+    /// The optional-chain expression just checked (by address) whose
+    /// `undefined` exists only because the chain may short-circuit
+    /// (`a?.b` with a defined `b`): the next link of the same chain is
+    /// skipped with it. At most one entry.
+    pub(crate) short_circuit_undefined_exprs: Vec<usize>,
+    /// Results of `evaluate_instantiated_alias` for this checker: the same
+    /// `Simplify<Overwrite<Ctx, …>>` is read by every resolver of a file.
+    alias_evaluations: std::sync::Mutex<rustc_hash::FxHashMap<Type, Type>>,
+    /// The bare names behind `ambiguous_interface_keys` (a cheap first
+    /// test), and what each file re-exports (by normalized file name), to
+    /// find the declaring file of an interface imported through a barrel.
+    ambiguous_interface_names: Arc<rustc_hash::FxHashSet<std::string::String>>,
+    module_reexports: Arc<rustc_hash::FxHashMap<std::string::String, FileReexports>>,
+    /// For the file whose syntax is being resolved (injected or checked):
+    /// the ambiguous interface names it declares itself, or imports from
+    /// the declaring module, mapped to their file-scoped keys. A type
+    /// reference written in that file to such a name becomes a reference
+    /// to the key, so it means the same declaration wherever the type is
+    /// later expanded.
+    scoped_type_keys: rustc_hash::FxHashMap<std::string::String, std::string::String>,
+    /// This checker only builds project-wide state that per-file checkers
+    /// are cloned from; it never checks a file itself (`mark_donor`). Records
+    /// that a clone does not inherit are then not worth keeping.
+    donor_only: bool,
+    /// The file whose local binding types `file_local_binding_type` last
+    /// computed, with them.
+    file_local_bindings: Option<(std::string::String, Arc<Vec<(std::string::String, Type)>>)>,
+    /// Results of `resolve_module_to_path`'s filesystem resolution, shared
+    /// by a donor and its per-file clones: options fingerprint → containing
+    /// file → specifier → resolved path. Resolution probes the filesystem
+    /// and was repeated for the same import by every caller and every
+    /// export fixpoint round (over a third of the donor build).
+    module_path_memo: Arc<ModulePathMemo>,
+    /// Fingerprint of `compiler_options`, which resolution depends on.
+    options_fingerprint: u64,
     /// Overload signatures for functions/methods, keyed by variable name.
     /// Each entry is a list of FunctionType representing the overload signatures
     /// (excluding the implementation signature).
@@ -2460,6 +2780,9 @@ pub struct TypeChecker {
     /// worker clones it. AtomicU32 also keeps the existing `&self` API
     /// shape used by `enter_recursion`/`exit_recursion`.
     recursion_depth: AtomicU32,
+    /// `check_expr` nesting, bounded by [`MAX_EXPR_DEPTH`] apart from
+    /// `recursion_depth`.
+    expr_depth: AtomicU32,
     /// Set of type names currently being resolved, for cycle detection.
     /// `Mutex` (rather than `RefCell`) for `Sync`. Each per-file TypeChecker
     /// is owned by a single rayon worker so the mutex is uncontended.
@@ -2909,20 +3232,35 @@ impl Clone for TypeChecker {
                 self.strict_nullish_relation
                     .load(std::sync::atomic::Ordering::Relaxed),
             ),
-            class_info: Arc::clone(&self.class_info),
-            interface_info: Arc::clone(&self.interface_info),
-            type_aliases: Arc::clone(&self.type_aliases),
+            class_info: self.class_info.clone(),
+            interface_info: self.interface_info.clone(),
+            type_aliases: self.type_aliases.clone(),
+            alias_type_param_defaults: self.alias_type_param_defaults.clone(),
             duplicate_type_names: Arc::clone(&self.duplicate_type_names),
             global_type_names: Arc::clone(&self.global_type_names),
             namespace_type_names: Arc::clone(&self.namespace_type_names),
             type_resolution_namespace: self.type_resolution_namespace.clone(),
-            enum_info: Arc::clone(&self.enum_info),
+            enum_info: self.enum_info.clone(),
             imported_namespace_bindings: self.imported_namespace_bindings.clone(),
             imported_namespace_export_names: self.imported_namespace_export_names.clone(),
             alias_cycle_diagnostics: self.alias_cycle_diagnostics.clone(),
             module_exports: Arc::clone(&self.module_exports),
             module_type_exports: Arc::clone(&self.module_type_exports),
             module_known_exports: Arc::clone(&self.module_known_exports),
+            program_file_index: Arc::clone(&self.program_file_index),
+            stdlib_alias_marker_count: self.stdlib_alias_marker_count,
+            checked_member_object: None,
+            ambiguous_interface_keys: Arc::clone(&self.ambiguous_interface_keys),
+            short_circuit_undefined_exprs: Vec::new(),
+            alias_evaluations: std::sync::Mutex::default(),
+            ambiguous_interface_names: Arc::clone(&self.ambiguous_interface_names),
+            module_reexports: Arc::clone(&self.module_reexports),
+            scoped_type_keys: rustc_hash::FxHashMap::default(),
+            // A clone checks a file.
+            donor_only: false,
+            file_local_bindings: self.file_local_bindings.clone(),
+            module_path_memo: Arc::clone(&self.module_path_memo),
+            options_fingerprint: self.options_fingerprint,
             overloads: self.overloads.clone(),
             type_param_constraint_stack: self.type_param_constraint_stack.clone(),
             active_type_param_names: self.active_type_param_names.clone(),
@@ -2939,6 +3277,7 @@ impl Clone for TypeChecker {
             builtins_populated: self.builtins_populated,
             track_expression_types: self.track_expression_types,
             recursion_depth: AtomicU32::new(self.recursion_depth.load(Ordering::Relaxed)),
+            expr_depth: AtomicU32::new(self.expr_depth.load(Ordering::Relaxed)),
             assign_memo: Mutex::new(HashMap::new()),
             current_elaboration_mode: std::sync::atomic::AtomicU8::new(0),
             relation_mode: std::sync::atomic::AtomicU8::new(0),
@@ -3080,7 +3419,7 @@ impl TypeChecker {
             parent: None,
         };
         Self {
-            arena: vec![
+            arena: layered_map::LayeredArena::new(vec![
                 Type::Any,       // 0 = TYPE_ANY
                 Type::Unknown,   // 1 = TYPE_UNKNOWN
                 Type::Number,    // 2 = TYPE_NUMBER
@@ -3094,7 +3433,7 @@ impl TypeChecker {
                 Type::Symbol,    // 10 = TYPE_SYMBOL
                 Type::BigInt,    // 11 = TYPE_BIGINT
                 Type::Error,     // 12 = TYPE_ERROR
-            ],
+            ]),
             expression_types: rustc_hash::FxHashMap::default(),
             expression_type_spans: None,
             completion_never_calls: rustc_hash::FxHashSet::default(),
@@ -3127,20 +3466,34 @@ impl TypeChecker {
             suppress_comparison_no_overlap_depth: 0,
             uncalled_condition_depth: 0,
             strict_nullish_relation: std::sync::atomic::AtomicBool::new(false),
-            class_info: Arc::new(rustc_hash::FxHashMap::default()),
-            interface_info: Arc::new(rustc_hash::FxHashMap::default()),
-            type_aliases: Arc::new(rustc_hash::FxHashMap::default()),
+            class_info: Default::default(),
+            interface_info: Default::default(),
+            type_aliases: Default::default(),
+            alias_type_param_defaults: Default::default(),
             duplicate_type_names: Arc::new(rustc_hash::FxHashSet::default()),
             global_type_names: Arc::new(rustc_hash::FxHashSet::default()),
             namespace_type_names: Arc::new(rustc_hash::FxHashSet::default()),
             type_resolution_namespace: None,
-            enum_info: Arc::new(rustc_hash::FxHashMap::default()),
+            enum_info: Default::default(),
             imported_namespace_bindings: rustc_hash::FxHashSet::default(),
             imported_namespace_export_names: rustc_hash::FxHashMap::default(),
             alias_cycle_diagnostics: None,
             module_exports: Arc::new(rustc_hash::FxHashMap::default()),
             module_type_exports: Arc::new(rustc_hash::FxHashMap::default()),
             module_known_exports: Arc::new(rustc_hash::FxHashMap::default()),
+            program_file_index: Arc::new(std::sync::OnceLock::new()),
+            stdlib_alias_marker_count: 0,
+            checked_member_object: None,
+            ambiguous_interface_keys: Arc::default(),
+            short_circuit_undefined_exprs: Vec::new(),
+            alias_evaluations: std::sync::Mutex::default(),
+            ambiguous_interface_names: Arc::default(),
+            module_reexports: Arc::default(),
+            scoped_type_keys: rustc_hash::FxHashMap::default(),
+            donor_only: false,
+            file_local_bindings: None,
+            module_path_memo: Arc::default(),
+            options_fingerprint: 0,
             overloads: rustc_hash::FxHashMap::default(),
             type_param_constraint_stack: Vec::new(),
             active_type_param_names: Vec::new(),
@@ -3157,6 +3510,7 @@ impl TypeChecker {
             builtins_populated: false,
             track_expression_types: true,
             recursion_depth: AtomicU32::new(0),
+            expr_depth: AtomicU32::new(0),
             seen_types: Mutex::new(HashSet::new()),
             assign_memo: Mutex::new(HashMap::new()),
             current_elaboration_mode: std::sync::atomic::AtomicU8::new(0),
@@ -3268,6 +3622,13 @@ impl TypeChecker {
     }
 
     fn stable_type_display_map(&self) -> HashMap<u64, std::string::String> {
+        // Nothing reads type displays when expression types are off (a
+        // plain compile). The registry is cloned from the donor, so this
+        // formatted every type of the project once per file: 17% of a
+        // project check's CPU.
+        if !self.track_expression_types {
+            return HashMap::new();
+        }
         self.stable_registry
             .iter()
             .map(|(id, ty)| (id.0, ty.display_string()))
@@ -3326,8 +3687,12 @@ impl TypeChecker {
         if let Some(&existing_id) = self.dedup_map.get(&ty) {
             return existing_id;
         }
-        // Also register in the stable content-addressed registry
-        self.stable_registry.intern(&ty);
+        // Also register in the stable content-addressed registry, which
+        // only backs the type displays of expression tracking: a plain
+        // compile skips its deep hash of every new type.
+        if self.track_expression_types {
+            self.stable_registry.intern(&ty);
+        }
         let id = self.arena.len() as TypeId;
         self.dedup_map.insert(ty.clone(), id);
         self.arena.push(ty);
@@ -3391,7 +3756,7 @@ impl TypeChecker {
         //
         // Full declaration donors merge their remaining members into these
         // global seeds through the same interface-augmentation path.
-        let interfaces = Arc::make_mut(&mut self.interface_info);
+        let interfaces = (&mut self.interface_info);
         for name in [
             "Int8Array",
             "Uint8Array",
@@ -3406,35 +3771,33 @@ impl TypeChecker {
             "BigInt64Array",
             "BigUint64Array",
         ] {
-            interfaces
-                .entry(name.to_string())
-                .or_insert_with(|| InterfaceInfo {
-                    declaration_span: Span::new(0, 0),
-                    decl_file: String::new(),
-                    is_global: true,
-                    index_signatures: Vec::new(),
-                    index_locations: rustc_hash::FxHashMap::default(),
-                    object_type: ObjectTypeInfo {
-                        properties: vec![(
-                            "[Symbol.toStringTag]".to_string(),
-                            Arc::new(Type::StringLiteral(name.to_string())),
-                        )],
-                        call_signatures: Vec::new(),
-                        construct_signatures: Vec::new(),
-                        index_signature: None,
-                        index_signature_name: None,
-                        method_names: Vec::new(),
-                    },
-                    optional_props: Vec::new(),
-                    member_locations: rustc_hash::FxHashMap::default(),
-                    member_names: rustc_hash::FxHashMap::default(),
-                    readonly_members: std::iter::once("[Symbol.toStringTag]".to_string()).collect(),
-                    extends: Vec::new(),
-                    extends_sources: Vec::new(),
-                    type_params: Vec::new(),
-                    type_param_constraints: Vec::new(),
-                    required_type_params: 0,
-                });
+            interfaces.get_or_insert_with(name.to_string(), || InterfaceInfo {
+                declaration_span: Span::new(0, 0),
+                decl_file: String::new(),
+                is_global: true,
+                index_signatures: Vec::new(),
+                index_locations: rustc_hash::FxHashMap::default(),
+                object_type: ObjectTypeInfo::new(ObjectTypeData {
+                    properties: vec![(
+                        "[Symbol.toStringTag]".to_string(),
+                        Arc::new(Type::StringLiteral(name.to_string())),
+                    )],
+                    call_signatures: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signature: None,
+                    index_signature_name: None,
+                    method_names: Vec::new(),
+                }),
+                optional_props: Vec::new(),
+                member_locations: rustc_hash::FxHashMap::default(),
+                member_names: rustc_hash::FxHashMap::default(),
+                readonly_members: std::iter::once("[Symbol.toStringTag]".to_string()).collect(),
+                extends: Vec::new(),
+                extends_sources: Vec::new(),
+                type_params: Vec::new(),
+                type_param_constraints: Vec::new(),
+                required_type_params: 0,
+            });
         }
     }
 
@@ -3467,6 +3830,65 @@ impl TypeChecker {
     /// calls `Type::display_string` for every checked expression — that
     /// was 3.5 % of CPU on a 1 000-file slice (perf record, 2026-05-13).
     /// LSP / hover queries via `QueryEngine` keep tracking on (default).
+    /// Debugging aid (`TSC_RS_WHO_DECLARES=Name`): where the project-wide
+    /// registries got `name` from. The registries are keyed by bare name, so
+    /// "the wrong `Name`" questions start here.
+    pub fn describe_type_name(&self, name: &str) -> std::string::String {
+        let mut out = Vec::new();
+        if let Some(info) = self.interface_info.get(name) {
+            out.push(format!(
+                "interface ({} properties, global={}) from {}",
+                info.object_type.properties.len(),
+                info.is_global,
+                if info.decl_file.is_empty() {
+                    "<unknown>"
+                } else {
+                    &info.decl_file
+                }
+            ));
+        }
+        for (key, info) in self.interface_info.iter() {
+            if key.starts_with("__tsrs_file_interface__:") && key.ends_with(&format!("::{name}")) {
+                out.push(format!(
+                    "file-scoped interface ({} properties) {}",
+                    info.object_type.properties.len(),
+                    key.replace(FILE_INTERFACE_KEY_DOT, ".")
+                        .trim_start_matches("__tsrs_file_interface__:")
+                ));
+            }
+        }
+        if self.class_info.contains_key(name) {
+            out.push("class".to_string());
+        }
+        if let Some((params, body, _)) = self.type_aliases.get(name) {
+            let mut shown = body.display_string();
+            shown.truncate(120);
+            out.push(format!("alias<{}> = {shown}", params.join(", ")));
+        }
+        if self.enum_info.contains_key(name) {
+            out.push("enum".to_string());
+        }
+        if self.duplicate_type_names.contains(name) {
+            out.push("marked duplicate".to_string());
+        }
+        if out.is_empty() {
+            out.push("not registered".to_string());
+        }
+        format!("{name}: {}", out.join("; "))
+    }
+
+    /// Declares that this checker is a donor: it injects the project's
+    /// declarations and is then only cloned, one clone per checked file.
+    ///
+    /// A donor skips the member-location table behind "'x' is declared
+    /// here." notes. That table is per checker (a clone starts with an empty
+    /// one) and keyed by whole types, so filling it while injecting a
+    /// project's declaration files hashed every type literal in them — half
+    /// of the inject pass — for entries nothing could ever read.
+    pub fn mark_donor(&mut self) {
+        self.donor_only = true;
+    }
+
     pub fn disable_expression_types(&mut self) {
         self.track_expression_types = false;
     }
@@ -3910,18 +4332,64 @@ impl TypeChecker {
         // would clobber a re-exported `db: PrismaClient` from a `.d.ts`
         // chain — the exact failure that produced 144 phantom TS2339
         // errors on a large Next.js app project.
+        let timing = std::env::var_os("TSC_RS_INIT_TIMING").is_some();
+        let mut stage_start = std::time::Instant::now();
+        let mut stage = |name: &str| {
+            if timing {
+                eprintln!(
+                    "[inject] {name:<15} {:>7.1}ms",
+                    stage_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            stage_start = std::time::Instant::now();
+        };
+        // Which module interfaces share their name with another file's
+        // declaration: references to those are bound per file below.
+        let ambiguous = Self::collect_ambiguous_interface_keys(files);
+        if !ambiguous.is_empty() {
+            Arc::make_mut(&mut self.ambiguous_interface_names).extend(
+                ambiguous
+                    .iter()
+                    .map(|key| scoped_interface_display_name(key).to_string()),
+            );
+            Arc::make_mut(&mut self.ambiguous_interface_keys).extend(ambiguous);
+            Arc::make_mut(&mut self.module_reexports).extend(Self::collect_module_reexports(files));
+        }
+        stage("prepare");
         Self::inject_pass(self, files, true);
+        stage("pass .d.ts");
         Self::close_reexports(self, files, true);
+        stage("reexports .d.ts");
         Self::inject_pass(self, files, false);
+        stage("pass sources");
         Self::close_reexports(self, files, false);
+        stage("reexports src");
         // After all top-level declarations are injected into the global
         // scope, build per-file exports for namespace import resolution.
         // Has to run last because it consults the now-populated scope[0],
         // interface_info, class_info, etc. to find each export's type.
         self.index_alias_cycles(files);
+        // Declarations are all injected: share the registries now, so the
+        // export builders below can work on cheap clones of this checker.
+        stage("alias cycles");
+        self.freeze_registries();
         self.build_module_exports(files);
+        stage("exports");
         self.build_module_type_exports(files);
+        stage("type exports");
         self.declare_umd_globals(files);
+        // The project-wide registries are complete: share them, so the
+        // per-file checkers cloned from this one copy nothing.
+        self.freeze_registries();
+    }
+
+    fn freeze_registries(&mut self) {
+        self.arena.freeze();
+        self.class_info.freeze();
+        self.interface_info.freeze();
+        self.type_aliases.freeze();
+        self.alias_type_param_defaults.freeze();
+        self.enum_info.freeze();
     }
 
     /// `export as namespace Foo;` in a module makes the module's value a
@@ -4164,11 +4632,7 @@ impl TypeChecker {
     fn known_module_export_names(
         &self,
         source: &str,
-    ) -> Option<(
-        rustc_hash::FxHashSet<std::string::String>,
-        bool,
-        std::string::String,
-    )> {
+    ) -> Option<(KnownExportNames<'_>, bool, std::string::String)> {
         let containing = self.current_file_name.as_deref()?;
         let path = self
             .resolve_module_to_path(source, containing)
@@ -4184,26 +4648,27 @@ impl TypeChecker {
         // The errors harness only builds the name tables
         // (`module_known_exports` / `module_type_exports`); the typed value
         // table is a fallback for callers that ran the full inject pass.
-        let mut names: rustc_hash::FxHashSet<std::string::String> =
-            rustc_hash::FxHashSet::default();
-        let mut found = false;
-        if let Some(known) = self.lookup_module_known_exports(&path) {
-            names.extend(known.iter().cloned());
-            found = true;
-        }
-        if let Some(types) = self.lookup_module_type_exports(&path) {
-            names.extend(types.iter().cloned());
-            found = true;
-        }
-        if !found {
-            let exports = self.lookup_module_exports(&path)?;
-            names.extend(exports.iter().map(|(name, _)| name.clone()));
-        }
+        //
+        // A view over those tables: copying a module's names per import
+        // statement cost a quarter of the check on a project whose barrel
+        // modules export tens of thousands of names.
+        let known = self.lookup_module_known_exports(&path);
+        let types = self.lookup_module_type_exports(&path);
+        let values = if known.is_none() && types.is_none() {
+            Some(self.lookup_module_exports(&path)?)
+        } else {
+            None
+        };
+        let names = KnownExportNames {
+            known,
+            types,
+            values,
+        };
         // Only files that are modules take part (a script is TS2306
         // territory); `export =` modules expose the assigned value's members.
-        if !names.remove(MODULE_MARKER_EXPORT)
-            || names.contains("export=")
-            || names.contains(INCOMPLETE_EXPORTS_MARKER)
+        if !names.has(MODULE_MARKER_EXPORT)
+            || names.has("export=")
+            || names.has(INCOMPLETE_EXPORTS_MARKER)
         {
             return None;
         }
@@ -4217,14 +4682,17 @@ impl TypeChecker {
     /// table's own keys by path normalization.
     fn program_file_for_relative_specifier(&self, specifier: &str) -> Option<std::string::String> {
         let containing = self.current_file_name.as_deref()?;
-        let keys: Vec<std::string::String> = self
-            .module_known_exports
-            .keys()
-            .chain(self.module_type_exports.keys())
-            .chain(self.module_exports.keys())
-            .cloned()
-            .collect();
-        Self::program_file_for_specifier(specifier, containing, &keys)
+        let index = self.program_file_index.get_or_init(|| {
+            ProgramFileIndex::new(
+                self.module_known_exports
+                    .keys()
+                    .chain(self.module_type_exports.keys())
+                    .chain(self.module_exports.keys())
+                    .cloned()
+                    .collect(),
+            )
+        });
+        Self::program_file_for_specifier(specifier, containing, index)
     }
 
     /// Match a relative specifier against the program's own file names by
@@ -4234,7 +4702,7 @@ impl TypeChecker {
     fn program_file_for_specifier(
         specifier: &str,
         containing: &str,
-        keys: &[std::string::String],
+        index: &ProgramFileIndex,
     ) -> Option<std::string::String> {
         if !(specifier.starts_with("./") || specifier.starts_with("../")) {
             return None;
@@ -4262,16 +4730,22 @@ impl TypeChecker {
                 }
             }
         }
-        let found = keys
+        // The first key (in key order) whose normalized path is a candidate.
+        let found = candidates
             .iter()
-            .find(|key| candidates.contains(&Self::normalize_module_path(Path::new(key))))
-            .cloned()?;
-        let has_suffixed_sibling = keys.iter().any(|key| {
-            let normalized = Self::normalize_module_path(Path::new(key));
-            normalized.starts_with(base.as_str())
-                && !candidates.contains(&normalized)
-                && extensions.iter().any(|ext| normalized.ends_with(ext))
-        });
+            .filter_map(|candidate| index.by_normalized.get(candidate).copied())
+            .min()
+            .map(|position| index.keys[position].clone())?;
+        let start = index
+            .sorted_normalized
+            .partition_point(|normalized| normalized.as_str() < base.as_str());
+        let has_suffixed_sibling = index.sorted_normalized[start..]
+            .iter()
+            .take_while(|normalized| normalized.starts_with(base.as_str()))
+            .any(|normalized| {
+                !candidates.contains(normalized)
+                    && extensions.iter().any(|ext| normalized.ends_with(ext))
+            });
         if has_suffixed_sibling {
             return None;
         }
@@ -4363,6 +4837,7 @@ impl TypeChecker {
             return;
         };
         let synthetic_default_allowed = self.synthetic_default_imports_allowed();
+        let mut missing = Vec::new();
         for (member, span) in members {
             // Declaration files get a synthetic `default` (TS 6 defaults
             // allowSyntheticDefaultImports on) unless they declare one.
@@ -4372,12 +4847,12 @@ impl TypeChecker {
             if !names.contains(member) {
                 // tsc underlines the member name only (`x1` in `x1 as x`).
                 let name_span = Span::new(span.start, span.start + member.len() as u32);
-                self.diagnostics
-                    .push(diagnostics::error_module_no_exported_member(
-                        source, member, name_span,
-                    ));
+                missing.push(diagnostics::error_module_no_exported_member(
+                    source, member, name_span,
+                ));
             }
         }
+        self.diagnostics.extend(missing);
     }
 
     /// Build the file→exports map used by per-file import handling to
@@ -4391,49 +4866,272 @@ impl TypeChecker {
     ///   user: `import { z } from "zod"` → `z` typed as `Module(external)`
     /// The first iteration fills `external`'s exports. The second uses
     /// those to resolve `z`'s type for `index`'s re-export.
+    /// One file's own exported values (no re-exports). `imports` are the
+    /// file's imported value bindings when their types are already known
+    /// (the refinement pass); they shadow the flat by-name registry.
+    fn compute_direct_exports(
+        &mut self,
+        file: &SourceFile,
+        imports: &[(String, Type)],
+    ) -> Vec<(String, Type)> {
+        self.injected_decl_file = Some(file.file_name.clone());
+        self.current_source = Some(file.text.clone());
+        // The file's annotations name its own declarations.
+        self.scoped_type_keys = self.collect_scoped_type_keys(file, &file.file_name, true);
+        self.file_is_module_flag = Self::file_is_module(file);
+        self.file_shadows_global_symbol = Self::file_shadows_global_symbol(file);
+        self.file_shadows_global_intl = Self::file_shadows_global_intl(file);
+        self.file_shadows_global_array = Self::file_shadows_global_array(file);
+        let mut exports: Vec<(String, Type)> = Vec::new();
+        // A declaration file is ambient throughout: namespace
+        // members are exported without an `export` keyword.
+        let declaration_file = file.file_name.ends_with(".d.ts")
+            || file.file_name.ends_with(".d.mts")
+            || file.file_name.ends_with(".d.cts");
+        if declaration_file {
+            self.ambient_depth += 1;
+        }
+        // The file's own top-level bindings are in scope for the
+        // initializers after them (`const t = make(); export
+        // const p = t.procedure;`): exported ones are declared as
+        // they are collected, the others here.
+        self.push_scope();
+        for (name, ty) in imports {
+            self.declare_var(name, ty.clone());
+        }
+        // Each statement types on its own budget, as in the checking pass:
+        // the counters are per thread and nothing else resets them here.
+        reset_instantiation_budget();
+        let typeof_aliases = if declaration_file {
+            Vec::new()
+        } else {
+            self.declare_functions_named_by_typeof_aliases(file)
+        };
+        for stmt in &file.statements {
+            reset_instantiation_budget();
+            if !declaration_file {
+                if let StmtKind::Var(var_stmt) = &stmt.kind {
+                    for declaration in &var_stmt.declarations {
+                        let PatKind::Ident(name) = &declaration.name.kind else {
+                            continue;
+                        };
+                        if let Some(ty) = self.local_variable_declaration_type(
+                            file,
+                            var_stmt,
+                            declaration,
+                            &[],
+                            false,
+                        ) {
+                            self.declare_var(name, ty);
+                        }
+                    }
+                }
+            }
+            let collected = exports.len();
+            self.collect_exports_from_stmt(stmt, file, &mut exports);
+            if !declaration_file
+                && matches!(&stmt.kind, StmtKind::Export(export)
+                        if matches!(&export.kind, ExportDeclKind::Decl(inner)
+                            if matches!(inner.kind, StmtKind::Var(_))))
+            {
+                for (name, ty) in &exports[collected..] {
+                    if !name.contains('.') {
+                        self.declare_var(name, ty.clone());
+                    }
+                }
+            }
+        }
+        // `export const p: A` with `type A = ReturnType<typeof f>`
+        // for a function of this file: importers cannot look
+        // `f` up, so the alias is evaluated here.
+        for (_, ty) in exports.iter_mut() {
+            let Type::TypeReference(reference, args) = &*ty else {
+                continue;
+            };
+            if !args.is_empty() {
+                continue;
+            }
+            let bare = reference.rsplit("::").next().unwrap_or(reference);
+            let Some((_, body)) = typeof_aliases.iter().find(|(alias, _)| alias == bare) else {
+                continue;
+            };
+            reset_instantiation_budget();
+            let evaluated = self.simplify_type(body);
+            let mut names = Vec::new();
+            Self::collect_typeof_names(&evaluated, &mut names);
+            if names.is_empty()
+                && !matches!(evaluated, Type::Any | Type::Error)
+                && !self.contains_unresolved_type_param(&evaluated)
+            {
+                *ty = evaluated;
+            }
+        }
+        self.pop_scope();
+        if declaration_file {
+            self.ambient_depth -= 1;
+        }
+        self.resolve_local_export_aliases(&mut exports);
+        Self::resolve_namespace_unique_aliases(&mut exports);
+        exports
+    }
+
+    /// The value bindings `file` imports by name, typed from `snapshot`.
+    fn imported_value_bindings(
+        &self,
+        file: &SourceFile,
+        snapshot: &rustc_hash::FxHashMap<String, Vec<(String, Type)>>,
+    ) -> Vec<(String, Type)> {
+        let mut bindings = Vec::new();
+        for stmt in &file.statements {
+            let StmtKind::Import(imp) = &stmt.kind else {
+                continue;
+            };
+            if imp.type_only {
+                continue;
+            }
+            let ImportClause::Named { default, named, .. } = &imp.specifiers else {
+                continue;
+            };
+            if default.is_none() && named.iter().all(|spec| spec.is_type) {
+                continue;
+            }
+            let Some(target_path) = self.resolve_module_to_path(&imp.source, &file.file_name)
+            else {
+                continue;
+            };
+            let Some(target_exports) = Self::module_path_alternatives(&target_path)
+                .into_iter()
+                .find_map(|path| {
+                    snapshot.get(&path).or_else(|| {
+                        let canonical = tsc_rs_resolver::canonicalize(&path)?;
+                        snapshot.get(canonical.to_string_lossy().as_ref())
+                    })
+                })
+            else {
+                continue;
+            };
+            if let Some(local) = default {
+                if let Some((_, ty)) = target_exports.iter().find(|(name, _)| name == "default") {
+                    bindings.push((local.clone(), ty.clone()));
+                }
+            }
+            for spec in named {
+                if spec.is_type {
+                    continue;
+                }
+                let remote = spec.imported.as_deref().unwrap_or(&spec.local);
+                if let Some((_, ty)) = target_exports.iter().find(|(name, _)| name == remote) {
+                    if !matches!(ty, Type::Any) {
+                        bindings.push((spec.local.clone(), ty.clone()));
+                    }
+                }
+            }
+        }
+        bindings
+    }
+
+    /// Recompute the direct exports of the files whose first pass left an
+    /// exported value untyped although they import values that are typed
+    /// now. Returns whether any export changed.
+    fn refine_direct_exports(
+        &self,
+        files: &[&SourceFile],
+        map: &rustc_hash::FxHashMap<String, Vec<(String, Type)>>,
+        direct: &mut rustc_hash::FxHashMap<String, Vec<(String, Type)>>,
+    ) -> bool {
+        let weak = |checker: &Self, ty: &Type| {
+            matches!(ty, Type::Any)
+                || matches!(ty, Type::TypeReference(_, args) if args.is_empty())
+                || checker.contains_unresolved_type_param(ty)
+        };
+        let refined: Vec<(String, Vec<(String, Type)>)> = files
+            .par_iter()
+            .filter(|file| {
+                !(file.file_name.ends_with(".d.ts")
+                    || file.file_name.ends_with(".d.mts")
+                    || file.file_name.ends_with(".d.cts"))
+                    && direct
+                        .get(&file.file_name)
+                        .is_some_and(|exports| exports.iter().any(|(_, ty)| weak(self, ty)))
+            })
+            .map_init(
+                || self.clone(),
+                |checker, file| {
+                    let imports = checker.imported_value_bindings(file, map);
+                    if imports.is_empty() {
+                        return None;
+                    }
+                    let recomputed = checker.compute_direct_exports(file, &imports);
+                    let previous = direct.get(&file.file_name)?;
+                    let mut merged = previous.clone();
+                    let mut changed = false;
+                    for (name, ty) in merged.iter_mut() {
+                        if !weak(checker, ty) {
+                            continue;
+                        }
+                        let Some((_, new_ty)) = recomputed.iter().find(|(n, _)| n == name) else {
+                            continue;
+                        };
+                        if new_ty != ty && !matches!(new_ty, Type::Any | Type::Error) {
+                            *ty = new_ty.clone();
+                            changed = true;
+                        }
+                    }
+                    changed.then(|| (file.file_name.clone(), merged))
+                },
+            )
+            .flatten()
+            .collect();
+        let changed = !refined.is_empty();
+        for (file_name, exports) in refined {
+            if let Some(canonical) = tsc_rs_resolver::canonicalize(&file_name) {
+                let canonical = canonical.to_string_lossy().into_owned();
+                if canonical != file_name {
+                    direct.insert(canonical, exports.clone());
+                }
+            }
+            direct.insert(file_name, exports);
+        }
+        changed
+    }
+
     fn build_module_exports(&mut self, files: &[&SourceFile]) {
         // Compute every file's *direct* exports first (no re-exports yet).
         // Stored separately so each iteration's `compute_indirect_exports`
         // can rebuild the per-file list from a frozen base.
+        let timing = std::env::var_os("TSC_RS_INIT_TIMING").is_some();
+        let phase_start = std::time::Instant::now();
+        let phase = |name: &str| {
+            if timing {
+                eprintln!(
+                    "[inject]   value exports: {name} at {:.0}ms",
+                    phase_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        };
+        // Each file's direct exports are computed on a worker's own clone of
+        // this checker (cheap once the registries are frozen): the loop body
+        // only yields the file's export list.
+        let direct_entries: Vec<(String, Vec<(String, Type)>)> = files
+            .par_iter()
+            .map_init(
+                || self.clone(),
+                |checker, file| {
+                    (
+                        file.file_name.clone(),
+                        checker.compute_direct_exports(file, &[]),
+                    )
+                },
+            )
+            .collect();
         let mut direct: rustc_hash::FxHashMap<String, Vec<(String, Type)>> =
             rustc_hash::FxHashMap::default();
-        for file in files {
-            let previous_decl_file = self.injected_decl_file.replace(file.file_name.clone());
-            let previous_source = self.current_source.replace(file.text.clone());
-            let previous_module_flag = self.file_is_module_flag;
-            let previous_symbol_shadow = self.file_shadows_global_symbol;
-            let previous_intl_shadow = self.file_shadows_global_intl;
-            let previous_array_shadow = self.file_shadows_global_array;
-            self.file_is_module_flag = Self::file_is_module(file);
-            self.file_shadows_global_symbol = Self::file_shadows_global_symbol(file);
-            self.file_shadows_global_intl = Self::file_shadows_global_intl(file);
-            self.file_shadows_global_array = Self::file_shadows_global_array(file);
-            let mut exports: Vec<(String, Type)> = Vec::new();
-            // A declaration file is ambient throughout: namespace members
-            // are exported without an `export` keyword.
-            let declaration_file = file.file_name.ends_with(".d.ts")
-                || file.file_name.ends_with(".d.mts")
-                || file.file_name.ends_with(".d.cts");
-            if declaration_file {
-                self.ambient_depth += 1;
-            }
-            for stmt in &file.statements {
-                self.collect_exports_from_stmt(stmt, file, &mut exports);
-            }
-            if declaration_file {
-                self.ambient_depth -= 1;
-            }
-            self.resolve_local_export_aliases(&mut exports);
-            Self::resolve_namespace_unique_aliases(&mut exports);
-            self.current_source = previous_source;
-            self.injected_decl_file = previous_decl_file;
-            self.file_is_module_flag = previous_module_flag;
-            self.file_shadows_global_symbol = previous_symbol_shadow;
-            self.file_shadows_global_intl = previous_intl_shadow;
-            self.file_shadows_global_array = previous_array_shadow;
-            direct.insert(file.file_name.clone(), exports);
+        for (file_name, exports) in direct_entries {
+            direct.insert(file_name, exports);
         }
+        phase("direct done");
         self.merge_module_augmentation_exports(files, &mut direct);
+        phase("augmentations done");
         // Mirror direct entries under canonical (symlink-resolved) paths
         // up-front so iteration snapshot lookups succeed for both the
         // original (include-glob) path and the resolver-returned
@@ -4442,7 +5140,7 @@ impl TypeChecker {
         // point at canonical files the snapshot doesn't index.
         let original_keys: Vec<String> = direct.keys().cloned().collect();
         for k in &original_keys {
-            if let Ok(canon) = std::fs::canonicalize(k) {
+            if let Some(canon) = tsc_rs_resolver::canonicalize(k) {
                 let canon_s = canon.to_string_lossy().into_owned();
                 if canon_s != *k && !direct.contains_key(&canon_s) {
                     if let Some(v) = direct.get(k).cloned() {
@@ -4457,62 +5155,95 @@ impl TypeChecker {
         // `Module(258 entries)` once external.d.ts's own re-exports
         // converge in a later round.
         let mut map = direct.clone();
-        for _ in 0..32 {
-            let snapshot = map.clone();
-            let mut next = direct.clone();
-            // Each file's contribution is a pure function of (file, snapshot,
-            // &self) and touches only its own export list, so run the files in
-            // parallel and merge. On apps/app (7.5k files) this per-round loop
-            // was ~7.4s serial and, times three rounds, was ~90% of the whole
-            // cold-init (`inject_external_types`); parallel it scales with
-            // cores (~7.4s -> ~0.6s here). Seed each entry from the file's
-            // `direct` exports — the exact base the old serial
-            // `next = direct.clone()` + in-place `map.entry(file).or_default()`
-            // mutation started from, so `next[file]` is identical and the
-            // untouched canonical-mirror keys carry over from `direct.clone()`
-            // just as before. Verified: byte-identical diagnostics on a 100-file
-            // apps/app batch vs the serial version.
-            let updates: Vec<(&String, Vec<(String, Type)>)> = files
-                .par_iter()
-                .map(|file| {
-                    let mut entry = direct.get(&file.file_name).cloned().unwrap_or_default();
-                    self.extend_exports_with_reexports(file, &snapshot, &mut entry);
-                    self.extend_exports_with_imported_names(file, &snapshot, &mut entry);
-                    (&file.file_name, entry)
-                })
-                .collect();
-            for (name, entry) in updates {
-                next.insert(name.clone(), entry);
-            }
-            // Mid-iteration mirror: each round may have written under
-            // the file.file_name path (the include-glob path); copy the
-            // value to the canonical (symlink-resolved) path too so the
-            // next round's `snapshot.get(resolver-output)` finds it.
-            let next_keys: Vec<String> = next.keys().cloned().collect();
-            for k in next_keys {
-                if next.get(&k).map(|v| v.is_empty()).unwrap_or(true) {
-                    continue;
+        phase("mirrors done");
+        let rounds_start = std::time::Instant::now();
+        // Pass 0 types each file's values with imports seen only through
+        // the flat by-name registry. Pass 1 recomputes the files that left
+        // a value untyped, with their imports bound to the types pass 0
+        // found, and reruns the rounds if that changed anything.
+        for pass in 0..2 {
+            if pass == 1 {
+                if !self.refine_direct_exports(files, &map, &mut direct) {
+                    break;
                 }
-                if let Ok(canon) = std::fs::canonicalize(&k) {
-                    let canon_s = canon.to_string_lossy().into_owned();
-                    if canon_s != k {
-                        let v = next.get(&k).cloned().unwrap_or_default();
-                        // Replace if the canonical entry is empty or smaller.
-                        let should_replace = next
-                            .get(&canon_s)
-                            .map(|cv| cv.len() < v.len())
-                            .unwrap_or(true);
-                        if should_replace {
-                            next.insert(canon_s, v);
+                map = direct.clone();
+                phase("refined");
+            }
+            for round in 0..32 {
+                if timing {
+                    eprintln!(
+                        "[inject]   value export round {round} at {:.0}ms",
+                        rounds_start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                // The previous round's map is read-only for the whole round.
+                let snapshot = &map;
+                // Each file's contribution is a pure function of (file, snapshot,
+                // &self) and touches only its own export list, so run the files in
+                // parallel and merge. On apps/app (7.5k files) this per-round loop
+                // was ~7.4s serial and, times three rounds, was ~90% of the whole
+                // cold-init (`inject_external_types`); parallel it scales with
+                // cores (~7.4s -> ~0.6s here). Seed each entry from the file's
+                // `direct` exports — the exact base the old serial
+                // `next = direct.clone()` + in-place `map.entry(file).or_default()`
+                // mutation started from, so `next[file]` is identical and the
+                // untouched canonical-mirror keys carry over from `direct.clone()`
+                // just as before. Verified: byte-identical diagnostics on a 100-file
+                // apps/app batch vs the serial version.
+                let updates: Vec<(&String, Vec<(String, Type)>)> = files
+                    .par_iter()
+                    .map(|file| {
+                        let mut entry = direct.get(&file.file_name).cloned().unwrap_or_default();
+                        self.extend_exports_with_reexports(file, snapshot, &mut entry);
+                        self.extend_exports_with_imported_names(file, snapshot, &mut entry);
+                        (&file.file_name, entry)
+                    })
+                    .collect();
+                // `direct` overridden by each file's entry of this round. Start
+                // from the round's entries and copy only the `direct` keys no
+                // file produced (the canonical-path mirrors), instead of cloning
+                // all of `direct` and then overwriting nearly every entry.
+                let mut next: rustc_hash::FxHashMap<String, Vec<(String, Type)>> =
+                    rustc_hash::FxHashMap::default();
+                next.reserve(direct.len());
+                for (name, entry) in updates {
+                    next.insert(name.clone(), entry);
+                }
+                for (name, entry) in &direct {
+                    if !next.contains_key(name) {
+                        next.insert(name.clone(), entry.clone());
+                    }
+                }
+                // Mid-iteration mirror: each round may have written under
+                // the file.file_name path (the include-glob path); copy the
+                // value to the canonical (symlink-resolved) path too so the
+                // next round's `snapshot.get(resolver-output)` finds it.
+                let next_keys: Vec<String> = next.keys().cloned().collect();
+                for k in next_keys {
+                    if next.get(&k).map(|v| v.is_empty()).unwrap_or(true) {
+                        continue;
+                    }
+                    if let Some(canon) = tsc_rs_resolver::canonicalize(&k) {
+                        let canon_s = canon.to_string_lossy().into_owned();
+                        if canon_s != k {
+                            let v = next.get(&k).cloned().unwrap_or_default();
+                            // Replace if the canonical entry is empty or smaller.
+                            let should_replace = next
+                                .get(&canon_s)
+                                .map(|cv| cv.len() < v.len())
+                                .unwrap_or(true);
+                            if should_replace {
+                                next.insert(canon_s, v);
+                            }
                         }
                     }
                 }
-            }
-            if module_exports_eq(&next, &map) {
+                if module_exports_eq(&next, &map) {
+                    map = next;
+                    break;
+                }
                 map = next;
-                break;
             }
-            map = next;
         }
         // Mirror entries under the canonicalized (symlink-resolved) path
         // for each file. Lets `lookup_module_exports` match resolver
@@ -4521,7 +5252,7 @@ impl TypeChecker {
         // saves an fs call per import lookup later.
         let original_keys: Vec<String> = map.keys().cloned().collect();
         for k in original_keys {
-            if let Ok(canon) = std::fs::canonicalize(&k) {
+            if let Some(canon) = tsc_rs_resolver::canonicalize(&k) {
                 let canon_s = canon.to_string_lossy().into_owned();
                 if canon_s != k && !map.contains_key(&canon_s) {
                     if let Some(v) = map.get(&k).cloned() {
@@ -4531,6 +5262,7 @@ impl TypeChecker {
             }
         }
         self.module_exports = Arc::new(map);
+        self.program_file_index = Arc::new(std::sync::OnceLock::new());
     }
 
     fn qualified_import_equals_evidence_in_scope(
@@ -5181,32 +5913,53 @@ impl TypeChecker {
                 _ => {}
             }
         }
-        fn imported_binding<'a>(
+        /// (source, remote name, type-only, namespace import) of an import
+        /// binding.
+        type ImportBinding<'a> = (&'a str, &'a str, bool, bool);
+
+        /// Every import binding of `file` by local name; the first
+        /// declaration of a name wins, in statement order. Built once per
+        /// file: looking a name up used to rescan all of the file's
+        /// statements for each exported name in each fixpoint round.
+        fn import_bindings<'a>(
             file: &'a SourceFile,
-            local_name: &str,
-        ) -> Option<(&'a str, &'a str, bool, bool)> {
+        ) -> rustc_hash::FxHashMap<&'a str, ImportBinding<'a>> {
+            let mut bindings: rustc_hash::FxHashMap<&'a str, ImportBinding<'a>> =
+                rustc_hash::FxHashMap::default();
             for statement in &file.statements {
                 match &statement.kind {
                     StmtKind::Import(import) => match &import.specifiers {
-                        ImportClause::Require(local) if local == local_name => {
-                            return Some((&import.source, "export=", import.type_only, false));
+                        ImportClause::Require(local) => {
+                            bindings.entry(local.as_str()).or_insert((
+                                &import.source,
+                                "export=",
+                                import.type_only,
+                                false,
+                            ));
                         }
-                        ImportClause::Require(_) => {}
                         ImportClause::Named {
                             default,
                             named,
                             namespace,
                         } => {
-                            if default.as_deref() == Some(local_name) {
-                                return Some((&import.source, "default", import.type_only, false));
+                            if let Some(default) = default.as_deref() {
+                                bindings.entry(default).or_insert((
+                                    &import.source,
+                                    "default",
+                                    import.type_only,
+                                    false,
+                                ));
                             }
-                            if namespace.as_deref() == Some(local_name) {
-                                return Some((&import.source, "", import.type_only, true));
+                            if let Some(namespace) = namespace.as_deref() {
+                                bindings.entry(namespace).or_insert((
+                                    &import.source,
+                                    "",
+                                    import.type_only,
+                                    true,
+                                ));
                             }
-                            if let Some(specifier) =
-                                named.iter().find(|specifier| specifier.local == local_name)
-                            {
-                                return Some((
+                            for specifier in named {
+                                bindings.entry(specifier.local.as_str()).or_insert((
                                     &import.source,
                                     specifier.imported.as_deref().unwrap_or(&specifier.local),
                                     import.type_only || specifier.is_type,
@@ -5215,7 +5968,7 @@ impl TypeChecker {
                             }
                         }
                     },
-                    StmtKind::ImportEquals(import) if import.name == local_name => {
+                    StmtKind::ImportEquals(import) => {
                         let ExprKind::Call(call) = &import.module_ref.kind else {
                             continue;
                         };
@@ -5229,12 +5982,14 @@ impl TypeChecker {
                         let ExprKind::StrLit(source) = &argument.kind else {
                             continue;
                         };
-                        return Some((source, "export=", false, false));
+                        bindings
+                            .entry(import.name.as_str())
+                            .or_insert((source, "export=", false, false));
                     }
                     _ => {}
                 }
             }
-            None
+            bindings
         }
         fn lookup<'a>(
             map: &'a ExportNameMap,
@@ -5244,7 +5999,7 @@ impl TypeChecker {
                 if let Some(names) = map.get(&alternative) {
                     return Some(names);
                 }
-                if let Ok(canonical) = std::fs::canonicalize(&alternative) {
+                if let Some(canonical) = tsc_rs_resolver::canonicalize(&alternative) {
                     if let Some(names) = map.get(canonical.to_string_lossy().as_ref()) {
                         return Some(names);
                     }
@@ -5255,7 +6010,7 @@ impl TypeChecker {
         fn mirror_canonical(map: &mut ExportNameMap) {
             let keys: Vec<_> = map.keys().cloned().collect();
             for key in keys {
-                let Ok(canonical) = std::fs::canonicalize(&key) else {
+                let Some(canonical) = tsc_rs_resolver::canonicalize(&key) else {
                     continue;
                 };
                 let canonical = canonical.to_string_lossy().into_owned();
@@ -5275,7 +6030,8 @@ impl TypeChecker {
         // Program files are virtual under the test harness; relative
         // re-exports resolve against these names when the filesystem
         // resolver cannot see them.
-        let program_files: Vec<String> = files.iter().map(|file| file.file_name.clone()).collect();
+        let program_files =
+            ProgramFileIndex::new(files.iter().map(|file| file.file_name.clone()).collect());
         for file in files {
             let mut local_type_names = rustc_hash::FxHashSet::default();
             let mut local_value_names = rustc_hash::FxHashSet::default();
@@ -5468,12 +6224,55 @@ impl TypeChecker {
 
         let mut type_map = direct_types.clone();
         let mut known_map = direct_known.clone();
-        for _ in 0..32 {
-            let type_snapshot = type_map.clone();
-            let known_snapshot = known_map.clone();
+        let import_index: rustc_hash::FxHashMap<&str, rustc_hash::FxHashMap<&str, ImportBinding>> =
+            files
+                .par_iter()
+                .map(|file| (file.file_name.as_str(), import_bindings(file)))
+                .collect();
+        // Per file, the map keys its entry read (set by its first
+        // computation), and the keys the previous round changed.
+        let mut read_keys: rustc_hash::FxHashMap<&str, rustc_hash::FxHashSet<String>> =
+            rustc_hash::FxHashMap::default();
+        let mut changed: Option<rustc_hash::FxHashSet<String>> = None;
+        let timing = std::env::var_os("TSC_RS_INIT_TIMING").is_some();
+        let rounds_start = std::time::Instant::now();
+        for round in 0..32 {
+            if timing {
+                eprintln!(
+                    "[inject]   type export round {round} at {:.0}ms",
+                    rounds_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            // The previous round's maps are read-only for the whole round.
+            let type_snapshot = &type_map;
+            let known_snapshot = &known_map;
             let updates: Vec<_> = files
                 .par_iter()
                 .map(|file| {
+                    // A file's entry is a function of the export sets it
+                    // reads. When none of them changed in the previous
+                    // round, this round's entry is the previous one
+                    // (barrel files with a thousand `export *` otherwise
+                    // rebuilt their whole name sets every round).
+                    if let (Some(changed), Some(read_keys)) =
+                        (changed.as_ref(), read_keys.get(file.file_name.as_str()))
+                    {
+                        if read_keys.is_disjoint(changed) {
+                            if let (Some(types), Some(known)) = (
+                                type_snapshot.get(&file.file_name),
+                                known_snapshot.get(&file.file_name),
+                            ) {
+                                return (
+                                    file.file_name.clone(),
+                                    types.clone(),
+                                    known.clone(),
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                    // Module paths whose export sets this file reads.
+                    let read_paths = std::cell::RefCell::new(Vec::<String>::new());
                     let mut type_entry = direct_types
                         .get(&file.file_name)
                         .cloned()
@@ -5507,8 +6306,10 @@ impl TypeChecker {
                             {
                                 known_entry.insert(exported.to_string());
                             }
-                            let Some((source, remote, _type_only, namespace)) =
-                                imported_binding(file, local)
+                            let Some((source, remote, _type_only, namespace)) = import_index
+                                .get(file.file_name.as_str())
+                                .and_then(|bindings| bindings.get(local))
+                                .copied()
                             else {
                                 return;
                             };
@@ -5533,12 +6334,15 @@ impl TypeChecker {
                                 known_entry.insert(exported.to_string());
                                 return;
                             }
-                            if lookup(&type_snapshot, &path)
-                                .is_some_and(|names| names.contains(remote))
+                            if {
+                                read_paths.borrow_mut().push(path.clone());
+                                lookup(type_snapshot, &path)
+                            }
+                            .is_some_and(|names| names.contains(remote))
                             {
                                 type_entry.insert(exported.to_string());
                             }
-                            if lookup(&known_snapshot, &path)
+                            if lookup(known_snapshot, &path)
                                 .is_some_and(|names| names.contains(remote))
                             {
                                 known_entry.insert(exported.to_string());
@@ -5580,15 +6384,27 @@ impl TypeChecker {
                                     known_entry.insert(INCOMPLETE_EXPORTS_MARKER.to_string());
                                     continue;
                                 };
+                                // A source that resolves to a file outside the
+                                // program (another package's typings, not
+                                // loaded) is as unseen as an unresolved one.
+                                if lookup(known_snapshot, &path).is_none()
+                                    && lookup(type_snapshot, &path).is_none()
+                                {
+                                    known_entry.insert(INCOMPLETE_EXPORTS_MARKER.to_string());
+                                    continue;
+                                }
                                 for specifier in specifiers {
                                     let exported =
                                         specifier.exported.as_deref().unwrap_or(&specifier.local);
-                                    if lookup(&type_snapshot, &path)
-                                        .is_some_and(|names| names.contains(&specifier.local))
+                                    if {
+                                        read_paths.borrow_mut().push(path.clone());
+                                        lookup(type_snapshot, &path)
+                                    }
+                                    .is_some_and(|names| names.contains(&specifier.local))
                                     {
                                         type_entry.insert(exported.to_string());
                                     }
-                                    if lookup(&known_snapshot, &path)
+                                    if lookup(known_snapshot, &path)
                                         .is_some_and(|names| names.contains(&specifier.local))
                                     {
                                         known_entry.insert(
@@ -5634,8 +6450,17 @@ impl TypeChecker {
                                     known_entry.insert(INCOMPLETE_EXPORTS_MARKER.to_string());
                                     continue;
                                 };
-                                let target_types = lookup(&type_snapshot, &path);
-                                if let Some(target_known) = lookup(&known_snapshot, &path) {
+                                if lookup(known_snapshot, &path).is_none()
+                                    && lookup(type_snapshot, &path).is_none()
+                                {
+                                    known_entry.insert(INCOMPLETE_EXPORTS_MARKER.to_string());
+                                    continue;
+                                }
+                                let target_types = {
+                                    read_paths.borrow_mut().push(path.clone());
+                                    lookup(type_snapshot, &path)
+                                };
+                                if let Some(target_known) = lookup(known_snapshot, &path) {
                                     for name in target_known.iter().filter(|name| {
                                         name.as_str() != "default"
                                             && name.as_str() != "export="
@@ -5683,28 +6508,82 @@ impl TypeChecker {
                     }
                     known_entry.extend(star_sources.into_keys());
                     type_entry.extend(star_type_names);
-                    (file.file_name.clone(), type_entry, known_entry)
+                    // Every map key `lookup` may consult for those paths.
+                    let mut keys = rustc_hash::FxHashSet::default();
+                    for read in read_paths.into_inner() {
+                        for alternative in TypeChecker::module_path_alternatives(&read) {
+                            if let Some(canonical) = tsc_rs_resolver::canonicalize(&alternative) {
+                                keys.insert(canonical.to_string_lossy().into_owned());
+                            }
+                            keys.insert(alternative);
+                        }
+                    }
+                    (file.file_name.clone(), type_entry, known_entry, Some(keys))
                 })
                 .collect();
 
-            let mut next_types = direct_types.clone();
-            let mut next_known = direct_known.clone();
-            for (path, type_entry, known_entry) in updates {
+            // The direct maps overridden by each file's entry of this round:
+            // start from the round's entries and copy only the direct keys
+            // no file produced, instead of cloning both project-wide maps
+            // and then overwriting nearly every entry.
+            let mut next_types = ExportNameMap::default();
+            let mut next_known = ExportNameMap::default();
+            next_types.reserve(direct_types.len());
+            next_known.reserve(direct_known.len());
+            // Files whose entries were reused: equal to the previous round's.
+            let mut reused: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+            for (path, type_entry, known_entry, keys) in updates {
+                if let Some((file_name, _)) = import_index.get_key_value(path.as_str()) {
+                    match keys {
+                        Some(keys) => {
+                            read_keys.insert(*file_name, keys);
+                        }
+                        None => {
+                            reused.insert(*file_name);
+                        }
+                    }
+                }
                 next_types.insert(path.clone(), type_entry);
                 next_known.insert(path, known_entry);
             }
+            for (path, names) in &direct_types {
+                if !next_types.contains_key(path) {
+                    next_types.insert(path.clone(), names.clone());
+                }
+            }
+            for (path, names) in &direct_known {
+                if !next_known.contains_key(path) {
+                    next_known.insert(path.clone(), names.clone());
+                }
+            }
             mirror_canonical(&mut next_types);
             mirror_canonical(&mut next_known);
-            if next_types == type_map && next_known == known_map {
-                type_map = next_types;
-                known_map = next_known;
-                break;
+            // The keys whose sets differ from the previous round's; none
+            // means the fixpoint is reached.
+            let mut now_changed = rustc_hash::FxHashSet::default();
+            for (next, previous) in [(&next_types, &type_map), (&next_known, &known_map)] {
+                for (key, names) in next {
+                    if !reused.contains(key.as_str()) && previous.get(key) != Some(names) {
+                        now_changed.insert(key.clone());
+                    }
+                }
+                for key in previous.keys() {
+                    if !next.contains_key(key) {
+                        now_changed.insert(key.clone());
+                    }
+                }
             }
+            let converged = now_changed.is_empty();
+            changed = Some(now_changed);
             type_map = next_types;
             known_map = next_known;
+            if converged {
+                break;
+            }
         }
         self.module_type_exports = Arc::new(type_map);
         self.module_known_exports = Arc::new(known_map);
+        self.program_file_index = Arc::new(std::sync::OnceLock::new());
     }
 
     /// `export { z }` (no source) where `z` is bound to `import * as z`
@@ -5741,7 +6620,7 @@ impl TypeChecker {
                     if let Some(v) = snapshot.get(&p) {
                         return Some(v.clone());
                     }
-                    if let Ok(canon) = std::fs::canonicalize(&p) {
+                    if let Some(canon) = tsc_rs_resolver::canonicalize(&p) {
                         let canon_s = canon.to_string_lossy().into_owned();
                         if let Some(v) = snapshot.get(&canon_s) {
                             return Some(v.clone());
@@ -5939,14 +6818,14 @@ impl TypeChecker {
             if properties.is_empty() {
                 continue;
             }
-            let static_surface = Type::ObjectType(ObjectTypeInfo {
+            let static_surface = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties,
                 call_signatures: Vec::new(),
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            });
+            }));
             *class_type = Type::Intersection(vec![static_surface, class_type.clone()].into());
         }
     }
@@ -6369,7 +7248,7 @@ impl TypeChecker {
             }
         }
         match ty {
-            Type::ObjectType(object) => Type::ObjectType(ObjectTypeInfo {
+            Type::ObjectType(object) => Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: object
                     .properties
                     .iter()
@@ -6387,7 +7266,7 @@ impl TypeChecker {
                 index_signature: object.index_signature.clone(),
                 index_signature_name: object.index_signature_name.clone(),
                 method_names: object.method_names.clone(),
-            }),
+            })),
             Type::Intersection(members) => Type::Intersection(
                 members
                     .iter()
@@ -6404,6 +7283,28 @@ impl TypeChecker {
         let Type::TypeReference(name, args) = ty else {
             return None;
         };
+        // A non-generic alias of `Omit<…>` (`Prisma.TransactionClient`).
+        if args.is_empty() && name != "Omit" {
+            let body = self
+                .type_aliases
+                .get(name.as_str())
+                .or_else(|| {
+                    // `Ns.Alias`: only an alias of `Omit<…>` is accepted
+                    // below, so the last segment is enough to find it.
+                    let (_, bare) = name.rsplit_once('.')?;
+                    self.type_aliases.get(bare)
+                })
+                .filter(|(params, _, _)| params.is_empty())
+                .map(|(_, body, _)| body.clone())?;
+            return match &body {
+                Type::TypeReference(inner, inner_args)
+                    if inner == "Omit" && inner_args.len() == 2 =>
+                {
+                    self.class_omit_property(&body, property)
+                }
+                _ => None,
+            };
+        }
         if name != "Omit" || args.len() != 2 {
             return None;
         }
@@ -6413,6 +7314,74 @@ impl TypeChecker {
             Type::This => (self.enclosing_class_names.last()?.as_str(), &[][..]),
             Type::TypeReference(name, args) if self.class_info.contains_key(name) => {
                 (name.as_str(), args.as_ref())
+            }
+            // An interface (possibly behind a generic alias written with its
+            // defaults): the member is read off the base when the key set
+            // does not remove it. No mapped type is materialised.
+            Type::TypeReference(base_name, base_args) => {
+                if self.key_type_contains_property(&args[1], property)? {
+                    return Some(LazyAliasProperty::Missing);
+                }
+                // Through non-generic aliases of a reference
+                // (`DefaultPrismaClient = PrismaClient`).
+                let mut base_ref = Type::TypeReference(base_name.clone(), base_args.clone());
+                for _ in 0..4 {
+                    let Type::TypeReference(alias, alias_args) = &base_ref else {
+                        break;
+                    };
+                    if !alias_args.is_empty() {
+                        break;
+                    }
+                    match self.type_aliases.get(alias.as_str()) {
+                        Some((params, body @ Type::TypeReference(..), _)) if params.is_empty() => {
+                            base_ref = body.clone();
+                        }
+                        _ => break,
+                    }
+                }
+                let Type::TypeReference(base_name, base_args) = &base_ref else {
+                    return None;
+                };
+                let defaulted = self.defaulted_alias_arguments(base_name, base_args);
+                let base_args = defaulted.as_ref().unwrap_or(base_args);
+                let shape = self.resolve_type_reference_to_object(base_name, base_args)?;
+                let Type::ObjectType(info) = &shape else {
+                    return None;
+                };
+                // An interface named without its (all defaulted) type
+                // arguments: its parameters are open, not a bare `T`.
+                let open_params: HashMap<std::string::String, Type> = if base_args.is_empty() {
+                    self.interface_info
+                        .get(base_name.as_str())
+                        .filter(|interface| interface.required_type_params == 0)
+                        .map(|interface| {
+                            interface
+                                .type_params
+                                .iter()
+                                .map(|param| (param.clone(), Type::Any))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    HashMap::new()
+                };
+                return Some(
+                    match info
+                        .properties
+                        .iter()
+                        .find(|(member, _)| member == property)
+                    {
+                        Some((_, member_ty)) => {
+                            let member_ty = Self::binding_member_value_type(member_ty);
+                            LazyAliasProperty::Present(if open_params.is_empty() {
+                                member_ty
+                            } else {
+                                Self::substitute(&member_ty, &open_params)
+                            })
+                        }
+                        None => LazyAliasProperty::Unknown,
+                    },
+                );
             }
             _ => return None,
         };
@@ -6500,6 +7469,188 @@ impl TypeChecker {
         }
     }
 
+    /// The names under `typeof` anywhere in `ty`.
+    fn collect_typeof_names(ty: &Type, out: &mut Vec<std::string::String>) {
+        match ty {
+            Type::Typeof(name) => out.push(name.clone()),
+            Type::TypeReference(_, args) => {
+                args.iter()
+                    .for_each(|arg| Self::collect_typeof_names(arg, out));
+            }
+            Type::Union(members) | Type::Intersection(members) => {
+                members
+                    .iter()
+                    .for_each(|member| Self::collect_typeof_names(member, out));
+            }
+            Type::IndexedAccess(object, index) => {
+                Self::collect_typeof_names(object, out);
+                Self::collect_typeof_names(index, out);
+            }
+            Type::Array(inner) | Type::Optional(inner) | Type::Keyof(inner) => {
+                Self::collect_typeof_names(inner, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// The file's non-generic top-level aliases written over `typeof f`
+    /// (`type A = ReturnType<typeof f>`), with their resolved bodies; each
+    /// such `f` that is a function of this file is declared in the current
+    /// scope with its return type inferred.
+    fn declare_functions_named_by_typeof_aliases(
+        &mut self,
+        file: &SourceFile,
+    ) -> Vec<(std::string::String, Type)> {
+        fn top_level(statement: &Stmt) -> &Stmt {
+            match &statement.kind {
+                StmtKind::Export(export) => match &export.kind {
+                    ExportDeclKind::Decl(inner) | ExportDeclKind::DefaultDecl(inner) => inner,
+                    _ => statement,
+                },
+                _ => statement,
+            }
+        }
+        fn typeof_names(node: &TypeNode, out: &mut Vec<std::string::String>) {
+            match &node.kind {
+                TypeNodeKind::TypeQuery(expr) => {
+                    if let ExprKind::Ident(name) = &expr.kind {
+                        out.push(name.to_string());
+                    }
+                }
+                TypeNodeKind::Reference(reference) => {
+                    for arg in reference.type_args.iter().flatten() {
+                        typeof_names(arg, out);
+                    }
+                }
+                TypeNodeKind::Paren(inner) | TypeNodeKind::Array(inner) => {
+                    typeof_names(inner, out);
+                }
+                TypeNodeKind::IndexedAccess(object, index) => {
+                    typeof_names(object, out);
+                    typeof_names(index, out);
+                }
+                TypeNodeKind::Union(members) | TypeNodeKind::Intersection(members) => {
+                    members.iter().for_each(|member| typeof_names(member, out));
+                }
+                _ => {}
+            }
+        }
+        let mut alias_nodes = Vec::new();
+        let mut wanted = Vec::new();
+        for statement in &file.statements {
+            let StmtKind::TypeAlias(alias) = &top_level(statement).kind else {
+                continue;
+            };
+            if alias
+                .type_params
+                .as_ref()
+                .is_some_and(|params| !params.is_empty())
+            {
+                continue;
+            }
+            let known = wanted.len();
+            typeof_names(&alias.type_ann, &mut wanted);
+            if wanted.len() > known {
+                alias_nodes.push(alias);
+            }
+        }
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let mut declared = false;
+        for statement in &file.statements {
+            let StmtKind::FnDecl(fn_decl) = &top_level(statement).kind else {
+                continue;
+            };
+            let Some(name) = &fn_decl.name else { continue };
+            if fn_decl.body.is_none() || !wanted.iter().any(|wanted| wanted == name) {
+                continue;
+            }
+            let signature = self.resolve_fn_type(fn_decl);
+            let signature = self.refine_fn_return_through_callbacks(fn_decl, signature);
+            self.declare_var(name, Type::Function(signature));
+            declared = true;
+        }
+        if !declared {
+            return Vec::new();
+        }
+        // Resolved with the functions in scope.
+        alias_nodes
+            .into_iter()
+            .map(|alias| {
+                (
+                    alias.name.to_string(),
+                    self.resolve_type_node(&alias.type_ann),
+                )
+            })
+            .collect()
+    }
+
+    /// A function without a return annotation whose body is a single
+    /// `return <generic call with a callback>`: the return type comes from
+    /// the checking pass when the plain inference left a type parameter
+    /// unresolved (see `infer_initializer_through_callbacks`).
+    fn refine_fn_return_through_callbacks(
+        &mut self,
+        fn_decl: &FnDecl,
+        mut signature: FunctionType,
+    ) -> FunctionType {
+        if fn_decl.return_type.is_some()
+            || fn_decl.is_async
+            || fn_decl.is_generator
+            || !self.contains_unresolved_type_param(&signature.return_type)
+        {
+            return signature;
+        }
+        let Some([statement]) = fn_decl.body.as_deref() else {
+            return signature;
+        };
+        let StmtKind::Return(Some(returned)) = &statement.kind else {
+            return signature;
+        };
+        self.push_scope();
+        for parameter in &fn_decl.params {
+            let ty = parameter
+                .type_ann
+                .as_ref()
+                .map(|annotation| self.resolve_type_node(annotation))
+                .unwrap_or(Type::Any);
+            self.declare_pattern_vars(&parameter.name, ty);
+        }
+        let refined = self.infer_initializer_through_callbacks(returned);
+        self.pop_scope();
+        if !self.contains_unresolved_type_param(&refined) {
+            signature.return_type = Arc::new(refined);
+        }
+        signature
+    }
+
+    /// `infer_expr_type`, except that a generic call whose type arguments
+    /// can only come from a contextually typed callback
+    /// (`base.use(({ ctx, next }) => next({ … }))`) is typed by the checking
+    /// pass, which gives the callback its parameter types. Diagnostics from
+    /// that pass are dropped: the file's own check reports them.
+    fn infer_initializer_through_callbacks(&mut self, initializer: &Expr) -> Type {
+        let inferred = self.infer_expr_type(initializer);
+        let has_callback = matches!(&initializer.kind, ExprKind::Call(call)
+        if call.args.iter().any(|arg| {
+            matches!(arg.kind, ExprKind::Arrow(_) | ExprKind::FnExpr(_))
+        }));
+        if !has_callback || !self.contains_unresolved_type_param(&inferred) {
+            return inferred;
+        }
+        let diagnostics = self.diagnostics.len();
+        let checked = self.check_expr(initializer);
+        self.diagnostics.truncate(diagnostics);
+        if matches!(checked, Type::Any | Type::Error)
+            || self.contains_unresolved_type_param(&checked)
+        {
+            inferred
+        } else {
+            checked
+        }
+    }
+
     fn local_variable_declaration_type(
         &mut self,
         file: &SourceFile,
@@ -6556,7 +7707,7 @@ impl TypeChecker {
                         self.local_initializer_type_from_bindings(initializer, local_bindings)
                             .unwrap_or_else(|| self.infer_expr_type(initializer))
                     } else {
-                        self.infer_expr_type(initializer)
+                        self.infer_initializer_through_callbacks(initializer)
                     };
                     if Self::is_const_assertion_expr(initializer) {
                         inferred
@@ -7195,7 +8346,33 @@ impl TypeChecker {
     }
 
     fn file_local_binding_type(&mut self, file: &SourceFile, target: &str) -> Option<Type> {
+        // One file's exports ask for its bindings name by name: compute the
+        // file's binding types once, not once per exported name (quadratic
+        // in a generated file's thousands of exported variables).
+        let cached = matches!(
+            &self.file_local_bindings,
+            Some((file_name, _)) if *file_name == file.file_name
+        );
+        if !cached {
+            let bindings = self.compute_file_local_bindings(file);
+            self.file_local_bindings = Some((file.file_name.clone(), Arc::new(bindings)));
+        }
+        let (_, bindings) = self.file_local_bindings.as_ref().expect("set above");
+        bindings
+            .iter()
+            .rev()
+            .find(|(name, _)| name == target)
+            .map(|(_, ty)| ty.clone())
+    }
+
+    fn compute_file_local_bindings(
+        &mut self,
+        file: &SourceFile,
+    ) -> Vec<(std::string::String, Type)> {
         let mut bindings = Vec::new();
+        // Each binding is in scope for the initializers after it
+        // (`const t = make(); export const p = t.procedure;`).
+        self.push_scope();
         for statement in &file.statements {
             let declaration = match &statement.kind {
                 StmtKind::Export(export) => match &export.kind {
@@ -7215,6 +8392,7 @@ impl TypeChecker {
                     &bindings,
                     false,
                 ) {
+                    let known = bindings.len();
                     self.collect_pattern_binding_types(
                         file,
                         &variable.name,
@@ -7222,14 +8400,16 @@ impl TypeChecker {
                         &mut bindings,
                         variable_statement.kind == VarKind::Const,
                     );
+                    for (name, ty) in &bindings[known..] {
+                        if !name.contains('.') {
+                            self.declare_var(name, ty.clone());
+                        }
+                    }
                 }
             }
         }
+        self.pop_scope();
         bindings
-            .into_iter()
-            .rev()
-            .find(|(name, _)| name == target)
-            .map(|(_, ty)| ty)
     }
 
     fn file_class_declaration<'a>(
@@ -7631,16 +8811,25 @@ impl TypeChecker {
                     None => Type::Number,
                 }
             };
-            properties.push((name, Arc::new(value_type)));
+            // The member's own type (`E.A`), as a member access types it in
+            // the declaring file: a bare literal is not assignable to a
+            // string enum, so an imported `E.A` could not be passed where
+            // `E` is expected.
+            let member_type = Type::EnumVariant {
+                enum_name: enum_decl.name.as_str().into(),
+                variant_name: name.clone(),
+                value: Some(Arc::new(value_type)),
+            };
+            properties.push((name, Arc::new(member_type)));
         }
-        Type::ObjectType(ObjectTypeInfo {
+        Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties,
             call_signatures: Vec::new(),
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        })
+        }))
     }
 
     fn collect_exports_from_stmt(
@@ -7667,14 +8856,14 @@ impl TypeChecker {
                         );
                         out.push((
                             "default".to_string(),
-                            Type::ObjectType(ObjectTypeInfo {
+                            Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                                 properties,
                                 call_signatures: Vec::new(),
                                 construct_signatures: Vec::new(),
                                 index_signature: None,
                                 index_signature_name: None,
                                 method_names: Vec::new(),
-                            }),
+                            })),
                         ));
                     }
                 }
@@ -7913,14 +9102,15 @@ impl TypeChecker {
                         }
                     }
                     let class_value = if !properties.is_empty() {
-                        let static_surface = Type::ObjectType(ObjectTypeInfo {
-                            properties,
-                            call_signatures: Vec::new(),
-                            construct_signatures: Vec::new(),
-                            index_signature: None,
-                            index_signature_name: None,
-                            method_names: Vec::new(),
-                        });
+                        let static_surface =
+                            Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                                properties,
+                                call_signatures: Vec::new(),
+                                construct_signatures: Vec::new(),
+                                index_signature: None,
+                                index_signature_name: None,
+                                method_names: Vec::new(),
+                            }));
                         Type::Intersection(vec![static_surface, nominal].into())
                     } else {
                         nominal
@@ -8191,14 +9381,14 @@ impl TypeChecker {
                 None => properties.push((export_name, Arc::new(export_ty))),
             }
         }
-        let static_surface = Type::ObjectType(ObjectTypeInfo {
+        let static_surface = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties,
             call_signatures: Vec::new(),
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
+        }));
         *value = Type::Intersection(vec![static_surface, nominal].into());
         Ok(())
     }
@@ -8273,7 +9463,7 @@ impl TypeChecker {
                             // links while the snapshot keys are the
                             // pre-canonical paths. Canonicalize the
                             // candidate and try again.
-                            if let Ok(canon) = std::fs::canonicalize(&p) {
+                            if let Some(canon) = tsc_rs_resolver::canonicalize(&p) {
                                 let canon_s = canon.to_string_lossy().into_owned();
                                 if let Some(v) = snapshot.get(&canon_s) {
                                     return Some(v.clone());
@@ -8314,7 +9504,7 @@ impl TypeChecker {
                             if let Some(v) = snapshot.get(&p) {
                                 return Some(v.clone());
                             }
-                            if let Ok(canon) = std::fs::canonicalize(&p) {
+                            if let Some(canon) = tsc_rs_resolver::canonicalize(&p) {
                                 let canon_s = canon.to_string_lossy().into_owned();
                                 if let Some(v) = snapshot.get(&canon_s) {
                                     return Some(v.clone());
@@ -8361,8 +9551,31 @@ impl TypeChecker {
         {
             return Some(path.clone());
         }
-        tsc_rs_resolver::resolve_module_name(specifier, containing_file, &self.compiler_options)
-            .map(|m| m.resolved_file_name)
+        if let Some(cached) = self
+            .module_path_memo
+            .read()
+            .expect("module_path_memo lock poisoned")
+            .get(&self.options_fingerprint)
+            .and_then(|files| files.get(containing_file))
+            .and_then(|specifiers| specifiers.get(specifier))
+        {
+            return cached.clone();
+        }
+        let resolved = tsc_rs_resolver::resolve_module_name(
+            specifier,
+            containing_file,
+            &self.compiler_options,
+        )
+        .map(|m| m.resolved_file_name);
+        self.module_path_memo
+            .write()
+            .expect("module_path_memo lock poisoned")
+            .entry(self.options_fingerprint)
+            .or_default()
+            .entry(containing_file.to_string())
+            .or_default()
+            .insert(specifier.to_string(), resolved.clone());
+        resolved
     }
 
     /// When a per-file checker was cloned from a donor that did not include a
@@ -8705,7 +9918,7 @@ impl TypeChecker {
                 return Some(v.clone());
             }
             // Try the symlink-resolved (canonical) path.
-            if let Ok(canon) = std::fs::canonicalize(&alt) {
+            if let Some(canon) = tsc_rs_resolver::canonicalize(&alt) {
                 let canon_s = canon.to_string_lossy().into_owned();
                 if let Some(v) = self.module_exports.get(&canon_s) {
                     return Some(v.clone());
@@ -8723,7 +9936,7 @@ impl TypeChecker {
             if let Some(names) = self.module_type_exports.get(&alternative) {
                 return Some(names);
             }
-            if let Ok(canonical) = std::fs::canonicalize(&alternative) {
+            if let Some(canonical) = tsc_rs_resolver::canonicalize(&alternative) {
                 if let Some(names) = self
                     .module_type_exports
                     .get(canonical.to_string_lossy().as_ref())
@@ -8743,7 +9956,7 @@ impl TypeChecker {
             if let Some(names) = self.module_known_exports.get(&alternative) {
                 return Some(names);
             }
-            if let Ok(canonical) = std::fs::canonicalize(&alternative) {
+            if let Some(canonical) = tsc_rs_resolver::canonicalize(&alternative) {
                 if let Some(names) = self
                     .module_known_exports
                     .get(canonical.to_string_lossy().as_ref())
@@ -8803,9 +10016,24 @@ impl TypeChecker {
     /// Walk all files of a given kind (`.d.ts` if `dts`, else `.ts`) and
     /// run `inject_stmt` on every top-level statement.
     fn inject_pass(this: &mut Self, files: &[&SourceFile], dts: bool) {
+        // With TSC_RS_INIT_TIMING, the files that took longest to inject.
+        let timing = std::env::var_os("TSC_RS_INIT_TIMING").is_some();
+        let mut slowest: Vec<(f64, &str)> = Vec::new();
+        let mut started: Option<(std::time::Instant, &str)> = None;
         for file in files {
+            if timing {
+                if let Some((start, name)) = started.take() {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    if ms >= 50.0 {
+                        slowest.push((ms, name));
+                    }
+                }
+            }
             if file.file_name.ends_with(".d.ts") != dts {
                 continue;
+            }
+            if timing {
+                started = Some((std::time::Instant::now(), file.file_name.as_str()));
             }
             let previous_decl_file = this.injected_decl_file.replace(file.file_name.clone());
             let previous_source = this.current_source.replace(file.text.clone());
@@ -8815,6 +10043,8 @@ impl TypeChecker {
             let previous_array_shadow = this.file_shadows_global_array;
             let previous_type_sources = std::mem::take(&mut this.imported_type_sources);
             this.imported_type_sources = this.collect_type_import_sources(file, &file.file_name);
+            let scoped_keys = this.collect_scoped_type_keys(file, &file.file_name, false);
+            let previous_scoped_keys = std::mem::replace(&mut this.scoped_type_keys, scoped_keys);
             // Preserve namespace-import context while declaration bodies are
             // lifted into the project-wide donor.  A stored alias such as
             //
@@ -8930,35 +10160,16 @@ impl TypeChecker {
                             && matches!(&module.name, ModuleName::Ident(name) if name == "global");
                         if is_global_augmentation {
                             if let Some(ModuleBody::Block(body)) = &module.body {
-                                let previous_module_flag = this.file_is_module_flag;
-                                let previous_ambient_depth = this.ambient_depth;
-                                this.file_is_module_flag = false;
-                                this.ambient_depth += 1;
-                                for global_statement in body {
-                                    // `namespace globalThis { var x }` adds
-                                    // globals; it must not bind a namespace
-                                    // that shadows `globalThis` itself.
-                                    if let StmtKind::ModuleDecl(inner) = &global_statement.kind {
-                                        if matches!(&inner.name, ModuleName::Ident(name) if name == "globalThis")
-                                        {
-                                            if let Some(ModuleBody::Block(members)) = &inner.body {
-                                                for member in members {
-                                                    this.inject_stmt(member, false);
-                                                }
-                                            }
-                                            continue;
-                                        }
-                                    }
-                                    this.inject_stmt(global_statement, false);
-                                }
-                                this.ambient_depth = previous_ambient_depth;
-                                this.file_is_module_flag = previous_module_flag;
+                                Self::inject_global_augmentation_body(this, body);
                             }
                         }
                         // `declare module "./x" { interface X { … } }` in a
                         // module file augments the target module: its
                         // interfaces merge with the target's declarations
                         // of the same name (tsc mergeModuleAugmentation).
+                        if let ModuleName::String(_) = &module.name {
+                            Self::inject_nested_global_augmentations(this, module);
+                        }
                         if let ModuleName::String(specifier) = &module.name {
                             // Augmenting an `export = N` module whose value
                             // is a namespace targets `N`'s members.
@@ -9005,6 +10216,13 @@ impl TypeChecker {
                         continue;
                     }
                 }
+                // An ambient `declare module "m" { global { … } }` in a
+                // script (`@types/node`'s `Buffer`, …) also adds globals.
+                if let StmtKind::ModuleDecl(module) = &stmt.kind {
+                    if matches!(module.name, ModuleName::String(_)) {
+                        Self::inject_nested_global_augmentations(this, module);
+                    }
+                }
                 this.inject_stmt(stmt, block_builtin_shadow);
             }
             this.file_is_module_flag = previous_module_flag;
@@ -9012,8 +10230,67 @@ impl TypeChecker {
             this.file_shadows_global_intl = previous_intl_shadow;
             this.file_shadows_global_array = previous_array_shadow;
             this.imported_type_sources = previous_type_sources;
+            this.scoped_type_keys = previous_scoped_keys;
             this.injected_decl_file = previous_decl_file;
             this.current_source = previous_source;
+        }
+        if timing {
+            if let Some((start, name)) = started.take() {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                if ms >= 50.0 {
+                    slowest.push((ms, name));
+                }
+            }
+            slowest.sort_by(|a, b| b.0.total_cmp(&a.0));
+            for (ms, name) in slowest.iter().take(8) {
+                eprintln!("[inject]   slow file {ms:>8.0}ms {name}");
+            }
+        }
+    }
+
+    /// Injects the statements of a `declare global { … }` body as globals.
+    fn inject_global_augmentation_body(this: &mut Self, body: &[Stmt]) {
+        let previous_module_flag = this.file_is_module_flag;
+        let previous_ambient_depth = this.ambient_depth;
+        this.file_is_module_flag = false;
+        this.ambient_depth += 1;
+        for global_statement in body {
+            // `namespace globalThis { var x }` adds globals; it must not
+            // bind a namespace that shadows `globalThis` itself.
+            if let StmtKind::ModuleDecl(inner) = &global_statement.kind {
+                if matches!(&inner.name, ModuleName::Ident(name) if name == "globalThis") {
+                    if let Some(ModuleBody::Block(members)) = &inner.body {
+                        for member in members {
+                            this.inject_stmt(member, false);
+                        }
+                    }
+                    continue;
+                }
+            }
+            this.inject_stmt(global_statement, false);
+        }
+        this.ambient_depth = previous_ambient_depth;
+        this.file_is_module_flag = previous_module_flag;
+    }
+
+    /// `global { … }` blocks directly inside an ambient module declaration
+    /// (`declare module "m" { global { var X } }`) augment the global scope,
+    /// as at a module's top level (tsc allows both).
+    fn inject_nested_global_augmentations(this: &mut Self, module: &ModuleDecl) {
+        let Some(ModuleBody::Block(body)) = &module.body else {
+            return;
+        };
+        for statement in body {
+            let StmtKind::ModuleDecl(inner) = &statement.kind else {
+                continue;
+            };
+            let is_global = inner.name_span.is_none()
+                && matches!(&inner.name, ModuleName::Ident(name) if name == "global");
+            if is_global {
+                if let Some(ModuleBody::Block(global_body)) = &inner.body {
+                    Self::inject_global_augmentation_body(this, global_body);
+                }
+            }
         }
     }
 
@@ -9042,8 +10319,8 @@ impl TypeChecker {
         // instance side (class/interface declaration merging).
         if self.class_info.contains_key(&interface.name) {
             let info = self.build_interface_info(&interface);
-            let object = info.object_type;
-            let classes = Arc::make_mut(&mut self.class_info);
+            let object = info.object_type.into_data();
+            let classes = (&mut self.class_info);
             if let Some(class) = classes.get_mut(&interface.name) {
                 for (member, ty) in object.properties {
                     let is_method = object.method_names.iter().any(|name| name == &member);
@@ -9502,11 +10779,11 @@ impl TypeChecker {
     /// declarations extend the set; a re-registered declaration replaces
     /// duplicates in place).
     fn merge_enum_members(
-        table: &mut rustc_hash::FxHashMap<std::string::String, Vec<(std::string::String, Type)>>,
+        table: &mut layered_map::LayeredMap<Vec<(std::string::String, Type)>>,
         name: std::string::String,
         members: Vec<(std::string::String, Type)>,
     ) {
-        let entry = table.entry(name).or_default();
+        let entry = table.get_or_insert_with(name, Vec::new);
         for (member_name, ty) in members {
             match entry
                 .iter_mut()
@@ -9593,20 +10870,21 @@ impl TypeChecker {
             }
         }
 
+        let incoming_object = incoming.object_type.into_data();
         let mut properties = std::mem::take(&mut existing.object_type.properties);
-        properties.extend(incoming.object_type.properties);
+        properties.extend(incoming_object.properties);
         existing.object_type.properties = check_class::merge_overloaded_function_props(properties);
         // tsc orders a later interface declaration's signatures FIRST in the
         // merged type (later overload sets take precedence).
         let mut merged_call_sigs: Vec<FunctionType> = Vec::new();
-        for signature in incoming.object_type.call_signatures {
+        for signature in incoming_object.call_signatures {
             if !existing.object_type.call_signatures.contains(&signature) {
                 merged_call_sigs.push(signature);
             }
         }
         merged_call_sigs.extend(std::mem::take(&mut existing.object_type.call_signatures));
         existing.object_type.call_signatures = merged_call_sigs;
-        for signature in incoming.object_type.construct_signatures {
+        for signature in incoming_object.construct_signatures {
             if !existing
                 .object_type
                 .construct_signatures
@@ -9616,7 +10894,7 @@ impl TypeChecker {
             }
         }
         if existing.object_type.index_signature.is_none() {
-            existing.object_type.index_signature = incoming.object_type.index_signature;
+            existing.object_type.index_signature = incoming_object.index_signature;
         }
         for (key, location) in incoming.index_locations {
             existing.index_locations.entry(key).or_insert(location);
@@ -9657,7 +10935,7 @@ impl TypeChecker {
     }
 
     fn merge_interface_registry_entry(&mut self, key: String, info: InterfaceInfo) {
-        let map = Arc::make_mut(&mut self.interface_info);
+        let map = (&mut self.interface_info);
         if let Some(existing) = map.get_mut(&key) {
             debug_assert!(Self::interface_infos_share_owner(existing, &info));
             Self::merge_interface_info(existing, info);
@@ -9720,7 +10998,7 @@ impl TypeChecker {
                     {
                         self.merge_interface_registry_entry(key, info);
                     } else {
-                        Arc::make_mut(&mut self.interface_info).insert(key, info);
+                        (&mut self.interface_info).insert(key, info);
                         self.ref_resolve_memo
                             .lock()
                             .expect("ref_resolve_memo lock poisoned")
@@ -9757,7 +11035,7 @@ impl TypeChecker {
                         let names: HashSet<&str> = type_params.iter().map(String::as_str).collect();
                         Self::rewrite_type_param_refs(&raw, &names)
                     };
-                    Arc::make_mut(&mut self.type_aliases).insert(
+                    (&mut self.type_aliases).insert(
                         format!("{namespace_path}.{}", alias.name),
                         (type_params, ty, required),
                     );
@@ -9782,7 +11060,7 @@ impl TypeChecker {
                             Some((name, Type::Number))
                         })
                         .collect();
-                    Arc::make_mut(&mut self.enum_info)
+                    (&mut self.enum_info)
                         .insert(format!("{namespace_path}.{}", enumeration.name), members);
                 }
                 _ => {}
@@ -9850,15 +11128,14 @@ impl TypeChecker {
                     } else {
                         // A real global declaration owns the bare name even if
                         // a declaration module happened to be injected first.
-                        Arc::make_mut(&mut self.interface_info)
-                            .insert(iface_decl.name.clone(), info);
+                        (&mut self.interface_info).insert(iface_decl.name.clone(), info);
                         self.ref_resolve_memo
                             .lock()
                             .expect("ref_resolve_memo lock poisoned")
                             .clear();
                     }
                 } else if !bare_exists {
-                    Arc::make_mut(&mut self.interface_info).insert(iface_decl.name.clone(), info);
+                    (&mut self.interface_info).insert(iface_decl.name.clone(), info);
                 } else if compatible_bare {
                     self.merge_interface_registry_entry(iface_decl.name.clone(), info);
                 }
@@ -9880,6 +11157,14 @@ impl TypeChecker {
                         // the canonical resolution for `new Map(...)`.
                     } else {
                         let info = self.build_class_info(class_decl);
+                        // A class whose name another file declares too is
+                        // also kept under its file-scoped key.
+                        if let Some(file) = self.injected_decl_file.as_deref() {
+                            let key = Self::file_interface_registry_key(file, name);
+                            if self.ambiguous_interface_keys.contains(&key) {
+                                self.insert_class_info(key, info.clone());
+                            }
+                        }
                         self.insert_class_info(name.clone(), info);
                     }
                 }
@@ -9892,6 +11177,7 @@ impl TypeChecker {
                     // ordering inside a kind is non-deterministic).
                     if self.lookup_var(name).is_none() {
                         let ft = self.resolve_fn_type(fn_decl);
+                        let ft = self.refine_fn_return_through_callbacks(fn_decl, ft);
                         self.declare_var(name, Type::Function(ft));
                     }
                 }
@@ -9928,6 +11214,12 @@ impl TypeChecker {
                                     })));
                         match self.lookup_var(name) {
                             Some(Type::Any) if declares_key_constant => {}
+                            // A namespace with no value exports is not
+                            // instantiated: it has no value meaning, so the
+                            // variable of the same name supplies it
+                            // (`declare namespace Bun { type T }` +
+                            // `declare var Bun: typeof import("bun")`).
+                            Some(Type::Namespace(namespace)) if namespace.exports.is_empty() => {}
                             Some(_) => continue,
                             None => {}
                         }
@@ -9965,7 +11257,23 @@ impl TypeChecker {
                 }
             }
             StmtKind::TypeAlias(ta) => {
+                // The alias's own parameters shadow same-named types of the
+                // program while its body is resolved (`Args`, `Payload`, `T`
+                // are also declared by other files).
+                let own_params: rustc_hash::FxHashSet<std::string::String> = ta
+                    .type_params
+                    .iter()
+                    .flatten()
+                    .map(|param| param.name.to_string())
+                    .collect();
+                let shadowing = !own_params.is_empty();
+                if shadowing {
+                    self.active_type_param_names.push(own_params);
+                }
                 let raw = self.resolve_type_node(&ta.type_ann);
+                if shadowing {
+                    self.active_type_param_names.pop();
+                }
                 let type_params: Vec<String> = ta
                     .type_params
                     .as_ref()
@@ -9990,11 +11298,56 @@ impl TypeChecker {
                         type_params.iter().map(String::as_str).collect();
                     Self::rewrite_type_param_refs(&raw, &names)
                 };
+                let defaults = self.alias_default_types(ta.type_params.as_deref());
                 if self.is_known_type_name(&ta.name) {
                     Arc::make_mut(&mut self.duplicate_type_names).insert(ta.name.clone());
                 }
-                Arc::make_mut(&mut self.type_aliases)
-                    .insert(ta.name.clone(), (type_params, ty, required));
+                // An alias whose name another file declares too is also kept
+                // under its file-scoped key (see `ambiguous_interface_keys`).
+                if let Some(file) = self.injected_decl_file.as_deref() {
+                    let key = Self::file_interface_registry_key(file, &ta.name);
+                    if self.ambiguous_interface_keys.contains(&key) {
+                        if let Some(defaults) = &defaults {
+                            (&mut self.alias_type_param_defaults)
+                                .insert(key.clone(), defaults.clone());
+                        }
+                        (&mut self.type_aliases)
+                            .insert(key, (type_params.clone(), ty.clone(), required));
+                    }
+                }
+                // A file's own `type ReturnType<T> = …` (vitest ships one)
+                // must not replace the lib utility every other file means
+                // by that name.
+                const LIB_UTILITY_ALIASES: &[&str] = &[
+                    "Partial",
+                    "Required",
+                    "Readonly",
+                    "Pick",
+                    "Omit",
+                    "Record",
+                    "Exclude",
+                    "Extract",
+                    "NonNullable",
+                    "Parameters",
+                    "ConstructorParameters",
+                    "ReturnType",
+                    "InstanceType",
+                    "Awaited",
+                    "ThisParameterType",
+                    "OmitThisParameter",
+                ];
+                let shadows_lib_utility = LIB_UTILITY_ALIASES.contains(&ta.name.as_str())
+                    && self.type_aliases.contains_key(ta.name.as_str())
+                    && self
+                        .injected_decl_file
+                        .as_deref()
+                        .is_some_and(|file| !stdlib::is_typescript_standard_library_file(file));
+                if !shadows_lib_utility {
+                    if let Some(defaults) = defaults {
+                        (&mut self.alias_type_param_defaults).insert(ta.name.clone(), defaults);
+                    }
+                    (&mut self.type_aliases).insert(ta.name.clone(), (type_params, ty, required));
+                }
             }
             StmtKind::ModuleDecl(module_decl) => {
                 if let ModuleName::Ident(ref name) = module_decl.name {
@@ -10024,6 +11377,10 @@ impl TypeChecker {
                         _ => self.build_namespace_value_exports(module_decl),
                     };
                     match self.lookup_var(name).cloned() {
+                        // A namespace without value exports is not
+                        // instantiated and must not replace a variable's
+                        // binding of the same name (even a placeholder).
+                        Some(Type::Any) if namespace.exports.is_empty() => {}
                         None | Some(Type::Any) => {
                             self.declare_var(name, Type::Namespace(namespace));
                         }
@@ -10103,7 +11460,7 @@ impl TypeChecker {
                         members.push((name, value_type));
                     }
                     Self::merge_enum_members(
-                        Arc::make_mut(&mut self.enum_info),
+                        (&mut self.enum_info),
                         enum_decl.name.clone(),
                         members,
                     );
@@ -10174,8 +11531,7 @@ impl TypeChecker {
                         }
                         if let Some(entry) = self.type_aliases.get(spec.local.as_str()).cloned() {
                             if !self.type_aliases.contains_key(exported_name.as_str()) {
-                                Arc::make_mut(&mut self.type_aliases)
-                                    .insert(exported_name.clone(), entry);
+                                (&mut self.type_aliases).insert(exported_name.clone(), entry);
                             }
                         } else if self.class_info.contains_key(spec.local.as_str())
                             && !self.class_info.contains_key(exported_name.as_str())
@@ -10190,7 +11546,7 @@ impl TypeChecker {
                                 .get(spec.local.as_str())
                                 .is_some_and(|info| !info.type_params.is_empty());
                             if !generic {
-                                Arc::make_mut(&mut self.type_aliases).insert(
+                                (&mut self.type_aliases).insert(
                                     exported_name.clone(),
                                     (
                                         Vec::new(),
@@ -10316,9 +11672,9 @@ impl TypeChecker {
         self.attach_type_parameter_constraint_notes();
         let stable_types = self.stable_type_display_map();
         TypeCheckOutput {
-            diagnostics: dedup_exact_diagnostics(
-                self.diagnostics,
-                self.current_file_name.as_deref(),
+            diagnostics: apply_comment_directives(
+                file,
+                dedup_exact_diagnostics(self.diagnostics, self.current_file_name.as_deref()),
             ),
             // Convert from internal FxHashMap to public std HashMap for
             // the output type. Single allocation; the fast hasher was only
@@ -10401,6 +11757,13 @@ impl TypeChecker {
         }
         self.ambient_depth = u32::from(self.current_file_is_declaration());
         self.compiler_options = options.clone();
+        self.options_fingerprint = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = rustc_hash::FxHasher::default();
+            format!("{options:?}").hash(&mut hasher);
+            // 0 is the fingerprint of a checker whose options were never set.
+            hasher.finish().max(1)
+        };
         self.current_file_has_lib_reference = file.text.contains("/// <reference");
         self.has_jsx_intrinsic_elements |= Self::declares_jsx_intrinsic_elements(&file.statements);
         self.prescan_type_imports(file);
@@ -10610,9 +11973,9 @@ impl TypeChecker {
         self.attach_type_parameter_constraint_notes();
         let stable_types = self.stable_type_display_map();
         TypeCheckOutput {
-            diagnostics: dedup_exact_diagnostics(
-                self.diagnostics,
-                self.current_file_name.as_deref(),
+            diagnostics: apply_comment_directives(
+                file,
+                dedup_exact_diagnostics(self.diagnostics, self.current_file_name.as_deref()),
             ),
             // Convert from internal FxHashMap to public std HashMap for
             // the output type. Single allocation; the fast hasher was only
@@ -11209,6 +12572,13 @@ impl TypeChecker {
     /// Like extract_member_type but returns None instead of Any when not found.
     /// Also resolves through interface/class types via class_info.
     fn extract_member_type_opt(&self, ty: &Type, name: &str) -> Option<Type> {
+        let member = self.extract_declared_member_type_opt(ty, name)?;
+        // A member computed from the receiver's type arguments
+        // (`ctx: Simplify<Overwrite<C, O>>`) binds as that result.
+        Some(self.evaluate_instantiated_alias(member))
+    }
+
+    fn extract_declared_member_type_opt(&self, ty: &Type, name: &str) -> Option<Type> {
         match ty {
             Type::ObjectType(obj) => {
                 for (prop_name, prop_ty) in &obj.properties {
@@ -11223,9 +12593,22 @@ impl TypeChecker {
                 }
                 None
             }
-            Type::TypeReference(type_name, _) => {
+            Type::TypeReference(type_name, type_args) => {
                 // Look up interface/class members
                 let base = type_name.split('<').next().unwrap_or(type_name);
+                // The declaration's type parameters stand for this
+                // reference's type arguments.
+                let instantiate = |declared: Type, type_params: &[std::string::String]| -> Type {
+                    if type_args.is_empty() || type_params.is_empty() {
+                        return declared;
+                    }
+                    let map: HashMap<std::string::String, Type> = type_params
+                        .iter()
+                        .cloned()
+                        .zip(type_args.iter().cloned())
+                        .collect();
+                    Self::substitute(&declared, &map)
+                };
                 // Check interface_info first
                 if let Some(info) = self.interface_info.get(base) {
                     for (pname, pty) in &info.object_type.properties {
@@ -11234,7 +12617,10 @@ impl TypeChecker {
                             .or_else(|| pname.strip_prefix("..."))
                             .unwrap_or(pname);
                         if pname_clean == name {
-                            return Some(Self::binding_member_value_type(pty));
+                            return Some(instantiate(
+                                Self::binding_member_value_type(pty),
+                                &info.type_params,
+                            ));
                         }
                     }
                 }
@@ -11242,7 +12628,10 @@ impl TypeChecker {
                 if let Some(info) = self.class_info.get(base) {
                     for (mname, mty) in &info.instance_properties {
                         if mname == name {
-                            return Some(Self::binding_member_value_type(mty));
+                            return Some(instantiate(
+                                Self::binding_member_value_type(mty),
+                                &info.type_params,
+                            ));
                         }
                     }
                     for (mname, mty) in &info.instance_methods {
@@ -11256,6 +12645,19 @@ impl TypeChecker {
                 let aliased = self.type_aliases.get(base).map(|(_, t, _)| t.clone());
                 if let Some(aliased) = aliased {
                     return self.extract_member_type_opt(&aliased, name);
+                }
+                // A member inherited through `extends`: the flattened
+                // instance shape has it.
+                if self.interface_info.contains_key(base) || self.class_info.contains_key(base) {
+                    if let Some(Type::ObjectType(shape)) =
+                        self.resolve_type_reference_to_object(type_name, type_args)
+                    {
+                        return shape
+                            .properties
+                            .iter()
+                            .find(|(member, _)| member == name)
+                            .map(|(_, member_ty)| Self::binding_member_value_type(member_ty));
+                    }
                 }
                 None
             }
@@ -11338,6 +12740,7 @@ impl TypeChecker {
                 self.check_binding_pattern_access(&p.name, &pty);
                 self.declare_pattern_vars(&p.name, pty.clone());
                 self.completion_mark_parameter(p);
+                self.mark_optional_parameter(p);
                 (pname, pty)
             })
             .collect();
@@ -11602,6 +13005,33 @@ impl TypeChecker {
         }
     }
 
+    /// Element type yielded by spreading a lib iterable (`[...set]`,
+    /// `[...map.keys()]`); `None` when `ty` is not one of them.
+    pub(crate) fn lib_iterable_element_type(ty: &Type) -> Option<Type> {
+        let Type::TypeReference(name, args) = ty else {
+            return None;
+        };
+        match (name.as_str(), args.as_ref()) {
+            (
+                "Set" | "ReadonlySet" | "Iterable" | "IterableIterator" | "Iterator"
+                | "IteratorObject" | "Generator" | "ArrayIterator" | "SetIterator" | "MapIterator"
+                | "StringIterator",
+                [element, ..],
+            ) => Some(element.clone()),
+            ("Map" | "ReadonlyMap", [key, value, ..]) => {
+                Some(Type::Tuple(Arc::from([key.clone(), value.clone()])))
+            }
+            (
+                "Set" | "ReadonlySet" | "Iterable" | "IterableIterator" | "Iterator"
+                | "IteratorObject" | "Generator" | "ArrayIterator" | "SetIterator" | "MapIterator"
+                | "Map" | "ReadonlyMap",
+                [],
+            ) => Some(Type::Any),
+            ("StringIterator", []) => Some(Type::String),
+            _ => None,
+        }
+    }
+
     /// Extract the type of an element at an index from an array/tuple.
     fn extract_element_type(&self, ty: &Type, index: usize) -> Type {
         match ty {
@@ -11735,6 +13165,9 @@ impl TypeChecker {
     }
 
     pub(crate) fn stdlib_value_alias_path(&self, alias: &str) -> Option<&str> {
+        if self.stdlib_alias_marker_count == 0 {
+            return None;
+        }
         let prefix = format!("__tsrs_stdlib_alias__{alias}\0");
         let mut scope = self.current_scope;
         loop {
@@ -11757,6 +13190,19 @@ impl TypeChecker {
         if parameter.optional {
             if let PatKind::Ident(name) = &parameter.name.kind {
                 self.declare_var(&Self::optional_value_marker_name(name), Type::Never);
+                // Inside the body an annotated `x?: T` is a `T | undefined`.
+                if self.strict_null_checks
+                    && parameter.type_ann.is_some()
+                    && parameter.initializer.is_none()
+                    && !parameter.dotdotdot
+                {
+                    if let Some(declared) = self.lookup_declared_var(name) {
+                        let with_undefined = Self::add_undefined_to_type(declared.clone());
+                        if with_undefined != declared {
+                            self.declare_var(name, with_undefined);
+                        }
+                    }
+                }
             }
         }
     }
@@ -12387,6 +13833,7 @@ impl TypeChecker {
                     // Resolve actual function type so argument type checking (TS2345)
                     // works correctly instead of losing type info with Type::Any
                     let ft = self.resolve_fn_type(fn_decl);
+                    let ft = self.refine_fn_return_through_callbacks(fn_decl, ft);
                     self.declare_var(name, Type::Function(ft));
                 }
             }
@@ -12658,7 +14105,38 @@ impl TypeChecker {
         }
     }
 
-    fn narrow_var(&mut self, name: &str, ty: Type) {
+    /// Forget every narrowed property path below `root` (`root.a`,
+    /// `root.a.b`): `root` was assigned.
+    pub(crate) fn clear_narrowed_paths_under(&mut self, root: &str) {
+        let mut scope_idx = self.current_scope;
+        loop {
+            let narrowed = &mut self.scopes[scope_idx].narrowed;
+            if !narrowed.is_empty() {
+                narrowed.retain(|key, _| {
+                    !(key.len() > root.len()
+                        && key.starts_with(root)
+                        && matches!(key.as_bytes()[root.len()], b'.' | b'['))
+                });
+            }
+            match self.scopes[scope_idx].parent {
+                Some(parent) => scope_idx = parent,
+                None => return,
+            }
+        }
+    }
+
+    /// `ty` may be `null` or `undefined`.
+    pub(crate) fn type_admits_nullish(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Null | Type::Undefined | Type::Void | Type::Optional(_) => true,
+            Type::Union(members) => members
+                .iter()
+                .any(|member| self.type_admits_nullish(member)),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn narrow_var(&mut self, name: &str, ty: Type) {
         let id = self.intern_type(ty);
         self.scopes[self.current_scope]
             .narrowed
@@ -12836,7 +14314,7 @@ impl TypeChecker {
                 continue;
             };
             let info = self.build_class_info(class_decl);
-            Arc::make_mut(&mut self.class_info).insert(name.clone(), info);
+            (&mut self.class_info).insert(name.clone(), info);
         }
     }
 
@@ -13607,6 +15085,7 @@ impl TypeChecker {
                         self.declare_pattern_vars(&p.name, pty);
                     }
                     let ft = self.resolve_fn_type(fn_decl);
+                    let ft = self.refine_fn_return_through_callbacks(fn_decl, ft);
                     self.pop_scope();
                     // Store parameter metadata for TS2554 arg count checking.
                     // Skip if the function body uses `arguments` (variadic).
@@ -13733,7 +15212,7 @@ impl TypeChecker {
                 if compatible && !stale_injected_copy {
                     self.merge_interface_registry_entry(iface_decl.name.clone(), info);
                 } else {
-                    Arc::make_mut(&mut self.interface_info).insert(iface_decl.name.clone(), info);
+                    (&mut self.interface_info).insert(iface_decl.name.clone(), info);
                     self.ref_resolve_memo
                         .lock()
                         .expect("ref_resolve_memo lock poisoned")
@@ -13785,11 +15264,7 @@ impl TypeChecker {
                         .insert(name_span.start, value_type.display_string());
                     members.push((name, value_type));
                 }
-                Self::merge_enum_members(
-                    Arc::make_mut(&mut self.enum_info),
-                    enum_decl.name.clone(),
-                    members,
-                );
+                Self::merge_enum_members((&mut self.enum_info), enum_decl.name.clone(), members);
                 self.declare_var(
                     &enum_decl.name,
                     Type::TypeReference(enum_decl.name.clone(), Arc::from([] as [Type; 0])),
@@ -13915,7 +15390,7 @@ impl TypeChecker {
                     self.expression_types
                         .insert(name_span.start, format!("type_alias_body={}", displayed));
                 }
-                Arc::make_mut(&mut self.type_aliases)
+                (&mut self.type_aliases)
                     .insert(type_alias.name.clone(), (type_params, resolved, required));
             }
             StmtKind::Export(export_decl) => match &export_decl.kind {
@@ -13925,6 +15400,259 @@ impl TypeChecker {
             },
             _ => {}
         }
+    }
+
+    /// See `scoped_type_keys`. `require_registered`: only keys the interface
+    /// registry already holds (when checking a file; while a file is being
+    /// injected its own declarations are still on their way in).
+    fn collect_scoped_type_keys(
+        &self,
+        file: &SourceFile,
+        current_file: &str,
+        require_registered: bool,
+    ) -> rustc_hash::FxHashMap<std::string::String, std::string::String> {
+        let mut keys = rustc_hash::FxHashMap::default();
+        if self.ambiguous_interface_keys.is_empty() {
+            return keys;
+        }
+        let scoped = |name: &str, declaring_file: &str| -> Option<std::string::String> {
+            let key = Self::file_interface_registry_key(declaring_file, name);
+            (self.ambiguous_interface_keys.contains(&key)
+                && (!require_registered
+                    || self.interface_info.contains_key(&key)
+                    || self.type_aliases.contains_key(&key)
+                    || self.class_info.contains_key(&key)))
+            .then_some(key)
+        };
+        // The file's own interfaces and aliases first: they shadow any import.
+        for statement in &file.statements {
+            let name = match &Self::unwrap_export_stmt(statement).kind {
+                StmtKind::InterfaceDecl(interface) => &interface.name,
+                StmtKind::TypeAlias(alias) => &alias.name,
+                StmtKind::ClassDecl(class) => match &class.name {
+                    Some(name) => name,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if let Some(key) = scoped(name, current_file) {
+                keys.insert(name.clone(), key);
+            }
+        }
+        // Then interfaces imported by name from the module declaring them.
+        for statement in &file.statements {
+            let StmtKind::Import(import) = &statement.kind else {
+                continue;
+            };
+            let ImportClause::Named { named, .. } = &import.specifiers else {
+                continue;
+            };
+            if named.is_empty() {
+                continue;
+            }
+            let Some(path) = self.resolve_module_to_path(&import.source, current_file) else {
+                continue;
+            };
+            for specifier in named {
+                if keys.contains_key(&specifier.local) {
+                    continue;
+                }
+                let imported = specifier.imported.as_deref().unwrap_or(&specifier.local);
+                if let Some(key) = self.scoped_key_of_export(imported, &path, require_registered, 8)
+                {
+                    keys.insert(specifier.local.clone(), key);
+                }
+            }
+        }
+        keys
+    }
+
+    /// The file-scoped key of the ambiguous interface that module `path`
+    /// exports as `name`: declared there, or reached through its re-exports
+    /// (at most `hops` of them).
+    fn scoped_key_of_export(
+        &self,
+        name: &str,
+        path: &str,
+        require_registered: bool,
+        hops: u8,
+    ) -> Option<std::string::String> {
+        if !self.ambiguous_interface_names.contains(name) {
+            // Renamed on the way (`export { A as B }`) is still followed
+            // below; a name no module declares ambiguously ends here.
+            if !self
+                .module_reexports
+                .get(&Self::normalized_file_name(path))
+                .is_some_and(|reexports| reexports.named.contains_key(name))
+            {
+                return None;
+            }
+        }
+        let key = Self::file_interface_registry_key(path, name);
+        if self.ambiguous_interface_keys.contains(&key)
+            && (!require_registered
+                || self.interface_info.contains_key(&key)
+                || self.type_aliases.contains_key(&key)
+                || self.class_info.contains_key(&key))
+        {
+            return Some(key);
+        }
+        if hops == 0 {
+            return None;
+        }
+        let reexports = self
+            .module_reexports
+            .get(&Self::normalized_file_name(path))?;
+        if let Some((source, original)) = reexports.named.get(name) {
+            let next = self.resolve_module_to_path(source, path)?;
+            return self.scoped_key_of_export(original, &next, require_registered, hops - 1);
+        }
+        reexports.stars.iter().find_map(|source| {
+            let next = self.resolve_module_to_path(source, path)?;
+            self.scoped_key_of_export(name, &next, require_registered, hops - 1)
+        })
+    }
+
+    fn normalized_file_name(file: &str) -> std::string::String {
+        tsc_rs_resolver::canonicalize(file)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| file.to_string())
+    }
+
+    /// See `module_reexports`.
+    fn collect_module_reexports(
+        files: &[&SourceFile],
+    ) -> rustc_hash::FxHashMap<std::string::String, FileReexports> {
+        let mut all = rustc_hash::FxHashMap::default();
+        for file in files {
+            let mut reexports = FileReexports::default();
+            // local name → (source specifier, imported name)
+            let mut imports: rustc_hash::FxHashMap<&str, (&str, &str)> =
+                rustc_hash::FxHashMap::default();
+            for statement in &file.statements {
+                let StmtKind::Import(import) = &statement.kind else {
+                    continue;
+                };
+                if let ImportClause::Named { named, .. } = &import.specifiers {
+                    for specifier in named {
+                        imports.insert(
+                            specifier.local.as_str(),
+                            (
+                                import.source.as_str(),
+                                specifier.imported.as_deref().unwrap_or(&specifier.local),
+                            ),
+                        );
+                    }
+                }
+            }
+            for statement in &file.statements {
+                let StmtKind::Export(export) = &statement.kind else {
+                    continue;
+                };
+                match &export.kind {
+                    ExportDeclKind::Named {
+                        specifiers,
+                        source: Some(source),
+                        ..
+                    } => {
+                        for specifier in specifiers {
+                            let exported = specifier.exported.as_ref().unwrap_or(&specifier.local);
+                            reexports.named.insert(
+                                exported.clone(),
+                                (source.clone(), specifier.local.clone()),
+                            );
+                        }
+                    }
+                    ExportDeclKind::Named {
+                        specifiers,
+                        source: None,
+                        ..
+                    } => {
+                        for specifier in specifiers {
+                            if let Some((source, imported)) = imports.get(specifier.local.as_str())
+                            {
+                                let exported =
+                                    specifier.exported.as_ref().unwrap_or(&specifier.local);
+                                reexports.named.insert(
+                                    exported.clone(),
+                                    ((*source).to_string(), (*imported).to_string()),
+                                );
+                            }
+                        }
+                    }
+                    ExportDeclKind::All {
+                        source,
+                        alias: None,
+                        ..
+                    } => reexports.stars.push(source.clone()),
+                    _ => {}
+                }
+            }
+            if !reexports.named.is_empty() || !reexports.stars.is_empty() {
+                all.insert(Self::normalized_file_name(&file.file_name), reexports);
+            }
+        }
+        all
+    }
+
+    /// See `ambiguous_interface_keys`.
+    fn collect_ambiguous_interface_keys(files: &[&SourceFile]) -> rustc_hash::FxHashSet<String> {
+        // Per top-level type name: the files declaring it, and which of
+        // them declare it as a module's interface or as a module's type
+        // alias (the two kinds the registries can hold per file).
+        #[derive(Clone, Copy, PartialEq)]
+        enum Declared {
+            Interface,
+            Alias,
+            Class,
+            Other,
+        }
+        let mut declarations: rustc_hash::FxHashMap<&str, Vec<(&str, Declared)>> =
+            rustc_hash::FxHashMap::default();
+        for file in files {
+            let is_module = Self::file_is_module(file);
+            for statement in &file.statements {
+                let (name, kind) = match &Self::unwrap_export_stmt(statement).kind {
+                    StmtKind::InterfaceDecl(interface) => {
+                        (interface.name.as_str(), Declared::Interface)
+                    }
+                    StmtKind::TypeAlias(alias) => (alias.name.as_str(), Declared::Alias),
+                    StmtKind::EnumDecl(enumeration) => (enumeration.name.as_str(), Declared::Other),
+                    StmtKind::ClassDecl(class) => match class.name.as_deref() {
+                        Some(name) => (name, Declared::Class),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
+                let kind = if is_module { kind } else { Declared::Other };
+                let entry = declarations.entry(name).or_default();
+                match entry
+                    .iter_mut()
+                    .find(|(declaring, _)| *declaring == file.file_name)
+                {
+                    // Declarations of one file merge: interfaces with
+                    // interfaces; any other mix is not a plain declaration.
+                    Some((_, previous)) => {
+                        if *previous != kind || kind != Declared::Interface {
+                            *previous = Declared::Other;
+                        }
+                    }
+                    None => entry.push((file.file_name.as_str(), kind)),
+                }
+            }
+        }
+        let mut keys = rustc_hash::FxHashSet::default();
+        for (name, declaring) in declarations {
+            if declaring.len() < 2 {
+                continue;
+            }
+            for (file, kind) in declaring {
+                if kind != Declared::Other {
+                    keys.insert(Self::file_interface_registry_key(file, name));
+                }
+            }
+        }
+        keys
     }
 
     /// Record, for the file about to be checked, every locally-imported TYPE
@@ -13937,8 +15665,10 @@ impl TypeChecker {
         let Some(cf) = current_file.as_deref() else {
             self.imported_type_sources.clear();
             self.imported_namespace_export_names.clear();
+            self.scoped_type_keys.clear();
             return;
         };
+        self.scoped_type_keys = self.collect_scoped_type_keys(file, cf, true);
         self.imported_type_sources = self.collect_type_import_sources(file, cf);
         self.imported_namespace_export_names = self.collect_namespace_import_export_names(file, cf);
     }
@@ -14401,17 +16131,23 @@ impl TypeChecker {
         if left == right {
             return true;
         }
-        match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
-            (Ok(left), Ok(right)) => left == right,
+        match (
+            tsc_rs_resolver::canonicalize(left),
+            tsc_rs_resolver::canonicalize(right),
+        ) {
+            (Some(left), Some(right)) => left == right,
             _ => false,
         }
     }
 
     fn file_interface_registry_key(file: &str, name: &str) -> std::string::String {
-        let normalized = std::fs::canonicalize(file)
+        let normalized = tsc_rs_resolver::canonicalize(file)
             .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| file.to_string());
-        format!("__tsrs_file_interface__:{normalized}::{name}")
+            .unwrap_or_else(|| file.to_string());
+        // The key travels as a type-reference name, where a `.` means a
+        // namespace-qualified name: keep the path free of them.
+        let normalized = normalized.replace('.', FILE_INTERFACE_KEY_DOT);
+        format!("{FILE_INTERFACE_KEY_PREFIX}{normalized}::{name}")
     }
 
     fn interface_lookup_name_for_source(&self, name: &str, source: Option<&str>) -> String {
@@ -15498,10 +17234,10 @@ impl TypeChecker {
                         )
                     })
                     .collect();
-                Type::ObjectType(ObjectTypeInfo {
+                Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     properties,
-                    ..info.clone()
-                })
+                    ..ObjectTypeData::clone(info)
+                }))
             }
             Type::Array(elem) => {
                 let contextual = match target {
@@ -17024,6 +18760,20 @@ impl TypeChecker {
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// An object type with at least one property, all of them optional, and
+    /// no signatures (tsc's "weak type").
+    fn is_all_optional_object(ty: &Type) -> bool {
+        matches!(ty, Type::ObjectType(info)
+            if !info.properties.is_empty()
+                && info.call_signatures.is_empty()
+                && info.construct_signatures.is_empty()
+                && info.index_signature.is_none()
+                && info
+                    .properties
+                    .iter()
+                    .all(|(_, property)| matches!(property.as_ref(), Type::Optional(_))))
+    }
+
     fn check_assertion_comparability_inner(&mut self, source: &Type, target: &Type, span: Span) {
         let exempt = |t: &Type| {
             matches!(
@@ -17036,6 +18786,28 @@ impl TypeChecker {
         };
         if exempt(source) || exempt(target) {
             return;
+        }
+        // An object literal that spreads a value whose members could not be
+        // enumerated (an index-signature record, `object`, an unreduced
+        // alias) carries the `__spread__` marker: it may have any property,
+        // so nothing says the conversion is a mistake.
+        if matches!(source, Type::ObjectType(info)
+            if info.properties.iter().any(|(name, _)| name == "__spread__"))
+        {
+            return;
+        }
+        // `x as A & B` where `A` alone is assignable to `x`'s type: the
+        // intersection is a subtype of `A`, hence of the source.
+        if let Type::Intersection(members) = target {
+            if members.iter().any(|member| {
+                let member = match member {
+                    Type::Typeof(name) => self.lookup_var(name).cloned().unwrap_or(Type::Any),
+                    other => other.clone(),
+                };
+                matches!(member, Type::Any) || self.is_assignable_to(&member, source)
+            }) {
+                return;
+            }
         }
         // An in-scope type parameter compares through its constraint (tsc):
         // `<T>{}` / `null as T` are not mistakes.
@@ -17065,6 +18837,30 @@ impl TypeChecker {
             return;
         }
         if self.is_assignable_to(source, target) || self.is_assignable_to(target, source) {
+            return;
+        }
+        // A union source is comparable when any one constituent is (tsc
+        // relates each member of a source union under the comparable
+        // relation): `x as T` with `x: U | undefined` only needs `U`.
+        if let Type::Union(members) = source {
+            if members.iter().any(|member| {
+                !matches!(member, Type::Undefined | Type::Null)
+                    && (self.is_assignable_to(member, target)
+                        || self.is_assignable_to(target, member)
+                        || Self::is_all_optional_object(target))
+            }) {
+                return;
+            }
+        }
+        // A target whose properties are all optional accepts any non-nullish
+        // source in a cast: the weak-type check ("no properties in common")
+        // belongs to assignability, not comparability.
+        if Self::is_all_optional_object(target)
+            && !matches!(
+                source,
+                Type::Undefined | Type::Null | Type::Void | Type::Union(_)
+            )
+        {
             return;
         }
         self.diagnostics.push(Diagnostic {
@@ -17222,6 +19018,113 @@ impl TypeChecker {
 
     fn is_assignable_to(&self, source: &Type, target: &Type) -> bool {
         use std::sync::atomic::Ordering;
+        // `G<any, any>` is assignable to any `G<…>`: `any` relates in every
+        // variance position. The source may be an alias of such a reference
+        // (`type AnyG = G<any, any>`), and either side may name `G` by its
+        // file-scoped key.
+        // In a file that binds `Name` to its own declaration's scoped key,
+        // `Name` (an instance from `new Name()`, `this`) and the key are one
+        // type.
+        if let (
+            Type::TypeReference(source_name, source_args),
+            Type::TypeReference(target_name, target_args),
+        ) = (source, target)
+        {
+            if source_name != target_name && source_args == target_args {
+                let bound = |bare: &str, key: &str| {
+                    self.scoped_type_keys
+                        .get(bare)
+                        .is_some_and(|scoped| scoped == key)
+                        && self.class_info.contains_key(key)
+                };
+                if bound(source_name, target_name) || bound(target_name, source_name) {
+                    return true;
+                }
+                // Two copies of one package (`node_modules/foo` and
+                // `node_modules/a/node_modules/foo`): the same file path
+                // below `node_modules/`, declaring the same class.
+                let package_path = |key: &str| -> Option<std::string::String> {
+                    let rest = key.strip_prefix(FILE_INTERFACE_KEY_PREFIX)?;
+                    let (file, _) = rest.rsplit_once("::")?;
+                    let (_, below) = file.rsplit_once("/node_modules/")?;
+                    // `@types/foo` types the package `foo`.
+                    Some(below.strip_prefix("@types/").unwrap_or(below).to_string())
+                };
+                let same_package_file = matches!(
+                    (package_path(source_name), package_path(target_name)),
+                    (Some(a), Some(b)) if a == b
+                );
+                // Across files: the by-name entry and a file-scoped entry of
+                // the same name are one class when they declare the same
+                // members (the by-name registry holds one of the program's
+                // same-named classes; a reference resolved without its
+                // file's scope carries the bare name).
+                let one_is_bare = !source_name.starts_with(FILE_INTERFACE_KEY_PREFIX)
+                    || !target_name.starts_with(FILE_INTERFACE_KEY_PREFIX);
+                if (one_is_bare || same_package_file)
+                    && scoped_interface_display_name(source_name)
+                        == scoped_interface_display_name(target_name)
+                {
+                    if let (Some(source_class), Some(target_class)) = (
+                        self.class_info.get(source_name.as_str()),
+                        self.class_info.get(target_name.as_str()),
+                    ) {
+                        let names = |members: &[(std::string::String, Type)]| {
+                            members
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .collect::<Vec<_>>()
+                        };
+                        // (A `.d.ts` and its source list the same methods;
+                        // their property lists differ in the private ones.)
+                        let methods = |class: &ClassInfo| {
+                            let mut names: Vec<std::string::String> = class
+                                .instance_methods
+                                .iter()
+                                .map(|(name, _)| name.clone())
+                                .filter(|name| !name.starts_with('#'))
+                                .collect();
+                            names.sort_unstable();
+                            names.dedup();
+                            names
+                        };
+                        let source_methods = methods(source_class);
+                        let same_methods = source_methods == methods(target_class);
+                        if same_methods && !source_methods.is_empty() {
+                            return true;
+                        }
+                        // Two copies of a package file, or the by-name entry
+                        // and a scoped one: member for member.
+                        if (same_package_file || one_is_bare)
+                            && same_methods
+                            && names(&source_class.instance_properties)
+                                == names(&target_class.instance_properties)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if self.is_any_instantiation_of(source, target)
+            || matches!(target, Type::Union(members)
+                if members.iter().any(|member| self.is_any_instantiation_of(source, member)))
+        {
+            return true;
+        }
+        // An object literal that spreads a value whose members could not be
+        // listed carries the `__spread__` marker: it may have any property,
+        // so no object-like target can be shown to reject it.
+        if let Type::ObjectType(info) = source {
+            if info.properties.iter().any(|(name, _)| name == "__spread__")
+                && matches!(
+                    target,
+                    Type::ObjectType(_) | Type::TypeReference(..) | Type::Intersection(_)
+                )
+            {
+                return true;
+            }
+        }
         // The requested relation mode applies to THIS call only; nested
         // relations start fresh (tsc passes checkMode per signature pair).
         let mode = self.relation_mode.swap(0, Ordering::Relaxed);
@@ -17299,7 +19202,7 @@ impl TypeChecker {
         // exports (`var xs: I[] = [moduleA]`).
         if let Type::Module(module) = source {
             if !matches!(target, Type::Module(_)) {
-                let shape = Type::ObjectType(ObjectTypeInfo {
+                let shape = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     properties: module
                         .exports
                         .iter()
@@ -17311,7 +19214,7 @@ impl TypeChecker {
                     index_signature: None,
                     index_signature_name: None,
                     method_names: Vec::new(),
-                });
+                }));
                 return Some(self.is_assignable_to(&shape, target));
             }
         }
@@ -17524,14 +19427,14 @@ impl TypeChecker {
                 index_sig = own_index_sig;
             }
 
-            let mut obj_type = Type::ObjectType(ObjectTypeInfo {
+            let mut obj_type = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties,
                 call_signatures: call_sigs,
                 construct_signatures: construct_sigs,
                 index_signature: index_sig,
                 index_signature_name: None,
                 method_names,
-            });
+            }));
 
             // Substitute type args in own properties
             if let Some(ref map) = subst_map {
@@ -17723,7 +19626,7 @@ impl TypeChecker {
                     })
                     .collect(),
             }),
-            Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo {
+            Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: info
                     .properties
                     .iter()
@@ -17801,7 +19704,7 @@ impl TypeChecker {
                 }),
                 index_signature_name: info.index_signature_name.clone(),
                 method_names: info.method_names.clone(),
-            }),
+            })),
             Type::Optional(inner) => {
                 Type::Optional(Arc::new(Self::substitute_this(inner, receiver)))
             }
@@ -17933,7 +19836,7 @@ impl TypeChecker {
                         .collect(),
                 })
             }
-            Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo {
+            Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: info
                     .properties
                     .iter()
@@ -18044,7 +19947,7 @@ impl TypeChecker {
                 }),
                 index_signature_name: info.index_signature_name.clone(),
                 method_names: info.method_names.clone(),
-            }),
+            })),
             Type::Conditional {
                 check,
                 extends,
@@ -18097,6 +20000,376 @@ impl TypeChecker {
     /// assignability (zod's `.refine(fn, { message: "..." })` overload).
     fn simplify_type_for_display(&self, ty: &Type) -> Type {
         self.simplify_type_modal(ty, true)
+    }
+
+    /// `Alias<Args>` reduced to the shape it computes, when the alias is a
+    /// type-level computation (conditional / mapped / indexed access) and
+    /// the reduction comes out fully concrete; the reference itself
+    /// otherwise.
+    /// `evaluate_instantiated_alias` on a type or on each member of a union
+    /// (`GetResult<…> | null`).
+    pub(crate) fn evaluate_instantiated_aliases(&self, ty: Type) -> Type {
+        match &ty {
+            Type::Union(members)
+                if members.iter().any(
+                    |member| matches!(member, Type::TypeReference(_, args) if !args.is_empty()),
+                ) =>
+            {
+                Type::flatten_union(
+                    members
+                        .iter()
+                        .map(|member| self.evaluate_instantiated_alias(member.clone()))
+                        .collect(),
+                )
+            }
+            Type::TypeReference(_, args) if !args.is_empty() => {
+                match self.evaluate_instantiated_alias(ty) {
+                    // `GetResult<…, "findMany">` reduces to `Row<…>[]`.
+                    Type::Array(element) => Type::Array(Arc::new(
+                        self.evaluate_instantiated_aliases(Type::clone(&element)),
+                    )),
+                    other => other,
+                }
+            }
+            _ => ty,
+        }
+    }
+
+    pub(crate) fn evaluate_instantiated_alias(&self, ty: Type) -> Type {
+        let Type::TypeReference(name, args) = &ty else {
+            return ty;
+        };
+        if args.is_empty() {
+            return ty;
+        }
+        let computes = self
+            .type_aliases
+            .get(name.as_str())
+            .or_else(|| {
+                let (qualifier, bare) = name.rsplit_once('.')?;
+                self.is_namespace_qualifier(qualifier)
+                    .then(|| self.type_aliases.get(bare))
+                    .flatten()
+            })
+            .is_some_and(|(_, body, _)| {
+                matches!(
+                    body,
+                    Type::Conditional { .. } | Type::Mapped { .. } | Type::IndexedAccess(..)
+                )
+            });
+        if !computes {
+            return ty;
+        }
+        // Computing over an `any` (or not-yet-known) argument yields shapes
+        // tsc would not: leave those to the lenient reference.
+        fn has_unknown_argument(args: &[Type], depth: u8) -> bool {
+            args.iter().any(|arg| match arg {
+                Type::Any | Type::Unknown | Type::Error => true,
+                Type::TypeReference(_, inner) if depth < 3 => {
+                    has_unknown_argument(inner, depth + 1)
+                }
+                _ => false,
+            })
+        }
+        if has_unknown_argument(args, 0) {
+            return ty;
+        }
+        if let Some(known) = self
+            .alias_evaluations
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&ty).cloned())
+        {
+            return known;
+        }
+        let result = self.evaluate_instantiated_alias_uncached(&ty);
+        // Only a completed evaluation is remembered: one that gave up (the
+        // statement's budget was nearly spent) must be retried, or the
+        // outcome would depend on which statement asked first.
+        if result != ty {
+            if let Ok(mut cache) = self.alias_evaluations.lock() {
+                cache.insert(ty, result.clone());
+            }
+        }
+        result
+    }
+
+    fn evaluate_instantiated_alias_uncached(&self, ty: &Type) -> Type {
+        let ty = ty.clone();
+        let reduced = self.simplify_type_for_display(&ty);
+        let is_empty_object = matches!(&reduced, Type::ObjectType(info)
+            if info.properties.is_empty() && info.index_signature.is_none());
+        if reduced != ty && !is_empty_object && self.computation_is_resolved(&reduced, 0) {
+            reduced
+        } else {
+            ty
+        }
+    }
+
+    /// The type-level computation that produced `ty` ran to completion: no
+    /// conditional, mapped, indexed-access or `keyof` is left at its top or
+    /// as a member's type. Named members (`db: PrismaClient`) are fine.
+    fn computation_is_resolved(&self, ty: &Type, depth: u8) -> bool {
+        match ty {
+            Type::Mapped { .. }
+            | Type::Conditional { .. }
+            | Type::IndexedAccess(..)
+            | Type::Keyof(_)
+            | Type::Infer(_)
+            | Type::TypeParameter(_)
+            | Type::Typeof(_)
+            | Type::Error => false,
+            Type::ObjectType(info) if depth == 0 => info
+                .properties
+                .iter()
+                .all(|(_, member)| self.computation_is_resolved(member, depth + 1)),
+            Type::Union(members) | Type::Intersection(members) => members
+                .iter()
+                .all(|member| self.computation_is_resolved(member, depth)),
+            Type::Optional(inner) => self.computation_is_resolved(inner, depth),
+            Type::TypeReference(..) => self.active_type_parameter_name(ty).is_none(),
+            _ => true,
+        }
+    }
+
+    /// `X` when the interface `name<args>` extends `Promise<X>` or
+    /// `PromiseLike<X>`, directly or through its bases.
+    pub(crate) fn promised_type_through_heritage(
+        &self,
+        name: &str,
+        args: &[Type],
+        depth: u8,
+    ) -> Option<Type> {
+        if depth > 6 {
+            return None;
+        }
+        if matches!(name, "Promise" | "PromiseLike") {
+            return (args.len() == 1).then(|| args[0].clone());
+        }
+        // A namespace-qualified name (`runtime.Types.Public.PrismaPromise`)
+        // is looked up by its last segment.
+        let info = self.interface_info.get(name).or_else(|| {
+            let (_, bare) = name.rsplit_once('.')?;
+            self.interface_info.get(bare)
+        })?;
+        let map: HashMap<std::string::String, Type> = info
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        info.extends.iter().find_map(|(base, base_args)| {
+            let base_args: Vec<Type> = base_args
+                .iter()
+                .map(|arg| Self::substitute(arg, &map))
+                .collect();
+            self.promised_type_through_heritage(base, &base_args, depth + 1)
+        })
+    }
+
+    /// The resolved defaults of an alias's type parameters, when it has any.
+    fn alias_default_types(
+        &self,
+        type_params: Option<&[tsc_rs_ast::TypeParam]>,
+    ) -> Option<Vec<Option<Type>>> {
+        let type_params = type_params?;
+        if !type_params.iter().any(|param| param.default.is_some()) {
+            return None;
+        }
+        Some(
+            type_params
+                .iter()
+                .map(|param| {
+                    param
+                        .default
+                        .as_ref()
+                        .map(|node| self.resolve_type_node(node))
+                })
+                .collect(),
+        )
+    }
+
+    /// The type arguments a generic alias written without any takes: its
+    /// parameters' defaults, each seeing the ones before it. `None` unless
+    /// every parameter has a default.
+    pub(crate) fn defaulted_alias_arguments(
+        &self,
+        name: &str,
+        written: &[Type],
+    ) -> Option<Arc<[Type]>> {
+        if !written.is_empty() {
+            return None;
+        }
+        let (params, _, required) = self.type_aliases.get(name)?;
+        if params.is_empty() || *required != 0 {
+            return None;
+        }
+        let defaults = self.alias_type_param_defaults.get(name)?;
+        let mut map: HashMap<std::string::String, Type> = HashMap::new();
+        let mut arguments = Vec::with_capacity(params.len());
+        for (param, default) in params.iter().zip(defaults.iter()) {
+            let argument = Self::substitute(default.as_ref()?, &map);
+            map.insert(param.clone(), argument.clone());
+            arguments.push(argument);
+        }
+        (arguments.len() == params.len()).then(|| arguments.into())
+    }
+
+    /// `source` is `G<any, …, any>` (directly, or as a non-generic alias of
+    /// it) and `target` is some `G<…>`; either may name `G` by its
+    /// file-scoped key.
+    fn is_any_instantiation_of(&self, source: &Type, target: &Type) -> bool {
+        let Type::TypeReference(target_name, target_args) = target else {
+            return false;
+        };
+        let aliased;
+        let source_reference = match source {
+            Type::TypeReference(name, args) if args.is_empty() => {
+                match self.type_aliases.get(name.as_str()) {
+                    Some((params, body, _)) if params.is_empty() => {
+                        aliased = body.clone();
+                        &aliased
+                    }
+                    _ => source,
+                }
+            }
+            _ => source,
+        };
+        // A target argument that is a computation over `unknown`/`any`
+        // (`Overwrite<Ctx, Overwrite<object, unknown>>`) is not reduced, so
+        // nothing can be held against the source argument there.
+        fn open_computation(ty: &Type, depth: u8) -> bool {
+            match ty {
+                Type::TypeReference(_, args) if depth < 4 && !args.is_empty() => {
+                    args.iter().any(|arg| {
+                        matches!(arg, Type::Unknown | Type::Any) || open_computation(arg, depth + 1)
+                    })
+                }
+                _ => false,
+            }
+        }
+        let Type::TypeReference(source_name, source_args) = source_reference else {
+            return false;
+        };
+        if scoped_interface_display_name(source_name) != scoped_interface_display_name(target_name)
+            || source_args.is_empty()
+            || source_args.len() != target_args.len()
+        {
+            return false;
+        }
+        // `new Cache(…)` of a generic class whose type argument we did not
+        // infer (tsc takes it from the assignment target): every argument
+        // `unknown`.
+        if self.class_info.contains_key(source_name.as_str())
+            && source_args.iter().all(|arg| matches!(arg, Type::Unknown))
+        {
+            return true;
+        }
+        let pairs = || source_args.iter().zip(target_args.iter());
+        // With an unreduced computation among the target's arguments the
+        // comparison cannot be decided; an `unknown` source argument is then
+        // given the benefit of the doubt too (it is the top type wherever
+        // the parameter is used as an input).
+        let undecidable = pairs().any(|(_, target_arg)| open_computation(target_arg, 0));
+        (undecidable || pairs().any(|(source_arg, _)| matches!(source_arg, Type::Any)))
+            && pairs().all(|(source_arg, target_arg)| {
+                matches!(source_arg, Type::Any)
+                    || source_arg == target_arg
+                    || open_computation(target_arg, 0)
+                    || (undecidable && matches!(source_arg, Type::Unknown))
+            })
+    }
+
+    /// Reduce `Obj["key"]` (at the top, in a union, or as a type argument,
+    /// e.g. `Promise<M["k"]>`) to the member's type when it resolves.
+    pub(crate) fn reduce_literal_indexed_accesses(&self, ty: &Type, depth: u8) -> Type {
+        if depth > 3 {
+            return ty.clone();
+        }
+        match ty {
+            Type::IndexedAccess(_, index)
+                if matches!(
+                    index.as_ref(),
+                    Type::StringLiteral(_) | Type::NumberLiteral(_)
+                ) =>
+            {
+                let reduced = self.simplify_type(ty);
+                if matches!(reduced, Type::IndexedAccess(..) | Type::Error) {
+                    ty.clone()
+                } else {
+                    reduced
+                }
+            }
+            Type::TypeReference(name, args)
+                if args
+                    .iter()
+                    .any(|arg| matches!(arg, Type::IndexedAccess(..))) =>
+            {
+                Type::TypeReference(
+                    name.clone(),
+                    args.iter()
+                        .map(|arg| self.reduce_literal_indexed_accesses(arg, depth + 1))
+                        .collect(),
+                )
+            }
+            _ => ty.clone(),
+        }
+    }
+
+    /// lib `Awaited<T>` for a `T` whose shape is known: promises unwrap
+    /// (recursively), unions distribute, anything without a `then` member
+    /// is itself. `None` when it cannot be told yet (a type parameter, an
+    /// unresolved reference, a custom thenable).
+    fn awaited_type(&self, ty: &Type, depth: u8) -> Option<Type> {
+        if depth > 8 {
+            return None;
+        }
+        match ty {
+            Type::Any | Type::Unknown | Type::Never | Type::Error => Some(ty.clone()),
+            Type::Null
+            | Type::Undefined
+            | Type::Void
+            | Type::String
+            | Type::Number
+            | Type::Boolean
+            | Type::BigInt
+            | Type::Symbol
+            | Type::StringLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::BooleanLiteral(_)
+            | Type::BigIntLiteral(_)
+            | Type::Array(_)
+            | Type::Tuple(_)
+            | Type::Function(_) => Some(ty.clone()),
+            Type::Union(members) => members
+                .iter()
+                .map(|member| self.awaited_type(member, depth + 1))
+                .collect::<Option<Vec<Type>>>()
+                .map(Type::flatten_union),
+            Type::TypeReference(name, args)
+                if matches!(name.as_str(), "Promise" | "PromiseLike") && args.len() == 1 =>
+            {
+                self.awaited_type(&args[0], depth + 1)
+            }
+            Type::ObjectType(info) => {
+                (!info.properties.iter().any(|(name, _)| name == "then")).then(|| ty.clone())
+            }
+            Type::TypeReference(name, _) => {
+                if self.type_aliases.contains_key(name.as_str())
+                    || self.active_type_parameter_name(ty).is_some()
+                {
+                    return None;
+                }
+                match self.get_class_instance_type(name) {
+                    Type::ObjectType(info) => {
+                        (!info.properties.iter().any(|(name, _)| name == "then"))
+                            .then(|| ty.clone())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn simplify_type_modal(&self, ty: &Type, display: bool) -> Type {
@@ -18163,10 +20436,22 @@ impl TypeChecker {
             Type::Union(members) => {
                 let mut out = Vec::new();
                 for m in members.iter() {
-                    if let Type::StringLiteral(s) = m {
-                        out.push(s.clone());
-                    } else {
-                        return None;
+                    match m {
+                        Type::StringLiteral(s) => {
+                            if !out.contains(s) {
+                                out.push(s.clone());
+                            }
+                        }
+                        Type::Never => {}
+                        // `keyof A | keyof B`: each side's own keys.
+                        Type::Keyof(_) => {
+                            for key in self.mapped_key_literals(m, display)? {
+                                if !out.contains(&key) {
+                                    out.push(key);
+                                }
+                            }
+                        }
+                        _ => return None,
                     }
                 }
                 Some(out)
@@ -18182,9 +20467,18 @@ impl TypeChecker {
     /// `None` when any member isn't a concrete object (can't enumerate).
     fn object_like_keys(&self, ty: &Type, display: bool) -> Option<Vec<String>> {
         match ty {
+            // `keyof object` is `never`.
+            Type::Object => Some(Vec::new()),
             Type::ObjectType(info) => {
                 Some(info.properties.iter().map(|(n, _)| n.clone()).collect())
             }
+            // The keys of a mapped type are the keys it maps to.
+            Type::Mapped { .. } => match self.simplify_type_modal(ty, true) {
+                Type::ObjectType(info) => {
+                    Some(info.properties.iter().map(|(n, _)| n.clone()).collect())
+                }
+                _ => None,
+            },
             Type::Intersection(members) => {
                 let mut out: Vec<String> = Vec::new();
                 for m in members.iter() {
@@ -18290,14 +20584,14 @@ impl TypeChecker {
 
             properties.push((out_name, Arc::new(prop_ty)));
         }
-        Some(Type::ObjectType(ObjectTypeInfo {
+        Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties,
             call_signatures: Vec::new(),
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        }))
+        })))
     }
 
     /// Whether a conditional's (already deep-expanded) check side is still
@@ -18350,7 +20644,22 @@ impl TypeChecker {
                 // `unknown` branch, silently widening every field. Roll the
                 // budget back to the pre-check mark once the relation is known.
                 let budget_mark = crate::instantiation_budget_mark();
-                let check_struct = self.deep_expand_for_conditional(&check_simp);
+                // Against `object` / `any` / `unknown` only the check type's
+                // own kind matters: expand the reference one level, not every
+                // member's type below it (an interface with a thousand typed
+                // members would spend the whole budget here).
+                let check_struct =
+                    if matches!(extends_simp, Type::Object | Type::Any | Type::Unknown) {
+                        match &check_simp {
+                            Type::TypeReference(..) => self
+                                .resolve_for_simplify(&check_simp)
+                                .unwrap_or_else(|| check_simp.clone()),
+                            other => other.clone(),
+                        }
+                    } else {
+                        let extends_struct = self.deep_expand_for_conditional(&extends_simp);
+                        self.deep_expand_check_for(&check_simp, &extends_struct)
+                    };
                 let extends_struct = self.deep_expand_for_conditional(&extends_simp);
                 crate::restore_instantiation_budget(budget_mark);
                 // Bail out if the check side is still abstract — either a
@@ -18409,11 +20718,44 @@ impl TypeChecker {
                 };
                 let simp_branch =
                     |me: &Self, t: &Arc<Type>| -> Type { me.simplify_type_modal(t, display) };
+                // `keyof X extends U ? A : B` distributes over X's keys, and a
+                // branch that names the checked type again (`Exclude<keyof X,
+                // U>` is `keyof X extends U ? never : keyof X`) means the key
+                // being tested, not all of them.
+                if let (Type::Keyof(_), Type::Union(keys)) = (&check_simp, &check_struct) {
+                    if !can_infer_match {
+                        let branch = |me: &Self, t: &Arc<Type>, key: &Type| -> Type {
+                            if t.as_ref() == check.as_ref() || *t.as_ref() == check_simp {
+                                key.clone()
+                            } else {
+                                simp_branch(me, t)
+                            }
+                        };
+                        let distributed: Vec<Type> = keys
+                            .iter()
+                            .map(|key| {
+                                crate::type_computations::evaluate_conditional_type_inner(
+                                    key,
+                                    &extends_struct,
+                                    &branch(self, true_type, key),
+                                    &branch(self, false_type, key),
+                                    &HashMap::new(),
+                                )
+                            })
+                            .collect();
+                        return self
+                            .simplify_type_modal(&Type::flatten_union(distributed), display);
+                    }
+                }
+                // The branches go in as written: only the selected one is
+                // simplified (below, on the result). Simplifying both first
+                // made `T extends any[] | Date ? T : { … }` pay for a full
+                // display fold of `T` it then discarded.
                 let evaluated = crate::type_computations::evaluate_conditional_type_inner(
                     eval_check,
                     eval_extends,
-                    &simp_branch(self, true_type),
-                    &simp_branch(self, false_type),
+                    true_type,
+                    false_type,
                     &HashMap::new(),
                 );
                 // The evaluator may return another Conditional / IndexedAccess
@@ -18430,8 +20772,11 @@ impl TypeChecker {
                 self.simplify_type_modal(&evaluated, display)
             }
             Type::IndexedAccess(obj, idx) => {
-                let obj_simp = self.simplify_type_modal(obj, display);
                 let idx_simp = self.simplify_type_modal(idx, display);
+                let obj_simp = match self.prune_alias_to_key_path(obj, &idx_simp) {
+                    Some(pruned) => self.simplify_type_modal(&pruned, display),
+                    None => self.simplify_type_modal(obj, display),
+                };
                 let obj_struct = self
                     .resolve_for_simplify(&obj_simp)
                     .unwrap_or_else(|| obj_simp.clone());
@@ -18464,6 +20809,20 @@ impl TypeChecker {
             // last `.` for namespace-qualified names (`core.output` →
             // `output`) since the donor's `inject_stmt` registers aliases
             // under their bare-name identifier with no namespace prefix.
+            Type::TypeReference(name, args)
+                if args.is_empty()
+                    && MAPPED_PARAMS_IN_RESOLUTION
+                        .with(|stack| stack.borrow().iter().any(|param| param == name)) =>
+            {
+                ty.clone()
+            }
+            Type::TypeReference(name, args) if name == "Awaited" && args.len() == 1 => {
+                let operand = self.simplify_type_modal(&args[0], display);
+                match self.awaited_type(&operand, 0) {
+                    Some(awaited) => awaited,
+                    None => ty.clone(),
+                }
+            }
             Type::TypeReference(name, args) => {
                 // Bare-name fallback only when the namespace prefix is a
                 // known import alias — see `resolve_type_reference_to_object`
@@ -18485,15 +20844,48 @@ impl TypeChecker {
                 if let Some((params, body, _required)) = self.type_aliases.get(lookup_name).cloned()
                 {
                     if !args.is_empty() && !params.is_empty() {
+                        // An argument that is itself a computed alias
+                        // (`Simplify<Overwrite<C, Overwrite<object, X>>>`)
+                        // is evaluated once here; left as a reference it
+                        // would be re-evaluated at every use in the body
+                        // (once per mapped key).
                         let map: std::collections::HashMap<String, Type> = params
                             .iter()
                             .zip(args.iter())
-                            .map(|(p, a)| (p.clone(), a.clone()))
+                            .map(|(p, a)| {
+                                let arg = match a {
+                                    Type::TypeReference(_, inner)
+                                        if display && !inner.is_empty() =>
+                                    {
+                                        self.evaluate_instantiated_alias(a.clone())
+                                    }
+                                    _ => a.clone(),
+                                };
+                                (p.clone(), arg)
+                            })
                             .collect();
                         let substituted = Self::substitute(&body, &map);
                         return self.simplify_type_modal(&substituted, display);
                     } else if args.is_empty() && params.is_empty() {
                         return self.simplify_type_modal(&body, display);
+                    }
+                }
+                // A conditional passed as a type argument
+                // (`B<N extends F ? Unwrap<N> : N>` once `N` is known)
+                // resolves like one written on its own.
+                if args
+                    .iter()
+                    .any(|arg| matches!(arg, Type::Conditional { .. }))
+                {
+                    let simplified: Vec<Type> = args
+                        .iter()
+                        .map(|arg| match arg {
+                            Type::Conditional { .. } => self.simplify_type_modal(arg, display),
+                            other => other.clone(),
+                        })
+                        .collect();
+                    if simplified.as_slice() != &args[..] {
+                        return Type::TypeReference(name.clone(), simplified.into());
                     }
                 }
                 ty.clone()
@@ -18567,14 +20959,14 @@ impl TypeChecker {
                         (n.clone(), Arc::new(simped))
                     })
                     .collect();
-                Type::ObjectType(ObjectTypeInfo {
+                Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     properties: new_props,
                     call_signatures: info.call_signatures.clone(),
                     construct_signatures: info.construct_signatures.clone(),
                     index_signature: info.index_signature.clone(),
                     index_signature_name: info.index_signature_name.clone(),
                     method_names: info.method_names.clone(),
-                })
+                }))
             }
             // Keyof: simplify the inner and, if it became a concrete
             // ObjectType, return the union of its property names as
@@ -18657,6 +21049,165 @@ impl TypeChecker {
     /// or `Type::Typeof(name)` into the concrete structural form it
     /// points to. Returns `None` for non-references or unresolvable
     /// names; callers fall back to the original type.
+    /// For `Alias<Args>["a"]["b"]…` with literal keys, where `Alias` is a
+    /// generic alias of a large object type: the alias instantiated from a
+    /// body pruned to the properties on that key path, under the same
+    /// indexed accesses (all but the last, which the caller applies).
+    ///
+    /// Instantiating substitutes the arguments through the whole body and
+    /// simplifies all of it, to then read one property. Prisma's
+    /// `TypeMap<ExtArgs>['model']['User']`, written once per model, did that
+    /// over the type map of every model (20 ms per model file at
+    /// declaration load). Substitution and simplification work property by
+    /// property, so pruning first gives the same type for the path.
+    pub(crate) fn prune_alias_to_key_path(&self, obj: &Type, last_key: &Type) -> Option<Type> {
+        // Small bodies are not worth a second code path.
+        const MIN_PROPERTIES: usize = 16;
+        let Type::StringLiteral(last_key) = last_key else {
+            return None;
+        };
+        // Keys from the outermost access inwards, then the alias reference.
+        let mut keys: Vec<&str> = vec![last_key.as_str()];
+        let mut base = obj;
+        while let Type::IndexedAccess(inner, key) = base {
+            let Type::StringLiteral(key) = key.as_ref() else {
+                return None;
+            };
+            keys.push(key.as_str());
+            base = inner.as_ref();
+        }
+        let Type::TypeReference(name, args) = base else {
+            return None;
+        };
+        if args.is_empty() {
+            return None;
+        }
+        // The alias lookup of the `TypeReference` arm of `simplify_type_impl`.
+        let lookup_name: &str = if self.type_aliases.contains_key(name.as_str()) {
+            name.as_str()
+        } else if let Some(idx) = name.rfind('.') {
+            let bare = &name[idx + 1..];
+            let qualifier = &name[..idx];
+            if self.type_aliases.contains_key(bare) && self.is_namespace_qualifier(qualifier) {
+                bare
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+        let (params, body, _required) = self.type_aliases.get(lookup_name)?;
+        if params.is_empty() {
+            return None;
+        }
+        // The object with only `key` (pruned further along `rest`), or with
+        // no property at all when it does not have `key`. `found` reports a
+        // hit anywhere.
+        fn prune_object(info: &ObjectTypeInfo, path: &[&str], found: &mut bool) -> Option<Type> {
+            let (key, rest) = path.split_first()?;
+            let mut matches = info.properties.iter().filter(|(name, _)| name == key);
+            let hit = matches.next();
+            if matches.next().is_some() {
+                return None;
+            }
+            let properties = match hit {
+                Some((name, ty)) => {
+                    *found = true;
+                    let ty = if rest.is_empty() {
+                        Arc::clone(ty)
+                    } else {
+                        let mut found_below = false;
+                        match prune(ty, rest, &mut found_below) {
+                            Some(pruned) if found_below => Arc::new(pruned),
+                            _ => Arc::clone(ty),
+                        }
+                    };
+                    vec![(name.clone(), ty)]
+                }
+                None => Vec::new(),
+            };
+            Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                method_names: info
+                    .method_names
+                    .iter()
+                    .filter(|method| properties.iter().any(|(name, _)| name == *method))
+                    .cloned()
+                    .collect(),
+                properties,
+                call_signatures: info.call_signatures.clone(),
+                construct_signatures: info.construct_signatures.clone(),
+                index_signature: info.index_signature.clone(),
+                index_signature_name: info.index_signature_name.clone(),
+            })))
+        }
+        // An object, or an intersection whose object members are pruned
+        // one by one (an indexed access reads each member's own property).
+        fn prune(ty: &Type, path: &[&str], found: &mut bool) -> Option<Type> {
+            match ty {
+                Type::ObjectType(info) => prune_object(info, path, found),
+                Type::Intersection(members) => {
+                    let mut pruned = Vec::with_capacity(members.len());
+                    for member in members.iter() {
+                        pruned.push(match member {
+                            Type::ObjectType(info) => prune_object(info, path, found)?,
+                            other => other.clone(),
+                        });
+                    }
+                    Some(Type::Intersection(pruned.into()))
+                }
+                _ => None,
+            }
+        }
+        // Properties at the top level plus the widest property one level
+        // down (a small wrapper around one huge map still counts as large).
+        fn shallow_count(ty: &Type) -> usize {
+            match ty {
+                Type::ObjectType(info) => info.properties.len(),
+                Type::Intersection(members) => members.iter().map(shallow_count).sum(),
+                _ => 0,
+            }
+        }
+        fn property_count(ty: &Type) -> usize {
+            match ty {
+                Type::ObjectType(info) => {
+                    info.properties.len()
+                        + info
+                            .properties
+                            .iter()
+                            .map(|(_, ty)| shallow_count(ty))
+                            .max()
+                            .unwrap_or(0)
+                }
+                Type::Intersection(members) => members.iter().map(property_count).sum(),
+                _ => 0,
+            }
+        }
+        if property_count(body) < MIN_PROPERTIES {
+            return None;
+        }
+        // Path from the alias body outwards.
+        let path: Vec<&str> = keys.iter().rev().copied().collect();
+        let mut found = false;
+        let pruned = prune(body, &path, &mut found)?;
+        if !found {
+            return None;
+        }
+        let map: std::collections::HashMap<String, Type> = params
+            .iter()
+            .zip(args.iter())
+            .map(|(param, arg)| (param.clone(), arg.clone()))
+            .collect();
+        let mut result = Self::substitute(&pruned, &map);
+        // Re-apply every access except the last.
+        for key in &path[..path.len() - 1] {
+            result = Type::IndexedAccess(
+                Arc::new(result),
+                Arc::new(Type::StringLiteral((*key).to_string())),
+            );
+        }
+        Some(result)
+    }
+
     fn resolve_for_simplify(&self, ty: &Type) -> Option<Type> {
         match ty {
             Type::TypeReference(name, args) => {
@@ -18717,6 +21268,72 @@ impl TypeChecker {
     /// (The old doc line here claimed FREE_FN_DEPTH "from substitute"; the code
     /// has always used the checker's own `recursion_depth` instead.)
     fn deep_expand_for_conditional(&self, ty: &Type) -> Type {
+        // Under a level limit (see `deep_expand_check_for`), stop where the
+        // `extends` pattern can no longer look.
+        let limit = EXPAND_LEVELS_LEFT.with(|levels| levels.get());
+        if limit == Some(0) {
+            return ty.clone();
+        }
+        if let Some(levels) = limit {
+            EXPAND_LEVELS_LEFT.with(|cell| cell.set(Some(levels - 1)));
+        }
+        let result = self.deep_expand_for_conditional_unlimited(ty);
+        EXPAND_LEVELS_LEFT.with(|cell| cell.set(limit));
+        result
+    }
+
+    /// How many levels of members a relation against `pattern` can inspect.
+    fn pattern_depth(pattern: &Type, budget: u32) -> u32 {
+        if budget == 0 {
+            return 0;
+        }
+        match pattern {
+            Type::ObjectType(info) => {
+                1 + info
+                    .properties
+                    .iter()
+                    .map(|(_, member)| Self::pattern_depth(member, budget - 1))
+                    .max()
+                    .unwrap_or(0)
+            }
+            Type::Union(members) | Type::Intersection(members) => members
+                .iter()
+                .map(|member| Self::pattern_depth(member, budget - 1))
+                .max()
+                .unwrap_or(0),
+            Type::Array(inner) | Type::Optional(inner) => {
+                1 + Self::pattern_depth(inner, budget - 1)
+            }
+            Type::Tuple(members) => {
+                1 + members
+                    .iter()
+                    .map(|member| Self::pattern_depth(member, budget - 1))
+                    .max()
+                    .unwrap_or(0)
+            }
+            // A reference left in the pattern is compared by name, not
+            // opened: nothing below it is inspected.
+            _ => 0,
+        }
+    }
+
+    /// Expand a conditional's check type as deep as its (already expanded)
+    /// `extends` pattern can inspect, plus a margin — not through every
+    /// member below that (`T extends any[] | Date` must not walk the whole
+    /// graph under `T`).
+    fn deep_expand_check_for(&self, check: &Type, extends_struct: &Type) -> Type {
+        const MAX_LEVELS: u32 = 8;
+        let levels = Self::pattern_depth(extends_struct, MAX_LEVELS);
+        if levels >= MAX_LEVELS {
+            return self.deep_expand_for_conditional(check);
+        }
+        let saved = EXPAND_LEVELS_LEFT.with(|cell| cell.replace(Some(levels + 1)));
+        let expanded = self.deep_expand_for_conditional(check);
+        EXPAND_LEVELS_LEFT.with(|cell| cell.set(saved));
+        expanded
+    }
+
+    fn deep_expand_for_conditional_unlimited(&self, ty: &Type) -> Type {
         if !self.enter_recursion() {
             return ty.clone();
         }
@@ -18732,6 +21349,15 @@ impl TypeChecker {
     fn deep_expand_for_conditional_inner(&self, ty: &Type) -> Type {
         // `pushed` tracks whether we owe an `expansion_exit`.
         let (expanded, pushed) = match ty {
+            // The parameter of a mapped type being resolved is not the
+            // type that happens to share its name.
+            Type::TypeReference(name, args)
+                if args.is_empty()
+                    && MAPPED_PARAMS_IN_RESOLUTION
+                        .with(|stack| stack.borrow().iter().any(|param| param == name)) =>
+            {
+                return ty.clone();
+            }
             Type::TypeReference(name, _) => {
                 if !expansion_enter(name) {
                     // This name is already being expanded further up the stack:
@@ -18748,10 +21374,39 @@ impl TypeChecker {
                     true,
                 )
             }
+            // `keyof I` for a known object shape is the union of its member
+            // names (`K extends keyof Ctx` has to see them).
+            Type::Keyof(inner) => {
+                let operand = match inner.as_ref() {
+                    Type::TypeReference(..) => self
+                        .resolve_for_simplify(inner)
+                        .unwrap_or_else(|| Type::clone(inner)),
+                    other => other.clone(),
+                };
+                let keys = match &operand {
+                    Type::Object => Some(Type::Never),
+                    Type::ObjectType(info)
+                        if info.index_signature.is_none()
+                            && !info
+                                .properties
+                                .iter()
+                                .any(|(name, _)| name.starts_with('[')) =>
+                    {
+                        Some(Type::flatten_union(
+                            info.properties
+                                .iter()
+                                .map(|(name, _)| Type::StringLiteral(name.clone()))
+                                .collect(),
+                        ))
+                    }
+                    _ => None,
+                };
+                (keys.unwrap_or_else(|| ty.clone()), false)
+            }
             other => (other.clone(), false),
         };
         let result = match &expanded {
-            Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo {
+            Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: info
                     .properties
                     .iter()
@@ -18762,7 +21417,7 @@ impl TypeChecker {
                 index_signature: info.index_signature.clone(),
                 index_signature_name: info.index_signature_name.clone(),
                 method_names: info.method_names.clone(),
-            }),
+            })),
             Type::Constructor(constructor) => Type::Constructor(ConstructorType {
                 is_abstract: constructor.is_abstract,
                 params: constructor
@@ -19025,14 +21680,14 @@ impl TypeChecker {
         match name {
             "Record" if args.len() == 2 => {
                 // Record<K, V> → { [key: K]: V }
-                Some(Type::ObjectType(ObjectTypeInfo {
+                Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     properties: Vec::new(),
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
                     index_signature: Some((Arc::new(args[0].clone()), Arc::new(args[1].clone()))),
                     index_signature_name: None,
                     method_names: Vec::new(),
-                }))
+                })))
             }
             _ => None,
         }
@@ -19519,7 +22174,7 @@ impl TypeChecker {
             && self.direct_constructor_signatures(source).is_some()
         {
             if let Some(members) = self.direct_constructor_static_members(source) {
-                let surface = Type::ObjectType(ObjectTypeInfo {
+                let surface = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     properties: members
                         .into_iter()
                         .map(|(name, ty)| (name, Arc::new(ty)))
@@ -19529,7 +22184,7 @@ impl TypeChecker {
                     index_signature: None,
                     index_signature_name: None,
                     method_names: Vec::new(),
-                });
+                }));
                 return self.is_assignable_to(&surface, target);
             }
         }
@@ -21642,14 +24297,14 @@ impl TypeChecker {
             };
             props.push((name, Arc::new(Type::Any)));
         }
-        Some(Type::ObjectType(ObjectTypeInfo {
+        Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: props,
             call_signatures: Vec::new(),
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        }))
+        })))
     }
 
     fn check_excess_properties(
@@ -21674,6 +24329,38 @@ impl TypeChecker {
             }
         }
 
+        // The empty object type `{}` (also what a `= {}` parameter default
+        // infers) takes any properties: it is not an excess-property target.
+        let is_empty_object = |ty: &Type| {
+            matches!(ty, Type::ObjectType(info)
+                if info.properties.is_empty()
+                    && info.index_signature.is_none()
+                    && info.call_signatures.is_empty()
+                    && info.construct_signatures.is_empty())
+        };
+        let is_open_spread = |ty: &Type| {
+            matches!(ty, Type::ObjectType(info)
+                if info.properties.iter().any(|(name, _)| name == "__spread__"))
+        };
+        match target_type {
+            Type::Optional(inner) if is_empty_object(inner) => return,
+            Type::Union(members)
+                if members.iter().any(is_empty_object)
+                    && members.iter().all(|member| {
+                        is_empty_object(member) || matches!(member, Type::Undefined)
+                    }) =>
+            {
+                return
+            }
+            other if is_empty_object(other) => return,
+            // A target inferred from a literal that spread a value whose
+            // members could not be listed (`let w = { ...unresolved }`)
+            // carries the `__spread__` marker: it may have any property, and
+            // so may a union that has such a member.
+            other if is_open_spread(other) => return,
+            Type::Union(members) if members.iter().any(is_open_spread) => return,
+            _ => {}
+        }
         // Nested fresh object literals are excess-checked against the
         // property type they fill (tsc relates property types recursively;
         // `{ 0: { colour: "blue" } }` against `{ [n: number]: Cover }`).
@@ -21844,6 +24531,8 @@ impl TypeChecker {
                         psp,
                         target_names.iter().copied(),
                     );
+                    // tsc stops at the literal's first excess property.
+                    break;
                 }
             }
             Type::Union(members) => {
@@ -21960,6 +24649,7 @@ impl TypeChecker {
                                 psp,
                             )),
                         }
+                        break;
                     }
                 }
             }
@@ -21998,7 +24688,7 @@ impl TypeChecker {
                     .filter(|n| direct.as_ref().is_none_or(|d| d.contains(n)))
                     .collect();
                 let target_disp = target_type.display_string_single_line();
-                for prop in excess {
+                if let Some(prop) = excess.into_iter().next() {
                     let psp = self.excess_property_span(lit, &prop, span);
                     self.push_excess_property(
                         &prop,
@@ -22054,8 +24744,9 @@ impl TypeChecker {
                         .filter(|n| !allowed.contains(n))
                         .filter(|n| direct.as_ref().is_none_or(|d| d.contains(n)))
                         .collect();
-                    let target_name = name.clone();
-                    for prop in excess {
+                    let target_name = scoped_interface_display_name(name).to_string();
+                    // tsc stops at the literal's first excess property.
+                    if let Some(prop) = excess.into_iter().next() {
                         let psp = self.excess_property_span(lit, &prop, span);
                         self.push_excess_property(
                             &prop,
@@ -23177,6 +25868,7 @@ impl TypeChecker {
                                             },
                                         )
                                     {
+                                        self.stdlib_alias_marker_count += 1;
                                         self.declare_var(
                                             &Self::stdlib_value_alias_marker(n, &value_path),
                                             Type::Never,
@@ -23296,7 +25988,12 @@ impl TypeChecker {
                 // ArrayLit / StrLit / NumLit / BoolLit added alongside the
                 // function-shaped fall-throughs so Prisma `orderBy: [...]`
                 // and similar return literals don't widen and trip TS2322.
-                let ret_ty = if expected_ret.is_some()
+                let returns_async = self.return_is_async_stack.last().copied().unwrap_or(false);
+                let ret_ty = if let Some(awaited) = expected_ret.as_ref().filter(|_| {
+                    returns_async && matches!(e.kind, ExprKind::Call(_) | ExprKind::Await(_))
+                }) {
+                    self.check_async_returned_expr(e, awaited)
+                } else if expected_ret.is_some()
                     && matches!(
                         e.kind,
                         ExprKind::Arrow(_)
@@ -23310,7 +26007,8 @@ impl TypeChecker {
                             | ExprKind::Template(_)
                             | ExprKind::Call(_)
                             | ExprKind::New(_)
-                    ) {
+                    )
+                {
                     self.check_expr_contextual(e, expected_ret.as_ref())
                 } else {
                     self.check_expr(e)
@@ -23348,6 +26046,11 @@ impl TypeChecker {
                                     Type::clone(&args[0])
                                 }
                             }
+                            // A promise subtype (`Prisma__ModelClient<T>`)
+                            // flattens the same way.
+                            Type::TypeReference(name, args) => self
+                                .promised_type_through_heritage(name, args, 0)
+                                .unwrap_or_else(|| ret_ty.clone()),
                             other => other.clone(),
                         }
                     } else {
@@ -25698,7 +28401,7 @@ impl TypeChecker {
     }
 
     fn normalize_module_path(path: &Path) -> String {
-        if let Ok(canonical) = path.canonicalize() {
+        if let Some(canonical) = tsc_rs_resolver::canonicalize(path) {
             return canonical
                 .to_string_lossy()
                 .replace('\\', "/")
@@ -26676,7 +29379,7 @@ impl TypeChecker {
         names
     }
 
-    fn type_param_name_is_active(&self, name: &str) -> bool {
+    pub(crate) fn type_param_name_is_active(&self, name: &str) -> bool {
         self.active_type_param_names
             .iter()
             .rev()
@@ -27169,7 +29872,16 @@ impl TypeChecker {
                     .as_ref()
                     .map(|args| args.len())
                     .unwrap_or(0);
-                if let Some((min_required, max_total)) = self.generic_arity_range(&name) {
+                // An imported name that several modules declare: the
+                // bare-name registry may hold another module's declaration
+                // (an unrelated generic `Filter<A, B>` for the imported plain
+                // `Filter`), so its arity says nothing about this reference.
+                let ambiguous_import = self.imported_type_sources.contains_key(&name)
+                    && self.duplicate_type_names.contains(&name);
+                if let Some((min_required, max_total)) = self
+                    .generic_arity_range(&name)
+                    .filter(|_| !ambiguous_import)
+                {
                     // JavaScript: omitted type arguments default to `any`.
                     let js_defaulted = provided == 0 && self.current_file_is_js();
                     if (provided < min_required || provided > max_total) && !js_defaulted {
@@ -36723,6 +39435,26 @@ impl TypeChecker {
     /// Literal types nested in array/object/tuple positions widen for display
     /// (`[""]` prints as `string[]`, `{ a: 1 }` as `{ a: number; }`); the
     /// top level and null/undefined are left as they are.
+    /// A union of at least two string/number literals (possibly with
+    /// `null`/`undefined`): the type of a value read from a declared
+    /// literal-union position, which literal widening leaves alone.
+    fn is_declared_literal_union(ty: &Type) -> bool {
+        let Type::Union(members) = ty else {
+            return false;
+        };
+        members
+            .iter()
+            .filter(|member| matches!(member, Type::StringLiteral(_) | Type::NumberLiteral(_)))
+            .count()
+            >= 2
+            && members.iter().all(|member| {
+                matches!(
+                    member,
+                    Type::StringLiteral(_) | Type::NumberLiteral(_) | Type::Null | Type::Undefined
+                )
+            })
+    }
+
     fn widen_nested_literal_positions(ty: &Type) -> Type {
         fn widen_leaf(ty: &Type) -> Type {
             match ty {
@@ -36751,18 +39483,27 @@ impl TypeChecker {
         match ty {
             Type::Array(elem) => Type::Array(Arc::new(widen_leaf(elem))),
             Type::Tuple(elems) => Type::Tuple(elems.iter().map(widen_leaf).collect()),
-            Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo {
+            Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: info
                     .properties
                     .iter()
-                    .map(|(name, prop)| (name.clone(), Arc::new(widen_leaf(prop))))
+                    .map(|(name, prop)| {
+                        // A member typed by a union of several literals was
+                        // read from a declared type (`s: item.status`), not
+                        // written as one fresh literal.
+                        if TypeChecker::is_declared_literal_union(prop) {
+                            (name.clone(), Arc::clone(prop))
+                        } else {
+                            (name.clone(), Arc::new(widen_leaf(prop)))
+                        }
+                    })
                     .collect(),
                 call_signatures: info.call_signatures.clone(),
                 construct_signatures: info.construct_signatures.clone(),
                 index_signature: info.index_signature.clone(),
                 index_signature_name: info.index_signature_name.clone(),
                 method_names: info.method_names.clone(),
-            }),
+            })),
             Type::Union(members) => Type::flatten_union(members.iter().map(widen_leaf).collect()),
             other => other.clone(),
         }
@@ -37138,7 +39879,7 @@ impl TypeChecker {
 
         match ty {
             Type::UniqueSymbol(_) => Type::Symbol,
-            Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo {
+            Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: info
                     .properties
                     .iter()
@@ -37163,7 +39904,7 @@ impl TypeChecker {
                 }),
                 index_signature_name: info.index_signature_name.clone(),
                 method_names: info.method_names.clone(),
-            }),
+            })),
             Type::Function(function) => Type::Function(erase_function(function)),
             Type::Array(element) => {
                 Type::Array(Arc::new(Self::erase_inferred_unique_symbols(element)))
@@ -37417,6 +40158,23 @@ impl TypeChecker {
                     Type::Tuple(elems.iter().map(|e| walk(e, unsolved)).collect())
                 }
                 Type::Optional(inner) => Type::Optional(Arc::new(walk(inner, unsolved))),
+                // `T extends X ? A : B` with `T` unsolved is decided as for
+                // `unknown`: `B`, unless `X` accepts everything.
+                Type::Conditional {
+                    check,
+                    extends,
+                    true_type,
+                    false_type,
+                } if matches!(check.as_ref(), Type::TypeParameter(name) if unsolved.contains(name.as_str()))
+                    || matches!(check.as_ref(), Type::TypeReference(name, args)
+                        if args.is_empty() && unsolved.contains(name.as_str())) =>
+                {
+                    if matches!(extends.as_ref(), Type::Any | Type::Unknown) {
+                        walk(true_type, unsolved)
+                    } else {
+                        walk(false_type, unsolved)
+                    }
+                }
                 _ => ty.clone(),
             }
         }
@@ -37455,17 +40213,24 @@ impl TypeChecker {
                     .properties
                     .iter()
                     .map(|(name, prop_ty)| {
+                        // A member whose type is a union of several literals
+                        // (`s: item.status`, `s: raw as "a" | "b"`) was read
+                        // from a declared type, not written as one fresh
+                        // literal: it keeps its type.
+                        if Self::is_declared_literal_union(prop_ty) {
+                            return (name.clone(), Arc::clone(prop_ty));
+                        }
                         (name.clone(), Arc::new(Self::widen_nested_literals(prop_ty)))
                     })
                     .collect();
-                Type::ObjectType(ObjectTypeInfo {
+                Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     properties: widened_props,
                     call_signatures: info.call_signatures.clone(),
                     construct_signatures: info.construct_signatures.clone(),
                     index_signature: info.index_signature.clone(),
                     index_signature_name: info.index_signature_name.clone(),
                     method_names: info.method_names.clone(),
-                })
+                }))
             }
             Type::Array(elem) => Type::Array(Arc::new(Self::widen_nested_literals(elem))),
             Type::Tuple(elems) => Type::Tuple(
@@ -37543,14 +40308,14 @@ impl TypeChecker {
                     .iter()
                     .map(|(name, prop_ty)| (name.clone(), Arc::new(Self::freeze_as_const(prop_ty))))
                     .collect();
-                Type::ObjectType(ObjectTypeInfo {
+                Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     properties: frozen_props,
                     call_signatures: info.call_signatures.clone(),
                     construct_signatures: info.construct_signatures.clone(),
                     index_signature: info.index_signature.clone(),
                     index_signature_name: info.index_signature_name.clone(),
                     method_names: info.method_names.clone(),
-                })
+                }))
             }
             Type::Union(members) => {
                 Type::Union(members.iter().map(|m| Self::freeze_as_const(m)).collect())
@@ -37700,6 +40465,18 @@ impl TypeChecker {
     fn key_type_contains_property(&self, keys: &Type, property: &str) -> Option<bool> {
         match keys {
             Type::StringLiteral(key) => Some(key == property),
+            // A non-generic alias of a key set (`runtime.ITXClientDenyList`),
+            // found by its last segment when namespace-qualified.
+            Type::TypeReference(name, args) if args.is_empty() => {
+                let (params, body, _) = self.type_aliases.get(name.as_str()).or_else(|| {
+                    let (_, bare) = name.rsplit_once('.')?;
+                    self.type_aliases.get(bare)
+                })?;
+                if !params.is_empty() || matches!(body, Type::TypeReference(..)) {
+                    return None;
+                }
+                self.key_type_contains_property(body, property)
+            }
             Type::Union(members) => {
                 let results: Vec<_> = members
                     .iter()
@@ -38197,7 +40974,7 @@ impl TypeChecker {
                     && info.properties.is_empty()
                     && info.index_signature.is_none() =>
             {
-                info.call_signatures.into_iter().next()
+                info.into_data().call_signatures.into_iter().next()
             }
             _ => None,
         }
@@ -38698,14 +41475,14 @@ impl TypeChecker {
                         Arc::new(Self::substitute(v, map)),
                     )
                 });
-                Type::ObjectType(ObjectTypeInfo {
+                Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     properties,
                     call_signatures,
                     construct_signatures,
                     index_signature,
                     index_signature_name: None,
                     method_names: Vec::new(),
-                })
+                }))
             }
             Type::TypeReference(name, args) => Type::TypeReference(
                 name.clone(),
@@ -38887,6 +41664,33 @@ impl TypeChecker {
                         self.resolve_type_for_assignability(ty)
                             .unwrap_or_else(|| ty.clone())
                     }
+                    // `Builder<…> | Fn<…>`: an alias among the alternatives
+                    // (a callable object type, typically) is matched by its
+                    // shape too.
+                    Type::Union(members)
+                        if members.iter().any(|member| {
+                            matches!(member, Type::TypeReference(reference, _)
+                                if self.type_aliases.contains_key(reference.as_str()))
+                        }) =>
+                    {
+                        Type::Union(
+                            members
+                                .iter()
+                                .map(|member| match member {
+                                    Type::TypeReference(reference, _)
+                                        if self.type_aliases.contains_key(reference.as_str())
+                                            && !type_params
+                                                .iter()
+                                                .any(|param| param == reference) =>
+                                    {
+                                        self.resolve_type_for_assignability(member)
+                                            .unwrap_or_else(|| member.clone())
+                                    }
+                                    other => other.clone(),
+                                })
+                                .collect(),
+                        )
+                    }
                     _ => ty.clone(),
                 };
                 (name.clone(), resolved)
@@ -38999,6 +41803,14 @@ impl TypeChecker {
                 if args.is_empty() && type_params.contains(name.as_str()) =>
             {
                 Self::record_inference_candidate(name, arg_ty, inferred);
+            }
+            // An optional member (`ctx?: T`) infers from the value given.
+            Type::Optional(param_inner) => {
+                let arg_inner = match arg_ty {
+                    Type::Optional(inner) => inner.as_ref(),
+                    other => other,
+                };
+                Self::infer_from_types(arg_inner, param_inner, type_params, inferred);
             }
             Type::Array(param_elem) => {
                 if let Type::Array(arg_elem) = arg_ty {
@@ -39149,6 +41961,19 @@ impl TypeChecker {
             // surrounding call returned an unsubstituted
             // `ProcedureBuilder<C, NewI>` (trpc chain bug).
             Type::ObjectType(param_info) => {
+                // A function given where a callable object type is expected
+                // (`{ (opts: O): R; tag?: string }`) infers from its one
+                // call signature.
+                if let (Type::Function(_), [signature]) =
+                    (arg_ty, param_info.call_signatures.as_slice())
+                {
+                    Self::infer_from_types(
+                        arg_ty,
+                        &Type::Function(signature.clone()),
+                        type_params,
+                        inferred,
+                    );
+                }
                 if let Type::ObjectType(arg_info) = arg_ty {
                     for (name, pty) in &param_info.properties {
                         if let Some((_, aty)) = arg_info.properties.iter().find(|(n, _)| n == name)
@@ -39581,6 +42406,60 @@ mod tests {
     }
 
     #[test]
+    fn test_excess_property_open_spread_target() {
+        // `w` is inferred from spreads of a type that does not resolve, so
+        // its type carries the `__spread__` marker (alone or in a union).
+        let src = r#"
+            declare const base: Missing.WhereInput;
+            declare function pick(): Missing.WhereInput;
+            export function f(flag: boolean) {
+                let w = flag ? { ...base, ...pick() } : pick();
+                w = { ...w, AND: [] };
+                let v = { ...base };
+                v = { ...v, AND: [] };
+                return [w, v];
+            }
+        "#;
+        let output = parse_and_check(src);
+        let excess: Vec<_> = output
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == 2353)
+            .collect();
+        assert!(excess.is_empty(), "unexpected TS2353: {:?}", excess);
+    }
+
+    #[test]
+    fn test_long_method_chain_is_linear() {
+        // Each link used to infer its receiver twice: 2^n work, so a
+        // 40-call chain never finished.
+        let chain = |n: usize| -> std::string::String {
+            (0..n)
+                .map(|i| format!(".replace(\"a{i}\", \"b\")"))
+                .collect()
+        };
+        let src = format!(
+            "export const s = \"x\"{};\nconst short: number = \"x\"{};",
+            chain(40),
+            chain(10)
+        );
+        let diag = check_has_error(&src, 2322);
+        assert!(diag.message.contains("'string'"), "{}", diag.message);
+    }
+
+    #[test]
+    fn test_long_method_chain_keeps_its_type() {
+        // Each link is two `check_expr` levels; sharing the 50-level type
+        // operation budget turned a 30-call chain into `any`.
+        let chain: std::string::String = (0..30)
+            .map(|i| format!(".replace(\"a{i}\", \"b\")"))
+            .collect();
+        let src = format!("const n: number = \"x\"{chain};");
+        let diag = check_has_error(&src, 2322);
+        assert!(diag.message.contains("'string'"), "{}", diag.message);
+    }
+
+    #[test]
     fn test_excess_property_index_signature_allows() {
         let src = r#"
             let x: { a: number; [key: string]: number } = { a: 1, b: 2, c: 3 };
@@ -39599,10 +42478,11 @@ mod tests {
             .iter()
             .filter(|d| d.code == 2353)
             .collect();
+        // tsc reports the literal's first excess property only.
         assert_eq!(
             excess_errors.len(),
-            2,
-            "Expected 2 excess property errors, got {:?}",
+            1,
+            "Expected 1 excess property error, got {:?}",
             excess_errors
         );
     }
@@ -40335,6 +43215,69 @@ mod tests {
             output.diagnostics.iter().all(|diag| diag.code != 6133),
             "Expected JSDoc link to count as a use: {:?}",
             output.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_enum_export_value_has_member_types() {
+        // An imported `E.A` reads the exported enum value's property: it must
+        // be the member's own type, since a bare `"A"` is not assignable to
+        // a string enum.
+        let file = tsc_rs_parser::parse("types.ts", r#"export enum E { A = "A", B = "B" }"#);
+        let StmtKind::Export(export) = &file.statements[0].kind else {
+            panic!("expected an export");
+        };
+        let ExportDeclKind::Decl(declaration) = &export.kind else {
+            panic!("expected an exported declaration");
+        };
+        let StmtKind::EnumDecl(enumeration) = &declaration.kind else {
+            panic!("expected an enum");
+        };
+        let Type::ObjectType(value) = TypeChecker::new().enum_export_value(enumeration) else {
+            panic!("expected an object type");
+        };
+        assert!(value.properties.iter().all(|(name, ty)| matches!(
+            ty.as_ref(),
+            Type::EnumVariant { enum_name, variant_name, value: Some(_) }
+                if enum_name == "E" && variant_name == name
+        )));
+    }
+
+    #[test]
+    fn test_ambiguous_interface_keys_cover_names_declared_by_several_files() {
+        // `Tool` is an interface in two modules and `Theme` an interface in
+        // one and an enum in another: references must be bound per file.
+        // `Only` has a single declaration and keeps its bare name.
+        let a = tsc_rs_parser::parse(
+            "a.ts",
+            "export interface Tool { one: number }\nexport interface Only { x: 1 }\ninterface Theme { text: string }",
+        );
+        let b = tsc_rs_parser::parse("b.ts", "export interface Tool { two: number }");
+        let e = tsc_rs_parser::parse("e.ts", "export enum Theme { Light, Dark }");
+        let keys = TypeChecker::collect_ambiguous_interface_keys(&[&a, &b, &e]);
+        let mut names: Vec<_> = keys
+            .iter()
+            .map(|key| scoped_interface_display_name(key))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Theme", "Tool", "Tool"]);
+        assert!(keys.contains(&TypeChecker::file_interface_registry_key("a.ts", "Theme")));
+        assert_eq!(scoped_interface_display_name("Plain"), "Plain");
+    }
+
+    #[test]
+    fn test_self_referential_generic_interface_is_covariant() {
+        // The shape of lib `PromiseLike`: inferring the method's `R` from
+        // `R | Thenable<R>` against the target's `R | Thenable<R>` must pair
+        // the `Thenable` members and bind R to R, not to the whole union.
+        check_no_errors(
+            r#"
+            interface Thenable<T> {
+                then<R>(onfulfilled: (value: T) => R | Thenable<R>): Thenable<R>;
+            }
+            declare const narrow: Thenable<string>;
+            const wide: Thenable<unknown> = narrow;
+            "#,
         );
     }
 
@@ -41795,7 +44738,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_obj(props: Vec<(&str, Type)>) -> Type {
-        Type::ObjectType(ObjectTypeInfo {
+        Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: props
                 .into_iter()
                 .map(|(n, t)| (n.to_string(), Arc::new(t)))
@@ -41805,7 +44748,7 @@ mod tests {
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        })
+        }))
     }
 
     // --- keyof_type ---
@@ -45039,16 +47982,14 @@ const aliasedDate: Date = throughAlias(new Date());
         let mut donor = TypeChecker::new();
         donor.inject_external_types(&[&first]);
         let mut augmented = donor.clone();
-        assert!(Arc::ptr_eq(
-            &donor.interface_info,
-            &augmented.interface_info
-        ));
+        assert!(donor
+            .interface_info
+            .shares_base_with(&augmented.interface_info));
 
         augmented.inject_external_types(&[&second]);
-        assert!(!Arc::ptr_eq(
-            &donor.interface_info,
-            &augmented.interface_info
-        ));
+        assert!(!donor
+            .interface_info
+            .shares_base_with(&augmented.interface_info));
         let donor_properties = &donor
             .interface_info
             .get("Merged")

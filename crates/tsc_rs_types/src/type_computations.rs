@@ -155,14 +155,14 @@ pub(crate) fn substitute_inner(ty: &Type, type_args: &HashMap<std::string::Strin
                     Arc::new(substitute(v, type_args)),
                 )
             });
-            Type::ObjectType(ObjectTypeInfo {
+            Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: props,
                 call_signatures: call_sigs,
                 construct_signatures: construct_sigs,
                 index_signature: index_sig,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            })
+            }))
         }
         Type::Conditional {
             check,
@@ -374,6 +374,12 @@ pub(crate) fn is_type_assignable(source: &Type, target: &Type) -> bool {
                         | Type::Constructor(_)
                         | Type::Array(_)
                         | Type::Tuple(_)
+                        // A named type left unexpanded below the top level
+                        // (a function's return `Ctx`, `Promise<Ctx>`): the
+                        // caller expands the check type itself, so what is
+                        // still a reference here is an interface or class
+                        // instance.
+                        | Type::TypeReference(..)
                 );
             }
             if let Type::Union(members) = target {
@@ -523,7 +529,12 @@ pub(crate) fn do_infer_match(
     // Without this, the Function member never gets a chance to extract V.
     // Skip when the pattern is itself a Union/Intersection — those
     // need to see the full source shape for distributive matching.
-    if !matches!(pattern, Type::Union(_) | Type::Intersection(_)) {
+    // A bare `infer R` binds the whole source, union included
+    // (`ReturnType<() => "a" | "b">` is `"a" | "b"`).
+    if !matches!(
+        pattern,
+        Type::Union(_) | Type::Intersection(_) | Type::Infer(_)
+    ) {
         if let Type::Union(src_members) = source {
             for member in src_members.iter() {
                 let mut tentative = bindings.clone();
@@ -781,6 +792,20 @@ pub(crate) fn evaluate_conditional_type_inner(
         _ => None,
     };
 
+    // Nothing to substitute: decide on the types as given. (Walking a
+    // deep-expanded check type with an empty map cost a node-by-node pass
+    // charged to the evaluation budget.)
+    if type_args.is_empty() {
+        if matches!(check, Type::TypeParameter(_)) {
+            return Type::Conditional {
+                check: Arc::new(check.clone()),
+                extends: Arc::new(extends.clone()),
+                true_type: Arc::new(true_type.clone()),
+                false_type: Arc::new(false_type.clone()),
+            };
+        }
+        return eval_single_conditional(check, extends, true_type, false_type);
+    }
     let check_subst = substitute(check, type_args);
     let extends_subst = substitute(extends, type_args);
 
@@ -970,14 +995,14 @@ pub(crate) fn evaluate_mapped_type_inner(
         properties.push((out_name, Arc::new(prop_ty)));
     }
 
-    Type::ObjectType(ObjectTypeInfo {
+    Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
         properties,
         call_signatures: Vec::new(),
         construct_signatures: Vec::new(),
         index_signature: None,
         index_signature_name: None,
         method_names: Vec::new(),
-    })
+    }))
 }
 
 pub(crate) fn resolve_constraint_keys(
@@ -1130,14 +1155,14 @@ mod tests {
         // Promise<{a: number}> extends Promise<infer V> → V = {a: number}
         let source = Type::TypeReference(
             "Promise".into(),
-            vec![Type::ObjectType(ObjectTypeInfo {
+            vec![Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![("a".into(), Arc::new(Type::Number))],
                 call_signatures: vec![],
                 construct_signatures: vec![],
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            })]
+            }))]
             .into(),
         );
         let pattern = Type::TypeReference("Promise".into(), vec![Type::Infer("V".into())].into());
@@ -1165,14 +1190,14 @@ mod tests {
         // Conditional: Promise<{a:number}> extends Promise<infer V> ? V : never
         let check = Type::TypeReference(
             "Promise".into(),
-            vec![Type::ObjectType(ObjectTypeInfo {
+            vec![Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![("a".into(), Arc::new(Type::Number))],
                 call_signatures: vec![],
                 construct_signatures: vec![],
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            })]
+            }))]
             .into(),
         );
         let extends = Type::TypeReference("Promise".into(), vec![Type::Infer("V".into())].into());

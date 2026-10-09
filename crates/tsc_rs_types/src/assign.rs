@@ -501,14 +501,15 @@ fn assign_inner(
     // ---- Object types (structural property-by-property) -----------------
     if let Type::ObjectType(target_obj) = target {
         if let Type::Constructor(source_ctor) = source {
-            let source_object = Type::ObjectType(crate::ObjectTypeInfo {
-                properties: Vec::new(),
-                call_signatures: Vec::new(),
-                construct_signatures: vec![source_ctor.clone()],
-                index_signature: None,
-                index_signature_name: None,
-                method_names: Vec::new(),
-            });
+            let source_object =
+                Type::ObjectType(crate::ObjectTypeInfo::new(crate::ObjectTypeData {
+                    properties: Vec::new(),
+                    call_signatures: Vec::new(),
+                    construct_signatures: vec![source_ctor.clone()],
+                    index_signature: None,
+                    index_signature_name: None,
+                    method_names: Vec::new(),
+                }));
             return assign_to_object(target_obj, target, &source_object, opts, dejavu);
         }
         return assign_to_object(target_obj, target, source, opts, dejavu);
@@ -1238,7 +1239,7 @@ fn not_assignable_types(target: &Type, source: &Type) -> AssignError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FunctionType, ObjectTypeInfo};
+    use crate::{FunctionType, ObjectTypeData, ObjectTypeInfo};
 
     #[test]
     fn any_accepts_everything() {
@@ -1331,24 +1332,24 @@ mod tests {
     #[test]
     fn intersection_target() {
         // Source must be assignable to ALL members of target intersection.
-        let obj1 = Type::ObjectType(ObjectTypeInfo {
+        let obj1 = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![("x".into(), Arc::new(Type::Number))],
             call_signatures: vec![],
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
-        let obj2 = Type::ObjectType(ObjectTypeInfo {
+        }));
+        let obj2 = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![("y".into(), Arc::new(Type::String))],
             call_signatures: vec![],
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
+        }));
         let target = Type::Intersection(vec![obj1.clone(), obj2.clone()].into());
-        let source = Type::ObjectType(ObjectTypeInfo {
+        let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![
                 ("x".into(), Arc::new(Type::Number)),
                 ("y".into(), Arc::new(Type::String)),
@@ -1358,7 +1359,7 @@ mod tests {
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
+        }));
         assert!(is_assignable(&target, &source));
     }
 
@@ -1463,15 +1464,15 @@ mod tests {
 
     #[test]
     fn object_structural() {
-        let target = Type::ObjectType(ObjectTypeInfo {
+        let target = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![("name".into(), Arc::new(Type::String))],
             call_signatures: vec![],
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
-        let source = Type::ObjectType(ObjectTypeInfo {
+        }));
+        let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![
                 ("name".into(), Arc::new(Type::String)),
                 ("age".into(), Arc::new(Type::Number)),
@@ -1481,13 +1482,13 @@ mod tests {
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
+        }));
         assert!(is_assignable(&target, &source));
     }
 
     #[test]
     fn object_missing_property() {
-        let target = Type::ObjectType(ObjectTypeInfo {
+        let target = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![
                 ("name".into(), Arc::new(Type::String)),
                 ("age".into(), Arc::new(Type::Number)),
@@ -1497,15 +1498,15 @@ mod tests {
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
-        let source = Type::ObjectType(ObjectTypeInfo {
+        }));
+        let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![("name".into(), Arc::new(Type::String))],
             call_signatures: vec![],
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
+        }));
         assert!(!is_assignable(&target, &source));
     }
 

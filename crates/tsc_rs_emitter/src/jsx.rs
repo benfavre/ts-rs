@@ -1557,8 +1557,7 @@ impl<'a> Emitter<'a> {
                     // Component: keep original name (with unicode escapes)
                     let n = n;
                     // Apply CJS import map qualification (e.g. `MySFC` → `component_1.MySFC`)
-                    if let Some((var_name, imported)) = self.cjs_import_map.get(n.as_str()).cloned()
-                    {
+                    if let Some((var_name, imported)) = self.cjs_import_ref(n, name.span.start) {
                         if imported.is_empty() {
                             self.write(&var_name);
                         } else {
@@ -1567,6 +1566,7 @@ impl<'a> Emitter<'a> {
                     // Apply CJS export qualification (e.g. `MySFC` → `exports.MySFC`)
                     } else if self.export_target.as_ref().is_some_and(|t| t == "exports")
                         && self.cjs_var_export_names.contains(n.as_str())
+                        && !self.import_shadows.is_shadowed(n, name.span.start)
                     {
                         self.write_cjs_export_access("exports", n);
                     } else {

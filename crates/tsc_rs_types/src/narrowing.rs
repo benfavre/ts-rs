@@ -461,22 +461,22 @@ mod tests {
 
     #[test]
     fn narrow_discriminant() {
-        let a = Type::ObjectType(crate::ObjectTypeInfo {
+        let a = Type::ObjectType(crate::ObjectTypeInfo::new(crate::ObjectTypeData {
             properties: vec![("kind".into(), Arc::new(Type::StringLiteral("a".into())))],
             call_signatures: vec![],
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
-        let b = Type::ObjectType(crate::ObjectTypeInfo {
+        }));
+        let b = Type::ObjectType(crate::ObjectTypeInfo::new(crate::ObjectTypeData {
             properties: vec![("kind".into(), Arc::new(Type::StringLiteral("b".into())))],
             call_signatures: vec![],
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
+        }));
         let ty = Type::Union(vec![a.clone(), b.clone()].into());
 
         let result = narrow_by_discriminant(&ty, "kind", &Type::StringLiteral("a".into()));

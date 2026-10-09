@@ -217,7 +217,7 @@ impl TypeChecker {
         } else if let Some(body) = signature.body {
             let inferred = self.compatibility_return_type(body, &mut bindings);
             if signature.is_async {
-                Self::wrap_async_inferred_return(inferred)
+                self.wrap_async_inferred(inferred)
             } else {
                 inferred
             }

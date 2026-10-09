@@ -606,7 +606,7 @@ impl<'a> Parser<'a> {
                     } else {
                         None
                     };
-                    let type_args = self.try_parse_type_args();
+                    let type_args = self.try_parse_type_args_in(true);
                     return TypeNode {
                         kind: TypeNodeKind::ImportType(Box::new(ImportTypeNode {
                             argument: Box::new(argument),
@@ -645,7 +645,7 @@ impl<'a> Parser<'a> {
                 // Consume optional type arguments (instantiation expression type).
                 // e.g. `typeof Err<U>` — the type args are part of the type
                 // query and don't need to be preserved (erased during emit).
-                let _ = self.try_parse_type_args();
+                let _ = self.try_parse_type_args_in(true);
                 TypeNode {
                     kind: TypeNodeKind::TypeQuery(Box::new(expr)),
                     span: self.span_from(start),
@@ -686,7 +686,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                let type_args = self.try_parse_type_args();
+                let type_args = self.try_parse_type_args_in(true);
                 TypeNode {
                     kind: TypeNodeKind::ImportType(Box::new(ImportTypeNode {
                         argument: Box::new(argument),
@@ -964,7 +964,7 @@ impl<'a> Parser<'a> {
                 // Type references accept keyword names as well as identifiers,
                 // including `const` in angle-bracket const assertions.
                 let expr = self.parse_type_entity_name();
-                let type_args = self.try_parse_type_args();
+                let type_args = self.try_parse_type_args_in(true);
                 // Check for type predicate: paramName is Type
                 // Only in return type context (allow_type_predicate flag)
                 if self.at(TokenKind::Is) && self.allow_type_predicate {
@@ -1387,7 +1387,15 @@ impl<'a> Parser<'a> {
         Some(params)
     }
 
+    /// Type arguments after an expression (`f<T>(x)`), where `<` may also be
+    /// a comparison.
     pub(crate) fn try_parse_type_args(&mut self) -> Option<Vec<TypeNode>> {
+        self.try_parse_type_args_in(false)
+    }
+
+    /// `in_type`: after a type name, where `<` can only open a type argument
+    /// list — the comparison heuristics below do not apply.
+    pub(crate) fn try_parse_type_args_in(&mut self, in_type: bool) -> Option<Vec<TypeNode>> {
         let saved = self.pos;
         let saved_token = self.tokens.get(self.pos).cloned();
         let list_start = self.cur_span().start;
@@ -1425,8 +1433,9 @@ impl<'a> Parser<'a> {
                 return None;
             }
             // `< ( identifier .` — member access in parens, not type args
-            // e.g., `x < (product.price || 0)`
-            if next.kind == TokenKind::OpenParen {
+            // e.g., `x < (product.price || 0)`. In a type, the same tokens
+            // are a parenthesized qualified name: `Promise<(ns.T & U) | null>`.
+            if !in_type && next.kind == TokenKind::OpenParen {
                 if let (Some(id), Some(dot)) =
                     (self.tokens.get(self.pos + 2), self.tokens.get(self.pos + 3))
                 {

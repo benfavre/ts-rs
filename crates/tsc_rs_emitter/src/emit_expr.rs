@@ -10,6 +10,28 @@ enum OcCallReceiver {
 
 /// Escape a raw template string for use inside a JS string literal.
 /// Backslashes are doubled, quotes escaped, and control chars handled.
+/// Whether a binary expression has a line break that belongs to its layout:
+/// between an operand and its operator, or inside an operand that is not a
+/// template literal. Line breaks inside template literal operands are part of
+/// the string and say nothing about how the expression is laid out.
+fn binary_has_newline_outside_templates(expr: &Expr, source: &str) -> bool {
+    let has_newline = |start: u32, end: u32| {
+        source
+            .get(start as usize..end as usize)
+            // An unusable span is not evidence of a single-line layout.
+            .is_none_or(|text| text.contains('\n'))
+    };
+    match &expr.kind {
+        ExprKind::Binary(bin) => {
+            has_newline(bin.left.span.end, bin.right.span.start)
+                || binary_has_newline_outside_templates(&bin.left, source)
+                || binary_has_newline_outside_templates(&bin.right, source)
+        }
+        ExprKind::Template(_) | ExprKind::NoSubstTemplate(_) => false,
+        _ => has_newline(expr.span.start, expr.span.end),
+    }
+}
+
 fn escape_template_raw_for_js_string(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() * 2);
     let mut chars = raw.chars().peekable();
@@ -766,6 +788,7 @@ impl<'a> Emitter<'a> {
             if self.export_target.as_ref().is_some_and(|t| t == "exports")
                 && self.cjs_var_export_names.contains(name.as_str())
                 && !self.cjs_param_shadows.contains(name.as_str())
+                && !self.import_shadows.is_shadowed(name, expr.span.start)
             {
                 self.record_mapping(expr.span);
                 self.write_cjs_export_access("exports", name);
@@ -780,8 +803,7 @@ impl<'a> Emitter<'a> {
             let skip_for_class_shadow = self.class_name_locally_shadowed
                 && self.current_class_name.as_deref() == Some(name.as_str());
             if !skip_for_class_shadow {
-                if let Some((var_name, imported)) = self.cjs_import_map.get(name.as_str()).cloned()
-                {
+                if let Some((var_name, imported)) = self.cjs_import_ref(name, expr.span.start) {
                     self.record_mapping(expr.span);
                     if imported.is_empty() {
                         self.write(&var_name);
@@ -798,6 +820,9 @@ impl<'a> Emitter<'a> {
             if let ExprKind::Ident(name) = &call.callee.kind {
                 if self.export_target.as_ref().is_some_and(|t| t == "exports")
                     && self.cjs_var_export_names.contains(name.as_str())
+                    && !self
+                        .import_shadows
+                        .is_shadowed(name, call.callee.span.start)
                 {
                     self.record_mapping(expr.span);
                     self.write("(0, ");
@@ -819,7 +844,8 @@ impl<'a> Emitter<'a> {
         // CJS import call rewriting: `test()` → `(0, file1_1.test)()`
         if let ExprKind::Call(call) = &expr.kind {
             if let ExprKind::Ident(name) = &call.callee.kind {
-                if let Some((var_name, imported)) = self.cjs_import_map.get(name.as_str()).cloned()
+                if let Some((var_name, imported)) =
+                    self.cjs_import_ref(name, call.callee.span.start)
                 {
                     self.record_mapping(expr.span);
                     let system_direct_call = self.is_system() && self.rewrite_ident_with_import_map;
@@ -870,6 +896,15 @@ impl<'a> Emitter<'a> {
             let e = expr.span.end as usize;
             s < e && e <= self.source.len() && self.source[s..e].contains('\n')
         };
+        // For a binary expression, "multi-line" must mean that the EXPRESSION
+        // is laid out over several lines. A line break inside a template
+        // literal operand is content, not layout: the multi-line operator
+        // paths below re-indent and re-space the source text, and doing that
+        // to `` `\n.a { min-height: 1px }\n` + rest `` rewrote the string
+        // itself (`min - height`, extra indentation on every line).
+        let operator_layout_is_multiline = span_is_multiline
+            && (!matches!(expr.kind, ExprKind::Binary(_))
+                || binary_has_newline_outside_templates(expr, self.source));
         let has_cjs_ref =
             !self.cjs_import_map.is_empty() && expr_has_cjs_import_ref(expr, &self.cjs_import_map);
         // `import.meta.{dirname,filename,url}` has no runtime form in CJS;
@@ -1029,8 +1064,9 @@ impl<'a> Emitter<'a> {
                 }
                 _ => false,
             };
-        let is_multiline_operator_expr =
-            span_is_multiline && matches!(expr.kind, ExprKind::Binary(_) | ExprKind::Unary(_)) && {
+        let is_multiline_operator_expr = operator_layout_is_multiline
+            && matches!(expr.kind, ExprKind::Binary(_) | ExprKind::Unary(_))
+            && {
                 let s = expr.span.start as usize;
                 let e = expr.span.end as usize;
                 s < e && e <= self.source.len() && {
@@ -1038,7 +1074,7 @@ impl<'a> Emitter<'a> {
                     !src.contains("//") && !src.contains("/*")
                 }
             };
-        let is_compact_multiline_binary_expr = span_is_multiline
+        let is_compact_multiline_binary_expr = operator_layout_is_multiline
             && matches!(expr.kind, ExprKind::Binary(_))
             && {
                 let s = expr.span.start as usize;
@@ -1333,7 +1369,7 @@ impl<'a> Emitter<'a> {
                 s < e && e <= self.source.len() && self.source[s..e].starts_with("\\u")
             });
         if can_copy_source_fast_path
-            && span_is_multiline
+            && operator_layout_is_multiline
             && self.in_arrow_body_expr
             && matches!(expr.kind, ExprKind::Binary(_))
         {
@@ -1345,7 +1381,7 @@ impl<'a> Emitter<'a> {
             return;
         }
         if can_copy_source_fast_path && !is_multiline_operator_expr {
-            if span_is_multiline
+            if operator_layout_is_multiline
                 && self.in_arrow_body_expr
                 && matches!(expr.kind, ExprKind::Binary(_))
             {
@@ -1400,7 +1436,7 @@ impl<'a> Emitter<'a> {
                 {
                     self.write(name);
                 } else if self.rewrite_ident_with_import_map
-                    && self.cjs_import_map.contains_key(name.as_str())
+                    && self.cjs_import_ref(name, expr.span.start).is_some()
                 {
                     self.emit_value_name_ref(name);
                 } else if self.current_class_static_alias.is_some()
@@ -1502,7 +1538,7 @@ impl<'a> Emitter<'a> {
                 // Tagged templates need the `(0, ...)` wrapper (like function
                 // calls) to avoid binding `this` to the module object.
                 let cjs_tag = if let ExprKind::Ident(name) = &tagged.tag.kind {
-                    self.cjs_import_map.get(name.as_str()).cloned()
+                    self.cjs_import_ref(name, tagged.tag.span.start)
                 } else {
                     None
                 };
@@ -7958,15 +7994,16 @@ impl<'a> Emitter<'a> {
                             && !self.ns_local_bindings.contains(name.as_str())
                     });
                 let needs_expand = ns_qualify
-                    || self.cjs_import_map.get(name.as_str()).is_some_and(
-                        |(var_name, imported)| {
+                    || self
+                        .cjs_import_ref(name, span.start)
+                        .is_some_and(|(var_name, imported)| {
                             !imported.is_empty() || var_name.as_str() != name.as_str()
-                        },
-                    );
+                        });
                 // CJS: shorthand prop referencing an exported var must expand
                 // `{ test }` → `{ test: exports.test }`
                 let cjs_expand = self.export_target.as_ref().is_some_and(|t| t == "exports")
-                    && self.cjs_var_export_names.contains(name.as_str());
+                    && self.cjs_var_export_names.contains(name.as_str())
+                    && !self.import_shadows.is_shadowed(name, span.start);
                 if cjs_expand {
                     self.write(name);
                     self.write(": exports.");
@@ -7974,6 +8011,7 @@ impl<'a> Emitter<'a> {
                 } else if needs_expand {
                     self.write(name);
                     self.write(": ");
+                    self.value_ref_pos = Some(span.start);
                     self.emit_value_name_ref(name);
                 } else {
                     self.write(name);

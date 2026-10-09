@@ -180,7 +180,7 @@ impl TypeChecker {
                 visibility
             } else if !assignable {
                 let object = |ty: Type, method: bool| {
-                    Type::ObjectType(ObjectTypeInfo {
+                    Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                         properties: vec![(name.clone(), Arc::new(ty))],
                         call_signatures: Vec::new(),
                         construct_signatures: Vec::new(),
@@ -191,7 +191,7 @@ impl TypeChecker {
                         } else {
                             Vec::new()
                         },
-                    })
+                    }))
                 };
                 self.assignability_elaboration(
                     &object(source_ty.clone(), source.method),

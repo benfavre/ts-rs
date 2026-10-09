@@ -749,7 +749,10 @@ pub(crate) fn is_typescript_standard_library_file(file_name: &str) -> bool {
     let Some(lib_dir) = find_typescript_lib_dir() else {
         return false;
     };
-    let (Ok(file), Ok(lib_dir)) = (fs::canonicalize(file_name), fs::canonicalize(lib_dir)) else {
+    let (Some(file), Some(lib_dir)) = (
+        tsc_rs_resolver::canonicalize(file_name),
+        tsc_rs_resolver::canonicalize(lib_dir),
+    ) else {
         return false;
     };
     file.parent() == Some(lib_dir.as_path())

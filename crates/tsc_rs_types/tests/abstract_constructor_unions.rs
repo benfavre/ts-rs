@@ -571,48 +571,52 @@ fn constructor_types_display_with_valid_precedence_and_parameter_syntax() {
         "(abstract new <T extends string = string>(value?: T, ...rest: T[]) => T) | undefined"
     );
 
-    let object = Type::ObjectType(tsc_rs_types::ObjectTypeInfo {
-        properties: Vec::new(),
-        call_signatures: Vec::new(),
-        construct_signatures: vec![ConstructorType {
-            is_abstract: false,
-            params: vec![("?value".into(), Type::TypeParameter("T".into()))],
-            return_type: Arc::new(Type::TypeParameter("T".into())),
-            type_params: vec!["T".into()],
-            type_param_constraints: vec![Some(Type::String)],
-            type_param_defaults: vec![Some(Type::String)],
-        }],
-        index_signature: None,
-        index_signature_name: None,
-        method_names: Vec::new(),
-    });
+    let object = Type::ObjectType(tsc_rs_types::ObjectTypeInfo::new(
+        tsc_rs_types::ObjectTypeData {
+            properties: Vec::new(),
+            call_signatures: Vec::new(),
+            construct_signatures: vec![ConstructorType {
+                is_abstract: false,
+                params: vec![("?value".into(), Type::TypeParameter("T".into()))],
+                return_type: Arc::new(Type::TypeParameter("T".into())),
+                type_params: vec!["T".into()],
+                type_param_constraints: vec![Some(Type::String)],
+                type_param_defaults: vec![Some(Type::String)],
+            }],
+            index_signature: None,
+            index_signature_name: None,
+            method_names: Vec::new(),
+        },
+    ));
     assert_eq!(
         object.display_string(),
         "new <T extends string = string>(value?: T) => T"
     );
 
-    let returns_function = Type::ObjectType(tsc_rs_types::ObjectTypeInfo {
-        properties: Vec::new(),
-        call_signatures: Vec::new(),
-        construct_signatures: vec![ConstructorType {
-            is_abstract: false,
-            params: Vec::new(),
-            return_type: Arc::new(Type::Function(FunctionType {
+    let returns_function = Type::ObjectType(tsc_rs_types::ObjectTypeInfo::new(
+        tsc_rs_types::ObjectTypeData {
+            properties: Vec::new(),
+            call_signatures: Vec::new(),
+            construct_signatures: vec![ConstructorType {
+                is_abstract: false,
                 params: Vec::new(),
-                return_type: Arc::new(Type::String),
+                return_type: Arc::new(Type::Function(FunctionType {
+                    params: Vec::new(),
+                    return_type: Arc::new(Type::String),
+                    type_params: Vec::new(),
+                    type_param_defaults: Vec::new(),
+                    type_param_constraints: Vec::new(),
+                    type_predicate: None,
+                })),
                 type_params: Vec::new(),
-                type_param_defaults: Vec::new(),
                 type_param_constraints: Vec::new(),
-                type_predicate: None,
-            })),
-            type_params: Vec::new(),
-            type_param_constraints: Vec::new(),
-            type_param_defaults: Vec::new(),
-        }],
-        index_signature: None,
-        index_signature_name: None,
-        method_names: Vec::new(),
-    });
+                type_param_defaults: Vec::new(),
+            }],
+            index_signature: None,
+            index_signature_name: None,
+            method_names: Vec::new(),
+        },
+    ));
     assert_eq!(returns_function.display_string(), "new () => () => string");
 }
 

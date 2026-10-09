@@ -8,6 +8,27 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
+
+pub use tsc_rs_resolver::{
+    disable_and_clear_path_caches, enable_canonical_path_cache, path_caches_enabled,
+};
+
+static ONE_SHOT_PROCESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declares that this process compiles once and exits (a CLI run, not
+/// watch, pipe or LSP mode). Filesystem answers are then remembered
+/// ([`enable_canonical_path_cache`]) and a compile leaves its ASTs, symbol
+/// tables and checker state for the OS to reclaim at exit instead of
+/// freeing them node by node (about a second on a 6,000-file project).
+pub fn set_one_shot_process() {
+    ONE_SHOT_PROCESS.store(true, std::sync::atomic::Ordering::Relaxed);
+    enable_canonical_path_cache();
+}
+
+/// See [`set_one_shot_process`].
+pub fn is_one_shot_process() -> bool {
+    ONE_SHOT_PROCESS.load(std::sync::atomic::Ordering::Relaxed)
+}
 use tsc_rs_ast::{CompilerOptions, Diagnostic, DiagnosticCategory, SourceFile, StmtKind};
 use tsc_rs_emitter::EmitOutput;
 use tsc_rs_query::QueryEngine;
@@ -146,14 +167,15 @@ impl TsProject {
     /// Produces JS output regardless of type errors, import resolution, etc.
     /// Use for fast JSX/TS → JS transforms where correctness is validated elsewhere.
     pub fn transpile_only(&self) -> CompilationResult {
-        let mut file_outputs = Vec::new();
-
-        for file_name in &self.file_names {
-            match std::fs::read_to_string(file_name) {
+        // Files are independent without type information: emit in parallel.
+        let file_outputs: Vec<FileOutput> = self
+            .file_names
+            .par_iter()
+            .map(|file_name| match std::fs::read_to_string(file_name) {
                 Ok(source) => {
                     let sf = tsc_rs_parser::parse(file_name, &source);
                     let emit = tsc_rs_emitter::emit(&sf, &self.options);
-                    file_outputs.push(FileOutput {
+                    FileOutput {
                         file_name: file_name.clone(),
                         emit,
                         // Skipping the TYPE checker does not make the file
@@ -164,30 +186,28 @@ impl TsProject {
                         // the string and invents an export. Dropping these
                         // diagnostics is what let that ship twice; carry them.
                         diagnostics: sf.diagnostics.clone(),
-                    });
+                    }
                 }
-                Err(e) => {
-                    file_outputs.push(FileOutput {
-                        file_name: file_name.clone(),
-                        emit: tsc_rs_emitter::EmitOutput {
-                            javascript: String::new(),
-                            source_map: None,
-                            declaration_file: None,
-                            require_var_counters: Default::default(),
-                            system_register_counter: 0,
-                        },
-                        diagnostics: vec![Diagnostic {
-                            code: 6053,
-                            message: format!("Cannot read file '{}': {}", file_name, e),
-                            category: DiagnosticCategory::Error,
-                            file_name: Some(file_name.clone()),
-                            span: None,
-                            related: None,
-                        }],
-                    });
-                }
-            }
-        }
+                Err(e) => FileOutput {
+                    file_name: file_name.clone(),
+                    emit: tsc_rs_emitter::EmitOutput {
+                        javascript: String::new(),
+                        source_map: None,
+                        declaration_file: None,
+                        require_var_counters: Default::default(),
+                        system_register_counter: 0,
+                    },
+                    diagnostics: vec![Diagnostic {
+                        code: 6053,
+                        message: format!("Cannot read file '{}': {}", file_name, e),
+                        category: DiagnosticCategory::Error,
+                        file_name: Some(file_name.clone()),
+                        span: None,
+                        related: None,
+                    }],
+                },
+            })
+            .collect();
 
         CompilationResult {
             files: file_outputs,
@@ -196,6 +216,17 @@ impl TsProject {
     }
 
     fn compile_selected(&self, selected_files: &[String]) -> CompilationResult {
+        let timing = std::env::var("TSC_RS_INIT_TIMING").is_ok();
+        let mut stage_start = std::time::Instant::now();
+        let mut stage = |name: &str| {
+            if timing {
+                eprintln!(
+                    "[check]  {name:<14} {:>7.1}ms",
+                    stage_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            stage_start = std::time::Instant::now();
+        };
         // Parse the full project graph in parallel so that selected outputs
         // still type-check against unchanged dependencies. Read+parse is
         // independent per file and dominates wall time on large projects.
@@ -232,7 +263,10 @@ impl TsProject {
         }
 
         // Phase 1.5: Autodiscovery of `.d.ts` files reachable via imports.
+        stage("read + parse");
+        let listed_file_count = parsed_files.len();
         autodiscover_dts(&mut parsed_files, &self.options);
+        stage("autodiscover");
 
         // Phase 2: Bind all files in parallel — bind is referentially
         // transparent per SourceFile and the resulting SymbolTables are
@@ -242,6 +276,7 @@ impl TsProject {
 
         // Phase 3: Resolve imports and link cross-file symbols
         // Build a map from file path -> index for lookup
+        stage("bind");
         let file_index: HashMap<String, usize> = parsed_files
             .iter()
             .enumerate()
@@ -265,23 +300,39 @@ impl TsProject {
                     // Find the target file in our project
                     if let Some(&target_idx) = file_index.get(&resolved_module.resolved_file_name) {
                         if target_idx != file_idx {
-                            // Clone the target table to avoid double-borrow
-                            let target_table = symbol_tables[target_idx].clone();
-                            tsc_rs_symbols::link_imports(
-                                &mut symbol_tables[file_idx],
-                                &target_table,
-                                import,
-                            );
+                            // Borrow the two tables disjointly: cloning the
+                            // target's whole table per import edge copied a
+                            // heavily imported file's symbols once per importer.
+                            let (importer, target) = if file_idx < target_idx {
+                                let (head, tail) = symbol_tables.split_at_mut(target_idx);
+                                (&mut head[file_idx], &tail[0])
+                            } else {
+                                let (head, tail) = symbol_tables.split_at_mut(file_idx);
+                                (&mut tail[0], &head[target_idx])
+                            };
+                            tsc_rs_symbols::link_imports(importer, target, import);
                         }
                     }
                 }
             }
         }
 
+        stage("link imports");
         let mut available_file_names: Vec<String> = available_file_names.into_iter().collect();
         available_file_names.sort();
         let all_parsed_refs: Vec<&SourceFile> = parsed_files.iter().collect();
-        let selected: HashSet<&str> = selected_files.iter().map(String::as_str).collect();
+        let mut selected: HashSet<&str> = selected_files.iter().map(String::as_str).collect();
+        // A full compile also checks the sources that imports pulled into
+        // the program (tsc checks every non-declaration file of a program,
+        // not only the tsconfig's own files).
+        if selected_files.len() == self.file_names.len() {
+            selected.extend(
+                parsed_files[listed_file_count.min(parsed_files.len())..]
+                    .iter()
+                    .map(|sf| sf.file_name.as_str())
+                    .filter(|name| is_workspace_ts_source(name)),
+            );
+        }
 
         // Pre-build a "donor" TypeChecker with the project-wide cross-file
         // type tables (class_info, interface_info, type_aliases, enum_info,
@@ -318,6 +369,7 @@ impl TsProject {
         // idempotent on top-level decls (skips when the key is already
         // present), so the local scope ends up identical to the per-file
         // inject case after the file's check pass re-runs its own decls.
+        let donor_start = std::time::Instant::now();
         let donor: Option<tsc_rs_types::TypeChecker> = if all_parsed_refs.is_empty() {
             None
         } else {
@@ -328,13 +380,31 @@ impl TsProject {
             // `display_string()` saves the ~3.5% of CPU profile spent
             // formatting type names that nothing consumes.
             d.disable_expression_types();
+            d.mark_donor();
             d.inject_external_types(&all_parsed_refs);
+            if let Ok(names) = std::env::var("TSC_RS_WHO_DECLARES") {
+                for name in names.split(',') {
+                    eprintln!("[declares] {}", d.describe_type_name(name.trim()));
+                }
+            }
             d.register_available_files(&available_file_names);
             // Drop project-wide inject diagnostics so they don't get
             // duplicated under every per-file check.
             d.take_diagnostics();
             Some(d)
         };
+
+        if timing {
+            eprintln!(
+                "[check]  donor build    {:>7.1}ms",
+                donor_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        // Summed over worker threads (CPU time, not wall).
+        let slow_checks: std::sync::Mutex<Vec<(u64, String)>> = std::sync::Mutex::new(Vec::new());
+        let clone_nanos = std::sync::atomic::AtomicU64::new(0);
+        let check_nanos = std::sync::atomic::AtomicU64::new(0);
+        let files_start = std::time::Instant::now();
 
         // Pre-materialize the selected (index, sf) pairs into a Vec so
         // that par_iter exposes an IndexedParallelIterator and `.collect()`
@@ -348,12 +418,39 @@ impl TsProject {
         let file_outputs: Vec<FileOutput> = selected_indices
             .par_iter()
             .map(|&(i, sf)| {
-                let mut checker = match &donor {
-                    Some(d) => d.clone(),
-                    None => tsc_rs_types::TypeChecker::new(),
+                // Under skipLibCheck tsc reports a declaration file's syntax
+                // errors but neither its semantic nor its checker grammar
+                // errors (TS1046, …), and never runs the checker on it.
+                let skip_check = self.options.skip_lib_check == Some(true)
+                    && is_declaration_file_name(&sf.file_name);
+                let semantic_diagnostics = if skip_check {
+                    Vec::new()
+                } else {
+                    let clone_start = std::time::Instant::now();
+                    let mut checker = match &donor {
+                        Some(d) => d.clone(),
+                        None => tsc_rs_types::TypeChecker::new(),
+                    };
+                    let check_start = std::time::Instant::now();
+                    checker.set_current_file_name(&sf.file_name);
+                    let diagnostics = checker
+                        .check_with_options(sf, &symbol_tables[i], &self.options)
+                        .diagnostics;
+                    if timing {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        clone_nanos
+                            .fetch_add((check_start - clone_start).as_nanos() as u64, Relaxed);
+                        let spent = check_start.elapsed();
+                        check_nanos.fetch_add(spent.as_nanos() as u64, Relaxed);
+                        if spent.as_millis() >= 250 {
+                            slow_checks
+                                .lock()
+                                .expect("slow check list poisoned")
+                                .push((spent.as_millis() as u64, sf.file_name.clone()));
+                        }
+                    }
+                    diagnostics
                 };
-                checker.set_current_file_name(&sf.file_name);
-                let check_output = checker.check_with_options(sf, &symbol_tables[i], &self.options);
 
                 // Skip JS / source-map / .d.ts emission in `--noEmit` mode.
                 // The emit pass is non-trivial (a full AST walk producing a
@@ -377,14 +474,48 @@ impl TsProject {
                     diagnostics: dedup_diagnostics(
                         sf.diagnostics
                             .iter()
+                            .filter(|diag| {
+                                !(skip_check && tsc_rs_parser::is_grammar_diagnostic(diag.code))
+                            })
                             .cloned()
-                            .chain(check_output.diagnostics)
+                            .chain(semantic_diagnostics)
                             .collect(),
                         &sf.file_name,
                     ),
                 }
             })
             .collect();
+
+        if timing {
+            use std::sync::atomic::Ordering::Relaxed;
+            eprintln!(
+                "[check]  per-file wall  {:>7.1}ms; cpu: donor clones {:.1}s, check+drop {:.1}s",
+                files_start.elapsed().as_secs_f64() * 1000.0,
+                clone_nanos.load(Relaxed) as f64 / 1e9,
+                check_nanos.load(Relaxed) as f64 / 1e9,
+            );
+        }
+        if timing {
+            let mut slow = slow_checks.into_inner().expect("slow check list poisoned");
+            slow.sort_by(|a, b| b.0.cmp(&a.0));
+            for (ms, name) in slow.iter().take(8) {
+                eprintln!("[check]    slow file {ms:>6}ms {name}");
+            }
+        }
+        let teardown_start = std::time::Instant::now();
+        if is_one_shot_process() {
+            std::mem::forget((donor, symbol_tables, parsed_files));
+        } else {
+            drop(donor);
+            drop(symbol_tables);
+            drop(parsed_files);
+        }
+        if timing {
+            eprintln!(
+                "[check]  teardown       {:>7.1}ms",
+                teardown_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
 
         CompilationResult {
             files: file_outputs,
@@ -398,6 +529,7 @@ impl TsProject {
     /// when diagnostics are present.
     pub fn compile_query(&self) -> QueryCompilationResult {
         let mut engine = QueryEngine::with_options(self.options.clone());
+        engine.set_one_shot(true);
         let mut project_diagnostics = Vec::new();
 
         for file_name in &self.file_names {
@@ -550,9 +682,10 @@ impl TsProject {
                 if timing {
                     let now = std::time::Instant::now();
                     eprintln!(
-                        "[init] {:<14} {:>7.1}ms",
+                        "[init] {:<14} {:>7.1}ms  rss {} MB",
                         $label,
-                        now.duration_since($prev).as_secs_f64() * 1000.0
+                        now.duration_since($prev).as_secs_f64() * 1000.0,
+                        resident_mb()
                     );
                     now
                 } else {
@@ -633,12 +766,17 @@ impl TsProject {
                     available_set.insert(resolved_module.resolved_file_name.clone());
                     if let Some(&target_idx) = file_index.get(&resolved_module.resolved_file_name) {
                         if target_idx != file_idx {
-                            let target_table = symbol_tables[target_idx].clone();
-                            tsc_rs_symbols::link_imports(
-                                &mut symbol_tables[file_idx],
-                                &target_table,
-                                import,
-                            );
+                            // Borrow the two tables disjointly: cloning the
+                            // target's whole table per import edge copied a
+                            // heavily imported file's symbols once per importer.
+                            let (importer, target) = if file_idx < target_idx {
+                                let (head, tail) = symbol_tables.split_at_mut(target_idx);
+                                (&mut head[file_idx], &tail[0])
+                            } else {
+                                let (head, tail) = symbol_tables.split_at_mut(file_idx);
+                                (&mut tail[0], &head[target_idx])
+                            };
+                            tsc_rs_symbols::link_imports(importer, target, import);
                         }
                     }
                 }
@@ -647,6 +785,12 @@ impl TsProject {
 
         let mut available_file_names: Vec<String> = available_set.into_iter().collect();
         available_file_names.sort();
+        // Linked; from here on requests only link against the tables (the
+        // donor is built from the ASTs), so drop everything else in them
+        // before the donor adds its own peak.
+        symbol_tables
+            .par_iter_mut()
+            .for_each(tsc_rs_symbols::SymbolTable::retain_link_surface);
         let t_link = phase!("link", t_bind);
 
         // Build the project-wide donor TypeChecker. Same recipe as
@@ -658,6 +802,7 @@ impl TsProject {
         let mut donor = tsc_rs_types::TypeChecker::new();
         donor.enable_module_resolution_diagnostics();
         donor.disable_expression_types();
+        donor.mark_donor();
         donor.inject_external_types(&all_parsed_refs);
         donor.register_available_files(&available_file_names);
         donor.take_diagnostics();
@@ -671,16 +816,35 @@ impl TsProject {
             );
         }
 
+        // Requests need the donor, the symbol tables and the file index;
+        // the ASTs (most of the session's memory) and the available-file
+        // list were only inputs to the donor, which keeps its own copies.
+        let project_file_count = parsed_files
+            .iter()
+            .filter(|sf| !sf.file_name.starts_with("__lib"))
+            .count();
+        drop(all_parsed_refs);
+        drop(parsed_files);
+        drop(available_file_names);
+
         CheckSession {
             options: self.options.clone(),
-            parsed_files,
+            project_file_count,
             symbol_tables,
             file_index,
-            available_file_names,
             donor,
             init_diagnostics,
         }
     }
+}
+
+/// Resident memory in MB (Linux `/proc/self/statm`; 0 elsewhere), for the
+/// init timing lines.
+fn resident_mb() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+        .map_or(0, |pages| pages * 4096 / (1024 * 1024))
 }
 
 /// Long-lived state for the `--check-pipe` daemon (and similar editor
@@ -690,10 +854,9 @@ impl TsProject {
 /// ~tens of ms instead of a 30 s full-project recompile.
 pub struct CheckSession {
     options: CompilerOptions,
-    parsed_files: Vec<SourceFile>,
+    project_file_count: usize,
     symbol_tables: Vec<tsc_rs_symbols::SymbolTable>,
     file_index: HashMap<String, usize>,
-    available_file_names: Vec<String>,
     donor: tsc_rs_types::TypeChecker,
     init_diagnostics: Vec<Diagnostic>,
 }
@@ -701,10 +864,7 @@ pub struct CheckSession {
 impl CheckSession {
     /// Number of project files (excluding stdlib stubs) loaded.
     pub fn project_file_count(&self) -> usize {
-        self.parsed_files
-            .iter()
-            .filter(|sf| !sf.file_name.starts_with("__lib"))
-            .count()
+        self.project_file_count
     }
 
     /// Diagnostics produced during the initial parse pass (file-read
@@ -762,8 +922,11 @@ impl CheckSession {
             if let Some(resolved_module) = resolved {
                 if let Some(&target_idx) = self.file_index.get(&resolved_module.resolved_file_name)
                 {
-                    let target_table = self.symbol_tables[target_idx].clone();
-                    tsc_rs_symbols::link_imports(&mut symbols, &target_table, import);
+                    tsc_rs_symbols::link_imports(
+                        &mut symbols,
+                        &self.symbol_tables[target_idx],
+                        import,
+                    );
                 }
             }
         }
@@ -916,7 +1079,9 @@ fn autodiscover_max_bytes() -> u64 {
     std::env::var("TSC_RS_AUTODISCOVER_MAX_FILE_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(500_000)
+        // A one-shot run builds the whole program, as tsc does; the caps
+        // bound the memory of long-lived sessions.
+        .unwrap_or(if is_one_shot_process() { 0 } else { 500_000 })
 }
 
 /// Maximum number of files added by autodiscovery. Defaults to 1500;
@@ -931,7 +1096,11 @@ fn autodiscover_max_files() -> usize {
     std::env::var("TSC_RS_AUTODISCOVER_MAX_FILES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1500)
+        .unwrap_or(if is_one_shot_process() {
+            usize::MAX
+        } else {
+            1500
+        })
 }
 
 /// Maximum BFS rounds. Limits how deep autodiscovery follows
@@ -947,7 +1116,7 @@ fn autodiscover_max_rounds() -> usize {
     std::env::var("TSC_RS_AUTODISCOVER_MAX_ROUNDS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(6)
+        .unwrap_or(if is_one_shot_process() { 1000 } else { 6 })
 }
 
 /// Maximum files to autodiscover per node_modules package. Without this
@@ -969,7 +1138,7 @@ fn autodiscover_max_per_package() -> usize {
     std::env::var("TSC_RS_AUTODISCOVER_MAX_PER_PACKAGE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(250)
+        .unwrap_or(if is_one_shot_process() { 0 } else { 250 })
 }
 
 /// Autodiscover `.d.ts` files reachable via imports + `export … from "…"`
@@ -1048,6 +1217,16 @@ fn is_dts_path(path: &str) -> bool {
     path.ends_with(".d.ts") || path.ends_with(".d.cts") || path.ends_with(".d.mts")
 }
 
+/// A TypeScript (not declaration, not JavaScript) source file outside
+/// `node_modules`.
+fn is_workspace_ts_source(path: &str) -> bool {
+    !is_dts_path(path)
+        && [".ts", ".tsx", ".mts", ".cts"]
+            .iter()
+            .any(|ext| path.ends_with(ext))
+        && node_modules_package(path).is_none()
+}
+
 fn autodiscover_should_follow(from: &str, to: &str) -> bool {
     let from_pkg = node_modules_package(from);
     let to_pkg = node_modules_package(to);
@@ -1122,7 +1301,14 @@ pub fn autodiscover_dts(parsed_files: &mut Vec<SourceFile>, options: &CompilerOp
                         // why zod/v4 inference collapsed to `any` (only its
                         // entry `.d.ts` re-exported `.d.cts` files, which
                         // were rejected here).
-                        if !is_dts_path(&path) {
+                        //
+                        // A TypeScript source outside node_modules is part
+                        // of the program too: tsc loads (and checks) every
+                        // source an import resolves to, which is how a
+                        // workspace package consumed from source
+                        // (`@scope/services` → `../services/src/…`) gets
+                        // its exports known and its own errors reported.
+                        if !is_dts_path(&path) && !is_workspace_ts_source(&path) {
                             return None;
                         }
                         // Cross-package transitive scoping: a workspace
@@ -1175,6 +1361,9 @@ pub fn autodiscover_dts(parsed_files: &mut Vec<SourceFile>, options: &CompilerOp
                             return None;
                         }
                     }
+                    if prisma_model_without_namespace(path, max_bytes) {
+                        return None;
+                    }
                 }
                 std::fs::read_to_string(path)
                     .ok()
@@ -1200,6 +1389,36 @@ pub fn autodiscover_dts(parsed_files: &mut Vec<SourceFile>, options: &CompilerOp
             parsed_files.len() - initial_count,
             parsed_files.len()
         );
+    }
+}
+
+/// A Prisma-generated per-model typing (`<client>/models/<Model>.d.ts`) whose
+/// client namespace (`<client>/internal/prismaNamespace.d.ts`) is over the
+/// size cap, so it will not be loaded.
+///
+/// A model file's types are written against that namespace
+/// (`Prisma.$ProductPayload`, `Prisma.StringFilter`, …), so without it they
+/// are hollow shells: the payload and result types already resolve to
+/// `any`, and only the top-level keys of the `*WhereInput` / `*Select`
+/// shapes survive. Skipping them leaves those names unresolved. The files
+/// are not small, though: a large production client has ~1 300 models
+/// under the cap, 92 MB of `.d.ts` that took a `packages/scripts` daemon
+/// from 0.85 to 3.2 GB RSS and an `apps/app` one from 2.3 to 5 GB. One-shot
+/// runs set no cap and load both, as tsc does.
+fn prisma_model_without_namespace(path: &str, max_bytes: u64) -> bool {
+    let p = Path::new(path);
+    let Some(models_dir) = p.parent() else {
+        return false;
+    };
+    if models_dir.file_name().and_then(|n| n.to_str()) != Some("models") || !is_dts_path(path) {
+        return false;
+    }
+    let Some(client_dir) = models_dir.parent() else {
+        return false;
+    };
+    match std::fs::metadata(client_dir.join("internal").join("prismaNamespace.d.ts")) {
+        Ok(meta) => meta.len() > max_bytes,
+        Err(_) => false,
     }
 }
 
@@ -1611,7 +1830,32 @@ fn tsconfig_dir(config_path: &Path) -> &Path {
 /// and any errors encountered.
 pub fn parse_tsconfig(path: &str) -> Result<ParsedCommandLine, String> {
     let mut visited = std::collections::HashSet::new();
-    parse_tsconfig_with_visited(path, &mut visited)
+    let mut result = parse_tsconfig_with_visited(path, &mut visited)?;
+
+    // Auto-load @types/* entry points so ambient declarations (e.g.
+    // `declare var global: typeof globalThis` in @types/node/globals.d.ts)
+    // land in the donor scope. Matches TypeScript's default behavior: if
+    // `compilerOptions.types` is unspecified, every @types/* package found
+    // under `typeRoots` (default `node_modules/@types`, walking up parent
+    // directories) is included.
+    //
+    // Once, on the merged config: done per config of an `extends` chain it
+    // made a child without `include` look like it listed files, and the
+    // merge then dropped the files it inherits from its base.
+    let _at = std::time::Instant::now();
+    augment_with_at_types(
+        tsconfig_dir(Path::new(path)),
+        &result.options,
+        &mut result.file_names,
+    );
+    if std::env::var("TSC_RS_INIT_TIMING").is_ok() {
+        eprintln!(
+            "[init]   at_types       {:>7.1}ms ({} total)",
+            _at.elapsed().as_secs_f64() * 1000.0,
+            result.file_names.len()
+        );
+    }
+    Ok(result)
 }
 
 fn parse_tsconfig_with_visited(
@@ -1715,27 +1959,11 @@ fn parse_tsconfig_content(content: &str, config_dir: &Path) -> Result<ParsedComm
 
     // Discover files
     let _dt = std::time::Instant::now();
-    let mut file_names = discover_files(content, config_dir, &mut errors);
+    let file_names = discover_files(content, config_dir, &mut errors);
     if std::env::var("TSC_RS_INIT_TIMING").is_ok() {
         eprintln!(
             "[init]   discover_files {:>7.1}ms ({} files)",
             _dt.elapsed().as_secs_f64() * 1000.0,
-            file_names.len()
-        );
-    }
-    let _at = std::time::Instant::now();
-
-    // Auto-load @types/* entry points so ambient declarations (e.g.
-    // `declare var global: typeof globalThis` in @types/node/globals.d.ts)
-    // land in the donor scope. Matches TypeScript's default behavior: if
-    // `compilerOptions.types` is unspecified, every @types/* package found
-    // under `typeRoots` (default `node_modules/@types`, walking up parent
-    // directories) is included.
-    augment_with_at_types(config_dir, &options, &mut file_names);
-    if std::env::var("TSC_RS_INIT_TIMING").is_ok() {
-        eprintln!(
-            "[init]   at_types       {:>7.1}ms ({} total)",
-            _at.elapsed().as_secs_f64() * 1000.0,
             file_names.len()
         );
     }
@@ -1759,6 +1987,11 @@ fn augment_with_at_types(
     if options.no_lib == Some(true) {
         return;
     }
+    // `-p tsconfig.json` gives an empty relative `config_dir`, which the
+    // upward `node_modules` walks below cannot climb: use its absolute form.
+    let absolute_config_dir =
+        std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+    let config_dir = absolute_config_dir.as_path();
 
     // Resolve the type roots. Default = `node_modules/@types` walked up
     // from config_dir until found or filesystem root.
@@ -1794,10 +2027,6 @@ fn augment_with_at_types(
         }
     };
 
-    if type_roots.is_empty() {
-        return;
-    }
-
     // Determine which packages to load.
     let packages_to_load: Option<Vec<String>> = match &options.types {
         Some(list) => {
@@ -1828,13 +2057,14 @@ fn augment_with_at_types(
         for pkg_name in pkg_names {
             // De-dup across roots: a package found in a closer root wins —
             // matches TypeScript's "nearest typeRoot wins" merge.
-            if !seen.insert(pkg_name.clone()) {
+            if seen.contains(&pkg_name) {
                 continue;
             }
             let pkg_dir = root.join(&pkg_name);
             if !pkg_dir.is_dir() {
                 continue;
             }
+            seen.insert(pkg_name.clone());
             if let Some(entry) = find_types_pkg_entry(&pkg_dir) {
                 let norm = normalize_path(Path::new(&entry));
                 if !file_names.contains(&norm) {
@@ -1848,6 +2078,56 @@ fn augment_with_at_types(
                 // pass.
                 collect_reference_paths(&norm, file_names);
             }
+        }
+    }
+
+    // An explicit `types` entry that no type root holds resolves like a
+    // `/// <reference types>` directive: through `node_modules` (tsc).
+    // `"types": ["bun-types"]` names a plain package, not an `@types` one.
+    for pkg_name in packages_to_load.iter().flatten() {
+        if seen.contains(pkg_name) {
+            continue;
+        }
+        if let Some(entry) = resolve_type_reference(pkg_name, config_dir) {
+            seen.insert(pkg_name.clone());
+            if !file_names.contains(&entry) {
+                file_names.push(entry.clone());
+            }
+            collect_reference_paths(&entry, file_names);
+        }
+    }
+}
+
+fn is_declaration_file_name(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    [".d.ts", ".d.tsx", ".d.mts", ".d.cts"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+/// Resolves a type reference (`types` entry or `/// <reference types>`)
+/// from `from_dir` up: `node_modules/@types/<name>` first, then
+/// `node_modules/<name>` (tsc's secondary lookup).
+fn resolve_type_reference(name: &str, from_dir: &Path) -> Option<String> {
+    let at_types_name = match name.strip_prefix('@') {
+        Some(scoped) => scoped.replacen('/', "__", 1),
+        None => name.to_string(),
+    };
+    let mut dir = std::path::absolute(from_dir).ok()?;
+    loop {
+        let node_modules = dir.join("node_modules");
+        for pkg_dir in [
+            node_modules.join("@types").join(&at_types_name),
+            node_modules.join(name),
+        ] {
+            if pkg_dir.is_dir() {
+                if let Some(entry) = find_types_pkg_entry(&pkg_dir) {
+                    return Some(normalize_path(Path::new(&entry)));
+                }
+            }
+        }
+        if !dir.pop() {
+            return None;
         }
     }
 }
@@ -1904,9 +2184,14 @@ fn collect_reference_paths(entry_path: &str, file_names: &mut Vec<String>) {
                 Some(s) => s.trim_start(),
                 None => continue,
             };
-            let after_path = match after_lt.strip_prefix("path") {
-                Some(s) => s.trim_start(),
-                None => continue,
+            // `path` names a file; `types` names a package (resolved
+            // through node_modules below).
+            let (is_types, after_path) = if let Some(s) = after_lt.strip_prefix("path") {
+                (false, s.trim_start())
+            } else if let Some(s) = after_lt.strip_prefix("types") {
+                (true, s.trim_start())
+            } else {
+                continue;
             };
             let after_eq = match after_path.strip_prefix('=') {
                 Some(s) => s.trim_start(),
@@ -1924,6 +2209,15 @@ fn collect_reference_paths(entry_path: &str, file_names: &mut Vec<String>) {
                 continue;
             };
             let referenced = &rest_after_quote[..end];
+            if is_types {
+                if let Some(entry) = resolve_type_reference(referenced, parent) {
+                    if !file_names.contains(&entry) {
+                        file_names.push(entry.clone());
+                    }
+                    to_visit.push(entry);
+                }
+                continue;
+            }
             let mut target = parent.join(referenced);
             // `<reference path>` paths can omit the `.d.ts` extension; try
             // adding it if the literal isn't a file.
@@ -2195,17 +2489,52 @@ fn collect_files_matching(
     collect_files_matching_inner(dir, &exts, has_default, files, &mut visited, excluded_dirs);
 }
 
+/// What identifies a directory for cycle detection: its device and inode
+/// where the platform exposes them, else its canonical path.
+#[cfg(unix)]
+type DirIdentity = (u64, u64);
+#[cfg(not(unix))]
+type DirIdentity = PathBuf;
+
+/// `dir`'s identity, or `None` when it is not a directory.
+fn dir_identity(dir: &Path) -> Option<DirIdentity> {
+    let meta = std::fs::metadata(dir).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::canonicalize(dir).ok()
+    }
+}
+
 fn collect_files_matching_inner(
     dir: &Path,
     exts: &[&str],
     has_default: bool,
     files: &mut Vec<PathBuf>,
-    visited: &mut std::collections::HashSet<PathBuf>,
+    visited: &mut std::collections::HashSet<DirIdentity>,
     excluded_dirs: &[String],
 ) {
-    if !dir.is_dir() {
+    // Skip node_modules — never useful to recurse into.
+    if dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "node_modules")
+    {
         return;
     }
+    // One `stat` both checks the directory and identifies it for symlink
+    // cycle detection (a `canonicalize` was a `readlink` per path
+    // component, most of a 6 000-file project's discovery time).
+    let Some(identity) = dir_identity(dir) else {
+        return;
+    };
     // Prune excluded subtrees up front — the whole point is to not `readdir`
     // them at all. Match the same normalized-prefix form the post-walk filter
     // uses so behavior is identical, just earlier.
@@ -2218,21 +2547,8 @@ fn collect_files_matching_inner(
             return;
         }
     }
-    // Resolve symlinks to detect cycles.
-    let canonical = match std::fs::canonicalize(dir) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    if !visited.insert(canonical) {
+    if !visited.insert(identity) {
         return; // Already visited — symlink cycle.
-    }
-    // Skip node_modules — never useful to recurse into.
-    if dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n == "node_modules")
-    {
-        return;
     }
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -2433,8 +2749,10 @@ fn resolve_extends_path(extends: &str, config_dir: &Path) -> PathBuf {
         };
 
     if !is_relative {
-        // Bare / scoped package specifier → node_modules walk.
-        let mut dir = config_dir.to_path_buf();
+        // Bare / scoped package specifier → node_modules walk. `-p
+        // tsconfig.json` gives an empty relative `config_dir`, which `pop`
+        // cannot climb out of: walk from its absolute form.
+        let mut dir = std::path::absolute(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
         loop {
             let nm = dir.join("node_modules").join(extends);
             // 1. exact file (the common `.../base.json` case)
@@ -2544,6 +2862,75 @@ fn merge_configs(base: ParsedCommandLine, override_config: ParsedCommandLine) ->
     }
     if o.ts_build_info_file.is_some() {
         options.ts_build_info_file = o.ts_build_info_file.clone();
+    }
+    // Every other option a child sets also overrides its base. (These were
+    // dropped: a child's `types`, `strictNullChecks`, `allowJs`, … had no
+    // effect under `extends`.)
+    macro_rules! override_set {
+        ($($field:ident),* $(,)?) => {
+            $(if o.$field.is_some() {
+                options.$field = o.$field.clone();
+            })*
+        };
+    }
+    override_set!(
+        no_implicit_returns,
+        no_unused_locals,
+        no_unused_parameters,
+        strict_null_checks,
+        strict_function_types,
+        strict_bind_call_apply,
+        strict_property_initialization,
+        jsx_factory,
+        jsx_fragment_factory,
+        jsx_import_source,
+        types,
+        type_roots,
+        allow_js,
+        check_js,
+        allow_importing_ts_extensions,
+        skip_default_lib_check,
+        no_lib,
+        exact_optional_property_types,
+        no_emit_on_error,
+        isolated_modules,
+        preserve_const_enums,
+        filename,
+        no_error_truncation,
+        experimental_decorators,
+        emit_decorator_metadata,
+        use_define_for_class_fields,
+        module_detection,
+        verbatim_module_syntax,
+        no_check,
+        no_resolve,
+        down_level_iteration,
+        import_helpers,
+        emit_bom,
+        new_line,
+        remove_comments,
+        no_emit_helpers,
+        always_strict,
+        pretty,
+        no_fallthrough_cases_in_switch,
+        allow_unreachable_code,
+        force_consistent_casing_in_file_names,
+        use_unknown_in_catch_variables,
+        no_property_access_from_index_signature,
+        no_unchecked_indexed_access,
+        resolve_json_module,
+        isolated_declarations,
+        emit_declaration_only,
+        imports_not_used_as_values,
+        preserve_type_annotations,
+        preserve_comments,
+        preserve_whitespace,
+        fast_emit,
+    );
+    // Unmodelled options: the child's value replaces the base's by name.
+    for (name, value) in &o.other {
+        options.other.retain(|(existing, _)| existing != name);
+        options.other.push((name.clone(), value.clone()));
     }
 
     // File names come from the child config
@@ -2706,10 +3093,12 @@ fn extract_json_object(json: &str, field: &str) -> Option<String> {
 }
 
 fn normalize_path(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/")
+    tsc_rs_resolver::dedupe_package_file(
+        tsc_rs_resolver::canonicalize(path)
+            .unwrap_or_else(|| path.to_path_buf())
+            .to_string_lossy()
+            .replace('\\', "/"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2720,6 +3109,20 @@ fn normalize_path(path: &Path) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// The discovered files under `root`. Default discovery also loads every
+    /// ancestor's `node_modules/@types` (as tsc does), so a test project in a
+    /// temp dir sees whatever typings the machine has above it (a
+    /// `/tmp/node_modules`, `~/node_modules`).
+    fn own_files(file_names: &[String], root: &Path) -> Vec<String> {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let prefix = root.to_string_lossy().replace('\\', "/");
+        file_names
+            .iter()
+            .filter(|f| f.starts_with(prefix.as_str()))
+            .cloned()
+            .collect()
+    }
 
     #[test]
     fn parse_simple_tsconfig() {
@@ -2743,12 +3146,13 @@ mod tests {
         fs::write(root.join("src/main.ts"), "const x = 1;").unwrap();
 
         let result = parse_tsconfig(root.join("tsconfig.json").to_str().unwrap()).unwrap();
+        let own = own_files(&result.file_names, &root);
         assert!(result.options.target.is_some());
         assert!(result.options.module.is_some());
         assert_eq!(result.options.strict, Some(true));
         assert_eq!(result.options.out_dir.as_deref(), Some("./dist"));
-        assert_eq!(result.file_names.len(), 1);
-        assert!(result.file_names[0].contains("main.ts"));
+        assert_eq!(own.len(), 1);
+        assert!(own[0].contains("main.ts"));
     }
 
     #[test]
@@ -2771,9 +3175,10 @@ mod tests {
         .unwrap();
 
         let result = parse_tsconfig(root.join("tsconfig.json").to_str().unwrap()).unwrap();
-        assert_eq!(result.file_names.len(), 2);
-        assert!(result.file_names.iter().any(|f| f.contains("a.ts")));
-        assert!(result.file_names.iter().any(|f| f.contains("b.ts")));
+        let own = own_files(&result.file_names, &root);
+        assert_eq!(own.len(), 2);
+        assert!(own.iter().any(|f| f.contains("a.ts")));
+        assert!(own.iter().any(|f| f.contains("b.ts")));
     }
 
     #[test]
@@ -3028,8 +3433,9 @@ mod tests {
         .unwrap();
 
         let result = parse_tsconfig(root.join("tsconfig.json").to_str().unwrap()).unwrap();
-        assert_eq!(result.file_names.len(), 1);
-        assert!(result.file_names[0].contains("main.ts"));
+        let own = own_files(&result.file_names, &root);
+        assert_eq!(own.len(), 1);
+        assert!(own[0].contains("main.ts"));
     }
 
     #[test]
@@ -3068,6 +3474,45 @@ mod tests {
         assert!(result.options.module.is_some());
         // Should inherit strict from base
         assert_eq!(result.options.strict, Some(true));
+    }
+
+    #[test]
+    fn extends_child_overrides_every_option_and_inherits_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.ts"), "const x = 1;").unwrap();
+        fs::write(
+            root.join("base.json"),
+            r#"{
+                "compilerOptions": { "strict": true, "strictNullChecks": true, "types": ["node"] },
+                "include": ["src/**/*.ts"]
+            }"#,
+        )
+        .unwrap();
+        // No `include` of its own; `types: []` also keeps the result free
+        // of whatever @types the temp dir's ancestors hold.
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{
+                "extends": "./base.json",
+                "compilerOptions": {
+                    "strictNullChecks": false,
+                    "types": [],
+                    "experimentalDecorators": true
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = parse_tsconfig(root.join("tsconfig.json").to_str().unwrap()).unwrap();
+        assert_eq!(result.options.strict, Some(true));
+        assert_eq!(result.options.strict_null_checks, Some(false));
+        assert_eq!(result.options.types.as_deref(), Some(&[][..]));
+        assert_eq!(result.options.experimental_decorators, Some(true));
+        // The base's `include` is inherited.
+        assert_eq!(result.file_names.len(), 1);
+        assert!(result.file_names[0].ends_with("main.ts"));
     }
 
     #[test]
@@ -3134,8 +3579,9 @@ mod tests {
         .unwrap();
 
         let result = parse_tsconfig(root.join("tsconfig.json").to_str().unwrap()).unwrap();
+        let own = own_files(&result.file_names, &root);
         // Should find .ts and .tsx but not .js
-        assert_eq!(result.file_names.len(), 2);
+        assert_eq!(own.len(), 2);
     }
 
     #[test]
@@ -3453,7 +3899,8 @@ mod tests {
         .unwrap();
 
         let result = parse_tsconfig(root.join("tsconfig.json").to_str().unwrap()).unwrap();
-        assert_eq!(result.file_names.len(), 0);
+        let own = own_files(&result.file_names, &root);
+        assert_eq!(own.len(), 0);
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].code, 6053);
     }
@@ -3642,8 +4089,9 @@ mod tests {
         .unwrap();
 
         let result = parse_tsconfig(root.join("tsconfig.json").to_str().unwrap()).unwrap();
-        assert_eq!(result.file_names.len(), 1);
-        assert!(result.file_names[0].ends_with("/top.ts"));
+        let own = own_files(&result.file_names, &root);
+        assert_eq!(own.len(), 1);
+        assert!(own[0].ends_with("/top.ts"));
     }
 
     #[test]

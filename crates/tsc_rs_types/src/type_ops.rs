@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use std::collections::HashMap;
 
-use crate::{FunctionType, MappedModifierKind, ObjectTypeInfo, Type};
+use crate::{FunctionType, MappedModifierKind, ObjectTypeData, ObjectTypeInfo, Type};
 
 // ---------------------------------------------------------------------------
 // Extends result
@@ -281,7 +281,7 @@ fn substitute_inner(ty: &Type, name: &str, replacement: &Type) -> Type {
 }
 
 fn substitute_object(obj: &ObjectTypeInfo, name: &str, replacement: &Type) -> ObjectTypeInfo {
-    ObjectTypeInfo {
+    ObjectTypeInfo::new(ObjectTypeData {
         properties: obj
             .properties
             .iter()
@@ -329,7 +329,7 @@ fn substitute_object(obj: &ObjectTypeInfo, name: &str, replacement: &Type) -> Ob
         }),
         index_signature_name: obj.index_signature_name.clone(),
         method_names: obj.method_names.clone(),
-    }
+    })
 }
 
 /// Apply substitution from a map of type parameters to their replacements.
@@ -660,14 +660,14 @@ pub fn expand_mapped(
     let _ = readonly_mod;
     let _ = optional_mod;
 
-    Type::ObjectType(ObjectTypeInfo {
+    Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
         properties,
         call_signatures: Vec::new(),
         construct_signatures: Vec::new(),
         index_signature: None,
         index_signature_name: None,
         method_names: Vec::new(),
-    })
+    }))
 }
 
 /// Try to extract a list of string keys from a type (for mapped type expansion).
@@ -1277,7 +1277,7 @@ mod tests {
 
     #[test]
     fn keyof_object_type() {
-        let obj = Type::ObjectType(ObjectTypeInfo {
+        let obj = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![
                 ("x".into(), Arc::new(Type::Number)),
                 ("y".into(), Arc::new(Type::String)),
@@ -1287,7 +1287,7 @@ mod tests {
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
+        }));
         let result = resolve_keyof(&obj);
         assert_eq!(
             result,
@@ -1310,7 +1310,7 @@ mod tests {
 
     #[test]
     fn indexed_access_object_property() {
-        let obj = Type::ObjectType(ObjectTypeInfo {
+        let obj = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![
                 ("name".into(), Arc::new(Type::String)),
                 ("age".into(), Arc::new(Type::Number)),
@@ -1320,7 +1320,7 @@ mod tests {
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
+        }));
         let result = resolve_indexed_access(&obj, &Type::StringLiteral("name".into()));
         assert_eq!(result, Type::String);
     }
@@ -1341,7 +1341,7 @@ mod tests {
 
     #[test]
     fn indexed_access_union_index() {
-        let obj = Type::ObjectType(ObjectTypeInfo {
+        let obj = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![
                 ("a".into(), Arc::new(Type::String)),
                 ("b".into(), Arc::new(Type::Number)),
@@ -1351,7 +1351,7 @@ mod tests {
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        });
+        }));
         let idx = Type::Union(
             vec![
                 Type::StringLiteral("a".into()),

@@ -1,3 +1,6 @@
+/// Returns the allocator's freed pages to the OS now (a no-op with mimalloc).
+pub(crate) fn release_free_memory() {}
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -289,6 +292,9 @@ fn main() {
     if cli.watch {
         run_watch(project, &cli, config_path.as_deref());
     } else {
+        // One-shot run (not watch, pipe or LSP mode): the filesystem is
+        // fixed for its duration and teardown is left to process exit.
+        tsc_rs_project::set_one_shot_process();
         // Compile on a dedicated thread with a larger stack. Same rationale
         // as the `--check-pipe` branch above: nested generic typings
         // (especially generated Prisma `.d.ts` files) overflow the default
@@ -533,7 +539,7 @@ fn compile_and_emit(project: &TsProject, cli: &CliArgs, config_path: Option<&str
         print_diagnostics(&syntax_diags, project, cli.max_errors);
         let has_errors = result.has_errors();
         if !no_emit && !has_errors {
-            write_outputs(&result, &project.options);
+            write_outputs(&result, &project.options, config_path);
         }
         if has_errors {
             print_error_summary(&syntax_diags);
@@ -545,7 +551,12 @@ fn compile_and_emit(project: &TsProject, cli: &CliArgs, config_path: Option<&str
         let query_result = project.compile_query();
         print_diagnostics(&query_result.diagnostics, project, cli.max_errors);
         print_error_summary(&query_result.diagnostics);
-        return query_result.has_errors();
+        let has_errors = query_result.has_errors();
+        if tsc_rs_project::is_one_shot_process() {
+            // The engine holds every file's analysis; exit reclaims it.
+            std::mem::forget(query_result);
+        }
+        return has_errors;
     }
 
     let is_incremental = is_incremental_mode(project, cli);
@@ -578,7 +589,7 @@ fn compile_and_emit(project: &TsProject, cli: &CliArgs, config_path: Option<&str
 
     // Write output files unless --noEmit
     if !no_emit && !result.has_errors() {
-        write_outputs(&result, &project.options);
+        write_outputs(&result, &project.options, config_path);
     }
 
     print_error_summary(&all_diags);
@@ -645,53 +656,156 @@ fn collect_all_diagnostics(result: &CompilationResult) -> Vec<Diagnostic> {
 }
 
 /// Write .js (and optionally .d.ts / .map) files.
-fn write_outputs(result: &CompilationResult, options: &CompilerOptions) {
+fn write_outputs(result: &CompilationResult, options: &CompilerOptions, config_path: Option<&str>) {
+    // Path options are relative to the tsconfig that sets them (tsc), not
+    // to the current directory.
+    let config_dir = config_path
+        .and_then(|cfg| std::path::absolute(cfg).ok())
+        .and_then(|cfg| cfg.parent().map(Path::to_path_buf));
+    let resolve = |value: &str| -> PathBuf {
+        let path = Path::new(value);
+        match &config_dir {
+            Some(dir) if !path.is_absolute() => dir.join(path),
+            _ => path.to_path_buf(),
+        }
+    };
+    let out_dir = options.out_dir.as_deref().map(resolve);
+    // tsc keeps each file's path below `rootDir`, else below the common
+    // directory of the emitted sources (computeCommonSourceDirectory).
+    let source_root = out_dir.as_ref().map(|_| match options.root_dir.as_deref() {
+        Some(root) => normalize_components(&resolve(root)),
+        None => common_source_directory(
+            result
+                .files
+                .iter()
+                .filter(|file| !is_declaration_or_json(&file.file_name))
+                .map(|file| normalize_components(&absolute_or_same(&file.file_name))),
+        ),
+    });
+    let jsx_preserve = matches!(
+        options.jsx,
+        Some(tsc_rs_ast::JsxEmit::Preserve | tsc_rs_ast::JsxEmit::ReactNative)
+    );
+
     for file_output in &result.files {
-        let source_path = Path::new(&file_output.file_name);
-        let base = source_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("output");
-
-        let out_dir = if let Some(ref dir) = options.out_dir {
-            PathBuf::from(dir)
-        } else {
-            source_path
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."))
+        // tsc emits nothing for declaration files and JSON modules.
+        if is_declaration_or_json(&file_output.file_name) {
+            continue;
+        }
+        let source_path = normalize_components(&absolute_or_same(&file_output.file_name));
+        let target_base = match (&out_dir, &source_root) {
+            (Some(out_dir), Some(root)) => match source_path.strip_prefix(root) {
+                Ok(relative) => out_dir.join(relative),
+                Err(_) => out_dir.join(source_path.file_name().unwrap_or_default()),
+            },
+            _ => source_path.clone(),
         };
-
-        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        let Some(dir) = target_base.parent() else {
+            continue;
+        };
+        if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!(
                 "error: Cannot create output directory '{}': {e}",
-                out_dir.display()
+                dir.display()
             );
             continue;
         }
-
-        // Write .js
-        let js_path = out_dir.join(format!("{base}.js"));
+        let (js_ext, dts_ext) = output_extensions(&file_output.file_name, jsx_preserve);
+        let js_path = with_output_extension(&target_base, js_ext);
         if let Err(e) = std::fs::write(&js_path, &file_output.emit.javascript) {
             eprintln!("error: Cannot write '{}': {e}", js_path.display());
         }
-
-        // Write .js.map if present
         if let Some(ref map) = file_output.emit.source_map {
-            let map_path = out_dir.join(format!("{base}.js.map"));
+            let map_path = with_output_extension(&target_base, &format!("{js_ext}.map"));
             if let Err(e) = std::fs::write(&map_path, map) {
                 eprintln!("error: Cannot write '{}': {e}", map_path.display());
             }
         }
-
-        // Write .d.ts if present
         if let Some(ref dts) = file_output.emit.declaration_file {
-            let dts_path = out_dir.join(format!("{base}.d.ts"));
+            let dts_path = with_output_extension(&target_base, dts_ext);
             if let Err(e) = std::fs::write(&dts_path, dts) {
                 eprintln!("error: Cannot write '{}': {e}", dts_path.display());
             }
         }
     }
+}
+
+fn is_declaration_or_json(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.ends_with(".json")
+        || [".d.ts", ".d.mts", ".d.cts", ".d.tsx"]
+            .iter()
+            .any(|ext| lower.ends_with(ext))
+}
+
+fn absolute_or_same(file_name: &str) -> PathBuf {
+    std::path::absolute(file_name).unwrap_or_else(|_| PathBuf::from(file_name))
+}
+
+/// Drops `.` and folds `..` lexically, as tsc's path normalization does.
+fn normalize_components(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The longest directory that contains every file (tsc
+/// `computeCommonSourceDirectoryOfFilenames`).
+fn common_source_directory(files: impl Iterator<Item = PathBuf>) -> PathBuf {
+    let mut common: Option<PathBuf> = None;
+    for file in files {
+        let dir = file.parent().map(Path::to_path_buf).unwrap_or_default();
+        common = Some(match common {
+            None => dir,
+            Some(current) => current
+                .components()
+                .zip(dir.components())
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| a.as_os_str())
+                .collect(),
+        });
+    }
+    common.unwrap_or_default()
+}
+
+/// The `.js`-side and declaration extensions tsc emits for a source file.
+fn output_extensions(file_name: &str, jsx_preserve: bool) -> (&'static str, &'static str) {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".mts") || lower.ends_with(".mjs") {
+        (".mjs", ".d.mts")
+    } else if lower.ends_with(".cts") || lower.ends_with(".cjs") {
+        (".cjs", ".d.cts")
+    } else if (lower.ends_with(".tsx") || lower.ends_with(".jsx")) && jsx_preserve {
+        (".jsx", ".d.ts")
+    } else {
+        (".js", ".d.ts")
+    }
+}
+
+/// `base` with its source extension (`.ts`, `.d.ts`, `.tsx`, …) replaced.
+fn with_output_extension(base: &Path, extension: &str) -> PathBuf {
+    let name = base
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("output");
+    let lower = name.to_ascii_lowercase();
+    let stem_len = [
+        ".d.mts", ".d.cts", ".d.ts", ".mts", ".cts", ".tsx", ".jsx", ".mjs", ".cjs", ".ts", ".js",
+    ]
+    .iter()
+    .find(|ext| lower.ends_with(*ext))
+    .map_or(name.len(), |ext| name.len() - ext.len());
+    base.with_file_name(format!("{}{extension}", &name[..stem_len]))
 }
 
 // ---------------------------------------------------------------------------
@@ -745,19 +859,19 @@ fn run_build(args: &[String]) {
 
 fn print_diagnostics(diagnostics: &[Diagnostic], project: &TsProject, max_errors: Option<usize>) {
     let use_color = is_tty();
+    let cwd = std::env::current_dir().ok();
     let mut errors_printed: usize = 0;
     let total_errors = diagnostics
         .iter()
         .filter(|d| d.category == DiagnosticCategory::Error)
         .count();
 
-    // Build a lookup from file_name -> source text for line/col resolution
-    let mut source_cache: HashMap<String, String> = HashMap::new();
-    for fname in &project.file_names {
-        if let Ok(src) = std::fs::read_to_string(fname) {
-            source_cache.insert(fname.clone(), src);
-        }
-    }
+    // file_name -> source text for line/col resolution, read on a file's
+    // first diagnostic (reading every project file up front cost more than
+    // printing). Any file can carry diagnostics: imports pull sources from
+    // outside the tsconfig's own file list into the program.
+    let _ = project;
+    let mut source_cache: HashMap<String, Option<String>> = HashMap::new();
 
     for diag in diagnostics {
         if let Some(cap) = max_errors {
@@ -773,14 +887,22 @@ fn print_diagnostics(diagnostics: &[Diagnostic], project: &TsProject, max_errors
         };
 
         let location = if let (Some(ref fname), Some(span)) = (&diag.file_name, diag.span) {
-            if let Some(source) = source_cache.get(fname.as_str()) {
+            let source = source_cache
+                .entry(fname.clone())
+                .or_insert_with(|| std::fs::read_to_string(fname).ok());
+            if let Some(source) = source {
                 let (line, col) = offset_to_line_col(source, span.start);
-                format!("{}({},{})", fname, line + 1, col + 1)
+                format!(
+                    "{}({},{})",
+                    display_file_name(fname, cwd.as_deref()),
+                    line + 1,
+                    col + 1
+                )
             } else {
-                fname.clone()
+                display_file_name(fname, cwd.as_deref())
             }
         } else if let Some(ref fname) = diag.file_name {
-            fname.clone()
+            display_file_name(fname, cwd.as_deref())
         } else {
             String::new()
         };
@@ -859,12 +981,47 @@ fn is_tty() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
-    // On CI or dumb terminals, disable color
+    // Like tsc's `pretty` default: color only when diagnostics go to a
+    // terminal, never when piped or redirected.
+    use std::io::IsTerminal;
+    if !std::io::stderr().is_terminal() {
+        return false;
+    }
     match std::env::var("TERM") {
         Ok(term) if term == "dumb" => false,
         Ok(_) => true,
         Err(_) => false,
     }
+}
+
+/// tsc prints diagnostic file names relative to the current directory.
+fn display_file_name(file_name: &str, cwd: Option<&Path>) -> String {
+    let Some(cwd) = cwd else {
+        return file_name.to_string();
+    };
+    let path = Path::new(file_name);
+    if !path.is_absolute() {
+        return file_name.to_string();
+    }
+    let file_parts: Vec<_> = path.components().collect();
+    let cwd_parts: Vec<_> = cwd.components().collect();
+    let common = file_parts
+        .iter()
+        .zip(&cwd_parts)
+        .take_while(|(a, b)| a == b)
+        .count();
+    // Only the root in common (another drive or top-level tree): keep it.
+    if common <= 1 {
+        return file_name.to_string();
+    }
+    let mut relative = PathBuf::new();
+    for _ in common..cwd_parts.len() {
+        relative.push("..");
+    }
+    for part in &file_parts[common..] {
+        relative.push(part.as_os_str());
+    }
+    relative.to_string_lossy().replace('\\', "/")
 }
 
 // ---------------------------------------------------------------------------

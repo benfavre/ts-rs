@@ -799,7 +799,7 @@ impl TypeChecker {
     /// diagnostic follows. JS files keep their expando leniency.
     /// The built-in `import.meta` shape (standard + runtime properties).
     fn import_meta_builtin_shape(&self) -> Type {
-        Type::ObjectType(ObjectTypeInfo {
+        Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![
                 ("url".to_string(), Arc::new(Type::String)),
                 // Bun/Deno/Node extensions
@@ -810,7 +810,7 @@ impl TypeChecker {
                 ("filename".to_string(), Arc::new(Type::String)),
                 (
                     "env".to_string(),
-                    Arc::new(Type::ObjectType(ObjectTypeInfo {
+                    Arc::new(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                         properties: Vec::new(),
                         call_signatures: Vec::new(),
                         construct_signatures: Vec::new(),
@@ -820,7 +820,7 @@ impl TypeChecker {
                         )),
                         index_signature_name: None,
                         method_names: Vec::new(),
-                    })),
+                    }))),
                 ),
                 (
                     "resolve".to_string(),
@@ -850,7 +850,7 @@ impl TypeChecker {
             index_signature: None,
             index_signature_name: None,
             method_names: Vec::new(),
-        })
+        }))
     }
 
     fn report_invalid_assignment_target(&mut self, target: &Expr) -> bool {
@@ -4651,6 +4651,20 @@ impl TypeChecker {
         out
     }
 
+    /// Checks the expression an async function returns against `awaited`,
+    /// its declared return type with the promise removed: a returned call
+    /// is contextually typed by `Promise<awaited>`, `await call()` by
+    /// `awaited` (tsc infers the callee's type arguments from it).
+    pub(crate) fn check_async_returned_expr(&mut self, expr: &Expr, awaited: &Type) -> Type {
+        match &expr.kind {
+            ExprKind::Call(_) => {
+                let promised = Type::TypeReference("Promise".into(), Arc::from([awaited.clone()]));
+                self.check_expr_contextual(expr, Some(&promised))
+            }
+            _ => self.check_expr_contextual(expr, Some(awaited)),
+        }
+    }
+
     pub(crate) fn check_expr_contextual(
         &mut self,
         expr: &Expr,
@@ -4681,6 +4695,21 @@ impl TypeChecker {
                     .insert(expr.span.start, contextual_type.cloned().unwrap());
                 let ty = self.check_expr(expr);
                 self.contextual_call_returns.remove(&expr.span.start);
+                return ty;
+            }
+            // `await call()`: the awaited call returns a promise of the
+            // contextual type.
+            ExprKind::Await(inner)
+                if contextual_type.is_some() && matches!(inner.kind, ExprKind::Call(_)) =>
+            {
+                let promised = Type::TypeReference(
+                    "Promise".into(),
+                    Arc::from([contextual_type.cloned().unwrap()]),
+                );
+                self.contextual_call_returns
+                    .insert(inner.span.start, promised);
+                let ty = self.check_expr(expr);
+                self.contextual_call_returns.remove(&inner.span.start);
                 return ty;
             }
             ExprKind::Template(template) => {
@@ -4865,8 +4894,17 @@ impl TypeChecker {
                         }
                         tsc_rs_ast::ObjLitProp::Spread(e, _) => {
                             let spread_ty = self.check_expr(e);
+                            let before = properties.len();
                             any_spread |= self
                                 .merge_spread_into_object_properties(&spread_ty, &mut properties);
+                            // A spread whose members could not be listed
+                            // keeps the literal open (see the uncontextual
+                            // object-literal arm).
+                            if properties.len() == before
+                                && !matches!(spread_ty, Type::ObjectType(_))
+                            {
+                                properties.push(("__spread__".to_string(), Arc::new(Type::Any)));
+                            }
                         }
                         _ => {}
                     }
@@ -4878,14 +4916,14 @@ impl TypeChecker {
                 if any_spread {
                     return Type::Any;
                 }
-                return Type::ObjectType(ObjectTypeInfo {
+                return Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     properties: Self::dedup_object_props_last_wins(properties),
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
                     method_names: Vec::new(),
-                });
+                }));
             }
             ExprKind::ArrayLit(elems) if contextual_type.is_some() => {
                 // A tuple alias (`type Robot = [number, string]`) or a union
@@ -4911,6 +4949,15 @@ impl TypeChecker {
                     // checkArrayLiteral) and its element type otherwise.
                     if let ExprKind::Spread(inner) = &elem.kind {
                         let inner_ty = self.check_expr(inner);
+                        // A lib iterable contributes what it yields.
+                        if let Some(element) = Self::lib_iterable_element_type(&inner_ty) {
+                            checked_types.push(if tuple_ctx.is_some() {
+                                Type::Rest(Arc::new(Type::Array(Arc::new(element))))
+                            } else {
+                                element
+                            });
+                            continue;
+                        }
                         let inner_ty = match &inner_ty {
                             Type::TypeReference(..) => self
                                 .resolve_type_for_assignability(&inner_ty)
@@ -5057,6 +5104,33 @@ impl TypeChecker {
         let resolved_contextual =
             contextual_type.and_then(|ty| self.resolve_type_for_assignability(ty));
         let contextual_type = resolved_contextual.as_ref().or(contextual_type);
+        // A union with exactly one callable alternative (`Builder<…> |
+        // (opts: O) => R`) types the function by that alternative.
+        let callable_alternative = match contextual_type {
+            Some(Type::Union(members)) => {
+                let mut callable = members.iter().filter_map(|member| {
+                    let resolved = match member {
+                        Type::TypeReference(..) => self
+                            .resolve_type_for_assignability(member)
+                            .unwrap_or_else(|| member.clone()),
+                        other => other.clone(),
+                    };
+                    match &resolved {
+                        Type::Function(_) => Some(resolved),
+                        Type::ObjectType(info) if !info.call_signatures.is_empty() => {
+                            Some(resolved)
+                        }
+                        _ => None,
+                    }
+                });
+                match (callable.next(), callable.next()) {
+                    (Some(only), None) => Some(only),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let contextual_type = callable_alternative.as_ref().or(contextual_type);
         // Extract the contextual function type's params if available
         let ctx_params: Option<&Vec<(std::string::String, Type)>> =
             contextual_type.and_then(|ct| match ct {
@@ -5271,6 +5345,15 @@ impl TypeChecker {
                                 ExprKind::Arrow(_) | ExprKind::FnExpr(_) | ExprKind::ObjectLit(_)
                             ) {
                             self.check_expr_contextual(e, ctx_ret_type.as_ref())
+                        } else if let Some(awaited) = arrow
+                            .is_async
+                            .then(|| self.return_type_stack.last().cloned().flatten())
+                            .flatten()
+                            .filter(|_| matches!(e.kind, ExprKind::Call(_) | ExprKind::Await(_)))
+                        {
+                            // `async (): Promise<X> => call()`: the declared
+                            // return type contextually types the call.
+                            self.check_async_returned_expr(e, &awaited)
                         } else {
                             self.check_expr(e)
                         };
@@ -5295,6 +5378,17 @@ impl TypeChecker {
                         };
                         // TS2322: check arrow expression body against declared return type
                         if let Some(Some(expected_ret)) = self.return_type_stack.last().cloned() {
+                            // An async arrow returns what its body's promise
+                            // resolves to.
+                            let inferred = match &inferred {
+                                Type::TypeReference(name, args)
+                                    if arrow.is_async
+                                        && matches!(name.as_str(), "Promise" | "PromiseLike") =>
+                                {
+                                    args.first().cloned().unwrap_or(Type::Any)
+                                }
+                                other => other.clone(),
+                            };
                             if !self.is_assignable_to(&inferred, &expected_ret)
                                 && !matches!(expected_ret, Type::Any | Type::Error)
                                 && !matches!(inferred, Type::Any | Type::Error)
@@ -5309,7 +5403,7 @@ impl TypeChecker {
                             Some(t) => self.resolve_type_node(t),
                             // Async concise-body arrow (`async () => 42`)
                             // returns `Promise<42>`, not `42`.
-                            None if arrow.is_async => Self::wrap_async_inferred_return(inferred),
+                            None if arrow.is_async => self.wrap_async_inferred(inferred),
                             None => inferred,
                         }
                     }
@@ -5335,7 +5429,7 @@ impl TypeChecker {
                                 // types as `() => void` and fails assignment to
                                 // `() => Promise<void>`.
                                 if arrow.is_async {
-                                    Self::wrap_async_inferred_return(inferred)
+                                    self.wrap_async_inferred(inferred)
                                 } else {
                                     inferred
                                 }
@@ -5591,12 +5685,14 @@ impl TypeChecker {
     }
 
     pub(crate) fn check_expr(&mut self, expr: &Expr) -> Type {
-        if !self.enter_recursion() {
+        let depth = self.expr_depth.load(Ordering::Relaxed);
+        if depth >= MAX_EXPR_DEPTH {
             return Type::Any;
         }
+        self.expr_depth.store(depth + 1, Ordering::Relaxed);
         let result = self.check_expr_inner(expr);
         self.record_checked_expression_type(expr, &result);
-        self.exit_recursion();
+        self.expr_depth.store(depth, Ordering::Relaxed);
         result
     }
 
@@ -6484,8 +6580,18 @@ impl TypeChecker {
                     self.in_callee_position = true;
                     let callee_ty_raw = self.check_expr(&call.callee);
                     self.in_callee_position = saved_callee_pos;
+                    // The receiver was just checked as part of the callee: reuse
+                    // that type. Checking it again doubled the work at every
+                    // link of a method chain (`s.replace(…).replace(…)…`, 2^n).
                     let receiver_for_this: Option<Type> = match &call.callee.kind {
-                        ExprKind::Member(mem) => Some(self.check_expr(&mem.object)),
+                        ExprKind::Member(mem) => Some(match self.checked_member_object.take() {
+                            Some((object, ty))
+                                if object == std::ptr::from_ref::<Expr>(&mem.object) as usize =>
+                            {
+                                ty
+                            }
+                            _ => self.check_expr(&mem.object),
+                        }),
                         _ => None,
                     };
                     let callee_ty = if let Some(ref recv) = receiver_for_this {
@@ -7517,12 +7623,28 @@ impl TypeChecker {
                     ExprKind::Member(_) => Self::member_path(&mem.object)
                         .and_then(|p| self.lookup_narrowed(&p))
                         .unwrap_or_else(|| self.check_expr(&mem.object)),
-                    _ => self.check_expr(&mem.object),
+                    _ => {
+                        let ty = self.check_expr(&mem.object);
+                        // For a call whose callee this member access is.
+                        self.checked_member_object =
+                            Some((std::ptr::from_ref::<Expr>(&mem.object) as usize, ty.clone()));
+                        ty
+                    }
                 };
                 // Member access on a bare constrained type parameter sees
                 // the constraint's apparent type (`t.x` with `T extends I`).
                 if let Some(apparent) = self.typeparam_constraint_apparent(&obj_ty) {
                     obj_ty = apparent;
+                }
+                // `a?.b.c`: the `undefined` of `a?.b` that only stands for the
+                // chain short-circuiting does not reach `.c` — the whole
+                // rest of the chain is skipped with it.
+                let continues_short_circuit = !mem.optional
+                    && self.type_contains_undefined(&obj_ty)
+                    && self.short_circuit_undefined_exprs.last()
+                        == Some(&(std::ptr::from_ref::<Expr>(&mem.object) as usize));
+                if continues_short_circuit {
+                    obj_ty = self.remove_undefined_only(&obj_ty);
                 }
                 if !mem.optional {
                     self.check_nullable_access(&obj_ty, &mem.object);
@@ -7662,8 +7784,8 @@ impl TypeChecker {
                 );
                 let lazy_alias_member = match &member_obj {
                     Type::TypeReference(_, _) => self
-                        .lazy_object_merge_property(&member_obj, &mem.property)
-                        .or_else(|| self.class_omit_property(&member_obj, &mem.property))
+                        .class_omit_property(&member_obj, &mem.property)
+                        .or_else(|| self.lazy_object_merge_property(&member_obj, &mem.property))
                         .map(|member| match member {
                             LazyAliasProperty::Present(value) => value,
                             LazyAliasProperty::Missing => {
@@ -7688,7 +7810,9 @@ impl TypeChecker {
                                 Type::Optional(inner) => {
                                     Type::flatten_union(vec![Type::clone(&inner), Type::Undefined])
                                 }
-                                _ => Type::clone(&prop_ty),
+                                // A member written as a type-level
+                                // computation reads as its result.
+                                _ => self.evaluate_instantiated_alias(Type::clone(&prop_ty)),
                             }
                         } else if !info.call_signatures.is_empty()
                             && matches!(
@@ -7813,6 +7937,9 @@ impl TypeChecker {
                     }
                     // Resolve member access on TypeReference (class instances)
                     Type::TypeReference(ref name, ref type_args) => {
+                        // `Alias` for `Alias<A = D, …>` means `Alias<D, …>`.
+                        let defaulted_args = self.defaulted_alias_arguments(name, type_args);
+                        let type_args = defaulted_args.as_ref().unwrap_or(type_args);
                         // Constructor values (`typeof C`): members are the
                         // class STATICS.
                         if let Some(cls) = name.strip_prefix("typeof ") {
@@ -8001,8 +8128,26 @@ impl TypeChecker {
                                             .get(name.as_str())
                                             .map(|(params, _, _)| params.clone())
                                     });
+                                // `MessageEvent` written without its (all
+                                // defaulted) type arguments: members read with
+                                // the parameters open, not as a bare `T`.
+                                let all_defaulted = type_args.is_empty()
+                                    && self.interface_info.get(name.as_str()).is_some_and(|info| {
+                                        !info.type_params.is_empty()
+                                            && info.required_type_params == 0
+                                            && !info
+                                                .type_params
+                                                .iter()
+                                                .any(|param| self.type_param_name_is_active(param))
+                                    });
                                 type_params.and_then(|tps| {
-                                    if tps.is_empty() || type_args.is_empty() {
+                                    if all_defaulted {
+                                        Some(
+                                            tps.iter()
+                                                .map(|param| (param.clone(), Type::Any))
+                                                .collect(),
+                                        )
+                                    } else if tps.is_empty() || type_args.is_empty() {
                                         None
                                     } else {
                                         let mut map = HashMap::new();
@@ -8244,10 +8389,19 @@ impl TypeChecker {
                                     })
                             };
                             // Substitute class type parameters if available
-                            if let (Some(map), false) = (&subst_map, already_substituted) {
+                            let member = if let (Some(map), false) = (&subst_map, already_substituted) {
                                 Self::substitute(&raw_ty, map)
                             } else {
                                 raw_ty
+                            };
+                            // A member declared through a type-level
+                            // computation over the receiver's type arguments
+                            // (`ctx: Simplify<Overwrite<C, O>>`) is that
+                            // computation's result once they are known.
+                            if type_args.is_empty() {
+                                member
+                            } else {
+                                self.evaluate_instantiated_alias(member)
                             }
                         }
                     }
@@ -8533,7 +8687,8 @@ impl TypeChecker {
                     _ => Type::Any,
                 });
                 // For optional chaining, the result is T | undefined
-                if is_optional_chain && !matches!(member_ty, Type::Any | Type::Error | Type::Never)
+                if (is_optional_chain || continues_short_circuit)
+                    && !matches!(member_ty, Type::Any | Type::Error | Type::Never)
                 {
                     match &member_ty {
                         Type::Union(members)
@@ -8541,13 +8696,25 @@ impl TypeChecker {
                         {
                             member_ty // already has undefined
                         }
-                        _ => Type::flatten_union(vec![member_ty, Type::Undefined]),
+                        Type::Undefined => member_ty,
+                        _ => {
+                            // This `undefined` is the short-circuit's alone.
+                            self.short_circuit_undefined_exprs.clear();
+                            self.short_circuit_undefined_exprs
+                                .push(std::ptr::from_ref::<Expr>(expr) as usize);
+                            Type::flatten_union(vec![member_ty, Type::Undefined])
+                        }
                     }
                 } else {
                     member_ty
                 }
             }
             ExprKind::ElemAccess(ea) => {
+                if let Some(narrowed) =
+                    Self::element_path(expr).and_then(|key| self.lookup_narrowed(&key))
+                {
+                    return narrowed;
+                }
                 if let (ExprKind::Ident(object_name), ExprKind::StrLit(key)) =
                     (&ea.object.kind, &ea.index.kind)
                 {
@@ -9001,14 +9168,16 @@ impl TypeChecker {
                         if let ExprKind::Ident(name) = &member.object.kind {
                             let expanded = self.lookup_var(name).cloned().and_then(|base| {
                                 let mut info = match base {
-                                    Type::Function(signature) => ObjectTypeInfo {
-                                        properties: Vec::new(),
-                                        call_signatures: vec![signature],
-                                        construct_signatures: Vec::new(),
-                                        index_signature: None,
-                                        index_signature_name: None,
-                                        method_names: Vec::new(),
-                                    },
+                                    Type::Function(signature) => {
+                                        ObjectTypeInfo::new(ObjectTypeData {
+                                            properties: Vec::new(),
+                                            call_signatures: vec![signature],
+                                            construct_signatures: Vec::new(),
+                                            index_signature: None,
+                                            index_signature_name: None,
+                                            method_names: Vec::new(),
+                                        })
+                                    }
                                     Type::ObjectType(info) if !info.call_signatures.is_empty() => {
                                         info
                                     }
@@ -9190,8 +9359,31 @@ impl TypeChecker {
                 // tripping bogus null/undefined diagnostics on the
                 // post-assignment reads.
                 if assign.op == AssignOp::Assign {
+                    // A property path (`a.b = v`): what was known about it
+                    // and the paths below it no longer holds; a non-nullish
+                    // value leaves the path without its nullish members.
+                    if let Some(path) = Self::member_path(&assign.left).filter(|path| {
+                        matches!(assign.left.kind, ExprKind::Member(_)) && path.contains('.')
+                    }) {
+                        self.clear_narrowed_var(&path);
+                        self.clear_narrowed_paths_under(&path);
+                        if !matches!(right_ty, Type::Any | Type::Error)
+                            && !Self::type_is_nullish(&right_ty)
+                            && !self.type_admits_nullish(&right_ty)
+                        {
+                            if let Some(declared) = self.resolve_member_path_type(&path) {
+                                let narrowed = self.remove_null_undefined(&declared);
+                                if narrowed != declared
+                                    && !matches!(declared, Type::Any | Type::Error)
+                                {
+                                    self.narrow_var(&path, narrowed);
+                                }
+                            }
+                        }
+                    }
                     if let ExprKind::Ident(ref name) = assign.left.kind {
                         self.clear_narrowed_var(name);
+                        self.clear_narrowed_paths_under(name);
                         // ASSIGNMENT NARROWING: after `x = <non-nullish>` the
                         // reference's flow type drops the nullish members of
                         // its declared type — `let d: Date | undefined; … d =
@@ -9214,8 +9406,23 @@ impl TypeChecker {
                                         .filter(|member| self.is_assignable_to(&right_ty, member))
                                         .cloned()
                                         .collect();
-                                    if !kept.is_empty() && kept.len() < members.len() {
-                                        self.narrow_var(name, Type::flatten_union(kept));
+                                    // A value that cannot be nullish never
+                                    // leaves the nullish members behind,
+                                    // whatever the member-wise test said (an
+                                    // unreduced generic "fits" everything, or
+                                    // nothing).
+                                    let non_nullish_value = !self.type_admits_nullish(&right_ty)
+                                        && !matches!(right_ty, Type::Unknown);
+                                    // No member fits: an invalid assignment (reported
+                                    // on its own) leaves the declared type.
+                                    let mut narrowed: Vec<Type> = kept;
+                                    if non_nullish_value {
+                                        narrowed.retain(|member| {
+                                            !matches!(member, Type::Null | Type::Undefined)
+                                        });
+                                    }
+                                    if !narrowed.is_empty() && narrowed.len() < members.len() {
+                                        self.narrow_var(name, Type::flatten_union(narrowed));
                                     }
                                 }
                             }
@@ -9620,14 +9827,14 @@ impl TypeChecker {
                 if any_spread_plain {
                     return Type::Any;
                 }
-                Type::ObjectType(ObjectTypeInfo {
+                Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     properties: Self::dedup_object_props_last_wins(properties),
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
                     method_names: Vec::new(),
-                })
+                }))
             }
             ExprKind::Arrow(arrow) => {
                 self.check_node_module_reserved_syntax(expr);
@@ -9695,7 +9902,15 @@ impl TypeChecker {
                 self.generator_stack.push(false);
                 let ret_type = match &arrow.body {
                     ArrowBody::Expr(e) => {
-                        let inferred = self.check_expr(e);
+                        let inferred = match arrow
+                            .is_async
+                            .then(|| self.return_type_stack.last().cloned().flatten())
+                            .flatten()
+                            .filter(|_| matches!(e.kind, ExprKind::Call(_) | ExprKind::Await(_)))
+                        {
+                            Some(awaited) => self.check_async_returned_expr(e, &awaited),
+                            None => self.check_expr(e),
+                        };
                         let inferred = self.widen_fresh_return_expr_type(e, inferred);
                         // Without strictNullChecks a nullish return widens to
                         // `any` (tsc getWidenedType), whatever the contextual
@@ -9709,6 +9924,17 @@ impl TypeChecker {
                         };
                         // TS2322: check arrow expression body against declared return type
                         if let Some(Some(expected_ret)) = self.return_type_stack.last().cloned() {
+                            // An async arrow returns what its body's promise
+                            // resolves to.
+                            let inferred = match &inferred {
+                                Type::TypeReference(name, args)
+                                    if arrow.is_async
+                                        && matches!(name.as_str(), "Promise" | "PromiseLike") =>
+                                {
+                                    args.first().cloned().unwrap_or(Type::Any)
+                                }
+                                other => other.clone(),
+                            };
                             if !self.is_assignable_to(&inferred, &expected_ret)
                                 && !matches!(expected_ret, Type::Any | Type::Error)
                                 && !matches!(inferred, Type::Any | Type::Error)
@@ -9723,7 +9949,7 @@ impl TypeChecker {
                             Some(t) => self.resolve_type_node(t),
                             // Async concise-body arrow (`async () => 42`)
                             // returns `Promise<42>`, not `42`.
-                            None if arrow.is_async => Self::wrap_async_inferred_return(inferred),
+                            None if arrow.is_async => self.wrap_async_inferred(inferred),
                             None => inferred,
                         }
                     }
@@ -9749,7 +9975,7 @@ impl TypeChecker {
                                 // types as `() => void` and fails assignment to
                                 // `() => Promise<void>`.
                                 if arrow.is_async {
-                                    Self::wrap_async_inferred_return(inferred)
+                                    self.wrap_async_inferred(inferred)
                                 } else {
                                     inferred
                                 }
@@ -10157,7 +10383,7 @@ impl TypeChecker {
                             | "WeakMap",
                             [],
                         ) => Type::Any,
-                        _ => ty.clone(),
+                        _ => Self::lib_iterable_element_type(&ty).unwrap_or_else(|| ty.clone()),
                     },
                     Type::String | Type::StringLiteral(_) => Type::String,
                     _ => ty,
@@ -10176,15 +10402,24 @@ impl TypeChecker {
                     )));
                 }
                 let ty = self.check_expr(inner);
-                // Unwrap Promise<T> -> T
-                match ty {
+                // Unwrap Promise<T> -> T; a result written as a type-level
+                // computation (`GetResult<Payload, Args, "findMany">`) is
+                // that computation's value.
+                let awaited = match ty {
                     Type::TypeReference(ref name, ref args)
                         if name == "Promise" && args.len() == 1 =>
                     {
                         args[0].clone()
                     }
+                    // An interface that extends `Promise<X>` / `PromiseLike<X>`
+                    // (Prisma's `Prisma__ModelClient<T>` → `PrismaPromise<T>`)
+                    // awaits to `X`.
+                    Type::TypeReference(ref name, ref args) => self
+                        .promised_type_through_heritage(name, args, 0)
+                        .unwrap_or(ty),
                     _ => ty,
-                }
+                };
+                self.evaluate_instantiated_aliases(awaited)
             }
             ExprKind::Yield(delegate, inner) => {
                 // tsc checkYieldExpression: outside a generator body the
@@ -10845,6 +11080,8 @@ impl TypeChecker {
                         &ft.type_params,
                         &type_param_map,
                     );
+                    // `M[K]` with `K` now a literal is that member's type.
+                    let ret = self.reduce_literal_indexed_accesses(&ret, 0);
                     (params, ret)
                 } else {
                     (ft.params.clone(), Type::clone(&ft.return_type))
@@ -11277,7 +11514,10 @@ impl TypeChecker {
             None => {
                 let lib_value = crate::stdlib::stdlib_member_availability(&self.compiler_options)
                     .is_some_and(|availability| availability.declares_global_value(name));
-                if lib_value {
+                // A global declared by another program file, or by a
+                // `declare global { var x }` block (this module's own
+                // included), is a property of `globalThis` as well.
+                if lib_value || self.user_global_value_names.contains(name) {
                     return Some(self.lookup_var(name).cloned().unwrap_or(Type::Any));
                 }
                 self.global_this_unknown_member(span)
@@ -11381,7 +11621,9 @@ impl TypeChecker {
             | Type::NumberLiteral(_)
             | Type::BooleanLiteral(_)
             | Type::BigIntLiteral(_)
-            | Type::TemplateLiteral { .. } => true,
+            | Type::TemplateLiteral { .. }
+            // `K extends keyof M` (tsc counts index types here).
+            | Type::Keyof(_) => true,
             Type::Union(members) => members.iter().all(Self::is_primitive_constraint),
             _ => false,
         }
@@ -12940,6 +13182,7 @@ impl TypeChecker {
                     self.check_binding_pattern_access(&param.name, &pty);
                     self.declare_pattern_vars(&param.name, pty);
                     self.completion_mark_parameter(param);
+                    self.mark_optional_parameter(param);
                 }
                 // Push declared return type for TS2322 checking in return statements
                 let declared_ret = method
@@ -13057,6 +13300,7 @@ impl TypeChecker {
                     self.check_binding_pattern_access(&param.name, &pty);
                     self.declare_pattern_vars(&param.name, pty);
                     self.completion_mark_parameter(param);
+                    self.mark_optional_parameter(param);
                 }
                 if let Some(ref body) = ctor.body {
                     self.hoist_block_declarations(body);
@@ -13200,6 +13444,7 @@ impl TypeChecker {
                     self.check_binding_pattern_access(&param.name, &pty);
                     self.declare_pattern_vars(&param.name, pty);
                     self.completion_mark_parameter(param);
+                    self.mark_optional_parameter(param);
                 }
                 // Getters: expected return type = own annotation, else the
                 // paired setter's param type.

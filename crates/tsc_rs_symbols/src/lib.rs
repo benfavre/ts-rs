@@ -421,6 +421,29 @@ pub struct SymbolTable {
 }
 
 impl SymbolTable {
+    /// Keeps only what [`crate::link_imports`] reads from an import's
+    /// target: the exported symbols' name, flags, declarations and members,
+    /// at their original ids. Everything else (scopes, references,
+    /// non-exported symbols, …) is dropped. For long-lived holders of a
+    /// whole project's tables that only link against them afterwards (the
+    /// `--check-pipe` session: ~670 MB of tables on apps/app).
+    pub fn retain_link_surface(&mut self) {
+        for symbol in &mut self.symbols {
+            if symbol.flags & SYM_EXPORT == 0 {
+                symbol.name = String::new();
+                symbol.flags = 0;
+                symbol.declarations = Vec::new();
+                symbol.members = Default::default();
+            }
+            symbol.exports = Default::default();
+        }
+        let symbols = std::mem::take(&mut self.symbols);
+        *self = SymbolTable {
+            symbols,
+            ..Default::default()
+        };
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

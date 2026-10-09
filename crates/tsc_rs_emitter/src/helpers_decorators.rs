@@ -928,6 +928,7 @@ impl<'a> Emitter<'a> {
                                 self.helper_prefix(),
                                 &cjs_map,
                                 &self.cjs_string_import_locals,
+                                &self.import_shadows,
                             )
                         } else {
                             collect_member_decorator_strings(
@@ -938,6 +939,7 @@ impl<'a> Emitter<'a> {
                                 self.helper_prefix(),
                                 &cjs_map,
                                 &self.cjs_string_import_locals,
+                                &self.import_shadows,
                             )
                         };
                         if decorators.is_empty() {
@@ -1041,6 +1043,7 @@ impl<'a> Emitter<'a> {
                                     dec,
                                     &cjs_map,
                                     &self.cjs_string_import_locals,
+                                    &self.import_shadows,
                                 )
                             })
                             .collect();
@@ -1166,6 +1169,7 @@ impl<'a> Emitter<'a> {
                                     dec,
                                     &cjs_map,
                                     &self.cjs_string_import_locals,
+                                    &self.import_shadows,
                                 )
                             })
                             .collect();
@@ -1189,6 +1193,7 @@ impl<'a> Emitter<'a> {
                                         dec,
                                         &cjs_map,
                                         &self.cjs_string_import_locals,
+                                        &self.import_shadows,
                                     );
                                     decorators.push(format!(
                                         "{}__param({}, {})",
@@ -1312,6 +1317,7 @@ impl<'a> Emitter<'a> {
                 dec,
                 &cjs_map,
                 &self.cjs_string_import_locals,
+                &self.import_shadows,
             );
             if !remove_comments {
                 let comment = crate::analysis::trailing_line_comment(self.source, dec.span.end);
@@ -1337,6 +1343,7 @@ impl<'a> Emitter<'a> {
                             dec,
                             &cjs_map,
                             &self.cjs_string_import_locals,
+                            &self.import_shadows,
                         );
                         class_decs.push(format!(
                             "{}__param({}, {})",

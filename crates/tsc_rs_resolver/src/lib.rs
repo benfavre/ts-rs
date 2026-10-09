@@ -97,14 +97,103 @@ pub fn resolve_module_name(
         .unwrap_or(ModuleResolutionKind::Node);
 
     // Try path mapping first
-    if let Some(resolved) = try_path_mapping(module_name, options) {
-        return Some(resolved);
-    }
+    let resolved = if let Some(resolved) = try_path_mapping(module_name, options) {
+        Some(resolved)
+    } else {
+        match kind {
+            ModuleResolutionKind::Node => resolve_node(module_name, containing_file, options),
+            ModuleResolutionKind::Classic => resolve_classic(module_name, containing_file),
+        }
+    };
+    resolved.map(|mut resolved| {
+        resolved.resolved_file_name = dedupe_package_file(resolved.resolved_file_name);
+        resolved
+    })
+}
 
-    match kind {
-        ModuleResolutionKind::Node => resolve_node(module_name, containing_file, options),
-        ModuleResolutionKind::Classic => resolve_classic(module_name, containing_file),
+/// `name@version` of a `node_modules` package root, remembered for the
+/// process (see [`dedupe_package_file`]).
+static PACKAGE_IDS: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<String, Option<String>>>,
+> = std::sync::OnceLock::new();
+/// First path seen for each `name@version` + subpath.
+static PACKAGE_FILE_REDIRECTS: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+/// A file of a `node_modules` package that is a byte-for-byte install of a
+/// package already seen elsewhere (same `name@version`, same path inside
+/// it) is the file seen first, as tsc redirects duplicate packages to one
+/// source file. Package managers nest copies of the same version under
+/// each dependent (`@types/cors/node_modules/@types/node`, …): without
+/// this an apps/app program held 16 copies of `@types/node`, 37 MB of
+/// declarations whose globals all merged.
+///
+/// The table is never cleared: a long-lived session must redirect a
+/// request's imports exactly as its init did.
+pub fn dedupe_package_file(path: String) -> String {
+    const MARKER: &str = "/node_modules/";
+    let Some(last) = path.rfind(MARKER) else {
+        return path;
+    };
+    let after = &path[last + MARKER.len()..];
+    let mut segments = after.splitn(3, '/');
+    let Some(first) = segments.next() else {
+        return path;
+    };
+    let name_len = if first.starts_with('@') {
+        match segments.next() {
+            Some(second) => first.len() + 1 + second.len(),
+            None => return path,
+        }
+    } else {
+        first.len()
+    };
+    if after.len() <= name_len + 1 {
+        return path;
     }
+    let root = &path[..last + MARKER.len() + name_len];
+    let subpath = &after[name_len + 1..];
+
+    let ids = PACKAGE_IDS.get_or_init(Default::default);
+    let cached = ids
+        .read()
+        .expect("package id cache poisoned")
+        .get(root)
+        .cloned();
+    let id = match cached {
+        Some(id) => id,
+        None => {
+            let id = read_package_json(&Path::new(root).join("package.json")).and_then(|pkg| {
+                let value = pkg.value()?;
+                let name = value.get("name")?.as_str()?;
+                let version = value.get("version")?.as_str()?;
+                Some(format!("{name}@{version}"))
+            });
+            ids.write()
+                .expect("package id cache poisoned")
+                .insert(root.to_string(), id.clone());
+            id
+        }
+    };
+    let Some(id) = id else {
+        return path;
+    };
+    let key = format!("{id}/{subpath}");
+    let redirects = PACKAGE_FILE_REDIRECTS.get_or_init(Default::default);
+    if let Some(first) = redirects
+        .read()
+        .expect("package redirect table poisoned")
+        .get(&key)
+    {
+        return first.clone();
+    }
+    redirects
+        .write()
+        .expect("package redirect table poisoned")
+        .entry(key)
+        .or_insert(path)
+        .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +262,7 @@ fn resolve_relative(
     //    resolves to the runtime `.cjs` file (no types) instead of the
     //    sibling `.d.cts` (the real type surface).
     if let Some(dts_pair) = jsx_to_dts_pair(&candidate) {
-        if dts_pair.is_file() {
+        if dts_pair.probe_is_file() {
             return Some(ResolvedModule {
                 resolved_file_name: normalize_path(&dts_pair),
                 is_external_library_import: is_external,
@@ -182,7 +271,7 @@ fn resolve_relative(
     }
 
     // 1. Try the exact path (if it already has an extension)
-    if candidate.is_file() {
+    if candidate.probe_is_file() {
         return Some(ResolvedModule {
             resolved_file_name: normalize_path(&candidate),
             is_external_library_import: is_external,
@@ -192,7 +281,7 @@ fn resolve_relative(
     // 2. Try adding extensions
     for ext in ALL_EXTENSIONS {
         let with_ext = append_extension(&candidate, ext);
-        if with_ext.is_file() {
+        if with_ext.probe_is_file() {
             return Some(ResolvedModule {
                 resolved_file_name: normalize_path(&with_ext),
                 is_external_library_import: is_external,
@@ -203,7 +292,7 @@ fn resolve_relative(
     // 3. Try index files (if candidate is a directory or could be)
     for index in INDEX_FILES {
         let index_path = PathBuf::from(format!("{}{index}", candidate.display()));
-        if index_path.is_file() {
+        if index_path.probe_is_file() {
             return Some(ResolvedModule {
                 resolved_file_name: normalize_path(&index_path),
                 is_external_library_import: is_external,
@@ -219,17 +308,91 @@ fn resolve_relative(
 /// Also checks `node_modules/@types/<module_name>` as a fallback, matching
 /// TypeScript's standard resolution for DefinitelyTyped packages (e.g.
 /// `import { resolve } from "path"` → `@types/node`).
+type NodeModulesCache = std::sync::RwLock<
+    std::collections::HashMap<PathBuf, std::collections::HashMap<String, Option<ResolvedModule>>>,
+>;
+static NODE_MODULES_CACHE: std::sync::OnceLock<NodeModulesCache> = std::sync::OnceLock::new();
+
+/// `resolve_node_modules_uncached`, remembered per (starting directory,
+/// module name) in one-shot runs: every file of a directory importing the
+/// same package repeated the same walk, `package.json` reads and parses.
 fn resolve_node_modules(module_name: &str, starting_dir: &Path) -> Option<ResolvedModule> {
+    if !CANONICAL_PATH_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return resolve_node_modules_uncached(module_name, starting_dir);
+    }
+    let cache = NODE_MODULES_CACHE.get_or_init(Default::default);
+    if let Some(found) = cache
+        .read()
+        .expect("node_modules cache poisoned")
+        .get(starting_dir)
+        .and_then(|modules| modules.get(module_name))
+    {
+        return found.clone();
+    }
+    let resolved = resolve_node_modules_uncached(module_name, starting_dir);
+    cache
+        .write()
+        .expect("node_modules cache poisoned")
+        .entry(starting_dir.to_path_buf())
+        .or_default()
+        .insert(module_name.to_string(), resolved.clone());
+    resolved
+}
+
+static PACKAGE_JSON_CACHE: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<PathBuf, Option<std::sync::Arc<PackageJson>>>>,
+> = std::sync::OnceLock::new();
+
+/// A `package.json`: its text and, parsed on first use, its JSON value.
+struct PackageJson {
+    text: String,
+    value: std::sync::OnceLock<Option<serde_json::Value>>,
+}
+
+impl PackageJson {
+    fn value(&self) -> Option<&serde_json::Value> {
+        self.value
+            .get_or_init(|| serde_json::from_str(&self.text).ok())
+            .as_ref()
+    }
+}
+
+/// Reads `path`; one-shot runs read and parse each `package.json` once.
+fn read_package_json(path: &Path) -> Option<std::sync::Arc<PackageJson>> {
+    let read = |path: &Path| {
+        std::fs::read_to_string(path).ok().map(|text| {
+            std::sync::Arc::new(PackageJson {
+                text,
+                value: std::sync::OnceLock::new(),
+            })
+        })
+    };
+    if !CANONICAL_PATH_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return read(path);
+    }
+    let cache = PACKAGE_JSON_CACHE.get_or_init(Default::default);
+    if let Some(found) = cache.read().expect("package.json cache poisoned").get(path) {
+        return found.clone();
+    }
+    let package = read(path);
+    cache
+        .write()
+        .expect("package.json cache poisoned")
+        .insert(path.to_path_buf(), package.clone());
+    package
+}
+
+fn resolve_node_modules_uncached(module_name: &str, starting_dir: &Path) -> Option<ResolvedModule> {
     let mut dir = starting_dir.to_path_buf();
 
     loop {
         let node_modules = dir.join("node_modules");
-        if node_modules.is_dir() {
+        if node_modules.probe_is_dir() {
             // Split module name into package name and subpath
             let (package_name, subpath) = split_package_subpath(module_name);
             let package_dir = node_modules.join(package_name);
 
-            if package_dir.is_dir() {
+            if package_dir.probe_is_dir() {
                 // First: try the package.json `exports` map. Modern packages
                 // (including bext's workspace deps like @bext-stack/framework)
                 // expose a flat-or-conditioned subpath table that maps
@@ -260,7 +423,7 @@ fn resolve_node_modules(module_name: &str, starting_dir: &Path) -> Option<Resolv
                 // Try index files in the package root
                 for index in INDEX_FILES {
                     let index_path = PathBuf::from(format!("{}{index}", package_dir.display()));
-                    if index_path.is_file() {
+                    if index_path.probe_is_file() {
                         return Some(ResolvedModule {
                             resolved_file_name: normalize_path(&index_path),
                             is_external_library_import: true,
@@ -273,7 +436,7 @@ fn resolve_node_modules(module_name: &str, starting_dir: &Path) -> Option<Resolv
             let candidate = node_modules.join(module_name);
             for ext in ALL_EXTENSIONS {
                 let with_ext = append_extension(&candidate, ext);
-                if with_ext.is_file() {
+                if with_ext.probe_is_file() {
                     return Some(ResolvedModule {
                         resolved_file_name: normalize_path(&with_ext),
                         is_external_library_import: true,
@@ -319,13 +482,13 @@ fn try_at_types(
     subpath: Option<&str>,
 ) -> Option<ResolvedModule> {
     let at_types = node_modules.join("@types");
-    if !at_types.is_dir() {
+    if !at_types.probe_is_dir() {
         return None;
     }
 
     // 1. Try @types/<package_name> directly (e.g. @types/express, @types/lodash)
     let types_pkg = at_types.join(package_name);
-    if types_pkg.is_dir() {
+    if types_pkg.probe_is_dir() {
         if let Some(sub) = subpath {
             if let Some(resolved) = resolve_relative(&format!("./{sub}"), &types_pkg, true) {
                 return Some(resolved);
@@ -336,7 +499,7 @@ fn try_at_types(
         }
         for index in INDEX_FILES {
             let index_path = PathBuf::from(format!("{}{index}", types_pkg.display()));
-            if index_path.is_file() {
+            if index_path.probe_is_file() {
                 return Some(ResolvedModule {
                     resolved_file_name: normalize_path(&index_path),
                     is_external_library_import: true,
@@ -348,10 +511,10 @@ fn try_at_types(
     // 2. Try @types/node/<module_name> for Node.js built-in modules
     //    e.g. "fs" → @types/node/fs.d.ts, "path" → @types/node/path.d.ts
     let at_types_node = at_types.join("node");
-    if at_types_node.is_dir() {
+    if at_types_node.probe_is_dir() {
         // Try @types/node/<module>.d.ts directly
         let builtin_dts = at_types_node.join(format!("{package_name}.d.ts"));
-        if builtin_dts.is_file() {
+        if builtin_dts.probe_is_file() {
             return Some(ResolvedModule {
                 resolved_file_name: normalize_path(&builtin_dts),
                 is_external_library_import: true,
@@ -359,9 +522,9 @@ fn try_at_types(
         }
         // Try @types/node/<module>/index.d.ts
         let builtin_dir = at_types_node.join(package_name);
-        if builtin_dir.is_dir() {
+        if builtin_dir.probe_is_dir() {
             let index_dts = builtin_dir.join("index.d.ts");
-            if index_dts.is_file() {
+            if index_dts.probe_is_file() {
                 return Some(ResolvedModule {
                     resolved_file_name: normalize_path(&index_dts),
                     is_external_library_import: true,
@@ -372,13 +535,13 @@ fn try_at_types(
 
     // 3. Try @types/bun for Bun built-in modules (e.g. "bun" → @types/bun)
     let at_types_bun = at_types.join("bun");
-    if at_types_bun.is_dir() && package_name == "bun" {
+    if at_types_bun.probe_is_dir() && package_name == "bun" {
         if let Some(resolved) = try_package_json(&at_types_bun) {
             return Some(resolved);
         }
         for index in INDEX_FILES {
             let index_path = PathBuf::from(format!("{}{index}", at_types_bun.display()));
-            if index_path.is_file() {
+            if index_path.probe_is_file() {
                 return Some(ResolvedModule {
                     resolved_file_name: normalize_path(&index_path),
                     is_external_library_import: true,
@@ -407,8 +570,8 @@ fn try_at_types(
 /// workspace deps use explicit subpath maps.
 fn try_exports_map(package_dir: &Path, subpath: Option<&str>) -> Option<ResolvedModule> {
     let pkg_path = package_dir.join("package.json");
-    let content = std::fs::read_to_string(&pkg_path).ok()?;
-    let pkg: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let package = read_package_json(&pkg_path)?;
+    let pkg = package.value()?;
     let exports = pkg.get("exports")?;
 
     let key = match subpath {
@@ -448,7 +611,7 @@ fn try_exports_map(package_dir: &Path, subpath: Option<&str>) -> Option<Resolved
 
     // Resolve target file relative to package_dir.
     let resolved_path = package_dir.join(&target_str);
-    if resolved_path.is_file() {
+    if resolved_path.probe_is_file() {
         return Some(ResolvedModule {
             resolved_file_name: normalize_path(&resolved_path),
             is_external_library_import: true,
@@ -459,7 +622,7 @@ fn try_exports_map(package_dir: &Path, subpath: Option<&str>) -> Option<Resolved
     // — this branch is just defensive.
     for ext in ALL_EXTENSIONS {
         let with_ext = append_extension(&resolved_path, ext);
-        if with_ext.is_file() {
+        if with_ext.probe_is_file() {
             return Some(ResolvedModule {
                 resolved_file_name: normalize_path(&with_ext),
                 is_external_library_import: true,
@@ -569,7 +732,8 @@ fn pick_condition_target(value: &serde_json::Value) -> Option<String> {
 /// Try reading package.json for `types`, `typings`, or `main` fields.
 fn try_package_json(package_dir: &Path) -> Option<ResolvedModule> {
     let pkg_path = package_dir.join("package.json");
-    let content = std::fs::read_to_string(&pkg_path).ok()?;
+    let package = read_package_json(&pkg_path)?;
+    let content = &package.text;
 
     // Simple JSON field extraction (avoids serde dependency)
     // Try types/typings first (TypeScript declaration), then main
@@ -578,7 +742,7 @@ fn try_package_json(package_dir: &Path) -> Option<ResolvedModule> {
             let resolved_path = package_dir.join(&value);
 
             // If the path exists as-is
-            if resolved_path.is_file() {
+            if resolved_path.probe_is_file() {
                 return Some(ResolvedModule {
                     resolved_file_name: normalize_path(&resolved_path),
                     is_external_library_import: true,
@@ -588,7 +752,7 @@ fn try_package_json(package_dir: &Path) -> Option<ResolvedModule> {
             // Try appending extensions
             for ext in ALL_EXTENSIONS {
                 let with_ext = append_extension(&resolved_path, ext);
-                if with_ext.is_file() {
+                if with_ext.probe_is_file() {
                     return Some(ResolvedModule {
                         resolved_file_name: normalize_path(&with_ext),
                         is_external_library_import: true,
@@ -615,7 +779,7 @@ fn resolve_classic(module_name: &str, containing_file: &str) -> Option<ResolvedM
         let candidate = containing_dir.join(module_name);
         for ext in CLASSIC_EXTENSIONS {
             let with_ext = append_extension(&candidate, ext);
-            if with_ext.is_file() {
+            if with_ext.probe_is_file() {
                 return Some(ResolvedModule {
                     resolved_file_name: normalize_path(&with_ext),
                     is_external_library_import: false,
@@ -630,7 +794,7 @@ fn resolve_classic(module_name: &str, containing_file: &str) -> Option<ResolvedM
             let candidate = dir.join(module_name);
             for ext in CLASSIC_EXTENSIONS {
                 let with_ext = append_extension(&candidate, ext);
-                if with_ext.is_file() {
+                if with_ext.probe_is_file() {
                     return Some(ResolvedModule {
                         resolved_file_name: normalize_path(&with_ext),
                         is_external_library_import: false,
@@ -665,7 +829,7 @@ fn try_path_mapping(module_name: &str, options: &CompilerOptions) -> Option<Reso
     let candidate = base_path.join(module_name);
     for ext in ALL_EXTENSIONS {
         let with_ext = append_extension(&candidate, ext);
-        if with_ext.is_file() {
+        if with_ext.probe_is_file() {
             return Some(ResolvedModule {
                 resolved_file_name: normalize_path(&with_ext),
                 is_external_library_import: false,
@@ -675,7 +839,7 @@ fn try_path_mapping(module_name: &str, options: &CompilerOptions) -> Option<Reso
 
     for index in INDEX_FILES {
         let index_path = PathBuf::from(format!("{}{index}", candidate.display()));
-        if index_path.is_file() {
+        if index_path.probe_is_file() {
             return Some(ResolvedModule {
                 resolved_file_name: normalize_path(&index_path),
                 is_external_library_import: false,
@@ -708,7 +872,7 @@ fn try_paths_mapping(
                 let candidate = base_path.join(&resolved_target);
 
                 // Try exact
-                if candidate.is_file() {
+                if candidate.probe_is_file() {
                     return Some(ResolvedModule {
                         resolved_file_name: normalize_path(&candidate),
                         is_external_library_import: false,
@@ -718,7 +882,7 @@ fn try_paths_mapping(
                 // Try extensions
                 for ext in ALL_EXTENSIONS {
                     let with_ext = append_extension(&candidate, ext);
-                    if with_ext.is_file() {
+                    if with_ext.probe_is_file() {
                         return Some(ResolvedModule {
                             resolved_file_name: normalize_path(&with_ext),
                             is_external_library_import: false,
@@ -729,7 +893,7 @@ fn try_paths_mapping(
                 // Try index files
                 for index in INDEX_FILES {
                     let index_path = PathBuf::from(format!("{}{index}", candidate.display()));
-                    if index_path.is_file() {
+                    if index_path.probe_is_file() {
                         return Some(ResolvedModule {
                             resolved_file_name: normalize_path(&index_path),
                             is_external_library_import: false,
@@ -879,10 +1043,141 @@ fn append_extension(path: &Path, ext: &str) -> PathBuf {
 
 fn normalize_path(path: &Path) -> String {
     // Canonicalize if possible, otherwise use the path as-is
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
+    canonicalize(path)
+        .unwrap_or_else(|| path.to_path_buf())
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// What a path is on disk, as remembered by the probe cache.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathKind {
+    Missing,
+    File,
+    Dir,
+    Other,
+}
+
+static PATH_KIND_CACHE: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<PathBuf, PathKind>>,
+> = std::sync::OnceLock::new();
+
+fn path_kind(path: &Path) -> PathKind {
+    let stat = |path: &Path| match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => PathKind::File,
+        Ok(meta) if meta.is_dir() => PathKind::Dir,
+        Ok(_) => PathKind::Other,
+        Err(_) => PathKind::Missing,
+    };
+    // Same switch as the canonical path cache: one-shot runs only. Misses
+    // are remembered too, which is what makes candidate probing cheap
+    // (most probes of a module resolution fail).
+    if !CANONICAL_PATH_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return stat(path);
+    }
+    let cache = PATH_KIND_CACHE.get_or_init(Default::default);
+    if let Some(kind) = cache.read().expect("path kind cache poisoned").get(path) {
+        return *kind;
+    }
+    let kind = stat(path);
+    cache
+        .write()
+        .expect("path kind cache poisoned")
+        .insert(path.to_path_buf(), kind);
+    kind
+}
+
+/// `Path::is_file` / `Path::is_dir` through the probe cache.
+trait PathProbe {
+    fn probe_is_file(&self) -> bool;
+    fn probe_is_dir(&self) -> bool;
+}
+
+impl PathProbe for Path {
+    fn probe_is_file(&self) -> bool {
+        path_kind(self) == PathKind::File
+    }
+
+    fn probe_is_dir(&self) -> bool {
+        path_kind(self) == PathKind::Dir
+    }
+}
+
+static CANONICAL_PATH_CACHE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CANONICAL_PATH_CACHE: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::HashMap<PathBuf, PathBuf>>,
+> = std::sync::OnceLock::new();
+
+/// Lets [`canonicalize`] remember its results for the rest of the process.
+///
+/// For one-shot runs (a CLI compile or check), where the filesystem is
+/// taken as fixed: resolving a project canonicalized the same paths over a
+/// million `readlink`s deep. Leave it off in long-lived processes (pipe
+/// workers, the language server): a deploy that re-points a symlink must
+/// be seen.
+pub fn enable_canonical_path_cache() {
+    CANONICAL_PATH_CACHE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Turns the filesystem caches off again and empties them.
+///
+/// For long-lived processes that take one snapshot of a project (the
+/// `--check-pipe` session): its init resolves the whole graph against a
+/// filesystem it treats as fixed anyway, so it runs with the caches on and
+/// calls this once the snapshot is built, leaving later requests to see
+/// the disk as it is.
+pub fn disable_and_clear_path_caches() {
+    CANONICAL_PATH_CACHE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    fn clear<K, V>(
+        cache: &std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<K, V>>>,
+    ) {
+        if let Some(cache) = cache.get() {
+            if let Ok(mut map) = cache.write() {
+                *map = std::collections::HashMap::new();
+            }
+        }
+    }
+    clear(&CANONICAL_PATH_CACHE);
+    clear(&PATH_KIND_CACHE);
+    clear(&PACKAGE_JSON_CACHE);
+    clear(&NODE_MODULES_CACHE);
+}
+
+/// Whether [`enable_canonical_path_cache`] is in effect.
+pub fn path_caches_enabled() -> bool {
+    CANONICAL_PATH_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `Path::canonicalize`, through the process-wide cache when
+/// [`enable_canonical_path_cache`] was called. Only successes are cached
+/// here; a missing path is answered by the probe cache ([`path_kind`]),
+/// which remembers misses. Callers canonicalize candidate spellings
+/// (`.ts`, `.d.ts`, `/index.ts`, …) that mostly do not exist, and each miss
+/// was a `readlink` per path component: 1.7 M of them in an apps/app
+/// `--check-pipe` init.
+pub fn canonicalize(path: impl AsRef<Path>) -> Option<PathBuf> {
+    let path = path.as_ref();
+    if !CANONICAL_PATH_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return path.canonicalize().ok();
+    }
+    let cache = CANONICAL_PATH_CACHE.get_or_init(Default::default);
+    if let Some(found) = cache
+        .read()
+        .expect("canonical path cache poisoned")
+        .get(path)
+    {
+        return Some(found.clone());
+    }
+    if path_kind(path) == PathKind::Missing {
+        return None;
+    }
+    let canonical = path.canonicalize().ok()?;
+    cache
+        .write()
+        .expect("canonical path cache poisoned")
+        .insert(path.to_path_buf(), canonical.clone());
+    Some(canonical)
 }
 
 /// Extract a simple string value for a given key from JSON content.

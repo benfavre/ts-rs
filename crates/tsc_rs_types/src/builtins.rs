@@ -40,7 +40,7 @@ impl BuiltinTypes {
 
         instance_members.insert(
             "String".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("length", Type::Number),
                     bprop(
@@ -186,12 +186,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         instance_members.insert(
             "Number".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop(
                         "toFixed",
@@ -213,12 +213,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         instance_members.insert(
             "Boolean".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("valueOf", builtin_method(&[], Type::Boolean)),
                     bprop("toString", builtin_method(&[], Type::String)),
@@ -228,12 +228,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         instance_members.insert(
             "Array".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("length", Type::Number),
                     bprop("push", builtin_method(&[("item", Type::Any)], Type::Number)),
@@ -478,12 +478,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         instance_members.insert(
             "Promise".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop(
                         "then",
@@ -566,12 +566,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         instance_members.insert(
             "Map".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("size", Type::Number),
                     bprop("get", builtin_method(&[("key", Type::Any)], Type::Any)),
@@ -619,12 +619,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         instance_members.insert(
             "Set".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("size", Type::Number),
                     bprop("add", builtin_method(&[("value", Type::Any)], Type::Any)),
@@ -668,12 +668,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         instance_members.insert(
             "RegExp".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("source", Type::String),
                     bprop("flags", Type::String),
@@ -706,12 +706,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         instance_members.insert(
             "Date".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("getTime", builtin_method(&[], Type::Number)),
                     bprop("getFullYear", builtin_method(&[], Type::Number)),
@@ -726,12 +726,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         instance_members.insert(
             "Error".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("message", Type::String),
                     bprop("name", Type::String),
@@ -745,13 +745,13 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         // Object.prototype instance methods — inherited by all objects
         instance_members.insert(
             "Object".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop(
                         "hasOwnProperty",
@@ -775,12 +775,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         global_values.insert(
             "Math".to_string(),
-            Type::ObjectType(ObjectTypeInfo {
+            Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("PI", Type::Number),
                     bprop("E", Type::Number),
@@ -886,12 +886,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            }),
+            })),
         );
 
         global_values.insert(
             "JSON".to_string(),
-            Type::ObjectType(ObjectTypeInfo {
+            Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop(
                         "parse",
@@ -907,12 +907,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            }),
+            })),
         );
 
         global_values.insert(
             "console".to_string(),
-            Type::ObjectType(ObjectTypeInfo {
+            Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("log", builtin_method(&[("message", Type::Any)], Type::Void)),
                     bprop(
@@ -941,12 +941,12 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            }),
+            })),
         );
 
         static_members.insert(
             "Object".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop(
                         "keys",
@@ -1031,11 +1031,11 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
         static_members.insert(
             "Date".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop("now", builtin_method(&[], Type::Number)),
                     bprop(
@@ -1052,11 +1052,11 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
         static_members.insert(
             "Array".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop(
                         "isArray",
@@ -1089,11 +1089,11 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
         static_members.insert(
             "Promise".to_string(),
-            ObjectTypeInfo {
+            ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![
                     bprop(
                         "resolve",
@@ -1161,7 +1161,7 @@ impl BuiltinTypes {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            },
+            }),
         );
 
         // Every constructor function exposes `prototype` (the instance shape).

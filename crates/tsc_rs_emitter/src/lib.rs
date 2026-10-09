@@ -24,6 +24,7 @@ mod helpers;
 mod helpers_await;
 mod helpers_decorators;
 mod helpers_rest;
+mod import_shadow;
 mod jsx;
 mod lexical_downlevel;
 mod new_spread;
@@ -1448,6 +1449,12 @@ struct Emitter<'a> {
     /// CJS import binding map: local name → (require_var, imported_name).
     /// Used to rewrite references like `Calculator` → `file1_1.Calculator`.
     cjs_import_map: HashMap<AstString, (AstString, AstString)>,
+    /// Scopes where a local binding shadows a top-level import; references
+    /// inside them must not be rewritten through `cjs_import_map`.
+    import_shadows: import_shadow::ImportShadows,
+    /// Source offset of the reference `emit_value_name_ref` is emitting, when
+    /// the caller knows it (lets the shadow check apply there).
+    value_ref_pos: Option<u32>,
     /// Named-import locals whose imported name was written as a string literal.
     /// CJS rewrites must retain that provenance even when the decoded name is a
     /// valid identifier (`import { "value" as local }`).
@@ -2038,6 +2045,8 @@ impl<'a> Emitter<'a> {
             cjs_string_import_locals: HashSet::new(),
             cjs_string_export_names: HashSet::new(),
             cjs_default_import_bindings: HashSet::new(),
+            import_shadows: Default::default(),
+            value_ref_pos: None,
             cjs_exported_names: HashSet::new(),
             cjs_default_fn_local_names: HashSet::new(),
             cjs_export_alias_map: HashMap::new(),
@@ -2912,7 +2921,7 @@ impl<'a> Emitter<'a> {
     ) {
         match &expr.kind {
             ExprKind::Ident(name) => {
-                if let Some((alias, member)) = self.cjs_import_map.get(name.as_str()) {
+                if let Some((ref alias, ref member)) = self.cjs_import_ref(name, expr.span.start) {
                     let replacement: String = if member.is_empty() {
                         alias.to_string()
                     } else {
@@ -2938,7 +2947,9 @@ impl<'a> Emitter<'a> {
                 // Tagged templates need `(0, alias.member)` wrapper (like function
                 // calls) to avoid binding `this` to the module object.
                 if let ExprKind::Ident(name) = &tagged.tag.kind {
-                    if let Some((alias, member)) = self.cjs_import_map.get(name.as_str()) {
+                    if let Some((ref alias, ref member)) =
+                        self.cjs_import_ref(name, tagged.tag.span.start)
+                    {
                         let replacement: String = if member.is_empty() {
                             alias.to_string()
                         } else {
@@ -5810,6 +5821,7 @@ impl<'a> Emitter<'a> {
         self.class_expr_temp_emitted = false;
         self.file_has_recovery_errors = !file.diagnostics.is_empty();
         self.collect_cjs_string_name_provenance(file);
+        self.import_shadows = import_shadow::ImportShadows::collect(&file.statements);
         self.generator_catch_names.clear();
         self.lexical_downlevel_plan =
             if self.needs_lexical_downlevel() && !self.file_has_recovery_errors {
@@ -9630,7 +9642,14 @@ fn prop_name_is_computed(name: &PropName) -> bool {
 /// For computed property names, emit the expression and return its text.
 fn prop_name_computed_str(name: &PropName, source: &str, options: &CompilerOptions) -> String {
     if let PropName::Computed(expr, _) = name {
-        emit_expr_to_string(source, options, expr, &HashMap::new(), &HashSet::new())
+        emit_expr_to_string(
+            source,
+            options,
+            expr,
+            &HashMap::new(),
+            &HashSet::new(),
+            &Default::default(),
+        )
     } else {
         prop_name_str(name)
     }
@@ -9656,6 +9675,7 @@ fn emit_expr_to_string(
     expr: &Expr,
     cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
     cjs_string_import_locals: &HashSet<AstString>,
+    import_shadows: &import_shadow::ImportShadows,
 ) -> String {
     emit_expr_to_string_inner(
         source,
@@ -9663,6 +9683,7 @@ fn emit_expr_to_string(
         expr,
         cjs_import_map,
         cjs_string_import_locals,
+        import_shadows,
         false,
     )
 }
@@ -9676,6 +9697,7 @@ fn emit_expr_to_string_await_to_yield(
     expr: &Expr,
     cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
     cjs_string_import_locals: &HashSet<AstString>,
+    import_shadows: &import_shadow::ImportShadows,
 ) -> String {
     emit_expr_to_string_inner(
         source,
@@ -9683,6 +9705,7 @@ fn emit_expr_to_string_await_to_yield(
         expr,
         cjs_import_map,
         cjs_string_import_locals,
+        import_shadows,
         true,
     )
 }
@@ -9693,6 +9716,7 @@ fn emit_expr_to_string_inner(
     expr: &Expr,
     cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
     cjs_string_import_locals: &HashSet<AstString>,
+    import_shadows: &import_shadow::ImportShadows,
     await_to_yield: bool,
 ) -> String {
     let adjusted = if expr.span.start < expr.span.end
@@ -9709,6 +9733,7 @@ fn emit_expr_to_string_inner(
     let mut e = Emitter::new(source, options, &[], HashMap::new());
     e.cjs_import_map = cjs_import_map.clone();
     e.cjs_string_import_locals = cjs_string_import_locals.clone();
+    e.import_shadows = import_shadows.clone();
     if await_to_yield {
         e.in_static_block_await_to_yield = true;
     }

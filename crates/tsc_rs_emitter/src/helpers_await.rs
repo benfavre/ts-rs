@@ -3232,7 +3232,7 @@ impl<'a> Emitter<'a> {
                             if self.is_commonjs()
                                 && self.cjs_string_import_locals.contains(local.as_str()) =>
                         {
-                            self.cjs_import_map.get(local.as_str()).cloned()
+                            self.cjs_import_ref(local, call.callee.span.start)
                         }
                         _ => None,
                     };
@@ -3695,13 +3695,13 @@ impl<'a> Emitter<'a> {
                 if self.export_target.as_ref().is_some_and(|t| t == "exports")
                     && self.cjs_var_export_names.contains(name.as_str())
                     && !self.cjs_param_shadows.contains(name.as_str())
+                    && !self.import_shadows.is_shadowed(name, expr.span.start)
                 {
                     self.write_cjs_export_access("exports", name);
                     return;
                 }
                 // CJS import reference rewriting: `x` → `a_1.default`
-                if let Some((var_name, imported)) = self.cjs_import_map.get(name.as_str()).cloned()
-                {
+                if let Some((var_name, imported)) = self.cjs_import_ref(name, expr.span.start) {
                     if imported.is_empty() {
                         self.write(&var_name);
                     } else {
@@ -3738,7 +3738,7 @@ impl<'a> Emitter<'a> {
                 self.write(": ");
                 self.emit_expr_await_to_yield(&p.value);
             }
-            ObjLitProp::Shorthand(name, _) => {
+            ObjLitProp::Shorthand(name, span) => {
                 let ns_qualify = self
                     .export_target
                     .as_ref()
@@ -3752,14 +3752,15 @@ impl<'a> Emitter<'a> {
                             && !self.ns_local_bindings.contains(name.as_str())
                     });
                 let needs_expand = ns_qualify
-                    || self.cjs_import_map.get(name.as_str()).is_some_and(
-                        |(var_name, imported)| {
+                    || self
+                        .cjs_import_ref(name, span.start)
+                        .is_some_and(|(var_name, imported)| {
                             !imported.is_empty() || var_name.as_str() != name.as_str()
-                        },
-                    );
+                        });
                 if needs_expand {
                     self.write(name);
                     self.write(": ");
+                    self.value_ref_pos = Some(span.start);
                     self.emit_value_name_ref(name);
                 } else {
                     self.write(name);

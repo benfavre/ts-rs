@@ -2002,6 +2002,7 @@ pub(crate) fn collect_member_decorator_strings(
     helper_prefix: &str,
     cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
     cjs_string_import_locals: &HashSet<AstString>,
+    import_shadows: &crate::import_shadow::ImportShadows,
 ) -> Vec<String> {
     collect_member_decorator_strings_inner(
         source,
@@ -2011,6 +2012,7 @@ pub(crate) fn collect_member_decorator_strings(
         helper_prefix,
         cjs_import_map,
         cjs_string_import_locals,
+        import_shadows,
         false,
     )
 }
@@ -2023,6 +2025,7 @@ pub(crate) fn collect_member_decorator_strings_await_to_yield(
     helper_prefix: &str,
     cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
     cjs_string_import_locals: &HashSet<AstString>,
+    import_shadows: &crate::import_shadow::ImportShadows,
 ) -> Vec<String> {
     collect_member_decorator_strings_inner(
         source,
@@ -2032,6 +2035,7 @@ pub(crate) fn collect_member_decorator_strings_await_to_yield(
         helper_prefix,
         cjs_import_map,
         cjs_string_import_locals,
+        import_shadows,
         true,
     )
 }
@@ -2044,6 +2048,7 @@ fn collect_member_decorator_strings_inner(
     helper_prefix: &str,
     cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
     cjs_string_import_locals: &HashSet<AstString>,
+    import_shadows: &crate::import_shadow::ImportShadows,
     await_to_yield: bool,
 ) -> Vec<String> {
     let mut result = Vec::new();
@@ -2061,6 +2066,7 @@ fn collect_member_decorator_strings_inner(
             dec,
             cjs_import_map,
             cjs_string_import_locals,
+            import_shadows,
         );
         if !remove_comments {
             let comment = trailing_line_comment(source, dec.span.end);
@@ -2088,6 +2094,7 @@ fn collect_member_decorator_strings_inner(
                 dec,
                 cjs_import_map,
                 cjs_string_import_locals,
+                import_shadows,
             );
             result.push(format!(
                 "{}__param({}, {})",

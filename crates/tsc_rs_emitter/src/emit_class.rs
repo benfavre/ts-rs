@@ -606,6 +606,7 @@ impl<'a> Emitter<'a> {
                 expr,
                 &self.cjs_import_map,
                 &self.cjs_string_import_locals,
+                &self.import_shadows,
             );
             if let Some(stripped) = text.strip_prefix('@') {
                 text = stripped.trim_start().to_string();
@@ -636,6 +637,7 @@ impl<'a> Emitter<'a> {
                         &m.object,
                         &self.cjs_import_map,
                         &self.cjs_string_import_locals,
+                        &self.import_shadows,
                     );
                     let temp = alloc_this_preserve_temp(temps);
                     Some(format!(
@@ -653,6 +655,7 @@ impl<'a> Emitter<'a> {
                         &e.index,
                         &self.cjs_import_map,
                         &self.cjs_string_import_locals,
+                        &self.import_shadows,
                     );
                     Some(format!("super[{}].bind(_outerThis)", idx_text))
                 } else {
@@ -662,6 +665,7 @@ impl<'a> Emitter<'a> {
                         &e.object,
                         &self.cjs_import_map,
                         &self.cjs_string_import_locals,
+                        &self.import_shadows,
                     );
                     let idx_text = emit_expr_to_string(
                         self.source,
@@ -669,6 +673,7 @@ impl<'a> Emitter<'a> {
                         &e.index,
                         &self.cjs_import_map,
                         &self.cjs_string_import_locals,
+                        &self.import_shadows,
                     );
                     let temp = alloc_this_preserve_temp(temps);
                     Some(format!(
@@ -697,6 +702,7 @@ impl<'a> Emitter<'a> {
                 decorator,
                 &self.cjs_import_map,
                 &self.cjs_string_import_locals,
+                &self.import_shadows,
             );
             if let Some(stripped) = decorator_text.strip_prefix('@') {
                 decorator_text = stripped.trim_start().to_string();
@@ -1685,6 +1691,7 @@ impl<'a> Emitter<'a> {
                 expr,
                 &self.cjs_import_map,
                 &self.cjs_string_import_locals,
+                &self.import_shadows,
             );
             parts.push(format!(
                 "{temp_name} = {}__propKey({expr_text})",
@@ -6072,6 +6079,7 @@ impl<'a> Emitter<'a> {
                             &action_expr,
                             &self.cjs_import_map,
                             &self.cjs_string_import_locals,
+                            &self.import_shadows,
                         );
                         if let Some(temp_name) = temp_opt {
                             name_parts.push(format!("{temp_name} = {action_text}"));
@@ -6087,6 +6095,7 @@ impl<'a> Emitter<'a> {
                     expr,
                     &self.cjs_import_map,
                     &self.cjs_string_import_locals,
+                    &self.import_shadows,
                 );
                 let maybe_method_temp = if !method.decorators.is_empty() {
                     general_temp_by_start.get(&expr.span.start).cloned()
@@ -8282,6 +8291,7 @@ impl<'a> Emitter<'a> {
                             &action_expr,
                             &self.cjs_import_map,
                             &self.cjs_string_import_locals,
+                            &self.import_shadows,
                         );
                         if let Some(temp_name) = temp_opt {
                             name_parts.push(format!("{temp_name} = {action_text}"));
@@ -8296,6 +8306,7 @@ impl<'a> Emitter<'a> {
                     expr,
                     &self.cjs_import_map,
                     &self.cjs_string_import_locals,
+                    &self.import_shadows,
                 );
                 let maybe_method_temp = if !method.decorators.is_empty() {
                     class_expr_temp_by_start.get(&expr.span.start).cloned()

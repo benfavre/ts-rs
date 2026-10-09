@@ -1792,7 +1792,8 @@ fn setup_multi_file_project(
             "compilerOptions": {{
                 "target": "es2015",
                 "module": "commonjs",
-                "strict": true
+                "strict": true,
+                "types": []
                 {tsconfig_extra}
             }},
             "files": [{files_list}]
@@ -2467,7 +2468,7 @@ fn project_compile_single_file() {
     std::fs::write(root.join("main.ts"), "const x: number = 42;").unwrap();
     std::fs::write(
         root.join("tsconfig.json"),
-        r#"{ "compilerOptions": { "target": "es2015" }, "files": ["main.ts"] }"#,
+        r#"{ "compilerOptions": { "target": "es2015", "types": [] }, "files": ["main.ts"] }"#,
     )
     .unwrap();
 
@@ -2485,7 +2486,7 @@ fn project_compile_missing_file() {
     let root = dir.path();
     std::fs::write(
         root.join("tsconfig.json"),
-        r#"{ "compilerOptions": {}, "files": ["nonexistent.ts"] }"#,
+        r#"{ "compilerOptions": { "types": [] }, "files": ["nonexistent.ts"] }"#,
     )
     .unwrap();
 
@@ -2532,7 +2533,7 @@ fn project_compile_two_files_with_import() {
     .unwrap();
     std::fs::write(
         root.join("tsconfig.json"),
-        r#"{ "compilerOptions": { "target": "es2015" }, "files": ["src/utils.ts", "src/main.ts"] }"#,
+        r#"{ "compilerOptions": { "target": "es2015", "types": [] }, "files": ["src/utils.ts", "src/main.ts"] }"#,
     )
     .unwrap();
 

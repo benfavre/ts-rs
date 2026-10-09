@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use std::collections::HashMap;
 
-use crate::{FunctionType, ObjectTypeInfo, Type};
+use crate::{FunctionType, ObjectTypeData, ObjectTypeInfo, Type};
 
 // ---------------------------------------------------------------------------
 // Inference priority
@@ -232,16 +232,40 @@ impl InferenceContext {
                 // `Statement | undefined` binds T = Statement, not the union);
                 // the rest infers from the remaining source members.
                 if let Type::Union(arg_members) = arg {
-                    let remaining_params: Vec<&Type> = param_members
+                    let mut remaining_params: Vec<&Type> = param_members
                         .iter()
                         .filter(|pm| !arg_members.contains(pm))
                         .collect();
-                    let remaining_args: Vec<Type> = arg_members
+                    let mut remaining_args: Vec<Type> = arg_members
                         .iter()
                         .filter(|am| !param_members.contains(am))
                         .cloned()
                         .collect();
-                    if remaining_params.len() < param_members.len() {
+                    // Then the closely matched members (tsc
+                    // isTypeCloselyMatchedBy): references to the same generic
+                    // type infer from each other and drop out as well, so
+                    // `R | PromiseLike<R>` against `X | PromiseLike<X>` binds
+                    // R = X instead of R = X | PromiseLike<X>.
+                    let mut matched_closely = false;
+                    remaining_params.retain(|pm| {
+                        let Type::TypeReference(param_name, param_args) = pm else {
+                            return true;
+                        };
+                        if param_args.is_empty() {
+                            return true;
+                        }
+                        let Some(position) = remaining_args.iter().position(|am| {
+                            matches!(am, Type::TypeReference(arg_name, arg_args)
+                                if arg_name == param_name && arg_args.len() == param_args.len())
+                        }) else {
+                            return true;
+                        };
+                        let matched = remaining_args.remove(position);
+                        self.infer_type(pm, &matched);
+                        matched_closely = true;
+                        false
+                    });
+                    if matched_closely || remaining_params.len() < param_members.len() {
                         if remaining_params.is_empty() || remaining_args.is_empty() {
                             return;
                         }
@@ -647,7 +671,7 @@ pub fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
             }),
         }),
 
-        Type::ObjectType(obj) => Type::ObjectType(ObjectTypeInfo {
+        Type::ObjectType(obj) => Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: obj
                 .properties
                 .iter()
@@ -676,7 +700,7 @@ pub fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
             }),
             index_signature_name: obj.index_signature_name.clone(),
             method_names: obj.method_names.clone(),
-        }),
+        })),
 
         Type::TypeReference(name, args) => Type::TypeReference(
             name.clone(),
@@ -991,7 +1015,7 @@ mod tests {
         // function get<T>(obj: { value: T }): T
         let result = infer_type_arguments(
             &["T".to_string()],
-            &[Type::ObjectType(ObjectTypeInfo {
+            &[Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![(
                     "value".to_string(),
                     Arc::new(Type::TypeParameter("T".to_string())),
@@ -1001,15 +1025,15 @@ mod tests {
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            })],
-            &[Type::ObjectType(ObjectTypeInfo {
+            }))],
+            &[Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![("value".to_string(), Arc::new(Type::Boolean))],
                 call_signatures: vec![],
                 construct_signatures: vec![],
                 index_signature: None,
                 index_signature_name: None,
                 method_names: Vec::new(),
-            })],
+            }))],
         );
         assert_eq!(result.get("T"), Some(&Type::Boolean));
     }

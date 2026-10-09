@@ -2658,6 +2658,7 @@ impl<'a> Emitter<'a> {
                                     d,
                                     &self.cjs_import_map,
                                     &self.cjs_string_import_locals,
+                                    &self.import_shadows,
                                 )
                             })
                             .collect();
@@ -8647,6 +8648,7 @@ impl<'a> Emitter<'a> {
     /// Emit a bare identifier in value position, applying the same namespace
     /// and CJS import rewrites used by expression emission.
     pub(super) fn emit_value_name_ref(&mut self, name: &str) {
+        let ref_pos = self.value_ref_pos.take();
         if name == "arguments" {
             if let Some(alias) = self.current_arguments_alias.clone() {
                 self.write(&alias);
@@ -8683,7 +8685,11 @@ impl<'a> Emitter<'a> {
             return;
         }
 
-        if let Some((var_name, imported)) = self.cjs_import_map.get(name).cloned() {
+        let import = match ref_pos {
+            Some(pos) => self.cjs_import_ref(name, pos),
+            None => self.cjs_import_map.get(name).cloned(),
+        };
+        if let Some((var_name, imported)) = import {
             if imported.is_empty() {
                 self.write(&var_name);
             } else if self.in_call_callee_context
@@ -14266,6 +14272,11 @@ impl<'a> Emitter<'a> {
                 let has_cjs = !self.cjs_import_map.is_empty()
                     && stmt_has_cjs_import_ref(s, &self.cjs_import_map);
                 let has_downlevel = self.stmt_needs_downlevel(s);
+                // `x` -> `exports.x` for exported `let`/`var` bindings.
+                let has_cjs_export_ref =
+                    self.export_target.as_ref().is_some_and(|t| t == "exports")
+                        && !self.cjs_var_export_names.is_empty()
+                        && stmt_has_ns_export_ref(s, &self.cjs_var_export_names);
                 let has_ns_ref = self.export_target.as_ref().is_some_and(|t| t != "exports")
                     && ((!self.namespace_exports.is_empty()
                         && stmt_has_ns_export_ref(s, &self.namespace_exports))
@@ -14277,6 +14288,7 @@ impl<'a> Emitter<'a> {
                     && !has_cjs
                     && !has_downlevel
                     && !has_ns_ref
+                    && !has_cjs_export_ref
                 {
                     let start = s.span.start as usize;
                     let end = s.span.end as usize;

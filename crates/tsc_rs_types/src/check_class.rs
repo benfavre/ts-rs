@@ -907,7 +907,7 @@ impl TypeChecker {
                                         vec![Type::Any, Type::Any, Type::Any].into(),
                                     )
                                 } else if method.is_async {
-                                    Self::wrap_async_inferred_return(inferred)
+                                    self.wrap_async_inferred(inferred)
                                 } else {
                                     inferred
                                 }
@@ -1238,7 +1238,7 @@ impl TypeChecker {
                 return;
             }
         }
-        std::sync::Arc::make_mut(&mut self.class_info).insert(name, info);
+        (&mut self.class_info).insert(name, info);
     }
 
     pub(crate) fn build_interface_info(&self, iface_decl: &InterfaceDecl) -> InterfaceInfo {
@@ -1285,6 +1285,8 @@ impl TypeChecker {
                     props.push((name, Arc::new(ty)));
                 }
                 TypeMemberKind::MethodSig(method) => {
+                    let _own_type_params =
+                        crate::type_params_in_resolution(method.type_params.as_deref());
                     let name = self.prop_name_to_string(&method.name);
                     let type_params: Vec<_> = method
                         .type_params
@@ -1477,6 +1479,32 @@ impl TypeChecker {
                         }
                     }
                 }
+                // `get x(): T` declares a property `x: T`; a lone `set x(v: T)`
+                // declares it by its parameter type.
+                TypeMemberKind::GetAccessorSig(accessor) => {
+                    let name = self.prop_name_to_string(&accessor.name);
+                    let ty = accessor
+                        .return_type
+                        .as_ref()
+                        .map(|t| self.resolve_type_node(t))
+                        .unwrap_or(Type::Any);
+                    match props.iter_mut().find(|(existing, _)| *existing == name) {
+                        Some(slot) => slot.1 = Arc::new(ty),
+                        None => props.push((name, Arc::new(ty))),
+                    }
+                }
+                TypeMemberKind::SetAccessorSig(accessor) => {
+                    let name = self.prop_name_to_string(&accessor.name);
+                    if !props.iter().any(|(existing, _)| *existing == name) {
+                        let ty = accessor
+                            .params
+                            .first()
+                            .and_then(|parameter| parameter.type_ann.as_ref())
+                            .map(|t| self.resolve_type_node(t))
+                            .unwrap_or(Type::Any);
+                        props.push((name, Arc::new(ty)));
+                    }
+                }
                 _ => {}
             }
         }
@@ -1548,7 +1576,7 @@ impl TypeChecker {
                 .cloned()
                 .unwrap_or_default(),
             is_global: !self.file_is_module_flag,
-            object_type: ObjectTypeInfo {
+            object_type: ObjectTypeInfo::new(ObjectTypeData {
                 properties: props,
                 call_signatures: call_sigs,
                 construct_signatures: construct_sigs,
@@ -1564,7 +1592,7 @@ impl TypeChecker {
                         _ => None,
                     })
                     .collect(),
-            },
+            }),
             optional_props,
             member_locations: {
                 let mut locations = rustc_hash::FxHashMap::default();
@@ -2943,6 +2971,17 @@ impl TypeChecker {
                     }
                     // Then add own properties (overriding inherited ones)
                     for prop in &iface.object_type.properties {
+                        // `x?: T` reads as `T | undefined`.
+                        let prop = &if iface.optional_props.contains(&prop.0)
+                            && !matches!(prop.1.as_ref(), Type::Optional(_))
+                        {
+                            (
+                                prop.0.clone(),
+                                Arc::new(Type::Optional(Arc::clone(&prop.1))),
+                            )
+                        } else {
+                            prop.clone()
+                        };
                         if let Some(pos) = properties.iter().position(|(n, _)| n == &prop.0) {
                             properties[pos] = prop.clone();
                         } else {
@@ -2961,14 +3000,14 @@ impl TypeChecker {
                             }
                         }
                     }
-                    return Type::ObjectType(ObjectTypeInfo {
+                    return Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                         properties,
                         call_signatures: iface.object_type.call_signatures.clone(),
                         construct_signatures: iface.object_type.construct_signatures.clone(),
                         index_signature: iface.object_type.index_signature.clone(),
                         index_signature_name: iface.object_type.index_signature_name.clone(),
                         method_names,
-                    });
+                    }));
                 }
                 return Type::TypeReference(class_name.to_string(), Arc::from([] as [Type; 0]));
             }
@@ -3076,14 +3115,14 @@ impl TypeChecker {
             }
         }
 
-        Type::ObjectType(ObjectTypeInfo {
+        Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties,
             call_signatures: Vec::new(),
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
             method_names,
-        })
+        }))
     }
 
     /// Return constructor parameter types only when the entire inheritance

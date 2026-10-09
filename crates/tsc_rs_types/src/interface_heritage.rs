@@ -39,7 +39,7 @@ impl TypeChecker {
             bases
                 .iter()
                 .find_map(|base| match self.heritage_apparent_type(base) {
-                    Type::ObjectType(object) => object.index_signature,
+                    Type::ObjectType(object) => object.into_data().index_signature,
                     _ => None,
                 })
         });

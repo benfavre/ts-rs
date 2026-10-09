@@ -587,21 +587,36 @@ pub(crate) fn expr_has_cjs_export_ref(expr: &Expr, names: &HashSet<AstString>) -
             ObjLitProp::Spread(e, _) => expr_has_cjs_export_ref(e, names),
             ObjLitProp::Method(m) => {
                 matches!(&m.name, PropName::Computed(e, _) if expr_has_cjs_export_ref(e, names))
+                    || m.body.iter().any(|s| stmt_has_ns_export_ref(s, names))
             }
             ObjLitProp::Get(a) | ObjLitProp::Set(a) => {
                 matches!(&a.name, PropName::Computed(e, _) if expr_has_cjs_export_ref(e, names))
+                    || a.body.iter().any(|s| stmt_has_ns_export_ref(s, names))
             }
-            _ => false,
+            ObjLitProp::ShorthandDefault(_, e, _) => expr_has_cjs_export_ref(e, names),
         }),
         ExprKind::Template(tpl) => tpl.exprs.iter().any(|e| expr_has_cjs_export_ref(e, names)),
         ExprKind::Comma(es) => es.iter().any(|e| expr_has_cjs_export_ref(e, names)),
         ExprKind::Yield(_, a) => a
             .as_ref()
             .is_some_and(|e| expr_has_cjs_export_ref(e, names)),
+        // Function bodies count too: a verbatim copy of the whole function
+        // would leave `x` unqualified inside it.
         ExprKind::Arrow(ar) => match &ar.body {
             ArrowBody::Expr(e) => expr_has_cjs_export_ref(e, names),
-            _ => false,
+            ArrowBody::Block(stmts) => stmts.iter().any(|s| stmt_has_ns_export_ref(s, names)),
         },
+        ExprKind::FnExpr(f) => f
+            .body
+            .as_ref()
+            .is_some_and(|b| b.iter().any(|s| stmt_has_ns_export_ref(s, names))),
+        ExprKind::TaggedTemplate(t) => {
+            expr_has_cjs_export_ref(&t.tag, names)
+                || t.quasi
+                    .exprs
+                    .iter()
+                    .any(|e| expr_has_cjs_export_ref(e, names))
+        }
         _ => false,
     }
 }
@@ -966,8 +981,48 @@ pub(crate) fn stmt_has_ns_export_ref(stmt: &Stmt, exports: &HashSet<AstString>) 
                     .as_ref()
                     .is_some_and(|b| b.iter().any(|s| stmt_check(s, inner_ref)))
             }
+            ExprKind::TaggedTemplate(tt) => {
+                expr_check(&tt.tag, exports)
+                    || tt.quasi.exprs.iter().any(|e| expr_check(e, exports))
+            }
+            ExprKind::JsxElement(el) => {
+                jsx_attrs_check(&el.attributes, exports)
+                    || jsx_children_check(&el.children, exports)
+            }
+            ExprKind::JsxSelfClosing(el) => jsx_attrs_check(&el.attributes, exports),
+            ExprKind::JsxFragment(fr) => jsx_children_check(&fr.children, exports),
             _ => false,
         }
+    }
+    fn jsx_attrs_check(attrs: &[JsxAttribute], exports: &HashSet<AstString>) -> bool {
+        attrs.iter().any(|a| match a {
+            JsxAttribute::Normal { value, .. } => {
+                value.as_ref().is_some_and(|v| expr_check(v, exports))
+            }
+            JsxAttribute::Spread(e, _) => expr_check(e, exports),
+        })
+    }
+    fn jsx_children_check(children: &[JsxChild], exports: &HashSet<AstString>) -> bool {
+        children.iter().any(|c| match c {
+            JsxChild::Text(..) => false,
+            JsxChild::Element(e) => expr_check(e, exports),
+            JsxChild::Expression(e, _) => e.as_ref().is_some_and(|e| expr_check(e, exports)),
+            JsxChild::Fragment(fr) => jsx_children_check(&fr.children, exports),
+        })
+    }
+    // The loop binding is not subtracted from `exports`: a false positive only
+    // costs the structured emit, a false negative copies a bare export name.
+    fn for_in_of_check(
+        left: &ForInOfLeft,
+        right: &Expr,
+        body: &Stmt,
+        exports: &HashSet<AstString>,
+    ) -> bool {
+        let left_hit = match left {
+            ForInOfLeft::Expr(e) => expr_check(e, exports),
+            ForInOfLeft::Var(_) | ForInOfLeft::Pat(_) => false,
+        };
+        left_hit || expr_check(right, exports) || stmt_check(body, exports)
     }
     fn stmt_check(stmt: &Stmt, exports: &HashSet<AstString>) -> bool {
         match &stmt.kind {
@@ -984,10 +1039,29 @@ pub(crate) fn stmt_has_ns_export_ref(stmt: &Stmt, exports: &HashSet<AstString>) 
             }
             StmtKind::Block(ss) => ss.iter().any(|s| stmt_check(s, exports)),
             StmtKind::For(f) => {
-                f.test.as_ref().is_some_and(|e| expr_check(e, exports))
+                f.init.as_ref().is_some_and(|init| match init {
+                    ForInit::Var(v) => v
+                        .declarations
+                        .iter()
+                        .any(|d| d.init.as_ref().is_some_and(|e| expr_check(e, exports))),
+                    ForInit::Expr(e) => expr_check(e, exports),
+                }) || f.test.as_ref().is_some_and(|e| expr_check(e, exports))
                     || f.update.as_ref().is_some_and(|e| expr_check(e, exports))
                     || stmt_check(&f.body, exports)
             }
+            StmtKind::ForOf(fo) => for_in_of_check(&fo.left, &fo.right, &fo.body, exports),
+            StmtKind::ForIn(fi) => for_in_of_check(&fi.left, &fi.right, &fi.body, exports),
+            StmtKind::Try(t) => {
+                t.block.iter().any(|s| stmt_check(s, exports))
+                    || t.handler
+                        .as_ref()
+                        .is_some_and(|h| h.body.iter().any(|s| stmt_check(s, exports)))
+                    || t.finalizer
+                        .as_ref()
+                        .is_some_and(|f| f.iter().any(|s| stmt_check(s, exports)))
+            }
+            StmtKind::Labeled(l) => stmt_check(&l.body, exports),
+            StmtKind::With(w) => expr_check(&w.object, exports) || stmt_check(&w.body, exports),
             StmtKind::While(w) => expr_check(&w.test, exports) || stmt_check(&w.body, exports),
             StmtKind::DoWhile(dw) => expr_check(&dw.test, exports) || stmt_check(&dw.body, exports),
             StmtKind::Switch(sw) => {

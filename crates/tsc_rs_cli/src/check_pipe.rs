@@ -151,6 +151,13 @@ pub fn run_check_pipe(config_path: &str) {
     let init_start = std::time::Instant::now();
     let init_timing = std::env::var("TSC_RS_INIT_TIMING").is_ok();
 
+    // The session is a snapshot (see "Staleness"): building it may remember
+    // filesystem answers, which cuts the init's repeated stat / realpath /
+    // package.json work. The caches are dropped once the snapshot exists, so
+    // requests still read the disk as it is.
+    let caches_were_on = tsc_rs_project::path_caches_enabled();
+    tsc_rs_project::enable_canonical_path_cache();
+
     // Resolve the project (loads tsconfig.json, expands includes, etc.).
     let project = match TsProject::from_config(config_path) {
         Ok(p) => p,
@@ -168,6 +175,10 @@ pub fn run_check_pipe(config_path: &str) {
     }
 
     let session = project.open_check_session();
+    if !caches_were_on {
+        tsc_rs_project::disable_and_clear_path_caches();
+    }
+    crate::release_free_memory();
 
     let init_ms = init_start.elapsed().as_millis() as u64;
     let stdout = std::io::stdout();
@@ -233,6 +244,9 @@ pub fn run_check_pipe(config_path: &str) {
         let response = handle(&session, &id, req);
         let _ = writeln!(out, "{}", response);
         let _ = out.flush();
+        // A request frees what its forked checker built; hand it back while
+        // the daemon waits for the next one.
+        crate::release_free_memory();
 
         request_count = request_count.saturating_add(1);
         let mut should_exit: Option<&'static str> = None;
@@ -261,6 +275,11 @@ pub fn run_check_pipe(config_path: &str) {
             break;
         }
     }
+    // Exit without dropping the session: freeing a large project's graph
+    // node by node took seconds (apps/app: ~2.4 s) on every shutdown and
+    // lifetime-cap respawn; the OS reclaims it at once.
+    let _ = out.flush();
+    std::process::exit(0);
 }
 
 // ---------------------------------------------------------------------------

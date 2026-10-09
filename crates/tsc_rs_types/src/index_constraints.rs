@@ -364,6 +364,7 @@ impl TypeChecker {
                 let properties: HashSet<_> =
                     match self.resolve_type_reference_to_object(&name, args) {
                         Some(Type::ObjectType(object)) => object
+                            .into_data()
                             .properties
                             .into_iter()
                             .map(|(name, _)| name)
@@ -379,7 +380,7 @@ impl TypeChecker {
         };
         let diagnostic_start = self.diagnostics.len();
         let mut seen = HashSet::new();
-        for (name, property) in object.properties {
+        for (name, property) in object.into_data().properties {
             if own_members.contains(&name) || name.starts_with('#') || !seen.insert(name.clone()) {
                 continue;
             }

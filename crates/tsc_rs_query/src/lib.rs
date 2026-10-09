@@ -335,6 +335,12 @@ pub struct QueryEngine {
     /// (re)checked; files present with a matching hash reuse their
     /// existing analysis.
     analyzed_hash: HashMap<String, u64>,
+    /// One-shot batch check (`tsc-rs -p … --noEmit`): nothing queries the
+    /// engine afterwards, so skip work that only the LSP needs —
+    /// type-checking declaration files under `skipLibCheck` (whose
+    /// expression types back hover inside library files) and the parse
+    /// cache's per-file `SourceFile` clones.
+    one_shot: bool,
 }
 
 const PARSE_CACHE_MAX_FILES: usize = 4000;
@@ -355,7 +361,13 @@ impl QueryEngine {
             dependencies: HashMap::new(),
             parse_cache: HashMap::new(),
             analyzed_hash: HashMap::new(),
+            one_shot: false,
         }
+    }
+
+    /// See `QueryEngine::one_shot`.
+    pub fn set_one_shot(&mut self, one_shot: bool) {
+        self.one_shot = one_shot;
     }
 
     /// Borrow this QE's options. Used by the LSP to decide whether the
@@ -453,9 +465,17 @@ impl QueryEngine {
                     }
                 }
                 let parsed = tsc_rs_parser::parse(file_name, source);
+                // Under skipLibCheck tsc skips a declaration file's checker
+                // grammar errors (TS1046, …) and keeps its syntax errors.
+                let skip_grammar = self.one_shot
+                    && self.options.skip_lib_check == Some(true)
+                    && is_declaration_file_name(file_name);
                 let parse_diags: Vec<Diagnostic> = parsed
                     .diagnostics
                     .iter()
+                    .filter(|diag| {
+                        !(skip_grammar && tsc_rs_parser::is_grammar_diagnostic(diag.code))
+                    })
                     .cloned()
                     .map(|diag| with_file_name(diag, file_name))
                     .collect();
@@ -467,7 +487,7 @@ impl QueryEngine {
         let mut parse_misses: Vec<(String, SourceFile)> = Vec::new();
         for (parsed, parse_diags, was_cache_hit) in parse_pass {
             self.diagnostics.extend(parse_diags);
-            if !was_cache_hit {
+            if !was_cache_hit && !self.one_shot {
                 parse_misses.push((parsed.file_name.clone(), parsed.clone()));
             }
             parsed_files.push(parsed);
@@ -511,7 +531,7 @@ impl QueryEngine {
             if !self.sources.contains_key(&sf.file_name) {
                 let hash = quick_source_hash(&sf.text);
                 self.sources.insert(sf.file_name.clone(), sf.text.clone());
-                if self.parse_cache.len() < PARSE_CACHE_MAX_FILES {
+                if !self.one_shot && self.parse_cache.len() < PARSE_CACHE_MAX_FILES {
                     self.parse_cache
                         .insert(sf.file_name.clone(), (hash, sf.clone()));
                 }
@@ -552,12 +572,17 @@ impl QueryEngine {
                 ) {
                     deps_for_file.push(parsed_files[target_idx].file_name.clone());
                     if target_idx != file_idx {
-                        let target_table = symbol_tables[target_idx].clone();
-                        tsc_rs_symbols::link_imports(
-                            &mut symbol_tables[file_idx],
-                            &target_table,
-                            import,
-                        );
+                        // Borrow the two tables disjointly: cloning the
+                        // target's whole table per import edge copied a
+                        // heavily imported file's symbols once per importer.
+                        let (importer, target) = if file_idx < target_idx {
+                            let (head, tail) = symbol_tables.split_at_mut(target_idx);
+                            (&mut head[file_idx], &tail[0])
+                        } else {
+                            let (head, tail) = symbol_tables.split_at_mut(file_idx);
+                            (&mut tail[0], &head[target_idx])
+                        };
+                        tsc_rs_symbols::link_imports(importer, target, import);
                     }
                 }
             }
@@ -626,6 +651,7 @@ impl QueryEngine {
         } else {
             let mut d = tsc_rs_types::TypeChecker::new();
             d.enable_module_resolution_diagnostics();
+            d.mark_donor();
             d.inject_external_types(&all_parsed_refs);
             d.register_available_files(&available_file_names);
             d.take_diagnostics();
@@ -683,9 +709,24 @@ impl QueryEngine {
             }
         }
 
+        let skip_declaration_checks = self.one_shot && self.options.skip_lib_check == Some(true);
         let check_results: Vec<CheckResult> = needs_recheck
             .into_par_iter()
             .map(|(file_name, parsed, symbols, _hash)| {
+                if skip_declaration_checks && is_declaration_file_name(&file_name) {
+                    // tsc reports a declaration file's syntax errors (already
+                    // collected by the parse pass) but no semantic errors
+                    // under skipLibCheck.
+                    return CheckResult {
+                        file_name,
+                        symbols,
+                        diagnostics: Vec::new(),
+                        expression_types: HashMap::new(),
+                        selected_overload_indices: HashMap::new(),
+                        type_ids_by_display: HashMap::new(),
+                        stable_types: HashMap::new(),
+                    };
+                }
                 let mut checker = match &donor {
                     Some(d) => d.clone(),
                     None => {
@@ -1880,6 +1921,14 @@ fn normalize_path(path: &str) -> String {
     } else {
         out
     }
+}
+
+fn is_declaration_file_name(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.ends_with(".d.ts")
+        || lower.ends_with(".d.tsx")
+        || lower.ends_with(".d.mts")
+        || lower.ends_with(".d.cts")
 }
 
 #[cfg(test)]

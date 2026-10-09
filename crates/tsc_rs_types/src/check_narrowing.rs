@@ -18,6 +18,11 @@ impl TypeChecker {
             ExprKind::Binary(bin) => {
                 match bin.op {
                     BinaryOp::StrictEq | BinaryOp::Eq => {
+                        if let Some((equal, not_equal)) =
+                            self.optional_chain_nullish_comparison(bin)
+                        {
+                            return (equal, not_equal);
+                        }
                         // typeof x === "string"
                         if let Some((name, narrowed_ty)) =
                             self.extract_typeof_narrowing(&bin.left, &bin.right)
@@ -54,20 +59,20 @@ impl TypeChecker {
                         // x === null
                         if let Some(name) = self.extract_null_equality(&bin.left, &bin.right) {
                             let alt = self.remove_type_from_var(&name, &Type::Null);
-                            return (vec![(name.clone(), Type::Null)], alt);
+                            return (self.exactly_nullish(&name, Type::Null), alt);
                         }
                         if let Some(name) = self.extract_null_equality(&bin.right, &bin.left) {
                             let alt = self.remove_type_from_var(&name, &Type::Null);
-                            return (vec![(name.clone(), Type::Null)], alt);
+                            return (self.exactly_nullish(&name, Type::Null), alt);
                         }
                         // x === undefined
                         if let Some(name) = self.extract_undefined_equality(&bin.left, &bin.right) {
                             let alt = self.remove_type_from_var(&name, &Type::Undefined);
-                            return (vec![(name.clone(), Type::Undefined)], alt);
+                            return (self.exactly_nullish(&name, Type::Undefined), alt);
                         }
                         if let Some(name) = self.extract_undefined_equality(&bin.right, &bin.left) {
                             let alt = self.remove_type_from_var(&name, &Type::Undefined);
-                            return (vec![(name.clone(), Type::Undefined)], alt);
+                            return (self.exactly_nullish(&name, Type::Undefined), alt);
                         }
                         // Discriminated union: x.kind === "value" or x.kind === 42
                         if let Some((var_name, consequent_ty, alternate_ty)) =
@@ -111,6 +116,11 @@ impl TypeChecker {
                         }
                     }
                     BinaryOp::StrictNe | BinaryOp::Ne => {
+                        if let Some((equal, not_equal)) =
+                            self.optional_chain_nullish_comparison(bin)
+                        {
+                            return (not_equal, equal);
+                        }
                         // typeof x !== "string" narrows the consequent to the
                         // complement and the alternate to the named typeof
                         // type. This is the inverse of the equality case.
@@ -147,20 +157,20 @@ impl TypeChecker {
                         // x !== null -> narrow out null in consequent
                         if let Some(name) = self.extract_null_equality(&bin.left, &bin.right) {
                             let consequent = self.remove_type_from_var(&name, &Type::Null);
-                            return (consequent, vec![(name.clone(), Type::Null)]);
+                            return (consequent, self.exactly_nullish(&name, Type::Null));
                         }
                         if let Some(name) = self.extract_null_equality(&bin.right, &bin.left) {
                             let consequent = self.remove_type_from_var(&name, &Type::Null);
-                            return (consequent, vec![(name.clone(), Type::Null)]);
+                            return (consequent, self.exactly_nullish(&name, Type::Null));
                         }
                         // x !== undefined
                         if let Some(name) = self.extract_undefined_equality(&bin.left, &bin.right) {
                             let consequent = self.remove_type_from_var(&name, &Type::Undefined);
-                            return (consequent, vec![(name.clone(), Type::Undefined)]);
+                            return (consequent, self.exactly_nullish(&name, Type::Undefined));
                         }
                         if let Some(name) = self.extract_undefined_equality(&bin.right, &bin.left) {
                             let consequent = self.remove_type_from_var(&name, &Type::Undefined);
-                            return (consequent, vec![(name.clone(), Type::Undefined)]);
+                            return (consequent, self.exactly_nullish(&name, Type::Undefined));
                         }
                         // Discriminated union (negated): x.kind !== "value"
                         if let Some((var_name, consequent_ty, alternate_ty)) =
@@ -186,6 +196,35 @@ impl TypeChecker {
                         let eq_chain = self.optional_chain_equality_narrowings(bin);
                         if !eq_chain.is_empty() {
                             return (vec![], eq_chain);
+                        }
+                    }
+                    // `"key" in x`: in the true branch `x` also has `key`
+                    // (tsc narrows to `T & Record<"key", unknown>`), of type
+                    // `unknown`.
+                    BinaryOp::In => {
+                        if let (ExprKind::StrLit(key), ExprKind::Ident(name)) =
+                            (&bin.left.kind, &bin.right.kind)
+                        {
+                            if let Some(declared) = self.lookup_var(name).cloned() {
+                                let known = !matches!(
+                                    self.resolve_member_on_type(&declared, key),
+                                    Type::Any | Type::Error | Type::Never
+                                );
+                                if !known
+                                    && matches!(
+                                        declared,
+                                        Type::TypeReference(..) | Type::ObjectType(_)
+                                    )
+                                {
+                                    // Recorded as a fact about the path `x.key`
+                                    // (not about `x`), so it ends with the
+                                    // branch.
+                                    return (
+                                        vec![(format!("{name}.{key}"), Type::Unknown)],
+                                        vec![],
+                                    );
+                                }
+                            }
                         }
                     }
                     BinaryOp::InstanceOf => {
@@ -270,6 +309,37 @@ impl TypeChecker {
                                         }
                                     }
                                 }
+                                // A union naming the class itself with type
+                                // arguments (`T | Promise<T>` against `Promise`)
+                                // splits into those members and the rest.
+                                if !name.contains('.') {
+                                    if let Some(Type::Union(members)) = self.lookup_var(&name) {
+                                        let is_instance = |member: &Type| {
+                                            matches!(member, Type::TypeReference(member_class, args)
+                                                if member_class == class_name.as_str()
+                                                    && !args.is_empty())
+                                        };
+                                        let (instances, others): (Vec<Type>, Vec<Type>) =
+                                            members.iter().cloned().partition(is_instance);
+                                        if !instances.is_empty()
+                                            && !others.is_empty()
+                                            && !others.iter().any(|member| {
+                                                matches!(member, Type::Any | Type::Unknown)
+                                                    || self
+                                                        .active_type_parameter_name(member)
+                                                        .is_some()
+                                            })
+                                        {
+                                            return (
+                                                vec![(
+                                                    name.clone(),
+                                                    Type::flatten_union(instances),
+                                                )],
+                                                vec![(name, Type::flatten_union(others))],
+                                            );
+                                        }
+                                    }
+                                }
                                 let alternate = self.remove_type_from_var(&name, &target);
                                 return (vec![(name.clone(), target)], alternate);
                             }
@@ -283,8 +353,12 @@ impl TypeChecker {
                         // when checking the next access. The false branch can't
                         // attribute the failure to either operand, so the
                         // alternate stays empty.
-                        let (left_c, _) = self.analyze_narrowing(&bin.left);
-                        let (right_c, _) = self.analyze_narrowing(&bin.right);
+                        let (left_c, left_a) = self.analyze_narrowing(&bin.left);
+                        let (right_c, right_a) = self.analyze_narrowing(&bin.right);
+                        // Whichever operand was falsy, a path BOTH narrow on
+                        // their false side is one of the two results:
+                        // after `if (!a?.x && !a?.y) return`, `a` is defined.
+                        let alternate = self.facts_of_either(left_a, &right_a);
                         let mut consequent = left_c;
                         for (name, ty) in right_c {
                             // Keep the LEFT fact on a shared path: it is the
@@ -305,7 +379,7 @@ impl TypeChecker {
                             }
                             consequent.push((name, ty));
                         }
-                        return (consequent, vec![]);
+                        return (consequent, alternate);
                     }
                     BinaryOp::LogOr => {
                         // Dual of `&&`: `x || y` is FALSY only when BOTH
@@ -318,8 +392,12 @@ impl TypeChecker {
                         // (`!(!x || c)` ⇒ `x`). The truthy branch can't
                         // attribute success to either operand, so the
                         // consequent stays empty.
-                        let (_, left_a) = self.analyze_narrowing(&bin.left);
-                        let (_, right_a) = self.analyze_narrowing(&bin.right);
+                        let (left_c, left_a) = self.analyze_narrowing(&bin.left);
+                        let (right_c, right_a) = self.analyze_narrowing(&bin.right);
+                        // Whichever operand was truthy, a path BOTH narrow is
+                        // one of their two results:
+                        // `a?.b?.x || a?.b?.y` proves `a.b` either way.
+                        let consequent = self.facts_of_either(left_c, &right_c);
                         let mut alternate = left_a;
                         for (name, ty) in right_a {
                             if matches!(ty, Type::Object) && self.narrowing_path_is_any(&name) {
@@ -335,7 +413,7 @@ impl TypeChecker {
                             }
                             alternate.push((name, ty));
                         }
-                        return (vec![], alternate);
+                        return (consequent, alternate);
                     }
                     _ => {}
                 }
@@ -417,9 +495,14 @@ impl TypeChecker {
                         // A surrounding guard may already have narrowed this
                         // exact path. Compose from that fact rather than
                         // restoring the declared property union from `obj`.
-                        let prop_ty = self
-                            .lookup_narrowed(&key)
-                            .unwrap_or_else(|| self.resolve_member_on_type(&obj_ty, &mem.property));
+                        let prop_ty = self.lookup_narrowed(&key).unwrap_or_else(|| {
+                            // The property is read off the receiver's
+                            // non-nullish part (`x?.p`, or `x.p` itself).
+                            self.resolve_member_on_type(
+                                &self.remove_null_undefined(&obj_ty),
+                                &mem.property,
+                            )
+                        });
                         let narrowed = self.remove_null_undefined(&prop_ty);
 
                         let mut consequent = chain_narrows.clone();
@@ -465,11 +548,19 @@ impl TypeChecker {
                                     .collect();
                                 Type::flatten_union(kept)
                             };
-                            let truthy_receiver = narrow_receiver(true);
+                            // A truthy `x.p` / `x?.p` also means `x` itself
+                            // is neither `null` nor `undefined`.
+                            let truthy_receiver =
+                                self.remove_null_undefined(&narrow_receiver(true));
                             if truthy_receiver != receiver_apparent
                                 && !matches!(truthy_receiver, Type::Never)
                             {
-                                consequent.push((obj.to_string(), truthy_receiver));
+                                // One fact per name: a later entry for the
+                                // same name would replace the chain's.
+                                match consequent.iter_mut().find(|(name, _)| name == obj) {
+                                    Some(slot) => slot.1 = truthy_receiver,
+                                    None => consequent.push((obj.to_string(), truthy_receiver)),
+                                }
                             }
                             let falsy_receiver = narrow_receiver(false);
                             if falsy_receiver != receiver_apparent
@@ -646,6 +737,21 @@ impl TypeChecker {
                                         consequent.push((arg_name.to_string(), target));
                                         return (consequent, alt);
                                     }
+                                    // `!isNil(a?.b?.c)`: a guard for `undefined`
+                                    // that fails proves the chain did not
+                                    // short-circuit, so every link before a
+                                    // `?.` is non-nullish in the false branch.
+                                    let guards_undefined = match pred.target_type.as_ref() {
+                                        Type::Undefined => true,
+                                        Type::Union(members) => members.contains(&Type::Undefined),
+                                        _ => false,
+                                    };
+                                    if guards_undefined {
+                                        let roots = self.optional_chain_root_narrowings(arg);
+                                        if !roots.is_empty() {
+                                            return (vec![], roots);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -664,6 +770,35 @@ impl TypeChecker {
                 let (consequent, alternate) = self.analyze_narrowing(&un.argument);
                 return (alternate, consequent);
             }
+            // `xs[0]` (a literal index on a nameable array): truthy means
+            // that element is there.
+            ExprKind::ElemAccess(access) => {
+                if let Some(key) = Self::element_path(expr) {
+                    let object = self.infer_expr_type(&access.object);
+                    let object = match &object {
+                        Type::TypeReference(..) => self
+                            .resolve_type_for_assignability(&object)
+                            .unwrap_or(object),
+                        _ => object,
+                    };
+                    let object = self.remove_null_undefined(&object);
+                    if let Type::Array(element) = &object {
+                        let present = self.remove_null_undefined(element);
+                        if !matches!(present, Type::Never | Type::Any) {
+                            // With `a.b?.[0]`, the chain did not
+                            // short-circuit either.
+                            let mut facts = self.optional_chain_root_narrowings(expr);
+                            facts.push((key, present));
+                            return (facts, vec![]);
+                        }
+                    }
+                }
+                // `a?.b?.[0]` truthy: the chain did not short-circuit.
+                let roots = self.optional_chain_root_narrowings(expr);
+                if !roots.is_empty() {
+                    return (roots, vec![]);
+                }
+            }
             ExprKind::Paren(inner) => return self.analyze_narrowing(inner),
             _ => {}
         }
@@ -674,6 +809,19 @@ impl TypeChecker {
     /// an identifier: `a` → "a", `a.b` → "a.b", `a?.b?.c` → "a.b.c". Returns
     /// None the moment a segment is computed (`a[i]`) or the root isn't a
     /// plain identifier, so only statically-nameable paths produce a key.
+    /// Narrowing key of `path[<numeric literal>]` (`a.b[0]` → "a.b[0]"),
+    /// for a statically nameable `path`.
+    pub(crate) fn element_path(expr: &Expr) -> Option<std::string::String> {
+        let ExprKind::ElemAccess(access) = &expr.kind else {
+            return None;
+        };
+        let ExprKind::NumLit(index) = &access.index.kind else {
+            return None;
+        };
+        let base = Self::member_path(&access.object)?;
+        Some(format!("{base}[{index}]"))
+    }
+
     pub(crate) fn member_path(expr: &Expr) -> Option<std::string::String> {
         match &expr.kind {
             ExprKind::Ident(name) => Some(name.to_string()),
@@ -750,11 +898,18 @@ impl TypeChecker {
         }
         let mut segs = path.split('.');
         let root = segs.next()?;
-        let mut cur = self
-            .lookup_narrowed(root)
-            .or_else(|| self.lookup_var(root).cloned())?;
+        let mut cur = if root == "this" {
+            // The enclosing class's instance.
+            let class_name = self.enclosing_class_names.last()?;
+            Type::TypeReference(class_name.clone(), Arc::from([] as [Type; 0]))
+        } else {
+            self.lookup_narrowed(root)
+                .or_else(|| self.lookup_var(root).cloned())?
+        };
         for seg in segs {
             let base = self.remove_null_undefined(&cur);
+            // A type parameter has its constraint's members.
+            let base = self.declared_type_param_constraint(&base).unwrap_or(base);
             cur = self.resolve_member_on_type(&base, seg);
         }
         Some(cur)
@@ -850,10 +1005,8 @@ impl TypeChecker {
         ident_side: &Expr,
         lit_side: &Expr,
     ) -> Option<std::string::String> {
-        if let ExprKind::Ident(ref name) = ident_side.kind {
-            if matches!(lit_side.kind, ExprKind::NullLit) {
-                return Some(name.to_string());
-            }
+        if matches!(lit_side.kind, ExprKind::NullLit) {
+            return Self::nullish_comparison_target(ident_side);
         }
         None
     }
@@ -864,14 +1017,123 @@ impl TypeChecker {
         ident_side: &Expr,
         lit_side: &Expr,
     ) -> Option<std::string::String> {
-        if let ExprKind::Ident(ref name) = ident_side.kind {
-            if let ExprKind::Ident(ref rhs) = lit_side.kind {
-                if rhs == "undefined" {
-                    return Some(name.to_string());
-                }
+        if let ExprKind::Ident(ref rhs) = lit_side.kind {
+            if rhs == "undefined" {
+                return Self::nullish_comparison_target(ident_side);
             }
         }
         None
+    }
+
+    /// The facts that hold when one of two conditions held, without knowing
+    /// which: a path both narrow, to the union of their results.
+    fn facts_of_either(
+        &self,
+        left: Vec<(std::string::String, Type)>,
+        right: &[(std::string::String, Type)],
+    ) -> Vec<(std::string::String, Type)> {
+        left.into_iter()
+            .filter_map(|(name, left_ty)| {
+                // `any` is not narrowed by a comparison.
+                if self.narrowing_path_is_any(&name) {
+                    return None;
+                }
+                let (_, right_ty) = right.iter().find(|(n, _)| *n == name)?;
+                let ty = if left_ty == *right_ty {
+                    left_ty
+                } else {
+                    Type::flatten_union(vec![left_ty, right_ty.clone()])
+                };
+                Some((name, ty))
+            })
+            .collect()
+    }
+
+    /// `a?.b <op> null|undefined`: the facts of the "equal" and the "not
+    /// equal" outcome. When the chain's value is not `undefined` (strict), or
+    /// not nullish (loose), the chain did not short-circuit, so every link
+    /// before a `?.` is non-nullish there and the path itself loses the
+    /// compared value. The "equal" outcome proves nothing about the links.
+    fn optional_chain_nullish_comparison(
+        &self,
+        bin: &tsc_rs_ast::BinaryExpr,
+    ) -> Option<(
+        Vec<(std::string::String, Type)>,
+        Vec<(std::string::String, Type)>,
+    )> {
+        let is_undefined =
+            |expr: &Expr| matches!(&expr.kind, ExprKind::Ident(name) if name == "undefined");
+        let is_null = |expr: &Expr| matches!(expr.kind, ExprKind::NullLit);
+        let (target, literal) = if is_undefined(&bin.right) || is_null(&bin.right) {
+            (&bin.left, &bin.right)
+        } else if is_undefined(&bin.left) || is_null(&bin.left) {
+            (&bin.right, &bin.left)
+        } else {
+            return None;
+        };
+        if !matches!(target.kind, ExprKind::Member(_)) || !Self::expr_in_optional_chain(target) {
+            return None;
+        }
+        let loose = matches!(bin.op, BinaryOp::Eq | BinaryOp::Ne);
+        let mut not_equal = if loose || is_undefined(literal) {
+            self.optional_chain_root_narrowings(target)
+        } else {
+            Vec::new()
+        };
+        if let Some(path) = Self::member_path(target) {
+            let leaf = if loose {
+                self.remove_nullish_from_var(&path)
+            } else if is_null(literal) {
+                self.remove_type_from_var(&path, &Type::Null)
+            } else {
+                self.remove_type_from_var(&path, &Type::Undefined)
+            };
+            // The leaf is only reachable under its roots.
+            if loose || is_undefined(literal) {
+                not_equal.extend(leaf);
+            }
+        }
+        Some((Vec::new(), not_equal))
+    }
+
+    /// What a comparison against `null`/`undefined` narrows: a variable, or
+    /// a property path on one (`a.b.c`, `this.x`).
+    fn nullish_comparison_target(expr: &Expr) -> Option<std::string::String> {
+        match &expr.kind {
+            ExprKind::Ident(name) => Some(name.to_string()),
+            ExprKind::Member(_) => Self::member_path(expr),
+            ExprKind::Paren(inner) => Self::nullish_comparison_target(inner),
+            _ => None,
+        }
+    }
+
+    /// The fact "`name` is exactly `nullish`" (`x === null`'s true branch).
+    /// A property path only gets it when its type is known to admit that
+    /// value; an unresolvable or `any` path stays as it is.
+    fn exactly_nullish(&self, name: &str, nullish: Type) -> Vec<(std::string::String, Type)> {
+        if name.contains('.') {
+            let admits = self
+                .nullish_comparison_source(name)
+                .is_some_and(|ty| match &ty {
+                    Type::Union(members) => members.contains(&nullish),
+                    other => *other == nullish,
+                });
+            if !admits {
+                return vec![];
+            }
+        }
+        vec![(name.to_string(), nullish)]
+    }
+
+    /// The type a nullish comparison of `name` starts from: the variable's,
+    /// or for a property path the most specific fact in scope.
+    fn nullish_comparison_source(&self, name: &str) -> Option<Type> {
+        if name.contains('.') {
+            self.resolve_member_path_type(name)
+                .filter(|ty| !matches!(ty, Type::Any | Type::Error))
+        } else {
+            self.lookup_var(name).cloned()
+        }
     }
 
     /// Remove a specific type from a variable's union type
@@ -900,7 +1162,7 @@ impl TypeChecker {
         name: &str,
         to_remove: &Type,
     ) -> Vec<(std::string::String, Type)> {
-        if let Some(ty) = self.lookup_var(name) {
+        if let Some(ty) = self.nullish_comparison_source(name).as_ref() {
             let result = match ty {
                 Type::Union(members) => {
                     let filtered: Vec<_> = members
@@ -924,7 +1186,7 @@ impl TypeChecker {
     /// undefined from `x`'s type (loose equality matches both). Returns the
     /// narrowing fact, or empty if it changes nothing.
     pub(crate) fn remove_nullish_from_var(&self, name: &str) -> Vec<(std::string::String, Type)> {
-        if let Some(ty) = self.lookup_var(name) {
+        if let Some(ty) = self.nullish_comparison_source(name).as_ref() {
             let result = self.remove_null_undefined(ty);
             if result != *ty {
                 return vec![(name.to_string(), result)];
@@ -936,7 +1198,7 @@ impl TypeChecker {
     /// The complement of `remove_nullish_from_var`: narrow `x` to just its
     /// null/undefined members (the `x == null` true branch).
     pub(crate) fn keep_nullish_of_var(&self, name: &str) -> Vec<(std::string::String, Type)> {
-        if let Some(ty) = self.lookup_var(name) {
+        if let Some(ty) = self.nullish_comparison_source(name).as_ref() {
             let kept: Type = match ty {
                 Type::Union(members) => Type::flatten_union(
                     members
@@ -967,6 +1229,22 @@ impl TypeChecker {
                 Type::flatten_union(filtered)
             }
             Type::Null | Type::Undefined => Type::Never,
+            // An optional member's `T?` is `T | undefined`.
+            Type::Optional(inner) => self.remove_null_undefined(inner),
+            other => other.clone(),
+        }
+    }
+
+    /// `ty` without `undefined` (`null` stays).
+    pub(crate) fn remove_undefined_only(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Union(members) => Type::flatten_union(
+                members
+                    .iter()
+                    .filter(|member| !matches!(member, Type::Undefined))
+                    .cloned()
+                    .collect(),
+            ),
             other => other.clone(),
         }
     }

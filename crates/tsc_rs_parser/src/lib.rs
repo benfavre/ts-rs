@@ -7106,7 +7106,16 @@ impl<'a> Parser<'a> {
                     }
                     _ => {}
                 }
+                // `as` right where a parameter starts is the parameter's
+                // name (`(as?: string) => …`), not the assertion operator.
+                let names_parameter = kind == TokenKind::As
+                    && i > 0
+                    && matches!(
+                        self.tokens[i - 1].kind,
+                        TokenKind::OpenParen | TokenKind::Comma | TokenKind::DotDotDot
+                    );
                 match kind {
+                    _ if names_parameter => {}
                     TokenKind::Dot
                     | TokenKind::QuestionDot
                     | TokenKind::EqualsEqualsEquals
