@@ -620,7 +620,7 @@ fn test_dts_optional_and_rest_params() {
 #[test]
 fn test_dts_import_namespace() {
     let dts = emit_dts("import * as path from 'path';");
-    assert!(dts.contains("import * as path from \"path\";"));
+    assert!(dts.contains("import * as path from 'path';"));
 }
 
 // ---------------------------------------------------------------

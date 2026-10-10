@@ -605,7 +605,10 @@ impl<'a> Emitter<'a> {
     pub(super) fn emit_expr(&mut self, expr: &Expr) {
         let previous_depth = self.emit_expr_depth;
         self.emit_expr_depth += 1;
+        // tsc maps both ends of every emitted expression.
+        self.record_mapping(expr.span);
         self.emit_expr_inner(expr);
+        self.record_mapping_end(expr.span);
         self.emit_expr_depth = previous_depth;
     }
 

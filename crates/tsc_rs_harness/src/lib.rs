@@ -819,6 +819,13 @@ struct ProjectScenario {
 struct ProjectInputFile {
     full_path: String,
     relative_path: String,
+    /// Whether the program first reached this file through a module import
+    /// (its name is then absolute, and tsc's project runner shows only the
+    /// base name in the errors baseline) rather than as a root file.
+    via_import: bool,
+    /// The name tsc's program gives a root or a `/// <reference>` target:
+    /// the spelling it was reached by, normalized (keeps leading `../`).
+    display: Option<String>,
 }
 
 type ConstValueMaps = (HashMap<String, f64>, HashMap<String, String>);
@@ -843,6 +850,14 @@ pub struct BaselineRunner {
 // that EACH spawn one of these threads, so an oversized reservation multiplies
 // peak memory and can OOM the suite.
 const BASELINE_CASE_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+thread_local! {
+    /// The per-file sections of the last outFile bundle the JS pipeline
+    /// built on this thread: (source name, emitted JavaScript), in bundle
+    /// order. The project harness maps the bundle back to its sources.
+    static OUT_FILE_SECTIONS: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 impl BaselineRunner {
     /// Create a new runner. `workspace_root` is the directory containing
@@ -1412,8 +1427,34 @@ impl BaselineRunner {
         let has_tsconfig = project_root.join("tsconfig.json").is_file();
         let mut options = self.load_project_options(&project_root)?;
         apply_project_scenario_overrides(&mut options, &scenario);
-        let inputs = self.discover_project_inputs(&project_root, &options, &scenario)?;
-        if inputs.is_empty() {
+        if options.type_roots.is_none() {
+            // tsc's project runner sees nothing above the test's directory:
+            // the default `node_modules/@types` walk stops there instead of
+            // reaching whatever the host has installed further up.
+            let top = self.workspace_root.join(&scenario.project_root);
+            let mut roots = Vec::new();
+            let mut dir = project_root.clone();
+            loop {
+                roots.push(
+                    dir.join("node_modules/@types")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                if dir == top || !dir.pop() {
+                    break;
+                }
+            }
+            options.type_roots = Some(roots);
+        }
+        let (scenario, root_diagnostics) =
+            validate_project_roots(scenario, &project_root, &options);
+        // Every listed root invalid: an empty program, not a directory scan.
+        let inputs = if scenario.input_files.is_empty() && !root_diagnostics.is_empty() {
+            Vec::new()
+        } else {
+            self.discover_project_inputs(&project_root, &options, &scenario)?
+        };
+        if inputs.is_empty() && root_diagnostics.is_empty() {
             return Err(format!(
                 "no source files found for project scenario '{}'",
                 scenario.scenario
@@ -1427,68 +1468,378 @@ impl BaselineRunner {
             .map(|f| (normalize_header_path(&f.full_path), f.relative_path.clone()))
             .collect();
 
+        // Names in the baseline are relative to the runner's directory (the
+        // scenario root), which a `project` subdirectory sits below.
+        let cwd = self.workspace_root.join(&scenario.project_root);
+        let to_cwd = |name: &str| -> String {
+            if scenario.project.is_none() {
+                name.to_string()
+            } else {
+                cwd_relative_path(
+                    &cwd,
+                    &normalize_header_path(&project_root.join(name).to_string_lossy()),
+                )
+            }
+        };
         let mut files = BTreeMap::new();
         for (variant, module_kind) in [("node", ModuleKind::CommonJS), ("amd", ModuleKind::AMD)] {
             let mut variant_options = options.clone();
             variant_options.module = Some(module_kind);
-            let path_ctx = project_baseline_path_context(&variant_options, &display_names);
+            // Output layout, as tsc computes it: from the common source
+            // directory (or rootDir) into outDir; declarations into
+            // declarationDir when set.
+            let resolve_dir = |dir: &str| {
+                normalize_path_segments(&normalize_header_path(
+                    &project_root.join(dir).to_string_lossy(),
+                ))
+            };
+            let common_dir = variant_options
+                .root_dir
+                .as_deref()
+                .map(resolve_dir)
+                .unwrap_or_else(|| project_common_source_dir(&inputs));
+            let js_out_dir = variant_options.out_dir.as_deref().map(resolve_dir);
+            let dts_out_dir = variant_options
+                .other
+                .iter()
+                .find_map(|(key, value)| (key == "declarationDir").then(|| resolve_dir(value)))
+                .or_else(|| js_out_dir.clone());
             let result =
                 tsc_rs_project::TsProject::new(file_names.clone(), variant_options.clone())
                     .compile();
 
             let mut emitted_files = Vec::new();
             let mut emitted_seen = HashSet::new();
-            for file in &result.files {
-                let full_name = normalize_header_path(&file.file_name);
-                let Some(relative_name) = display_by_full.get(&full_name) else {
-                    continue;
+            // tsc names an output written beside its source after the
+            // source's own name (a root's spelling).
+            let display_name = |full: &str, beside_source: bool| -> Option<String> {
+                beside_source
+                    .then(|| {
+                        inputs
+                            .iter()
+                            .find(|input| normalize_header_path(&input.full_path) == full)
+                            .and_then(|input| input.display.clone())
+                    })
+                    .flatten()
+            };
+            // tsc's runner stores an output outside the project directory as
+            // `diskFile<n>` with the output's extension, numbered in write order.
+            let mut disk_files = 0usize;
+            let mut disk_key = |name: &str| -> String {
+                let name = to_cwd(name);
+                if !name.starts_with("../") && !Path::new(&name).is_absolute() {
+                    return format!("{variant}/{name}");
+                }
+                let lower = name.to_ascii_lowercase();
+                let ext = if lower.ends_with(".d.ts") {
+                    ".d.ts"
+                } else if lower.ends_with(".js") {
+                    ".js"
+                } else {
+                    ".js.map"
                 };
+                let key = format!("{variant}/diskFile{disk_files}{ext}");
+                disk_files += 1;
+                key
+            };
+            // outFile only bundles AMD/System modules: with any other module
+            // kind and an external module in the program, tsc reports TS6082
+            // and bundles the scripts alone.
+            let mut extra_global = root_diagnostics.clone();
+            // TS6059: every emitted input must sit under rootDir.
+            if let Some(root_dir) = variant_options.root_dir.as_deref() {
+                let root = normalize_path_segments(&normalize_header_path(
+                    &project_root.join(root_dir).to_string_lossy(),
+                ));
+                for input in &inputs {
+                    let full = normalize_header_path(&input.full_path);
+                    let lower = full.to_ascii_lowercase();
+                    if lower.ends_with(".d.ts") || strip_prefix_path(&full, &root).is_some() {
+                        continue;
+                    }
+                    let name = input
+                        .display
+                        .clone()
+                        .unwrap_or_else(|| cwd_relative_path(&cwd, &full));
+                    let is_root = scenario.input_files.iter().any(|root| {
+                        normalize_path_segments(&normalize_header_path(
+                            &project_root.join(root).to_string_lossy(),
+                        )) == full
+                    });
+                    extra_global.push((
+                        Diagnostic {
+                            code: 6059,
+                            message: format!(
+                                "File '{name}' is not under 'rootDir' '{root_dir}'. 'rootDir' is expected to contain all source files."
+                            ),
+                            category: tsc_rs_ast::DiagnosticCategory::Error,
+                            file_name: None,
+                            span: None,
+                            related: None,
+                        },
+                        is_root.then(|| {
+                            "  The file is in the program because:\n    Root file specified for compilation"
+                                .to_string()
+                        }),
+                    ));
+                }
+            }
+            let scripts_only = variant_options.out_file.is_some()
+                && !matches!(
+                    variant_options.module,
+                    Some(ModuleKind::AMD | ModuleKind::System)
+                );
+            let (mut has_module, mut has_script) = (false, false);
+            if scripts_only {
+                for input in &inputs {
+                    if input.full_path.to_ascii_lowercase().ends_with(".d.ts") {
+                        continue;
+                    }
+                    let is_module = std::fs::read_to_string(&input.full_path).is_ok_and(|source| {
+                        source_file_looks_like_module(&tsc_rs_parser::parse(
+                            &input.full_path,
+                            &source,
+                        ))
+                    });
+                    has_module |= is_module;
+                    has_script |= !is_module;
+                }
+            }
+            let out_file_blocked = scripts_only && has_module;
+            if out_file_blocked {
+                extra_global.push((
+                    Diagnostic {
+                        code: 6082,
+                        message:
+                            "Only 'amd' and 'system' modules are supported alongside --outFile."
+                                .to_string(),
+                        category: tsc_rs_ast::DiagnosticCategory::Error,
+                        file_name: None,
+                        span: None,
+                        related: None,
+                    },
+                    None,
+                ));
+            }
+            if let Some(out_file) = variant_options
+                .out_file
+                .as_deref()
+                .filter(|_| !scripts_only || has_script)
+            {
+                // A bundle: the compiler-suite pipeline already concatenates
+                // the JavaScript and declaration outputs as tsc does.
+                for (name, content) in self.project_out_file_outputs(
+                    &inputs,
+                    &variant_options,
+                    out_file,
+                    &common_dir,
+                    &project_root,
+                    &scenario,
+                ) {
+                    if emitted_seen.insert(name.clone()) {
+                        emitted_files.push(to_cwd(&name));
+                    }
+                    files.insert(disk_key(&name), content);
+                }
+            }
+            for file in result
+                .files
+                .iter()
+                .filter(|_| variant_options.out_file.is_none())
+            {
+                let full_name = normalize_header_path(&file.file_name);
+                let lower = full_name.to_ascii_lowercase();
+                if !display_by_full.contains_key(&full_name)
+                    || lower.ends_with(".d.ts")
+                    || lower.ends_with(".d.mts")
+                    || lower.ends_with(".d.cts")
+                {
+                    continue;
+                }
 
                 if !file.emit.javascript.is_empty() {
-                    let js_name =
-                        output_name_for_source_js(relative_name, variant_options.jsx, &path_ctx);
-                    if emitted_seen.insert(js_name.clone()) {
-                        emitted_files.push(js_name.clone());
-                    }
-                    files.insert(
-                        format!("{variant}/{js_name}"),
-                        normalize_text(&file.emit.javascript),
+                    let js_name = project_output_path(
+                        &full_name,
+                        js_out_dir.as_deref(),
+                        &common_dir,
+                        &project_root,
+                        |name| ts_to_js_name_with_jsx(name, variant_options.jsx),
                     );
-
-                    if let Some(source_map) = &file.emit.source_map {
+                    // tsc's source-map paths depend on where the files land,
+                    // which only the project layout knows.
+                    let (javascript, source_map) = match &file.emit.source_map {
+                        Some(source_map) => {
+                            let (javascript, source_map) = project_source_map_paths(
+                                &file.emit.javascript,
+                                source_map,
+                                &ProjectMapPaths {
+                                    workspace_root: &self.workspace_root,
+                                    project_root: &project_root,
+                                    common_dir: &common_dir,
+                                    source: &full_name,
+                                    js_name: &js_name,
+                                    scenario: &scenario,
+                                },
+                            );
+                            (javascript, Some(source_map))
+                        }
+                        None => (file.emit.javascript.clone(), None),
+                    };
+                    // tsc writes the map before the JavaScript it describes.
+                    if let Some(source_map) = &source_map {
                         let map_name = format!("{js_name}.map");
                         if emitted_seen.insert(map_name.clone()) {
-                            emitted_files.push(map_name.clone());
+                            emitted_files.push(to_cwd(&map_name));
                         }
-                        files.insert(format!("{variant}/{map_name}"), normalize_text(source_map));
+                        files.insert(disk_key(&map_name), normalize_text(source_map));
                     }
+                    if emitted_seen.insert(js_name.clone()) {
+                        emitted_files.push(
+                            display_name(&full_name, js_out_dir.is_none())
+                                .map(|name| ts_to_js_name_with_jsx(&name, variant_options.jsx))
+                                .unwrap_or_else(|| to_cwd(&js_name)),
+                        );
+                    }
+                    files.insert(disk_key(&js_name), normalize_text(&javascript));
                 }
 
                 if let Some(declaration) = &file.emit.declaration_file {
-                    let dts_name = output_name_for_source_dts(relative_name, &path_ctx);
+                    let dts_name = project_output_path(
+                        &full_name,
+                        dts_out_dir.as_deref(),
+                        &common_dir,
+                        &project_root,
+                        ts_to_dts_name,
+                    );
                     if emitted_seen.insert(dts_name.clone()) {
-                        emitted_files.push(dts_name.clone());
+                        emitted_files.push(
+                            display_name(&full_name, dts_out_dir.is_none())
+                                .map(|name| ts_to_dts_name(&name))
+                                .unwrap_or_else(|| to_cwd(&dts_name)),
+                        );
                     }
-                    files.insert(format!("{variant}/{dts_name}"), normalize_text(declaration));
+                    files.insert(disk_key(&dts_name), normalize_text(declaration));
                 }
             }
 
             let diagnostics = format_project_diagnostics(
                 &result,
-                &project_root,
+                &self.workspace_root.join(&scenario.project_root),
                 &inputs,
-                module_kind,
                 &variant_options,
-                has_tsconfig,
+                has_tsconfig
+                    .then(|| project_root.join("tsconfig.json"))
+                    .as_deref(),
+                &extra_global,
             );
             files.insert(format!("{variant}/{stem}.errors.txt"), diagnostics);
             files.insert(
                 format!("{variant}/{stem}.json"),
-                build_project_summary_json(source, &display_names, &emitted_files),
+                build_project_summary_json(
+                    source,
+                    &inputs
+                        .iter()
+                        .map(|input| {
+                            input
+                                .display
+                                .clone()
+                                .unwrap_or_else(|| cwd_relative_path(&cwd, &input.full_path))
+                        })
+                        .collect::<Vec<_>>(),
+                    &emitted_files,
+                ),
             );
         }
 
         Ok(files)
+    }
+
+    /// The bundled outputs of an `outFile` project, through the compiler
+    /// suite's emit pipeline: `(output name, content)` in emit order.
+    fn project_out_file_outputs(
+        &self,
+        inputs: &[ProjectInputFile],
+        options: &CompilerOptions,
+        out_file: &str,
+        common_dir: &str,
+        project_root: &Path,
+        scenario: &ProjectScenario,
+    ) -> Vec<(String, String)> {
+        // Files are named from the common source directory, which is what
+        // AMD/System bundle module ids are relative to.
+        let wants_source_map = options.source_map == Some(true);
+        let mut options = options.clone();
+        options.root_dir = None;
+        let test_case = TestCase {
+            file_name: "project.ts".to_string(),
+            options,
+            files: inputs
+                .iter()
+                .map(|input| TestFile {
+                    name: strip_prefix_path(
+                        &normalize_path_segments(&normalize_header_path(&input.full_path)),
+                        common_dir,
+                    )
+                    .unwrap_or_else(|| input.relative_path.clone()),
+                    content: std::fs::read_to_string(&input.full_path).unwrap_or_default(),
+                })
+                .collect(),
+        };
+        let baseline = self.generate_js_baseline(&test_case, "project", "");
+        let out_js = normalize_header_path(out_file);
+        let wanted = [
+            format!("{out_js}.map"),
+            out_js.clone(),
+            js_to_dts_name(&out_js),
+        ];
+        let mut sections: Vec<(String, String)> = Vec::new();
+        for line in baseline.split_inclusive('\n') {
+            let header = line
+                .trim_end()
+                .strip_prefix("//// [")
+                .and_then(|rest| rest.strip_suffix(']'));
+            match header {
+                Some(name) => sections.push((name.to_string(), String::new())),
+                None => {
+                    if let Some((_, content)) = sections.last_mut() {
+                        content.push_str(line);
+                    }
+                }
+            }
+        }
+        let bundle_sections =
+            OUT_FILE_SECTIONS.with(|sections| std::mem::take(&mut *sections.borrow_mut()));
+        let mut outputs = Vec::new();
+        for name in wanted {
+            // The compiler-suite baseline names outputs by base name.
+            let short = basename(&name);
+            if let Some((_, content)) = sections
+                .iter()
+                .rev()
+                .find(|(section, _)| *section == name || *section == short)
+            {
+                let content = format!("{}\n", content.trim_end_matches('\n'));
+                outputs.push((name, normalize_text(&content)));
+            }
+        }
+        if wants_source_map {
+            if let Some(js_index) = outputs.iter().position(|(name, _)| *name == out_js) {
+                let (javascript, map) = project_bundle_source_map(
+                    &outputs[js_index].1,
+                    &bundle_sections,
+                    &ProjectBundlePaths {
+                        workspace_root: &self.workspace_root,
+                        project_root,
+                        common_dir,
+                        out_js: &out_js,
+                        scenario,
+                    },
+                );
+                outputs[js_index].1 = javascript;
+                outputs.insert(js_index, (format!("{out_js}.map"), map));
+            }
+        }
+        outputs
     }
 
     fn resolve_project_root(&self, scenario: &ProjectScenario) -> PathBuf {
@@ -1525,13 +1876,18 @@ impl BaselineRunner {
                 tsc_rs_project::TsProject::from_config(config_path.to_str().ok_or_else(|| {
                     format!("non-utf8 tsconfig path: {}", config_path.display())
                 })?)?;
-            let mut inputs = Vec::with_capacity(project.file_names.len());
-            for full_path in project.file_names {
-                let relative_path = relative_project_path(project_root, &full_path);
-                inputs.push(ProjectInputFile {
-                    full_path,
-                    relative_path,
-                });
+            // The tsconfig's files are roots; the program adds what they
+            // reference and import.
+            let roots: Vec<String> = project
+                .file_names
+                .iter()
+                .map(|full_path| relative_project_path(project_root, full_path))
+                .collect();
+            let mut inputs = discover_project_input_closure(project_root, options, &roots)?;
+            // tsconfig roots are named relative to the runner's directory,
+            // not as spelled relative to the project.
+            for input in &mut inputs {
+                input.display = None;
             }
             inputs
         } else {
@@ -1555,10 +1911,25 @@ impl BaselineRunner {
                         &project_root.join(relative).to_string_lossy(),
                     ),
                     relative_path: normalize_header_path(relative),
+                    via_import: false,
+                    display: None,
                 })
                 .collect();
         }
 
+        // tsc's project runner sees nothing outside the test tree: typings
+        // the tsconfig loader found above the checkout are not inputs.
+        let workspace = normalize_header_path(
+            &self
+                .workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| self.workspace_root.clone())
+                .to_string_lossy(),
+        );
+        files.retain(|file| {
+            let full = normalize_header_path(&file.full_path);
+            !Path::new(&full).is_absolute() || strip_prefix_path(&full, &workspace).is_some()
+        });
         let mut seen = HashSet::new();
         files.retain(|file| seen.insert(file.full_path.clone()));
         Ok(files)
@@ -1632,8 +2003,12 @@ impl BaselineRunner {
         // consecutive output sections -- only between the last input section
         // and the first output section (handled by the trailing newline of
         // the last input file's content).
-        let mut dts_sections: Vec<(String, String)> = Vec::new();
+        // (output name, content, ambient module id): the id is set for an
+        // external module that an AMD/System outFile bundle wraps in
+        // `declare module "<id>"`.
+        let mut dts_sections: Vec<(String, String, String)> = Vec::new();
         let mut js_sections: Vec<(String, String, String)> = Vec::new();
+        OUT_FILE_SECTIONS.with(|sections| sections.borrow_mut().clear());
         let mut wrote_output_section = false;
         let emit_declaration_only = path_ctx.emit_declaration_only;
         let mut compile_indices: Vec<usize> = test_case
@@ -2170,8 +2545,11 @@ impl BaselineRunner {
 
         // When outFile is set but no module kind is specified, TypeScript
         // excludes module files from the bundle (only scripts are bundled).
-        let skip_modules_in_out_file =
-            is_out_file && matches!(effective_options.module, None | Some(ModuleKind::None));
+        let skip_modules_in_out_file = is_out_file
+            && !matches!(
+                effective_options.module,
+                Some(ModuleKind::AMD | ModuleKind::System)
+            );
 
         // Collect type-only names from ALL files in the compilation so the
         // emitter can suppress spurious `exports.X = void 0;` for names that
@@ -3822,6 +4200,43 @@ impl BaselineRunner {
                         &effective_options,
                         &path_ctx,
                     );
+                    // A bundled module's dependencies are named by module id:
+                    // a specifier that resolves to a bundled file (including a
+                    // classic non-relative one) becomes that file's id.
+                    let js_content = if is_out_file
+                        && matches!(
+                            effective_options.module,
+                            Some(ModuleKind::AMD | ModuleKind::System)
+                        ) {
+                        let mut deps = Vec::new();
+                        for specifier in collect_project_module_specifiers(source_file) {
+                            if let Some(dep_idx) = resolve_module_specifier(
+                                name,
+                                &specifier,
+                                test_case,
+                                &path_to_idx,
+                                &path_ctx,
+                            ) {
+                                let dep = &test_case.files[dep_idx];
+                                if !is_node_modules_path(&dep.name) {
+                                    deps.push((
+                                        specifier,
+                                        amd_module_id_for_source(&dep.name, &path_ctx),
+                                    ));
+                                }
+                            }
+                        }
+                        rewrite_bundle_dependency_ids(&js_content, &deps)
+                    } else {
+                        js_content
+                    };
+                    if is_out_file {
+                        OUT_FILE_SECTIONS.with(|sections| {
+                            sections
+                                .borrow_mut()
+                                .push((emit_path.to_string(), js_content.clone()))
+                        });
+                    }
                     js_sections.push((js_name, module_id, js_content));
 
                     // Emit paired JSON (same stem as this TS file) right after the JS.
@@ -3852,9 +4267,20 @@ impl BaselineRunner {
             // If declaration generation is enabled, collect the .d.ts output.
             if let Some(ref dts) = emit_output.declaration_file {
                 let dts_content = dts.trim_end_matches('\n').to_string() + "\n";
+                let wraps_module = out_file_name.is_some()
+                    && matches!(
+                        effective_options.module,
+                        Some(ModuleKind::AMD | ModuleKind::System)
+                    )
+                    && source_file_looks_like_module(source_file);
                 for emit_path in &emission_paths {
                     let dts_name = output_name_for_source_dts(emit_path, &path_ctx);
-                    dts_sections.push((dts_name, dts_content.clone()));
+                    let module_id = if wraps_module {
+                        amd_module_id_for_source(emit_path, &path_ctx)
+                    } else {
+                        String::new()
+                    };
+                    dts_sections.push((dts_name, dts_content.clone(), module_id));
                 }
             }
         }
@@ -3952,7 +4378,19 @@ impl BaselineRunner {
         if let Some(out_file) = out_file_name.as_deref() {
             if !dts_sections.is_empty() {
                 let mut bundled_dts = String::new();
-                for (_, dts_content) in dts_sections {
+                let module_ids: Vec<String> = dts_sections
+                    .iter()
+                    .map(|(_, _, id)| id.clone())
+                    .filter(|id| !id.is_empty())
+                    .collect();
+                for (_, dts_content, module_id) in &dts_sections {
+                    let wrapped;
+                    let dts_content = if module_id.is_empty() {
+                        dts_content
+                    } else {
+                        wrapped = wrap_dts_in_ambient_module(dts_content, module_id, &module_ids);
+                        &wrapped
+                    };
                     if !bundled_dts.is_empty() && !bundled_dts.ends_with('\n') {
                         bundled_dts.push('\n');
                     }
@@ -3964,7 +4402,7 @@ impl BaselineRunner {
                 output.push_str(&bundled_dts);
             }
         } else {
-            for (dts_name, dts_content) in dts_sections {
+            for (dts_name, dts_content, _) in dts_sections {
                 output.push('\n');
                 output.push_str(&format!("//// [{dts_name}]\n"));
                 output.push_str(&dts_content);
@@ -7487,7 +7925,7 @@ fn relative_project_path(project_root: &Path, full_path: &str) -> String {
     let full_path = normalize_header_path(full_path);
     strip_prefix_path(&full_path, &project_root)
         .filter(|rel| !rel.is_empty())
-        .unwrap_or_else(|| basename(&full_path))
+        .unwrap_or_else(|| cwd_relative_path(Path::new(&project_root), &full_path))
 }
 
 fn discover_project_input_closure(
@@ -7505,19 +7943,24 @@ fn discover_project_input_closure(
     let mut ordered = Vec::new();
     let mut visiting = HashSet::new();
     let mut visited = HashSet::new();
+    let mut first_names = HashMap::new();
 
     for relative in root_files {
-        let full_path = normalize_header_path(&project_root.join(relative).to_string_lossy());
+        let full_path = normalize_path_segments(&normalize_header_path(
+            &project_root.join(relative).to_string_lossy(),
+        ));
         visit_project_input_file(
             project_root,
             &project_root_normalized,
             &full_path,
+            Some(normalize_path_segments(&normalize_header_path(relative))),
             options,
             allow_js,
             out_dir.as_deref(),
             declaration_dir.as_deref(),
             &mut visiting,
             &mut visited,
+            &mut first_names,
             &mut ordered,
         )?;
     }
@@ -7530,12 +7973,16 @@ fn visit_project_input_file(
     project_root: &Path,
     project_root_normalized: &str,
     full_path: &str,
+    // How tsc names the file when first reached: `None` through a module
+    // import (an absolute name), else the root/reference spelling.
+    reached_as: Option<String>,
     options: &CompilerOptions,
     allow_js: bool,
     out_dir: Option<&str>,
     declaration_dir: Option<&str>,
     visiting: &mut HashSet<String>,
     visited: &mut HashSet<String>,
+    first_names: &mut HashMap<String, Option<String>>,
     ordered: &mut Vec<ProjectInputFile>,
 ) -> Result<(), String> {
     let normalized = normalize_header_path(full_path);
@@ -7545,6 +7992,10 @@ fn visit_project_input_file(
     if !visiting.insert(normalized.clone()) {
         return Ok(());
     }
+    first_names
+        .entry(normalized.clone())
+        .or_insert_with(|| reached_as.clone());
+    let own_name = first_names.get(&normalized).cloned().flatten();
 
     if options.no_resolve != Some(true) {
         let path = Path::new(&normalized);
@@ -7552,6 +8003,39 @@ fn visit_project_input_file(
             let source = std::fs::read_to_string(path)
                 .map_err(|err| format!("failed to read project file {}: {err}", path.display()))?;
             let parsed = tsc_rs_parser::parse(&normalized, &source);
+
+            // tsc processes `/// <reference path>` targets before imports.
+            // Their names stay relative, as the runner shows them.
+            let dir = path.parent().unwrap_or(Path::new(""));
+            for reference in triple_slash_reference_paths(&source) {
+                let target = normalize_header_path(&dir.join(&reference).to_string_lossy());
+                let target = normalize_path_segments(&target);
+                if !Path::new(&target).is_file() {
+                    continue;
+                }
+                let reference_name = own_name.as_ref().map(|name| {
+                    let dir = dirname(name);
+                    normalize_path_segments(&if dir.is_empty() || dir == "." {
+                        reference.clone()
+                    } else {
+                        format!("{dir}/{reference}")
+                    })
+                });
+                visit_project_input_file(
+                    project_root,
+                    project_root_normalized,
+                    &target,
+                    reference_name,
+                    options,
+                    allow_js,
+                    out_dir,
+                    declaration_dir,
+                    visiting,
+                    visited,
+                    first_names,
+                    ordered,
+                )?;
+            }
 
             for specifier in collect_project_module_specifiers(&parsed) {
                 if let Some(resolved) =
@@ -7574,12 +8058,14 @@ fn visit_project_input_file(
                         project_root,
                         project_root_normalized,
                         &resolved_name,
+                        None,
                         options,
                         allow_js,
                         out_dir,
                         declaration_dir,
                         visiting,
                         visited,
+                        first_names,
                         ordered,
                     )?;
                 }
@@ -7592,6 +8078,8 @@ fn visit_project_input_file(
         ordered.push(ProjectInputFile {
             full_path: normalized.clone(),
             relative_path: relative_project_path(project_root, &normalized),
+            via_import: first_names.get(&normalized).is_some_and(Option::is_none),
+            display: first_names.get(&normalized).cloned().flatten(),
         });
     }
 
@@ -7662,6 +8150,8 @@ fn collect_project_source_files_recursive(
         files.push(ProjectInputFile {
             full_path: normalized.clone(),
             relative_path: relative_project_path(root, &normalized),
+            via_import: false,
+            display: None,
         });
     }
 
@@ -7718,7 +8208,14 @@ fn should_skip_project_file(
 }
 
 fn path_belongs_to_project(project_root: &str, full_path: &str) -> bool {
-    full_path == project_root || strip_prefix_path(full_path, project_root).is_some()
+    // tsc's runner serves the whole projects tree, so a module beside the
+    // project (`../other/m2`) is part of the program; the host beyond is not.
+    let boundary = project_root
+        .find("/tests/cases/projects/")
+        .map_or(project_root, |idx| {
+            &project_root[..idx + "/tests/cases/projects".len()]
+        });
+    full_path == boundary || strip_prefix_path(full_path, boundary).is_some()
 }
 
 /// Specifiers imported through a `require` construct (`import x =
@@ -7930,11 +8427,11 @@ fn project_baseline_path_context(
 
 fn format_project_diagnostics(
     result: &tsc_rs_project::CompilationResult,
-    project_root: &Path,
+    cwd: &Path,
     inputs: &[ProjectInputFile],
-    module_kind: ModuleKind,
     options: &CompilerOptions,
-    has_tsconfig: bool,
+    tsconfig: Option<&Path>,
+    extra_global: &[(Diagnostic, Option<String>)],
 ) -> String {
     let source_by_full: HashMap<String, String> = inputs
         .iter()
@@ -7944,7 +8441,7 @@ fn format_project_diagnostics(
                 .map(|source| (normalize_header_path(&input.full_path), source))
         })
         .collect();
-    let diagnostics_by_full: HashMap<String, Vec<Diagnostic>> = result
+    let mut diagnostics_by_full: HashMap<String, Vec<Diagnostic>> = result
         .files
         .iter()
         .map(|file| {
@@ -7954,100 +8451,847 @@ fn format_project_diagnostics(
             )
         })
         .collect();
-    let synthetic_warnings = synthetic_project_warning_lines(module_kind, options, has_tsconfig);
-    let mut lines = Vec::new();
 
-    lines.extend(synthetic_warnings.iter().cloned());
-    for diagnostic in &result.diagnostics {
-        lines.push(format_project_diagnostic_line(
-            diagnostic,
-            project_root,
-            &source_by_full,
-        ));
-    }
-    for file in &result.files {
-        for diagnostic in &file.diagnostics {
-            lines.push(format_project_diagnostic_line(
-                diagnostic,
-                project_root,
-                &source_by_full,
-            ));
+    // Option diagnostics: located in the tsconfig when there is one (at the
+    // option's value, or at `compilerOptions` for options set elsewhere),
+    // global otherwise.
+    let tsconfig_full = tsconfig.map(|path| normalize_header_path(&path.to_string_lossy()));
+    let tsconfig_source = tsconfig.and_then(|path| std::fs::read_to_string(path).ok());
+    let mut related_by_key: HashMap<(String, u32, u32), String> = HashMap::new();
+    let mut global: Vec<(Diagnostic, Option<String>)> = Vec::new();
+    for option_diag in tsc_rs_types::check_deprecated_options(options) {
+        let mut diagnostic = option_diag.diagnostic.clone();
+        let span = match (&tsconfig_full, &tsconfig_source) {
+            (Some(_), Some(source)) if !option_diag.option_name.is_empty() => {
+                locate_option_in_tsconfig(
+                    source,
+                    &option_diag.option_name,
+                    option_diag.point_at_value,
+                )
+            }
+            _ => None,
+        };
+        match (span, &tsconfig_full) {
+            (Some(span), Some(full)) => {
+                diagnostic.span = Some(span);
+                diagnostic.file_name = Some(full.clone());
+                if let Some(related) = &option_diag.related {
+                    related_by_key
+                        .insert((full.clone(), span.start, diagnostic.code), related.clone());
+                }
+                diagnostics_by_full
+                    .entry(full.clone())
+                    .or_default()
+                    .push(diagnostic);
+            }
+            _ => global.push((diagnostic, option_diag.related.clone())),
         }
     }
 
-    let mut section_lines = Vec::new();
-    for warning in &synthetic_warnings {
-        section_lines.push(format!("!!! {warning}"));
+    // `/// <reference path>` checks: a file referencing itself (TS1006), a
+    // missing target (TS6053), reported at the path text.
+    if options.no_resolve != Some(true) {
+        for input in inputs {
+            let full = normalize_header_path(&input.full_path);
+            let Some(source) = source_by_full.get(&full) else {
+                continue;
+            };
+            let dir = Path::new(&full).parent().unwrap_or(Path::new(""));
+            for (reference, start) in triple_slash_reference_path_spans(source) {
+                let target = normalize_path_segments(&normalize_header_path(
+                    &dir.join(&reference).to_string_lossy(),
+                ));
+                let (code, message) = if target == full {
+                    (
+                        1006,
+                        "A file cannot have a reference to itself.".to_string(),
+                    )
+                } else if !Path::new(&target).is_file() {
+                    (6053, format!("File '{reference}' not found."))
+                } else {
+                    continue;
+                };
+                diagnostics_by_full
+                    .entry(full.clone())
+                    .or_default()
+                    .push(Diagnostic {
+                        code,
+                        message,
+                        category: tsc_rs_ast::DiagnosticCategory::Error,
+                        file_name: Some(full.clone()),
+                        span: Some(tsc_rs_ast::Span::new(
+                            start as u32,
+                            (start + reference.len()) as u32,
+                        )),
+                        related: None,
+                    });
+            }
+        }
+    }
+    // TS6082 points at a tsconfig's `outFile` key when the file sets it.
+    let mut extra_global: Vec<(Diagnostic, Option<String>)> = extra_global.to_vec();
+    if let (Some(full), Some(source)) = (&tsconfig_full, &tsconfig_source) {
+        if source.contains("\"outFile\"") {
+            extra_global.retain(|(diagnostic, _)| {
+                if diagnostic.code != 6082 {
+                    return true;
+                }
+                let Some(span) = locate_option_in_tsconfig(source, "outFile", false) else {
+                    return true;
+                };
+                let mut located = diagnostic.clone();
+                located.span = Some(span);
+                located.file_name = Some(full.clone());
+                diagnostics_by_full
+                    .entry(full.clone())
+                    .or_default()
+                    .push(located);
+                false
+            });
+        }
+    }
+    // File-less diagnostics (from the options or the program) are global.
+    for (diagnostic, related) in extra_global.iter().cloned().chain(
+        result
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.file_name.is_none())
+            .map(|diagnostic| (diagnostic.clone(), None)),
+    ) {
+        let duplicate = global.iter().any(|(existing, _)| {
+            existing.code == diagnostic.code && existing.message == diagnostic.message
+        });
+        if !duplicate {
+            global.push((diagnostic, related));
+        }
+    }
+    global.sort_by(|a, b| {
+        a.0.code
+            .cmp(&b.0.code)
+            .then_with(|| a.0.message.cmp(&b.0.message))
+    });
+
+    for diagnostics in diagnostics_by_full.values_mut() {
+        diagnostics.sort_by(|a, b| {
+            let start = |d: &Diagnostic| d.span.map_or(0, |span| span.start);
+            start(a)
+                .cmp(&start(b))
+                .then_with(|| a.code.cmp(&b.code))
+                .then_with(|| a.message.cmp(&b.message))
+        });
+    }
+
+    // Header: file-less diagnostics first, then by file path and position.
+    let mut header = Vec::new();
+    for (diagnostic, related) in &global {
+        header.push(format!(
+            "error TS{}: {}",
+            diagnostic.code, diagnostic.message
+        ));
+        if let Some(related) = related {
+            header.push(related.clone());
+        }
+    }
+    let mut located: Vec<(Option<String>, u32, Vec<String>)> = Vec::new();
+    let mut push_located = |file: Option<String>, diagnostic: &Diagnostic| {
+        let start = diagnostic.span.map_or(0, |span| span.start);
+        let mut lines = vec![format_project_diagnostic_line(
+            diagnostic,
+            file.as_deref(),
+            cwd,
+            &source_by_full,
+            tsconfig_full.as_deref().zip(tsconfig_source.as_deref()),
+        )];
+        if let Some(file) = &file {
+            if let Some(related) = related_by_key.get(&(file.clone(), start, diagnostic.code)) {
+                lines.push(related.clone());
+            }
+        }
+        located.push((file, start, lines));
+    };
+    for diagnostic in result
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.file_name.is_some())
+    {
+        push_located(
+            diagnostic.file_name.as_deref().map(normalize_header_path),
+            diagnostic,
+        );
+    }
+    let mut owners: Vec<&String> = diagnostics_by_full.keys().collect();
+    owners.sort();
+    for owner in owners {
+        for diagnostic in &diagnostics_by_full[owner] {
+            let file = diagnostic
+                .file_name
+                .as_deref()
+                .map(normalize_header_path)
+                .unwrap_or_else(|| owner.clone());
+            push_located(Some(file), diagnostic);
+        }
+    }
+    // Option diagnostics located in the tsconfig precede the program's,
+    // which are sorted by file path and position.
+    located.sort_by(|a, b| {
+        let config_first = |file: &Option<String>| file != &tsconfig_full;
+        config_first(&a.0)
+            .cmp(&config_first(&b.0))
+            .then_with(|| a.0.cmp(&b.0))
+            .then(a.1.cmp(&b.1))
+    });
+    header.extend(located.into_iter().flat_map(|(_, _, lines)| lines));
+
+    let mut sections = Vec::new();
+    let mut section_inputs: Vec<(String, String, bool)> = Vec::new();
+    let mut display_overrides: HashMap<String, String> = HashMap::new();
+    if let (Some(full), Some(source)) = (&tsconfig_full, &tsconfig_source) {
+        section_inputs.push((full.clone(), source.clone(), false));
     }
     for input in inputs {
         let normalized = normalize_header_path(&input.full_path);
+        let source = source_by_full.get(&normalized).cloned().unwrap_or_default();
+        if let Some(display) = &input.display {
+            display_overrides.insert(normalized.clone(), display.clone());
+        }
+        section_inputs.push((normalized, source, input.via_import));
+    }
+    for (full, source, via_import) in &section_inputs {
         let diagnostics = diagnostics_by_full
-            .get(&normalized)
+            .get(full)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let source = source_by_full
-            .get(&normalized)
-            .map(String::as_str)
-            .unwrap_or("");
-        section_lines.extend(format_project_source_section(
-            &basename(&input.relative_path),
-            source,
-            diagnostics,
-        ));
+        let display_name = if *via_import {
+            basename(full)
+        } else if let Some(display) = display_overrides.get(full) {
+            display.clone()
+        } else {
+            cwd_relative_path(cwd, full)
+        };
+        for line in format_project_source_section(&display_name, source, diagnostics) {
+            let related = diagnostics.iter().find_map(|diagnostic| {
+                let start = diagnostic.span?.start;
+                (line == format!("!!! error TS{}: {}", diagnostic.code, diagnostic.message))
+                    .then(|| related_by_key.get(&(full.clone(), start, diagnostic.code)))
+                    .flatten()
+                    .map(|related| format!("!!! error TS{}: {related}", diagnostic.code))
+            });
+            sections.push(line);
+            sections.extend(related);
+        }
     }
 
+    // tsc's layout: the header, a blank line, the file-less errors, then
+    // each file section on its own line.
     let mut output = String::new();
-    if !lines.is_empty() {
-        output.push_str(&lines.join("\n"));
-        if !section_lines.is_empty() {
-            output.push_str("\n\n\n");
+    if header.is_empty() {
+        output.push_str(&sections.join("\n"));
+        output.push('\n');
+        return output;
+    }
+    for line in &header {
+        output.push_str(line);
+        output.push('\n');
+    }
+    output.push('\n');
+    let globals: Vec<String> = global
+        .iter()
+        .flat_map(|(diagnostic, related)| {
+            let mut lines = vec![format!(
+                "!!! error TS{}: {}",
+                diagnostic.code, diagnostic.message
+            )];
+            if let Some(related) = related {
+                for line in related.lines() {
+                    lines.push(format!("!!! error TS{}: {line}", diagnostic.code));
+                }
+            }
+            lines
+        })
+        .collect();
+    output.push_str(&globals.join("\n"));
+    for line in &sections {
+        if line.starts_with("==== ") {
+            output.push('\n');
         } else {
             output.push('\n');
         }
+        output.push_str(line);
     }
-    if !section_lines.is_empty() {
-        output.push_str(&section_lines.join("\n"));
-        output.push('\n');
-    }
-
+    output.push('\n');
     output
 }
 
-fn synthetic_project_warning_lines(
-    module_kind: ModuleKind,
+/// The span tsc reports an option diagnostic at in a tsconfig: the option's
+/// value (or key) when the file sets it, else the `compilerOptions` key.
+fn locate_option_in_tsconfig(
+    source: &str,
+    option_name: &str,
+    point_at_value: bool,
+) -> Option<tsc_rs_ast::Span> {
+    let search = format!("\"{option_name}\"");
+    if let Some(key_offset) = source.find(&search) {
+        let (start, len) = if point_at_value {
+            let after_key = key_offset + search.len();
+            let rest = &source[after_key..];
+            let value_start = rest
+                .find(':')
+                .map(|c| {
+                    let after_colon = &rest[c + 1..];
+                    after_key + c + 1 + (after_colon.len() - after_colon.trim_start().len())
+                })
+                .unwrap_or(key_offset);
+            let value_end = source[value_start..]
+                .find(&[',', '\n', '\r', '}'][..])
+                .map_or(source.len(), |end| value_start + end);
+            (value_start, source[value_start..value_end].trim().len())
+        } else {
+            (key_offset, search.len())
+        };
+        return Some(tsc_rs_ast::Span {
+            start: start as u32,
+            end: (start + len) as u32,
+        });
+    }
+    let key = "\"compilerOptions\"";
+    source.find(key).map(|offset| tsc_rs_ast::Span {
+        start: offset as u32,
+        end: (offset + key.len()) as u32,
+    })
+}
+
+/// tsc's checks on root file names: a missing file (TS6053), an
+/// unsupported extension (TS6054), an extensionless name no supported
+/// extension resolves (TS6231). Invalid roots leave the program.
+fn validate_project_roots(
+    mut scenario: ProjectScenario,
+    project_root: &Path,
     options: &CompilerOptions,
-    has_tsconfig: bool,
-) -> Vec<String> {
-    if has_tsconfig {
-        return Vec::new();
+) -> (ProjectScenario, Vec<(Diagnostic, Option<String>)>) {
+    const SUPPORTED: [&str; 7] = [".ts", ".tsx", ".d.ts", ".cts", ".d.cts", ".mts", ".d.mts"];
+    const JS: [&str; 4] = [".js", ".jsx", ".mjs", ".cjs"];
+    let allow_js = options.allow_js == Some(true);
+    let listed = SUPPORTED
+        .iter()
+        .chain(if allow_js { JS.iter() } else { [].iter() })
+        .map(|ext| format!("'{ext}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let because = "  The file is in the program because:\n    Root file specified for compilation"
+        .to_string();
+    let mut diagnostics = Vec::new();
+    let diagnostic = |code: u32, message: String| Diagnostic {
+        code,
+        message,
+        category: tsc_rs_ast::DiagnosticCategory::Error,
+        file_name: None,
+        span: None,
+        related: None,
+    };
+    let mut roots = Vec::new();
+    for root in std::mem::take(&mut scenario.input_files) {
+        let lower = root.to_ascii_lowercase();
+        let base = basename(&root);
+        let supported = SUPPORTED.iter().any(|ext| lower.ends_with(ext))
+            || (allow_js && JS.iter().any(|ext| lower.ends_with(ext)));
+        if supported {
+            if project_root.join(&root).is_file() {
+                roots.push(root);
+            } else {
+                diagnostics.push((
+                    diagnostic(6053, format!("File '{root}' not found.")),
+                    Some(because.clone()),
+                ));
+            }
+        } else if base.contains('.') {
+            diagnostics.push((
+                diagnostic(
+                    6054,
+                    format!("File '{root}' has an unsupported extension. The only supported extensions are {listed}."),
+                ),
+                Some(because.clone()),
+            ));
+        } else if let Some(found) = SUPPORTED
+            .iter()
+            .map(|ext| format!("{root}{ext}"))
+            .find(|candidate| project_root.join(candidate).is_file())
+        {
+            roots.push(found);
+        } else {
+            diagnostics.push((
+                diagnostic(
+                    6231,
+                    format!("Could not resolve the path '{root}' with the extensions: {listed}."),
+                ),
+                Some(because.clone()),
+            ));
+        }
+    }
+    scenario.input_files = roots;
+    (scenario, diagnostics)
+}
+
+struct ProjectBundlePaths<'a> {
+    workspace_root: &'a Path,
+    project_root: &'a Path,
+    common_dir: &'a str,
+    /// The bundle's path relative to the project root.
+    out_js: &'a str,
+    scenario: &'a ProjectScenario,
+}
+
+/// The source map of an outFile bundle, as tsc writes it: one source per
+/// bundled file, each file's region of the bundle mapped to it. Returns the
+/// bundle with tsc's sourceMappingURL and the map.
+fn project_bundle_source_map(
+    bundle: &str,
+    sections: &[(String, String)],
+    paths: &ProjectBundlePaths,
+) -> (String, String) {
+    let norm = |path: &str| normalize_path_segments(&normalize_header_path(path));
+    let workspace = norm(&paths.workspace_root.to_string_lossy());
+    let project_root = norm(&paths.project_root.to_string_lossy());
+    let js_path = norm(&format!("{project_root}/{}", paths.out_js));
+    let js_dir = dirname(&js_path);
+    let js_base = basename(&js_path);
+    let relative_from = |dir: &str, target: &str| cwd_relative_path(Path::new(dir), target);
+    let virtual_absolute = |option: &str| format!("/{}", option.trim_start_matches('/'));
+
+    // Where sources are relative to, and the URL (getSourceMapDirectory /
+    // getSourceMappingURL without a source file).
+    let mut url = format!("{js_base}.map");
+    let mut source_dir = js_dir.clone();
+    let mut file_urls = false;
+    if let Some(map_root) = paths.scenario.map_root.as_deref() {
+        if map_root.contains("://") {
+            url = if map_root.ends_with('/') {
+                format!("{map_root}{js_base}.map")
+            } else {
+                format!("{map_root}/{js_base}.map")
+            };
+            file_urls = true;
+        } else if paths.scenario.resolve_map_root == Some(true) {
+            url = format!(
+                "{}/{js_base}.map",
+                virtual_absolute(map_root).trim_end_matches('/')
+            );
+            source_dir = norm(&format!("{workspace}/{}", map_root.trim_start_matches('/')));
+        } else {
+            let real_dir = norm(&format!("{}/{map_root}", paths.common_dir));
+            url = relative_from(&js_dir, &format!("{real_dir}/{js_base}.map"));
+            source_dir = real_dir;
+        }
+    }
+    let mut source_root = String::new();
+    if let Some(root) = paths.scenario.source_root.as_deref() {
+        source_root = if paths.scenario.resolve_source_root == Some(true) {
+            virtual_absolute(root)
+        } else {
+            normalize_header_path(root)
+        };
+        if !source_root.ends_with('/') {
+            source_root.push('/');
+        }
+        source_dir = paths.common_dir.to_string();
+        file_urls = false;
     }
 
-    let mut warnings = Vec::new();
-    if module_kind == ModuleKind::AMD {
-        warnings.push("error TS5107: Option 'module=AMD' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '\"ignoreDeprecations\": \"6.0\"' to silence this error.".to_string());
+    let mut generator = tsc_rs_emitter::source_map::SourceMapGenerator::new(&js_base, &source_root);
+    // Each section's region: from its first own line to the next section's.
+    let bundle_lines: Vec<&str> = bundle.lines().collect();
+    let first_own_line = |section: &str| {
+        section
+            .lines()
+            .map(str::trim_end)
+            .find(|line| {
+                let text = line.trim();
+                !text.is_empty()
+                    && text != "\"use strict\";"
+                    && !text.starts_with("//# sourceMappingURL=")
+                    && !(text.starts_with("var __") && text.contains(" = (this && this.__"))
+            })
+            .map(str::to_string)
+    };
+    let mut starts: Vec<Option<usize>> = Vec::new();
+    let mut cursor = 0;
+    for (_, section) in sections {
+        let start = first_own_line(section).and_then(|line| {
+            (cursor..bundle_lines.len()).find(|&index| bundle_lines[index].trim_end() == line)
+        });
+        if let Some(start) = start {
+            cursor = start + 1;
+        }
+        starts.push(start);
     }
-    if options
-        .module_resolution
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("classic"))
+    let end_of_code = bundle_lines
+        .iter()
+        .rposition(|line| line.starts_with("//# sourceMappingURL="))
+        .unwrap_or(bundle_lines.len());
+    for (index, (name, _)) in sections.iter().enumerate() {
+        let Some(start) = starts[index] else {
+            continue;
+        };
+        let end = starts[index + 1..]
+            .iter()
+            .flatten()
+            .next()
+            .copied()
+            .unwrap_or(end_of_code);
+        let source_path = norm(&format!("{}/{name}", paths.common_dir));
+        let Ok(text) = std::fs::read_to_string(&source_path) else {
+            continue;
+        };
+        let source_entry = if file_urls {
+            let virtual_source =
+                strip_prefix_path(&source_path, &workspace).unwrap_or_else(|| source_path.clone());
+            format!("file:///{}", virtual_source.trim_start_matches('/'))
+        } else {
+            relative_from(&source_dir, &source_path)
+        };
+        let source_index = generator.add_source(&source_entry);
+        let file = tsc_rs_parser::parse(&source_path, &text);
+        let region: String = bundle_lines[start..end]
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect();
+        for (gen_line, gen_col, src_line, src_col) in
+            tsc_rs_emitter::tsc_source_mappings(&file, &region)
+        {
+            generator.add_mapping(tsc_rs_emitter::source_map::Mapping {
+                generated_line: gen_line + start as u32,
+                generated_column: gen_col,
+                source_index,
+                original_line: src_line,
+                original_column: src_col,
+                name_index: None,
+            });
+        }
+    }
+    let javascript = match bundle.rfind("//# sourceMappingURL=") {
+        Some(at) => {
+            let end = bundle[at..].find('\n').map_or(bundle.len(), |nl| at + nl);
+            format!(
+                "{}//# sourceMappingURL={url}{}",
+                &bundle[..at],
+                &bundle[end..]
+            )
+        }
+        None => bundle.to_string(),
+    };
+    (javascript, format!("{}\n", generator.to_json()))
+}
+
+struct ProjectMapPaths<'a> {
+    workspace_root: &'a Path,
+    project_root: &'a Path,
+    common_dir: &'a str,
+    /// Absolute source path.
+    source: &'a str,
+    /// Output path relative to the project root.
+    js_name: &'a str,
+    scenario: &'a ProjectScenario,
+}
+
+/// Rewrite a per-file source map's `sources`/`sourceRoot` and the
+/// JavaScript's `sourceMappingURL` the way tsc's emitter computes them
+/// (getSourceMapDirectory / getSourceMappingURL). tsc's project runner
+/// serves the workspace at `/`; `resolveMapRoot` / `resolveSourceRoot`
+/// make those options absolute there.
+fn project_source_map_paths(
+    javascript: &str,
+    map: &str,
+    paths: &ProjectMapPaths,
+) -> (String, String) {
+    let Ok(serde_json::Value::Object(mut fields)) = serde_json::from_str::<serde_json::Value>(map)
+    else {
+        return (javascript.to_string(), map.to_string());
+    };
+    let norm = |path: &str| normalize_path_segments(&normalize_header_path(path));
+    let workspace = norm(&paths.workspace_root.to_string_lossy());
+    let project_root = norm(&paths.project_root.to_string_lossy());
+    let source = norm(paths.source);
+    let js_path = norm(&format!("{project_root}/{}", paths.js_name));
+    let js_dir = dirname(&js_path);
+    let js_base = basename(&js_path);
+    let relative_from = |dir: &str, target: &str| cwd_relative_path(Path::new(dir), target);
+    let rel_in_common =
+        strip_prefix_path(&source, paths.common_dir).unwrap_or_else(|| source.clone());
+    let rel_dir = dirname(&rel_in_common);
+    let join = |base: &str, rest: &str| {
+        if rest.is_empty() || rest == "." {
+            base.to_string()
+        } else {
+            norm(&format!("{base}/{rest}"))
+        }
+    };
+    let virtual_absolute = |option: &str| format!("/{}", option.trim_start_matches('/'));
+    // The URL follows mapRoot; `sources` follow sourceRoot when set, else
+    // the map's directory (mapRoot's, or the JavaScript's).
+    let mut url = format!("{js_base}.map");
+    let mut sources = relative_from(&js_dir, &source);
+    if let Some(map_root) = paths.scenario.map_root.as_deref() {
+        if map_root.contains("://") {
+            let mut url_dir = map_root.to_string();
+            if !rel_dir.is_empty() && rel_dir != "." {
+                if !url_dir.ends_with('/') {
+                    url_dir.push('/');
+                }
+                url_dir.push_str(&rel_dir);
+            }
+            url = if url_dir.ends_with('/') {
+                format!("{url_dir}{js_base}.map")
+            } else {
+                format!("{url_dir}/{js_base}.map")
+            };
+            let virtual_source =
+                strip_prefix_path(&source, &workspace).unwrap_or_else(|| source.clone());
+            sources = format!("file:///{}", virtual_source.trim_start_matches('/'));
+        } else if paths.scenario.resolve_map_root == Some(true) {
+            let virtual_dir = join(&virtual_absolute(map_root), &rel_dir);
+            url = format!("{virtual_dir}/{js_base}.map");
+            let real_dir = join(
+                &format!("{workspace}/{}", map_root.trim_start_matches('/')),
+                &rel_dir,
+            );
+            sources = relative_from(&real_dir, &source);
+        } else {
+            let real_dir = join(&join(paths.common_dir, map_root), &rel_dir);
+            url = relative_from(&js_dir, &format!("{real_dir}/{js_base}.map"));
+            sources = relative_from(&real_dir, &source);
+        }
+    }
+    if let Some(source_root) = paths.scenario.source_root.as_deref() {
+        let mut root = if paths.scenario.resolve_source_root == Some(true) {
+            virtual_absolute(source_root)
+        } else {
+            normalize_header_path(source_root)
+        };
+        if !root.ends_with('/') {
+            root.push('/');
+        }
+        fields.insert("sourceRoot".into(), serde_json::Value::String(root));
+        sources = relative_from(paths.common_dir, &source);
+    }
+    fields.insert(
+        "sources".into(),
+        serde_json::Value::Array(vec![serde_json::Value::String(sources)]),
+    );
+    // tsc's field order, compact.
+    let mut out = String::from("{");
+    for (index, key) in [
+        "version",
+        "file",
+        "sourceRoot",
+        "sources",
+        "names",
+        "mappings",
+    ]
+    .iter()
+    .enumerate()
     {
-        warnings.push("error TS5107: Option 'moduleResolution=classic' is deprecated and will stop functioning in TypeScript 7.0. Specify compilerOption '\"ignoreDeprecations\": \"6.0\"' to silence this error.".to_string());
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "\"{key}\":{}",
+            fields.get(*key).cloned().unwrap_or(serde_json::Value::Null)
+        ));
     }
-    warnings
+    out.push('}');
+    let javascript = match javascript.rfind("//# sourceMappingURL=") {
+        Some(at) => {
+            let end = javascript[at..]
+                .find('\n')
+                .map_or(javascript.len(), |nl| at + nl);
+            format!(
+                "{}//# sourceMappingURL={url}{}",
+                &javascript[..at],
+                &javascript[end..]
+            )
+        }
+        None => javascript.to_string(),
+    };
+    (javascript, out)
+}
+
+/// Where tsc writes the output of `source` (absolute): beside it, or under
+/// `out_dir` laid out from `common_dir`. Relative to `project_root`.
+/// Rename `define([...])` / `System.register([...])` dependencies of a
+/// bundled module from their specifiers to their bundle module ids.
+fn rewrite_bundle_dependency_ids(js: &str, deps: &[(String, String)]) -> String {
+    if deps.iter().all(|(spec, id)| spec == id) {
+        return js.to_string();
+    }
+    let Some(line_start) = js.find("define(").or_else(|| js.find("System.register(")) else {
+        return js.to_string();
+    };
+    let line_end = js[line_start..]
+        .find('\n')
+        .map_or(js.len(), |end| line_start + end);
+    let Some(open) = js[line_start..line_end].find('[').map(|i| line_start + i) else {
+        return js.to_string();
+    };
+    let Some(close) = js[open..line_end].find(']').map(|i| open + i) else {
+        return js.to_string();
+    };
+    let mut list = js[open..close].to_string();
+    for (spec, id) in deps {
+        if spec == id {
+            continue;
+        }
+        list = list.replace(&format!("\"{spec}\""), &format!("\"{id}\""));
+    }
+    format!("{}{}{}", &js[..open], list, &js[close..])
+}
+
+/// A module's declarations inside an AMD/System outFile bundle: wrapped in
+/// `declare module "<id>"`, without `declare` modifiers, with imports of
+/// bundled modules pointing at their ids.
+fn wrap_dts_in_ambient_module(dts: &str, module_id: &str, module_ids: &[String]) -> String {
+    let dir = module_id.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let rewrite_specifier = |line: &str| -> String {
+        for (open, close) in [
+            ("require(\"", "\")"),
+            (" from \"", "\""),
+            ("require('", "')"),
+            (" from '", "'"),
+        ] {
+            let Some(start) = line.find(open).map(|i| i + open.len()) else {
+                continue;
+            };
+            let Some(len) = line[start..].find(close) else {
+                continue;
+            };
+            let spec = &line[start..start + len];
+            let candidate = normalize_path_segments(&if dir.is_empty() {
+                spec.to_string()
+            } else {
+                format!("{dir}/{spec}")
+            });
+            let resolved = if module_ids.iter().any(|id| *id == candidate) {
+                candidate
+            } else if module_ids.iter().any(|id| id == spec) {
+                spec.to_string()
+            } else {
+                return line.to_string();
+            };
+            // The id is a new literal: tsc prints it with double quotes.
+            let open_quote = start - 1;
+            let close_quote = start + len;
+            return format!(
+                "{}\"{}\"{}",
+                &line[..open_quote],
+                resolved,
+                &line[close_quote + 1..]
+            );
+        }
+        line.to_string()
+    };
+    let mut out = format!("declare module \"{module_id}\" {{\n");
+    for line in dts.lines() {
+        if line.trim() == "export {};" {
+            continue;
+        }
+        let line = if line.starts_with(' ') {
+            line.to_string()
+        } else if let Some(rest) = line.strip_prefix("export declare ") {
+            format!("export {rest}")
+        } else if let Some(rest) = line.strip_prefix("declare ") {
+            rest.to_string()
+        } else {
+            line.to_string()
+        };
+        let line = rewrite_specifier(&line);
+        if line.is_empty() {
+            out.push('\n');
+        } else {
+            out.push_str("    ");
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out.push_str("}\n");
+    out
+}
+
+fn project_output_path(
+    source: &str,
+    out_dir: Option<&str>,
+    common_dir: &str,
+    project_root: &Path,
+    to_output: impl Fn(&str) -> String,
+) -> String {
+    let source = normalize_header_path(source);
+    let placed = match out_dir {
+        // A file outside the common directory keeps its own path: tsc
+        // combines outDir with the absolute source path.
+        Some(out_dir) => match strip_prefix_path(&source, common_dir) {
+            Some(rel) => normalize_path_segments(&format!("{out_dir}/{rel}")),
+            None => source,
+        },
+        None => source,
+    };
+    cwd_relative_path(project_root, &to_output(&placed))
+}
+
+/// tsc's common source directory: the deepest directory containing every
+/// input that is not a declaration file.
+fn project_common_source_dir(inputs: &[ProjectInputFile]) -> String {
+    let mut common: Option<Vec<String>> = None;
+    for input in inputs {
+        let path = normalize_path_segments(&normalize_header_path(&input.full_path));
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".d.ts") || lower.ends_with(".d.mts") || lower.ends_with(".d.cts") {
+            continue;
+        }
+        let dir: Vec<String> = dirname(&path).split('/').map(str::to_string).collect();
+        common = Some(match common {
+            None => dir,
+            Some(prev) => prev
+                .into_iter()
+                .zip(dir)
+                .take_while(|(a, b)| a == b)
+                .map(|(a, _)| a)
+                .collect(),
+        });
+    }
+    common.map(|parts| parts.join("/")).unwrap_or_default()
+}
+
+/// `full_path` relative to the project runner's current directory, with
+/// `../` segments when it lies outside (as tsc's diagnostic formatter does).
+fn cwd_relative_path(cwd: &Path, full_path: &str) -> String {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let cwd = normalize_header_path(&cwd.to_string_lossy());
+    let full_path = normalize_header_path(full_path);
+    let from: Vec<&str> = cwd.split('/').filter(|part| !part.is_empty()).collect();
+    let to: Vec<&str> = full_path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return full_path;
+    }
+    let mut parts: Vec<&str> = vec![".."; from.len() - common];
+    parts.extend_from_slice(&to[common..]);
+    parts.join("/")
 }
 
 fn format_project_diagnostic_line(
     diagnostic: &Diagnostic,
-    project_root: &Path,
+    file_name: Option<&str>,
+    cwd: &Path,
     source_by_full: &HashMap<String, String>,
+    tsconfig: Option<(&str, &str)>,
 ) -> String {
     let base = format!("error TS{}: {}", diagnostic.code, diagnostic.message);
-    let Some(file_name) = diagnostic.file_name.as_deref() else {
+    let Some(file_name) = file_name else {
         return base;
     };
 
     let display_name = if Path::new(file_name).is_absolute() {
-        relative_project_path(project_root, file_name)
+        cwd_relative_path(cwd, file_name)
     } else {
         normalize_header_path(file_name)
     };
@@ -8055,6 +9299,11 @@ fn format_project_diagnostic_line(
     let source = source_by_full
         .get(&normalized)
         .cloned()
+        .or_else(|| {
+            tsconfig
+                .filter(|(full, _)| *full == normalized)
+                .map(|(_, source)| source.to_string())
+        })
         .or_else(|| std::fs::read_to_string(file_name).ok());
 
     if let (Some(span), Some(source)) = (diagnostic.span, source.as_deref()) {
@@ -8075,12 +9324,12 @@ fn format_project_source_section(
         display_name,
         diagnostics.len()
     )];
-    let mut source_lines: Vec<&str> = source.lines().collect();
-    // Rust's .lines() drops trailing empty line for sources ending with '\n'.
-    // TypeScript's harness preserves it as an indented blank line.
-    if source.ends_with('\n') {
-        source_lines.push("");
-    }
+    // tsc's harness splits on line breaks, so a trailing newline (or an
+    // empty file) leaves a final empty line.
+    let source_lines: Vec<&str> = source
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
 
     for (line_idx, line) in source_lines.iter().enumerate() {
         lines.push(format!("    {line}"));
@@ -8319,12 +9568,42 @@ fn collect_project_case_files_recursive(
     Ok(())
 }
 
+/// `/// <reference path="…">` values with the byte offset of each value.
+fn triple_slash_reference_path_spans(source: &str) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed
+            .strip_prefix("///")
+            .is_some_and(|rest| rest.trim_start().starts_with("<reference"))
+        {
+            if let Some(path_at) = line.find("path=") {
+                let after = &line[path_at + 5..];
+                let skipped = after.len() - after.trim_start().len();
+                let after = after.trim_start();
+                if let Some(quote) = after.chars().next().filter(|q| *q == '"' || *q == '\'') {
+                    let value = &after[1..];
+                    if let Some(end) = value.find(quote) {
+                        out.push((value[..end].to_string(), offset + path_at + 5 + skipped + 1));
+                    }
+                }
+            }
+        }
+        offset += line.len();
+    }
+    out
+}
+
 fn triple_slash_reference_paths(source: &str) -> Vec<String> {
     source
         .lines()
         .filter_map(|line| {
             let line = line.trim();
-            if !line.starts_with("/// <reference") {
+            if !line
+                .strip_prefix("///")
+                .is_some_and(|rest| rest.trim_start().starts_with("<reference"))
+            {
                 return None;
             }
             let after_path = line.split_once("path=")?.1.trim_start();

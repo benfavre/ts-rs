@@ -1530,15 +1530,38 @@ impl<'a> DeclarationEmitter<'a> {
             }
             ImportClause::Require(name) => {
                 self.write(name);
-                self.write(" = require(\"");
-                self.write(&import_decl.source);
-                self.writeln("\");");
+                self.write(" = require(");
+                self.write_module_specifier(import_decl);
+                self.writeln(");");
                 return;
             }
         }
-        self.write("\"");
-        self.write(&import_decl.source);
-        self.writeln("\";");
+        self.write_module_specifier(import_decl);
+        self.writeln(";");
+    }
+
+    /// The module specifier as written in the source (tsc keeps its quotes).
+    fn write_module_specifier(&mut self, import_decl: &ImportDecl) {
+        let span = import_decl.source_span;
+        let literal = self
+            .source
+            .get(span.start as usize..span.end as usize)
+            .filter(|text| {
+                text.len() >= 2
+                    && (text.starts_with('"') || text.starts_with('\''))
+                    && text.ends_with(&text[..1])
+            });
+        match literal {
+            Some(text) => {
+                let text = text.to_string();
+                self.write(&text);
+            }
+            None => {
+                self.write("\"");
+                self.write(&import_decl.source);
+                self.write("\"");
+            }
+        }
     }
 
     fn emit_export_decl(&mut self, export_decl: &ExportDecl) {

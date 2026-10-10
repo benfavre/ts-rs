@@ -1154,7 +1154,7 @@ fn es5_exported_empty_binding_source_maps_follow_final_generated_positions() {
     let source = "function rhs(){ return {}; } export const {} = rhs(); console.log('after');";
     let cases = [
         (ModuleKind::CommonJS, (3, 0), (4, 18)),
-        (ModuleKind::AMD, (4, 0), (5, 22)),
+        (ModuleKind::AMD, (4, 4), (5, 22)),
         (ModuleKind::ESNext, (1, 0), (2, 21)),
         (ModuleKind::System, (4, 4), (8, 38)),
     ];

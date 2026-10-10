@@ -277,6 +277,16 @@ impl<'a> Emitter<'a> {
     // ------------------------------------------------------------------
 
     pub(super) fn emit_stmt(&mut self, stmt: &Stmt) {
+        let mapped = self.source_map_gen.is_some();
+        let output_before = self.output.len();
+        self.emit_stmt_unmapped(stmt);
+        // tsc maps the end of every emitted statement, right after its text.
+        if mapped && self.output.len() > output_before {
+            self.record_trailing_mapping(stmt.span.end);
+        }
+    }
+
+    fn emit_stmt_unmapped(&mut self, stmt: &Stmt) {
         let saved_stmt_output_start = self.stmt_output_start;
         self.stmt_output_start = self.output.len();
 
@@ -13492,8 +13502,15 @@ impl<'a> Emitter<'a> {
         }
         let mut needs_transform = false;
         let mut rest_seen = false;
+        // Parameter-property modifiers only add a `this.x = x` after the
+        // default checks.
+        const PARAMETER_PROPERTY: u32 = tsc_rs_ast::MOD_PUBLIC
+            | tsc_rs_ast::MOD_PRIVATE
+            | tsc_rs_ast::MOD_PROTECTED
+            | tsc_rs_ast::MOD_READONLY
+            | tsc_rs_ast::MOD_OVERRIDE;
         for (index, p) in params.iter().enumerate() {
-            if !p.decorators.is_empty() || p.modifiers != MOD_NONE {
+            if !p.decorators.is_empty() || p.modifiers & !PARAMETER_PROPERTY != MOD_NONE {
                 return false;
             }
             let PatKind::Ident(name) = &p.name.kind else {

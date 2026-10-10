@@ -32,6 +32,7 @@ mod normalize;
 pub mod source_map;
 mod source_transform;
 mod spread_comments;
+mod tsc_source_map;
 mod type_erase;
 
 use analysis::*;
@@ -67,6 +68,14 @@ struct StandardDecoratorFieldSlot {
     prop_name: String,
     slot_stem: String,
     prev_slot_stem: Option<String>,
+}
+
+/// tsc-compatible source map mappings for `javascript`, emitted from
+/// `file`: (generated line, generated column, original line, original
+/// column), 0-based, in emission order (encode with
+/// [`source_map::SourceMapGenerator`], which coalesces them as tsc does).
+pub fn tsc_source_mappings(file: &SourceFile, javascript: &str) -> Vec<(u32, u32, u32, u32)> {
+    tsc_source_map::synthesize(&file.text, file, javascript)
 }
 
 pub fn emit(file: &SourceFile, options: &CompilerOptions) -> EmitOutput {
@@ -338,6 +347,27 @@ fn emit_with_emitter(e: &mut Emitter, file: &SourceFile) -> EmitOutput {
         e.output.push('\n');
     }
 
+    // tsc's mappings, recovered from the source and the emitted text.
+    if let Some(ref mut gen) = e.source_map_gen {
+        let source_index = e.source_index;
+        let mappings = tsc_source_map::synthesize(e.source, file, &e.output)
+            .into_iter()
+            .map(
+                |(generated_line, generated_column, original_line, original_column)| Mapping {
+                    generated_line,
+                    generated_column,
+                    source_index,
+                    original_line,
+                    original_column,
+                    name_index: None,
+                },
+            )
+            .collect();
+        // The structured emit paths recorded the nodes they printed
+        // (including synthesized wrappers of downleveled syntax); the
+        // synthesized set covers the source-copy paths.
+        gen.merge_mappings(mappings);
+    }
     let source_map = if let Some(ref gen) = e.source_map_gen {
         if wants_inline {
             let data_uri = gen.to_data_uri();
@@ -4678,15 +4708,62 @@ impl<'a> Emitter<'a> {
 
     /// Record a source map mapping from the current output position to a source span.
     fn record_mapping(&mut self, span: Span) {
+        self.record_mapping_at(span.start);
+    }
+
+    /// Record a mapping from the current output position to the end of a
+    /// source span (tsc maps both ends of every emitted node).
+    fn record_mapping_end(&mut self, span: Span) {
+        self.record_mapping_at(span.end);
+    }
+
+    /// Record a mapping to source `pos` at the end of the text just
+    /// written: when that text ended its line, the position before the
+    /// newline.
+    fn record_trailing_mapping(&mut self, pos: u32) {
+        if !(self.at_line_start && self.output.ends_with('\n') && self.out_line > 0) {
+            self.record_mapping_at(pos);
+            return;
+        }
+        let body = &self.output[..self.output.len() - 1];
+        let column = body
+            .rfind('\n')
+            .map_or(body.len(), |nl| body.len() - nl - 1) as u32;
         if let Some(ref mut gen) = self.source_map_gen {
             let (orig_line, orig_col) = if let Some(ref idx) = self.line_index {
-                idx.offset_to_line_col(span.start)
+                idx.offset_to_line_col(pos)
             } else {
-                offset_to_line_col(self.source, span.start)
+                offset_to_line_col(self.source, pos)
+            };
+            gen.add_mapping(Mapping {
+                generated_line: self.out_line - 1,
+                generated_column: column,
+                source_index: self.source_index,
+                original_line: orig_line,
+                original_column: orig_col,
+                name_index: None,
+            });
+        }
+    }
+
+    /// Record a mapping from the current output position to source `pos`.
+    /// At a line start the indentation is not written yet; the mapping
+    /// points after it, where the text will start.
+    fn record_mapping_at(&mut self, pos: u32) {
+        let generated_column = if self.at_line_start {
+            self.out_col + (self.indent * 4) as u32
+        } else {
+            self.out_col
+        };
+        if let Some(ref mut gen) = self.source_map_gen {
+            let (orig_line, orig_col) = if let Some(ref idx) = self.line_index {
+                idx.offset_to_line_col(pos)
+            } else {
+                offset_to_line_col(self.source, pos)
             };
             gen.add_mapping(Mapping {
                 generated_line: self.out_line,
-                generated_column: self.out_col,
+                generated_column,
                 source_index: self.source_index,
                 original_line: orig_line,
                 original_column: orig_col,

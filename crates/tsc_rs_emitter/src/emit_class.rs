@@ -3494,12 +3494,18 @@ impl<'a> Emitter<'a> {
         for member in &class_decl.members {
             match &member.kind {
                 ClassMemberKind::Constructor(ctor) => {
+                    // Overload signatures have no runtime presence.
+                    if ctor.body.is_none() {
+                        continue;
+                    }
                     constructors += 1;
+                    // Parameter properties become `this.x = x;` assignments.
+                    const PARAMETER_PROPERTY: u32 =
+                        MOD_PUBLIC | MOD_PRIVATE | MOD_PROTECTED | MOD_READONLY | MOD_OVERRIDE;
                     if constructors > 1
-                        || ctor.body.is_none()
                         || !ctor.decorators.is_empty()
                         || ctor.params.iter().any(|param| {
-                            param.modifiers != 0
+                            param.modifiers & !PARAMETER_PROPERTY != 0
                                 || !param.decorators.is_empty()
                                 || !matches!(&param.name.kind, PatKind::Ident(name) if name != "this" && name != "<error>")
                         })
@@ -3522,7 +3528,15 @@ impl<'a> Emitter<'a> {
                         || method.modifiers & (MOD_ABSTRACT | MOD_DECLARE) != 0
                         || !Self::legacy_es5_member_name_can_lower(&method.name, class_name)
                         || method.params.iter().any(|param| {
-                            param.modifiers != 0
+                            // Accessibility modifiers outside a constructor
+                            // are errors that emit erases.
+                            param.modifiers
+                                & !(MOD_PUBLIC
+                                    | MOD_PRIVATE
+                                    | MOD_PROTECTED
+                                    | MOD_READONLY
+                                    | MOD_OVERRIDE)
+                                != 0
                                 || !param.decorators.is_empty()
                                 || !matches!(&param.name.kind, PatKind::Ident(name) if name != "this" && name != "<error>")
                         })
@@ -3553,7 +3567,13 @@ impl<'a> Emitter<'a> {
                         || accessor.modifiers & (MOD_ABSTRACT | MOD_DECLARE) != 0
                         || !Self::legacy_es5_member_name_can_lower(&accessor.name, class_name)
                         || accessor.params.iter().any(|param| {
-                            param.modifiers != 0
+                            param.modifiers
+                                & !(MOD_PUBLIC
+                                    | MOD_PRIVATE
+                                    | MOD_PROTECTED
+                                    | MOD_READONLY
+                                    | MOD_OVERRIDE)
+                                != 0
                                 || !param.decorators.is_empty()
                                 || !matches!(&param.name.kind, PatKind::Ident(name) if name != "this" && name != "<error>")
                         })
@@ -3780,13 +3800,36 @@ impl<'a> Emitter<'a> {
                 if !(ownership_source.contains("//") || ownership_source.contains("/*")) {
                     continue;
                 }
-                let comments_are_leading = computed_accessor
-                    && self.comments.iter().all(|comment| {
-                        comment.pos < ownership_start
-                            || comment.pos >= ownership_end
-                            || comment.end <= member.span.start
-                    });
-                if !comments_are_leading {
+                // Comments inside a multi-line accessor body print with it.
+                let body_open = match &member.kind {
+                    ClassMemberKind::GetAccessor(accessor)
+                    | ClassMemberKind::SetAccessor(accessor) => {
+                        let body_limit = accessor
+                            .body
+                            .as_ref()
+                            .and_then(|body| body.first())
+                            .map_or(member.span.end.saturating_sub(1), |first| first.span.start);
+                        self.source_between(member.span.start, body_limit)
+                            .rfind('{')
+                            .map(|offset| member.span.start + offset as u32)
+                            // A one-line body prints compactly and would
+                            // drop an inline comment; only multi-line bodies
+                            // carry their comments through.
+                            .filter(|&open| {
+                                self.source_between(open, member.span.end).contains('\n')
+                            })
+                    }
+                    _ => None,
+                };
+                let comments_are_placed = self.comments.iter().all(|comment| {
+                    comment.pos < ownership_start
+                        || comment.pos >= ownership_end
+                        || (computed_accessor && comment.end <= member.span.start)
+                        || body_open.is_some_and(|open| {
+                            comment.pos > open && comment.end <= member.span.end
+                        })
+                });
+                if !comments_are_placed {
                     return false;
                 }
             }
@@ -4636,64 +4679,106 @@ impl<'a> Emitter<'a> {
     }
 
     fn legacy_es5_instance_initializers(class_decl: &ClassDecl) -> Vec<Stmt> {
-        class_decl
+        // Parameter properties are assigned first, in parameter order.
+        let span = Span::new(0, 0);
+        let parameter_properties = class_decl
             .members
             .iter()
-            .filter_map(|member| {
-                let ClassMemberKind::Property(property) = &member.kind else {
+            .filter_map(|member| match &member.kind {
+                ClassMemberKind::Constructor(ctor) if ctor.body.is_some() => Some(ctor),
+                _ => None,
+            })
+            .flat_map(|ctor| ctor.params.iter())
+            .filter(|param| {
+                param.modifiers
+                    & (MOD_PUBLIC | MOD_PRIVATE | MOD_PROTECTED | MOD_READONLY | MOD_OVERRIDE)
+                    != 0
+            })
+            .filter_map(|param| {
+                let PatKind::Ident(name) = &param.name.kind else {
                     return None;
-                };
-                if property.modifiers & (MOD_STATIC | MOD_DECLARE) != 0 {
-                    return None;
-                }
-                let initializer = property.initializer.as_ref()?;
-                let span = Span::new(0, 0);
-                let receiver = Box::new(Expr {
-                    kind: ExprKind::This,
-                    span,
-                });
-                let kind = match &property.name {
-                    PropName::Ident(name, _) => ExprKind::Member(Box::new(MemberExpr {
-                        object: receiver,
-                        property: name.clone(),
-                        optional: false,
-                    })),
-                    PropName::String(name, _) => ExprKind::ElemAccess(ElemAccessExpr {
-                        object: receiver,
-                        index: Box::new(Expr {
-                            kind: ExprKind::StrLit(name.clone()),
-                            span: property.name.span(),
-                        }),
-                        optional: false,
-                    }),
-                    PropName::Number(value, _) => ExprKind::ElemAccess(ElemAccessExpr {
-                        object: receiver,
-                        index: Box::new(Expr {
-                            kind: ExprKind::NumLit(value.clone()),
-                            span: property.name.span(),
-                        }),
-                        optional: false,
-                    }),
-                    PropName::Computed(key, _) => ExprKind::ElemAccess(ElemAccessExpr {
-                        object: receiver,
-                        index: key.clone(),
-                        optional: false,
-                    }),
-                    PropName::Private(..) => return None,
                 };
                 Some(Stmt {
                     kind: StmtKind::Expr(Box::new(Expr {
                         kind: ExprKind::Assign(AssignExpr {
-                            left: Box::new(Expr { kind, span }),
+                            left: Box::new(Expr {
+                                kind: ExprKind::Member(Box::new(MemberExpr {
+                                    object: Box::new(Expr {
+                                        kind: ExprKind::This,
+                                        span,
+                                    }),
+                                    property: name.clone(),
+                                    optional: false,
+                                })),
+                                span,
+                            }),
                             op: AssignOp::Assign,
-                            right: initializer.clone(),
+                            right: Box::new(Expr {
+                                kind: ExprKind::Ident(name.clone()),
+                                span: param.name.span,
+                            }),
                         }),
                         span,
                     })),
                     span,
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let fields = class_decl.members.iter().filter_map(|member| {
+            let ClassMemberKind::Property(property) = &member.kind else {
+                return None;
+            };
+            if property.modifiers & (MOD_STATIC | MOD_DECLARE) != 0 {
+                return None;
+            }
+            let initializer = property.initializer.as_ref()?;
+            let span = Span::new(0, 0);
+            let receiver = Box::new(Expr {
+                kind: ExprKind::This,
+                span,
+            });
+            let kind = match &property.name {
+                PropName::Ident(name, _) => ExprKind::Member(Box::new(MemberExpr {
+                    object: receiver,
+                    property: name.clone(),
+                    optional: false,
+                })),
+                PropName::String(name, _) => ExprKind::ElemAccess(ElemAccessExpr {
+                    object: receiver,
+                    index: Box::new(Expr {
+                        kind: ExprKind::StrLit(name.clone()),
+                        span: property.name.span(),
+                    }),
+                    optional: false,
+                }),
+                PropName::Number(value, _) => ExprKind::ElemAccess(ElemAccessExpr {
+                    object: receiver,
+                    index: Box::new(Expr {
+                        kind: ExprKind::NumLit(value.clone()),
+                        span: property.name.span(),
+                    }),
+                    optional: false,
+                }),
+                PropName::Computed(key, _) => ExprKind::ElemAccess(ElemAccessExpr {
+                    object: receiver,
+                    index: key.clone(),
+                    optional: false,
+                }),
+                PropName::Private(..) => return None,
+            };
+            Some(Stmt {
+                kind: StmtKind::Expr(Box::new(Expr {
+                    kind: ExprKind::Assign(AssignExpr {
+                        left: Box::new(Expr { kind, span }),
+                        op: AssignOp::Assign,
+                        right: initializer.clone(),
+                    }),
+                    span,
+                })),
+                span,
+            })
+        });
+        parameter_properties.into_iter().chain(fields).collect()
     }
 
     fn emit_legacy_es5_class_decl(&mut self, class_decl: &ClassDecl, lower_metadata_class: bool) {
@@ -4711,7 +4796,9 @@ impl<'a> Emitter<'a> {
             .members
             .iter()
             .find_map(|member| match &member.kind {
-                ClassMemberKind::Constructor(ctor) => Some((ctor, member.span)),
+                ClassMemberKind::Constructor(ctor) if ctor.body.is_some() => {
+                    Some((ctor, member.span))
+                }
                 _ => None,
             });
 

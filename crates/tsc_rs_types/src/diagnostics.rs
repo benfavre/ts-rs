@@ -1663,6 +1663,19 @@ pub fn check_deprecated_options(options: &CompilerOptions) -> Vec<DeprecatedOpti
             ));
         }
     }
+    let source_root = options
+        .other
+        .iter()
+        .any(|(name, value)| name.eq_ignore_ascii_case("sourceRoot") && !value.is_empty());
+    if source_root && options.source_map != Some(true) && options.inline_source_map != Some(true) {
+        // tsc's message text lacks the closing quote after the option name.
+        diags.push(option_error(
+            5051,
+            "sourceRoot",
+            false,
+            "Option 'sourceRoot can only be used when either option '--inlineSourceMap' or option '--sourceMap' is provided.",
+        ));
+    }
     if map_root && options.source_map != Some(true) && !declaration_map {
         diags.push(option_error(
             5069,
@@ -1678,6 +1691,14 @@ pub fn check_deprecated_options(options: &CompilerOptions) -> Vec<DeprecatedOpti
         .other
         .iter()
         .any(|(name, value)| name.eq_ignore_ascii_case("declarationDir") && !value.is_empty());
+    if declaration_dir && options.out_file.is_some() {
+        diags.push(option_error(
+            5053,
+            "declarationDir",
+            false,
+            "Option 'declarationDir' cannot be specified with option 'outFile'.",
+        ));
+    }
     if options.declaration != Some(true) && options.composite != Some(true) {
         for (name, enabled) in [
             ("declarationDir", declaration_dir),

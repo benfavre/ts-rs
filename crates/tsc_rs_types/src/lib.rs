@@ -27371,6 +27371,79 @@ impl TypeChecker {
                 self.with_depth -= 1;
             }
             StmtKind::Import(_import_decl) => {
+                let mut namespace_require = false;
+                // TS1147: inside a namespace (not `declare module "m"`) an
+                // `import x = require("m")` cannot name an external module.
+                // tsc reports it at the module name; the alias still binds.
+                if matches!(_import_decl.specifiers, ImportClause::Require(_))
+                    && self
+                        .module_block_local_names
+                        .last()
+                        .is_some_and(|(_, ambient_external_module)| !ambient_external_module)
+                {
+                    self.diagnostics.push(Diagnostic {
+                        code: 1147,
+                        message: "Import declarations in a namespace cannot reference a module."
+                            .to_string(),
+                        category: DiagnosticCategory::Error,
+                        file_name: None,
+                        span: Some(_import_decl.source_span),
+                        related: None,
+                    });
+                    // The program never resolves it (tsc collects module
+                    // references from the top level only), and tsc resolves
+                    // the alias lazily: a use of it reports the missing
+                    // module, unless an ambient `declare module "m"` exists.
+                    let specifier = &_import_decl.source;
+                    let alias = match &_import_decl.specifiers {
+                        ImportClause::Require(name) => name.as_str(),
+                        _ => "",
+                    };
+                    let (ambient, used) =
+                        self.current_source
+                            .as_deref()
+                            .map_or((true, false), |text| {
+                                let ambient = text.contains(&format!("module \"{specifier}\""))
+                                    || text.contains(&format!("module '{specifier}'"));
+                                let raw = text.get(stmt.span.end as usize..).unwrap_or("");
+                                // Uses in comments do not count.
+                                let mut after = std::string::String::with_capacity(raw.len());
+                                let mut rest = raw;
+                                while !rest.is_empty() {
+                                    if let Some(tail) = rest.strip_prefix("//") {
+                                        rest = tail.find('\n').map_or("", |end| &tail[end..]);
+                                    } else if let Some(tail) = rest.strip_prefix("/*") {
+                                        rest = tail.find("*/").map_or("", |end| &tail[end + 2..]);
+                                        after.push(' ');
+                                    } else {
+                                        let ch = rest.chars().next().unwrap_or(' ');
+                                        after.push(ch);
+                                        rest = &rest[ch.len_utf8()..];
+                                    }
+                                }
+                                let after = after.as_str();
+                                let is_ident =
+                                    |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+                                let used = !alias.is_empty()
+                                    && after.match_indices(alias).any(|(at, _)| {
+                                        !after[..at].chars().next_back().is_some_and(is_ident)
+                                            && !after[at + alias.len()..]
+                                                .chars()
+                                                .next()
+                                                .is_some_and(is_ident)
+                                    });
+                                (ambient, used)
+                            });
+                    if self.check_module_resolution && used && !ambient {
+                        let diag = if self.effective_module_resolution_is_classic() {
+                            error_cannot_find_module_classic(specifier, _import_decl.source_span)
+                        } else {
+                            error_cannot_find_module(specifier, _import_decl.source_span)
+                        };
+                        self.diagnostics.push(diag);
+                    }
+                    namespace_require = true;
+                }
                 // TS1202: `import x = require(...)` under an ES module kind.
                 if matches!(_import_decl.specifiers, ImportClause::Require(_))
                     && !_import_decl.type_only
@@ -27435,6 +27508,7 @@ impl TypeChecker {
                 {
                     // TS2835 / TS2834 replace the module-not-found report.
                 } else if self.check_module_resolution
+                    && !namespace_require
                     && !self.can_resolve_module(&_import_decl.source)
                 {
                     // tsc picks the code by import shape and effective module
@@ -27585,9 +27659,52 @@ impl TypeChecker {
                 self.check_type_declaration_computed_names(std::slice::from_ref(stmt));
             }
             StmtKind::ModuleDecl(module_decl) => {
+                self.report_module_keyword_namespace(module_decl);
                 self.check_namespace_declaration(module_decl);
             }
             _ => {}
+        }
+    }
+
+    /// TS1540: a namespace declared with the `module` keyword (TypeScript
+    /// 6), reported at every segment of a dotted name. String-named
+    /// ambient modules keep the keyword.
+    fn report_module_keyword_namespace(&mut self, module_decl: &tsc_rs_ast::ModuleDecl) {
+        let (ModuleName::Ident(_), Some(name_span)) = (&module_decl.name, module_decl.name_span)
+        else {
+            return;
+        };
+        let Some(text) = self.current_source.as_deref() else {
+            return;
+        };
+        let before = text
+            .get(..name_span.start as usize)
+            .unwrap_or("")
+            .trim_end();
+        let keyword_is_module = before.ends_with("module")
+            && !before[..before.len() - "module".len()]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$');
+        if !keyword_is_module {
+            return;
+        }
+        let mut segment = Some(module_decl);
+        while let Some(decl) = segment {
+            if let Some(span) = decl.name_span {
+                self.diagnostics.push(Diagnostic {
+                    code: 1540,
+                    message: "A 'namespace' declaration should not be declared using the 'module' keyword. Please use the 'namespace' keyword instead.".to_string(),
+                    category: DiagnosticCategory::Error,
+                    file_name: None,
+                    span: Some(span),
+                    related: None,
+                });
+            }
+            segment = match &decl.body {
+                Some(tsc_rs_ast::ModuleBody::Module(inner)) => Some(inner.as_ref()),
+                _ => None,
+            };
         }
     }
 
@@ -43691,7 +43808,7 @@ mod tests {
     /// Before the fix:
     ///   * `inject_external_types` walked every project file and called
     ///     `declare_var(name, ty)` unconditionally — last-write-wins.
-    ///   * For a large monorepo the mock at
+    ///   * For the acme repo the mock at
     ///     `apps/app/src/components/app/mock-db.ts` (`export const db = {…}`)
     ///     clobbered the real `declare const prisma: PrismaClient` from
     ///     `packages/db/dist/...`, leaking phantom TS2339 ("Property
@@ -43756,7 +43873,7 @@ mod tests {
 
     /// Regression: an exported interface in a declaration module is scoped to
     /// that module. It must not replace a same-named Web API global for files
-    /// that did not import it. In a large Next.js app, Express's
+    /// that did not import it. In the acme app, Express's
     /// `Response.status(code)` shadowed lib.dom's numeric `Response.status`,
     /// making `res.status` from `fetch()` look like a method.
     #[test]

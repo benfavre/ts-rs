@@ -101,6 +101,12 @@ impl SourceMapGenerator {
         self.mappings.push(mapping);
     }
 
+    /// Add mappings after the recorded ones; at one generated position the
+    /// recorded ones come first (coalescing keeps the later, forward one).
+    pub fn merge_mappings(&mut self, mappings: Vec<Mapping>) {
+        self.mappings.extend(mappings);
+    }
+
     /// Return a checkpoint that can later be used to remove mappings produced
     /// by a speculative buffered emission. Registered names intentionally stay
     /// interned because relocated mappings retain their existing name indices.
@@ -190,9 +196,11 @@ impl SourceMapGenerator {
         let mut prev_orig_col: u32 = 0;
         let mut prev_name: u32 = 0;
 
-        // Sort mappings by generated line, then column.
-        let mut sorted: Vec<&Mapping> = self.mappings.iter().collect();
-        sorted.sort_by_key(|m| (m.generated_line, m.generated_column));
+        // Sort mappings by generated line, then column (stable: recording
+        // order decides between mappings at one generated position).
+        let mut ordered: Vec<&Mapping> = self.mappings.iter().collect();
+        ordered.sort_by_key(|m| (m.generated_line, m.generated_column));
+        let sorted = tsc_coalesce_mappings(&ordered);
 
         let mut first_in_line = true;
 
@@ -730,4 +738,46 @@ mod tests {
         let end = json[start..].find('"').unwrap() + start;
         json[start..end].to_string()
     }
+}
+
+/// tsc's SourceMapGenerator.addMapping: a mapping at the pending generated
+/// position overwrites the pending source position unless it moves the
+/// source backwards, which commits the pending one; a mapping identical to
+/// the last committed one is dropped.
+fn tsc_coalesce_mappings<'a>(ordered: &[&'a Mapping]) -> Vec<&'a Mapping> {
+    let mut out: Vec<&'a Mapping> = Vec::with_capacity(ordered.len());
+    let mut pending: Option<&'a Mapping> = None;
+    let same_target = |a: &Mapping, b: &Mapping| {
+        a.generated_line == b.generated_line
+            && a.generated_column == b.generated_column
+            && a.source_index == b.source_index
+            && a.original_line == b.original_line
+            && a.original_column == b.original_column
+            && a.name_index == b.name_index
+    };
+    let mut commit = |pending: Option<&'a Mapping>, out: &mut Vec<&'a Mapping>| {
+        if let Some(mapping) = pending {
+            if !out.last().is_some_and(|last| same_target(last, mapping)) {
+                out.push(mapping);
+            }
+        }
+    };
+    for &mapping in ordered {
+        let new_position = pending.is_none_or(|p| {
+            p.generated_line != mapping.generated_line
+                || p.generated_column != mapping.generated_column
+        });
+        let backtracking = pending.is_some_and(|p| {
+            p.source_index == mapping.source_index
+                && (p.original_line > mapping.original_line
+                    || (p.original_line == mapping.original_line
+                        && p.original_column > mapping.original_column))
+        });
+        if new_position || backtracking {
+            commit(pending, &mut out);
+        }
+        pending = Some(mapping);
+    }
+    commit(pending, &mut out);
+    out
 }
