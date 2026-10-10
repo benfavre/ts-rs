@@ -2541,6 +2541,22 @@ impl<'a> Emitter<'a> {
                         return;
                     }
                     self.emitted_esm_export = true;
+                    // ES5: a named default-exported class lowers as a local
+                    // function class, then `export default C;`.
+                    if self.effective_target() < ScriptTarget::ES2015
+                        && class_decl.decorators.is_empty()
+                        && class_decl.name.is_some()
+                    {
+                        let mut local = class_decl.as_ref().clone();
+                        local.modifiers &= !(MOD_DEFAULT | MOD_EXPORT);
+                        if self.can_emit_legacy_es5_class_decl(&local) {
+                            self.emit_class_decl(&local);
+                            self.write("export default ");
+                            self.write(class_decl.name.as_deref().unwrap());
+                            self.writeln(";");
+                            return;
+                        }
+                    }
                     if class_decl.name.is_some()
                         && !self.should_preserve_decorators()
                         && self.options.experimental_decorators != Some(true)

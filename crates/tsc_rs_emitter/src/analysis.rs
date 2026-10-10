@@ -5052,9 +5052,24 @@ fn stmt_has_arrow_lexical_environment_hazard(stmt: &Stmt) -> bool {
     }
 }
 
+thread_local! {
+    /// While set, `this` is not a hazard: the caller captures it (`_this`).
+    static ARROW_THIS_CAPTURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether an arrow reads `arguments`, `super` or `new.target` (anything
+/// besides `this`, which a `var _this = this` capture covers).
+pub(crate) fn arrow_has_non_this_lexical_hazard(arrow: &ArrowFn) -> bool {
+    let previous = ARROW_THIS_CAPTURED.with(|flag| flag.replace(true));
+    let hazard = arrow_has_lexical_environment_hazard(arrow);
+    ARROW_THIS_CAPTURED.with(|flag| flag.set(previous));
+    hazard
+}
+
 fn expr_has_arrow_lexical_environment_hazard(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::This | ExprKind::Super => true,
+        ExprKind::This => !ARROW_THIS_CAPTURED.with(std::cell::Cell::get),
+        ExprKind::Super => true,
         ExprKind::Ident(name) => name == "arguments",
         ExprKind::MetaProp(meta) => meta.meta == "new" && meta.property == "target",
         ExprKind::Arrow(arrow) => arrow_has_lexical_environment_hazard(arrow),

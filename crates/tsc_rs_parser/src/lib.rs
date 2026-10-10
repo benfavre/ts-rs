@@ -5832,9 +5832,12 @@ impl<'a> Parser<'a> {
             // Recover `expr[]` without letting the following token sequence
             // (often a comma starting the next object-literal member) get
             // absorbed into the index expression.
-            self.error_code(
+            // tsc reports the missing argument with an empty span at `]`.
+            let at = self.cur_span().start;
+            self.error_at_span(
                 1011,
                 "An element access expression should take an argument.".into(),
+                Span::new(at, at),
             );
             let close_bracket = self.bump();
             Box::new(Expr {

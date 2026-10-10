@@ -307,6 +307,15 @@ impl<'a> Emitter<'a> {
         if stmt.span.start < self.skip_recovery_until {
             return;
         }
+        // ES5: destructuring declarations flatten to plain declarators.
+        if let StmtKind::Var(var_stmt) = &stmt.kind {
+            if let Some(flattened) = self.es5_flattened_var_stmt(stmt, var_stmt) {
+                self.emit_var_stmt(&flattened);
+                self.append_trailing_comment(stmt.span);
+                self.stmt_output_start = saved_stmt_output_start;
+                return;
+            }
+        }
 
         if matches!(&stmt.kind, StmtKind::TypeAlias(_))
             && self.emit_recovery_incorrect_return_token_type_alias(stmt.span)
@@ -1318,7 +1327,12 @@ impl<'a> Emitter<'a> {
                 .any(|stmt| matches!(&stmt.kind, StmtKind::Expr(expr) if matches!(expr.kind, ExprKind::Spread(_)))),
             _ => false,
         };
-        let needs_transform = stmt_needs_transform(stmt);
+        // A lowered ES5 class member rewrites `super` structurally.
+        let needs_transform = stmt_needs_transform(stmt)
+            || (self.es5_super_home.is_some()
+                && self
+                    .source_between(stmt.span.start, stmt.span.end)
+                    .contains("super"));
         let needs_downlevel = self.stmt_needs_downlevel(stmt);
         let has_unclosed_delimiter = self.stmt_has_unclosed_delimiter(stmt);
         // CJS: force structured emit for compound statements containing nested
@@ -13285,6 +13299,29 @@ impl<'a> Emitter<'a> {
     /// Emit a function/method body, checking if the original source was multi-line.
     /// For empty bodies that were multi-line in source, emit multi-line `{\n}`.
     pub(super) fn emit_block_for_decl_body(&mut self, stmts: &[Stmt], enclosing_span: Span) {
+        let Some(scope) = self.enter_this_capture_scope(enclosing_span) else {
+            self.emit_block_for_decl_body_scoped(stmts, enclosing_span);
+            return;
+        };
+        match scope.alias.clone() {
+            Some(alias) => {
+                // ES5: arrows in this body read `this` through `_this`.
+                let directives = stmts
+                    .iter()
+                    .take_while(|stmt| matches!(&stmt.kind, StmtKind::Expr(expr) if matches!(expr.kind, ExprKind::StrLit(_))))
+                    .count();
+                let mut body: Vec<Stmt> = stmts[..directives].to_vec();
+                body.push(crate::es5_destructuring::this_capture_stmt(&alias));
+                body.extend_from_slice(&stmts[directives..]);
+                self.force_multiline_body = true;
+                self.emit_block_for_decl_body_scoped(&body, enclosing_span);
+            }
+            None => self.emit_block_for_decl_body_scoped(stmts, enclosing_span),
+        }
+        self.leave_this_capture_scope(scope);
+    }
+
+    fn emit_block_for_decl_body_scoped(&mut self, stmts: &[Stmt], enclosing_span: Span) {
         let prev_in_parameter_initializer = self.in_parameter_initializer;
         self.in_parameter_initializer = false;
         // Take (not clone) the set: the new function scope starts empty so
@@ -13513,6 +13550,20 @@ impl<'a> Emitter<'a> {
             if !p.decorators.is_empty() || p.modifiers & !PARAMETER_PROPERTY != MOD_NONE {
                 return false;
             }
+            // A binding pattern becomes a temp parameter flattened in the
+            // body prologue.
+            if !matches!(p.name.kind, PatKind::Ident(_)) {
+                if p.dotdotdot
+                    || !crate::es5_destructuring::pattern_supported(&p.name)
+                    || p.initializer.as_ref().is_some_and(|init| {
+                        expr_has_lexical_new_target(init) || expr_has_super(init)
+                    })
+                {
+                    return false;
+                }
+                needs_transform = true;
+                continue;
+            }
             let PatKind::Ident(name) = &p.name.kind else {
                 return false;
             };
@@ -13599,10 +13650,8 @@ impl<'a> Emitter<'a> {
         if self.effective_target() != ScriptTarget::ES5
             || self.file_has_recovery_errors
             || self.is_js_file
-            || self.options.declaration == Some(true)
             || arrow.is_async
             || arrow.type_params.is_some()
-            || arrow.return_type.is_some()
             || !self.active_lexical_loop_helpers.is_empty()
             || arrow.params.iter().any(|param| {
                 param.dotdotdot
@@ -13617,7 +13666,10 @@ impl<'a> Emitter<'a> {
                             && name != "<error>"
                             && !name.is_empty())
             })
-            || arrow_has_lexical_environment_hazard(arrow)
+            // `this` alone is fine when the enclosing body captured it.
+            || (arrow_has_lexical_environment_hazard(arrow)
+                && (self.this_capture_alias.is_none()
+                    || crate::analysis::arrow_has_non_this_lexical_hazard(arrow)))
             || matches!(&arrow.body, ArrowBody::Block(stmts)
                 if !(stmts.is_empty()
                     || matches!(stmts.as_slice(), [Stmt { kind: StmtKind::Return(Some(_)), .. }])))
@@ -13641,7 +13693,21 @@ impl<'a> Emitter<'a> {
             // False positives (for example, an escaped string literal) merely
             // keep the original arrow syntax.
             || source.contains('\\')
-            || self.source.contains("class")
+            // An arrow directly in a class body (a field initializer, key or
+            // decorator) runs in the class's receiver environment; inside a
+            // member body it is ordinary. A class inside the arrow needs its
+            // own lowering.
+            || self.class_spans.iter().any(|class| {
+                (class.start <= expr_span.start
+                    && expr_span.end <= class.end
+                    && !self.this_boundary_spans.iter().any(|member| {
+                        member.start > class.start
+                            && member.end <= class.end
+                            && member.start <= expr_span.start
+                            && expr_span.end <= member.end
+                    }))
+                    || (expr_span.start <= class.start && class.end <= expr_span.end)
+            })
             || self.source.contains("...")
             || ["var await", "let await", "const await"]
                 .iter()
@@ -13746,6 +13812,35 @@ impl<'a> Emitter<'a> {
         compact_body: bool,
         emit_body: impl FnOnce(&mut Self, &[Stmt]),
     ) {
+        // The enclosing function spans from its first parameter to its body.
+        let enclosing = match (params.first(), stmts.last()) {
+            (Some(first), Some(last)) => Span::new(first.span.start, last.span.end),
+            _ => Span::new(0, 0),
+        };
+        let scope = (enclosing.end > enclosing.start)
+            .then(|| self.enter_this_capture_scope(enclosing))
+            .flatten();
+        let capture = scope.as_ref().and_then(|scope| scope.alias.clone());
+        self.pending_this_capture = capture.clone();
+        self.emit_scoped_body_with_param_initializers_layout_inner(
+            params,
+            stmts,
+            compact_body && capture.is_none(),
+            emit_body,
+        );
+        self.pending_this_capture = None;
+        if let Some(scope) = scope {
+            self.leave_this_capture_scope(scope);
+        }
+    }
+
+    fn emit_scoped_body_with_param_initializers_layout_inner(
+        &mut self,
+        params: &[Param],
+        stmts: &[Stmt],
+        compact_body: bool,
+        emit_body: impl FnOnce(&mut Self, &[Stmt]),
+    ) {
         // See emit_block_for_decl_body: take (not clone) to avoid deep-copying
         // every key just to clear the set for the new scope.
         let prev_emitted_var_names = std::mem::take(&mut self.emitted_var_names);
@@ -13806,11 +13901,24 @@ impl<'a> Emitter<'a> {
             }
             break;
         }
+        // ES5 `this` capture for arrows, ahead of the default-value checks.
+        if let Some(alias) = self.pending_this_capture.take() {
+            self.write("var ");
+            self.write(&alias);
+            self.writeln(" = this;");
+        }
         // Hoisted expression temps must follow directives so `"use strict"`
         // remains a directive after fields or parameters introduce a temp.
         let prologue_end = self.output.len();
 
         for p in params {
+            if !matches!(p.name.kind, PatKind::Ident(_)) && !p.dotdotdot {
+                if let Some(temp) = self.es5_param_temp_names.get(&p.span.start).cloned() {
+                    let flattened = self.es5_flattened_parameter(p, &temp);
+                    self.emit_var_stmt(&flattened);
+                }
+                continue;
+            }
             let Some(init) = p.initializer.as_ref() else {
                 continue;
             };
@@ -13964,7 +14072,12 @@ impl<'a> Emitter<'a> {
     }
 
     pub(super) fn _emit_block_for_decl_body(&mut self, stmts: &[Stmt], enclosing_span: Span) {
+        let force_multiline = std::mem::take(&mut self.force_multiline_body);
         if self.emit_invalid_try_recovery_body(enclosing_span) {
+            return;
+        }
+        if force_multiline && !stmts.is_empty() {
+            self.emit_block_with_span(stmts, Some(enclosing_span));
             return;
         }
         if !stmts.is_empty() {
@@ -14300,12 +14413,18 @@ impl<'a> Emitter<'a> {
                         || self.ns_export_stack.iter().any(|(_, exports)| {
                             !exports.is_empty() && stmt_has_ns_export_ref(s, exports)
                         }));
+                // A lowered ES5 class member rewrites `super` structurally.
+                let has_es5_super = self.es5_super_home.is_some()
+                    && self
+                        .source_between(s.span.start, s.span.end)
+                        .contains("super");
                 if !stmt_needs_transform(s)
                     && !has_ceref
                     && !has_cjs
                     && !has_downlevel
                     && !has_ns_ref
                     && !has_cjs_export_ref
+                    && !has_es5_super
                 {
                     let start = s.span.start as usize;
                     let end = s.span.end as usize;
@@ -14410,6 +14529,7 @@ impl<'a> Emitter<'a> {
     }
 
     pub(super) fn emit_params_without_initializers(&mut self, params: &[Param]) {
+        self.es5_name_parameter_temps(params);
         let mut first = true;
         for param in params {
             let is_error_name =
@@ -14430,6 +14550,11 @@ impl<'a> Emitter<'a> {
                 self.write(", ");
             }
             first = false;
+            if !matches!(param.name.kind, PatKind::Ident(_)) {
+                let temp = self.es5_param_temp_names[&param.span.start].clone();
+                self.write(&temp);
+                continue;
+            }
             if !is_error_name {
                 self.emit_binding_name(&param.name);
             }

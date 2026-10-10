@@ -6182,20 +6182,30 @@ impl BaselineRunner {
         // First: header diagnostics
         let mut header_lines: Vec<String> = Vec::new();
 
+        // Global (file-less) diagnostics come first, ordered as tsc's
+        // compareDiagnostics orders them: by code, then message.
+        // Each entry: (code, main line, continuation lines).
+        let mut global_entries: Vec<(u32, String, Vec<String>)> = Vec::new();
         for (message, related) in &overwrite_output_diags {
-            header_lines.push(format!("error TS5055: {message}"));
-            header_lines.push(related.clone());
+            global_entries.push((
+                5055,
+                format!("error TS5055: {message}"),
+                vec![related.clone()],
+            ));
         }
         for message in &multiple_output_diags {
-            header_lines.push(format!("error TS5056: {message}"));
+            global_entries.push((5056, format!("error TS5056: {message}"), Vec::new()));
         }
         for message in &unsupported_extension_diags {
-            header_lines.push(format!("error TS6054: {message}"));
-            header_lines.push("  The file is in the program because:".to_string());
-            header_lines.push("    Root file specified for compilation".to_string());
+            global_entries.push((
+                6054,
+                format!("error TS6054: {message}"),
+                vec![
+                    "  The file is in the program because:".to_string(),
+                    "    Root file specified for compilation".to_string(),
+                ],
+            ));
         }
-
-        // Global (no-file, no-span) diagnostics first
         for gd in &remaining_global_diags {
             let diag = &gd.diagnostic;
             let cat = match diag.category {
@@ -6204,23 +6214,29 @@ impl BaselineRunner {
                 tsc_rs_ast::DiagnosticCategory::Suggestion => "suggestion",
                 tsc_rs_ast::DiagnosticCategory::Message => "message",
             };
-            header_lines.push(format!("{} TS{}: {}", cat, diag.code, diag.message));
-            if let Some(ref related) = gd.related {
-                header_lines.push(related.clone());
-            }
-        }
-
-        for file_name in &disallowed_js_diags {
-            header_lines.push(format!(
-                "error TS6504: File '{file_name}' is a JavaScript file. Did you mean to enable the 'allowJs' option?"
+            global_entries.push((
+                diag.code,
+                format!("{} TS{}: {}", cat, diag.code, diag.message),
+                gd.related.iter().cloned().collect(),
             ));
-            header_lines.push("  The file is in the program because:".to_string());
-            header_lines.push("    Root file specified for compilation".to_string());
+        }
+        for file_name in &disallowed_js_diags {
+            global_entries.push((
+                6504,
+                format!(
+                    "error TS6504: File '{file_name}' is a JavaScript file. Did you mean to enable the 'allowJs' option?"
+                ),
+                vec![
+                    "  The file is in the program because:".to_string(),
+                    "    Root file specified for compilation".to_string(),
+                ],
+            ));
         }
 
         // File-level diagnostics — collect with sort keys (file_idx, line, col, code)
         // Each entry: (file_idx, line, col, code, formatted_line, optional_related_lines)
-        let mut file_header_entries: Vec<(usize, usize, usize, u32, String, Vec<String>)> =
+        // Each entry: (file_idx, line, col, span length, code, line, continuation).
+        let mut file_header_entries: Vec<(usize, usize, usize, u32, u32, String, Vec<String>)> =
             Vec::new();
         for (file_idx, (file_name, diags)) in all_diagnostics.iter().enumerate() {
             for diag in diags {
@@ -6274,10 +6290,15 @@ impl BaselineRunner {
                     full_related.push(part.to_string());
                 }
                 full_related.extend(related_lines);
+                let Some(span) = diag.span else {
+                    global_entries.push((diag.code, main_line, full_related));
+                    continue;
+                };
                 file_header_entries.push((
                     file_idx,
                     line,
                     col + 1,
+                    span.end.saturating_sub(span.start),
                     diag.code,
                     main_line,
                     full_related,
@@ -6286,6 +6307,7 @@ impl BaselineRunner {
         }
         // Sort by (file_name, line, col, code) — TypeScript sorts header
         // diagnostics alphabetically by file name, then by position.
+        // tsc's compareDiagnostics: position, then span length, then code.
         file_header_entries.sort_by(|a, b| {
             let a_name = &all_diagnostics[a.0].0;
             let b_name = &all_diagnostics[b.0].0;
@@ -6294,8 +6316,14 @@ impl BaselineRunner {
                 .then_with(|| a.1.cmp(&b.1))
                 .then_with(|| a.2.cmp(&b.2))
                 .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| a.4.cmp(&b.4))
         });
-        for (_, _, _, _, line_str, related) in &file_header_entries {
+        global_entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, line_str, related) in &global_entries {
+            header_lines.push(line_str.clone());
+            header_lines.extend(related.iter().cloned());
+        }
+        for (_, _, _, _, _, line_str, related) in &file_header_entries {
             header_lines.push(line_str.clone());
             for rel in related {
                 header_lines.push(rel.clone());
@@ -6322,45 +6350,18 @@ impl BaselineRunner {
             return String::new();
         }
 
-        // Second: global diagnostic annotation lines (before file sections)
-        if !remaining_global_diags.is_empty()
-            || !overwrite_output_diags.is_empty()
-            || !multiple_output_diags.is_empty()
-            || !unsupported_extension_diags.is_empty()
-            || !disallowed_js_diags.is_empty()
-        {
+        // Second: global diagnostic annotation lines (before file sections),
+        // in the header's order.
+        if !global_entries.is_empty() {
             output.push('\n');
-            for (message, related) in &overwrite_output_diags {
-                output.push_str(&format!("!!! error TS5055: {message}\n"));
-                output.push_str(&format!("!!! error TS5055: {related}\n"));
-            }
-            for message in &multiple_output_diags {
-                output.push_str(&format!("!!! error TS5056: {message}\n"));
-            }
-            for message in &unsupported_extension_diags {
-                output.push_str(&format!("!!! error TS6054: {message}\n"));
-                output.push_str("!!! error TS6054:   The file is in the program because:\n");
-                output.push_str("!!! error TS6054:     Root file specified for compilation\n");
-            }
-            for gd in &remaining_global_diags {
-                let diag = &gd.diagnostic;
-                let cat = match diag.category {
-                    tsc_rs_ast::DiagnosticCategory::Error => "error",
-                    tsc_rs_ast::DiagnosticCategory::Warning => "warning",
-                    tsc_rs_ast::DiagnosticCategory::Suggestion => "suggestion",
-                    tsc_rs_ast::DiagnosticCategory::Message => "message",
-                };
-                output.push_str(&format!("!!! {} TS{}: {}\n", cat, diag.code, diag.message));
-                if let Some(ref related) = gd.related {
-                    output.push_str(&format!("!!! {} TS{}: {}\n", cat, diag.code, related));
+            for (_, main_line, continuation) in &global_entries {
+                output.push_str("!!! ");
+                output.push_str(main_line);
+                output.push('\n');
+                let prefix = main_line.split(": ").next().unwrap_or("");
+                for line in continuation {
+                    output.push_str(&format!("!!! {prefix}: {line}\n"));
                 }
-            }
-            for file_name in &disallowed_js_diags {
-                output.push_str(&format!(
-                    "!!! error TS6504: File '{file_name}' is a JavaScript file. Did you mean to enable the 'allowJs' option?\n"
-                ));
-                output.push_str("!!! error TS6504:   The file is in the program because:\n");
-                output.push_str("!!! error TS6504:     Root file specified for compilation\n");
             }
         }
 
@@ -6373,9 +6374,10 @@ impl BaselineRunner {
                 .map(|(_, d)| d.as_slice())
                 .unwrap_or(&[]);
 
+            // File-less diagnostics were listed globally above.
             let error_count = diags
                 .iter()
-                .filter(|d| d.category == tsc_rs_ast::DiagnosticCategory::Error)
+                .filter(|d| d.category == tsc_rs_ast::DiagnosticCategory::Error && d.span.is_some())
                 .count();
 
             output.push_str(&format!(
@@ -6404,7 +6406,12 @@ impl BaselineRunner {
                 line_diags.sort_by(|a, b| {
                     let a_start = a.span.as_ref().map_or(0, |s| s.start);
                     let b_start = b.span.as_ref().map_or(0, |s| s.start);
-                    a_start.cmp(&b_start).then_with(|| a.code.cmp(&b.code))
+                    let a_len = a.span.as_ref().map_or(0, |s| s.end.saturating_sub(s.start));
+                    let b_len = b.span.as_ref().map_or(0, |s| s.end.saturating_sub(s.start));
+                    a_start
+                        .cmp(&b_start)
+                        .then_with(|| a_len.cmp(&b_len))
+                        .then_with(|| a.code.cmp(&b.code))
                 });
             }
 

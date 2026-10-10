@@ -48,16 +48,14 @@ pub(crate) fn synthesize(source: &str, file: &SourceFile, js: &str) -> Vec<(u32,
         &mut exported_vars,
     );
 
-    let mut walker = SpanWalker {
-        spans: Vec::new(),
-        brace_tokens: Vec::new(),
-    };
+    let mut walker = SpanWalker::default();
     for stmt in &file.statements {
         walker.stmt(stmt);
     }
     let SpanWalker {
         spans,
         brace_tokens,
+        ..
     } = walker;
 
     // An `export` wrapper and the declaration it wraps print as one node.
@@ -312,11 +310,55 @@ fn export_spans(statements: &[Stmt]) -> Vec<Span> {
     out
 }
 
-/// Collects the spans of every printable node, and the closing-brace
-/// positions of function bodies.
+/// The spans of every class declaration and class expression.
+pub(crate) fn class_spans(file: &SourceFile) -> Vec<Span> {
+    let mut walker = SpanWalker::default();
+    for stmt in &file.statements {
+        walker.stmt(stmt);
+    }
+    walker.classes
+}
+
+/// The spans of every class, function and arrow function (each starts a
+/// new `this`/`super` environment, or a lexical one for arrows).
+pub(crate) fn environment_spans(file: &SourceFile) -> Vec<Span> {
+    let mut walker = SpanWalker::default();
+    for stmt in &file.statements {
+        walker.stmt(stmt);
+    }
+    let mut spans = walker.classes;
+    spans.extend(walker.functions);
+    spans
+}
+
+/// For the ES5 `this` capture: the arrows whose only lexical hazard is
+/// `this`, and the spans that start a new `this` (classes, non-arrow
+/// functions and class members).
+pub(crate) fn this_capture_spans(file: &SourceFile) -> (Vec<Span>, Vec<Span>) {
+    let mut walker = SpanWalker::default();
+    for stmt in &file.statements {
+        walker.stmt(stmt);
+    }
+    let mut boundaries = walker.classes;
+    boundaries.extend(walker.plain_functions);
+    (walker.this_arrows, boundaries)
+}
+
+/// Collects the spans of every printable node, the closing-brace positions
+/// of function bodies, and class spans.
+/// Nesting beyond this is not walked (pathologically deep inputs would
+/// exhaust the stack); spans below it simply get no mappings.
+const MAX_WALK_DEPTH: usize = 1_000;
+
+#[derive(Default)]
 struct SpanWalker {
+    depth: usize,
     spans: Vec<Span>,
     brace_tokens: Vec<u32>,
+    classes: Vec<Span>,
+    functions: Vec<Span>,
+    plain_functions: Vec<Span>,
+    this_arrows: Vec<Span>,
 }
 
 impl SpanWalker {
@@ -327,6 +369,15 @@ impl SpanWalker {
     }
 
     fn stmt(&mut self, stmt: &Stmt) {
+        if self.depth >= MAX_WALK_DEPTH {
+            return;
+        }
+        self.depth += 1;
+        self.stmt_inner(stmt);
+        self.depth -= 1;
+    }
+
+    fn stmt_inner(&mut self, stmt: &Stmt) {
         self.spans.push(stmt.span);
         match &stmt.kind {
             StmtKind::Var(var) => {
@@ -480,6 +531,8 @@ impl SpanWalker {
     }
 
     fn function(&mut self, function: &FnDecl) {
+        self.functions.push(function.span);
+        self.plain_functions.push(function.span);
         if let Some(span) = function.name_span {
             self.spans.push(span);
         }
@@ -501,6 +554,7 @@ impl SpanWalker {
     }
 
     fn class(&mut self, class: &ClassDecl) {
+        self.classes.push(class.span);
         if let Some(span) = class.name_span {
             self.spans.push(span);
         }
@@ -509,6 +563,16 @@ impl SpanWalker {
         }
         for member in &class.members {
             self.spans.push(member.span);
+            if matches!(
+                member.kind,
+                ClassMemberKind::Method(_)
+                    | ClassMemberKind::Constructor(_)
+                    | ClassMemberKind::GetAccessor(_)
+                    | ClassMemberKind::SetAccessor(_)
+                    | ClassMemberKind::StaticBlock(_)
+            ) {
+                self.plain_functions.push(member.span);
+            }
             match &member.kind {
                 ClassMemberKind::Property(prop) => {
                     self.prop_name(&prop.name);
@@ -591,6 +655,15 @@ impl SpanWalker {
     }
 
     fn expr(&mut self, expr: &Expr) {
+        if self.depth >= MAX_WALK_DEPTH {
+            return;
+        }
+        self.depth += 1;
+        self.expr_inner(expr);
+        self.depth -= 1;
+    }
+
+    fn expr_inner(&mut self, expr: &Expr) {
         self.spans.push(expr.span);
         match &expr.kind {
             ExprKind::Template(template) => {
@@ -645,6 +718,12 @@ impl SpanWalker {
             }
             ExprKind::FnExpr(function) => self.function(function),
             ExprKind::Arrow(arrow) => {
+                self.functions.push(arrow.span);
+                if crate::analysis::arrow_has_lexical_environment_hazard(arrow)
+                    && !crate::analysis::arrow_has_non_this_lexical_hazard(arrow)
+                {
+                    self.this_arrows.push(arrow.span);
+                }
                 self.params(&arrow.params);
                 match &arrow.body {
                     ArrowBody::Expr(body) => self.expr(body),

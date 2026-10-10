@@ -560,10 +560,15 @@ class DefaultConsumer {
         "declare const dec: any; class Unsupported { @dec method() {} }",
     );
     let unsupported_js = emit(&unsupported, &options).javascript;
+    // tsc lowers a member-decorated class and applies the decorators inside
+    // the IIFE, before `return`.
+    let decorate_pos = unsupported_js.find("__decorate([").unwrap();
+    let return_pos = unsupported_js.find("return Unsupported;").unwrap();
     assert!(
-        unsupported_js.contains("class Unsupported")
-            && unsupported_js.contains("__decorate(["),
-        "decorated member shapes outside the narrow gate must keep the existing safe path: {unsupported_js}"
+        unsupported_js.contains("var Unsupported = /** @class */ (function () {")
+            && unsupported_js.contains("Unsupported.prototype.method = function () { };")
+            && decorate_pos < return_pos,
+        "member decorators apply inside the lowered class: {unsupported_js}"
     );
 }
 

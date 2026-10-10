@@ -3482,11 +3482,37 @@ impl<'a> Emitter<'a> {
         accessor.body.is_none() && accessor.modifiers & (MOD_ABSTRACT | MOD_DECLARE) != 0
     }
 
-    fn legacy_es5_class_shape_can_lower(class_decl: &ClassDecl) -> bool {
+    /// `legacy_decorators`: experimentalDecorators are on, so decorator
+    /// applications move into the IIFE (`C = __decorate([...], C)`).
+    fn legacy_es5_class_shape_can_lower(class_decl: &ClassDecl, legacy_decorators: bool) -> bool {
         let Some(class_name) = class_decl.name.as_deref() else {
             return false;
         };
-        if !class_decl.decorators.is_empty() || class_decl.modifiers & MOD_DEFAULT != 0 {
+        let decorated = |decorators: &[Expr]| !decorators.is_empty() && !legacy_decorators;
+        if decorated(&class_decl.decorators) || class_decl.modifiers & MOD_DEFAULT != 0 {
+            return false;
+        }
+        // tsc caches a decorated member's computed key in a temp; that
+        // shape keeps the native path.
+        // Erased members (ambient fields, abstract members) print nothing.
+        if class_decl.members.iter().any(|member| match &member.kind {
+            ClassMemberKind::Method(method) => {
+                method.body.is_some()
+                    && !method.decorators.is_empty()
+                    && matches!(method.name, PropName::Computed(..))
+            }
+            ClassMemberKind::Property(property) => {
+                property.modifiers & MOD_DECLARE == 0
+                    && !property.decorators.is_empty()
+                    && matches!(property.name, PropName::Computed(..))
+            }
+            ClassMemberKind::GetAccessor(accessor) | ClassMemberKind::SetAccessor(accessor) => {
+                !Self::legacy_es5_accessor_is_erased(accessor)
+                    && !accessor.decorators.is_empty()
+                    && matches!(accessor.name, PropName::Computed(..))
+            }
+            _ => false,
+        }) {
             return false;
         }
 
@@ -3503,10 +3529,10 @@ impl<'a> Emitter<'a> {
                     const PARAMETER_PROPERTY: u32 =
                         MOD_PUBLIC | MOD_PRIVATE | MOD_PROTECTED | MOD_READONLY | MOD_OVERRIDE;
                     if constructors > 1
-                        || !ctor.decorators.is_empty()
+                        || decorated(&ctor.decorators)
                         || ctor.params.iter().any(|param| {
                             param.modifiers & !PARAMETER_PROPERTY != 0
-                                || !param.decorators.is_empty()
+                                || decorated(&param.decorators)
                                 || !matches!(&param.name.kind, PatKind::Ident(name) if name != "this" && name != "<error>")
                         })
                         || (class_decl.extends.is_some()
@@ -3522,7 +3548,7 @@ impl<'a> Emitter<'a> {
                     if method.body.is_none() {
                         continue;
                     }
-                    if !method.decorators.is_empty()
+                    if decorated(&method.decorators)
                         || method.is_generator
                         || method.is_async
                         || method.modifiers & (MOD_ABSTRACT | MOD_DECLARE) != 0
@@ -3537,8 +3563,10 @@ impl<'a> Emitter<'a> {
                                     | MOD_READONLY
                                     | MOD_OVERRIDE)
                                 != 0
-                                || !param.decorators.is_empty()
-                                || !matches!(&param.name.kind, PatKind::Ident(name) if name != "this" && name != "<error>")
+                                || decorated(&param.decorators)
+                                || !(matches!(&param.name.kind, PatKind::Ident(name) if name != "this" && name != "<error>")
+                                    || (!matches!(param.name.kind, PatKind::Ident(_))
+                                        && crate::es5_destructuring::pattern_supported(&param.name)))
                         })
                     {
                         return false;
@@ -3548,7 +3576,7 @@ impl<'a> Emitter<'a> {
                     if Self::legacy_es5_accessor_is_erased(accessor) {
                         continue;
                     }
-                    if !accessor.decorators.is_empty()
+                    if decorated(&accessor.decorators)
                         || accessor.type_params.is_some()
                         || !accessor.params.is_empty()
                         || accessor.modifiers & (MOD_ABSTRACT | MOD_DECLARE) != 0
@@ -3561,7 +3589,7 @@ impl<'a> Emitter<'a> {
                     if Self::legacy_es5_accessor_is_erased(accessor) {
                         continue;
                     }
-                    if !accessor.decorators.is_empty()
+                    if decorated(&accessor.decorators)
                         || accessor.type_params.is_some()
                         || accessor.params.len() != 1
                         || accessor.modifiers & (MOD_ABSTRACT | MOD_DECLARE) != 0
@@ -3574,8 +3602,10 @@ impl<'a> Emitter<'a> {
                                     | MOD_READONLY
                                     | MOD_OVERRIDE)
                                 != 0
-                                || !param.decorators.is_empty()
-                                || !matches!(&param.name.kind, PatKind::Ident(name) if name != "this" && name != "<error>")
+                                || decorated(&param.decorators)
+                                || !(matches!(&param.name.kind, PatKind::Ident(name) if name != "this" && name != "<error>")
+                                    || (!matches!(param.name.kind, PatKind::Ident(_))
+                                        && crate::es5_destructuring::pattern_supported(&param.name)))
                         })
                     {
                         return false;
@@ -3585,7 +3615,7 @@ impl<'a> Emitter<'a> {
                     if property.modifiers & MOD_DECLARE != 0 {
                         continue;
                     }
-                    if !property.decorators.is_empty()
+                    if decorated(&property.decorators)
                         || property.modifiers & MOD_ACCESSOR != 0
                         || !Self::legacy_es5_erased_property_name_can_lower(&property.name)
                     {
@@ -3696,7 +3726,24 @@ impl<'a> Emitter<'a> {
     }
 
     fn legacy_es5_class_can_lower_without_dependency_gate(&self, class_decl: &ClassDecl) -> bool {
-        if !Self::legacy_es5_class_shape_can_lower(class_decl) {
+        if !Self::legacy_es5_class_shape_can_lower(
+            class_decl,
+            self.options.experimental_decorators == Some(true),
+        ) {
+            return false;
+        }
+        // A decorated CommonJS default export applies its decorators outside
+        // the lowered class; keep it on the established wrapper path.
+        if self.legacy_es5_cjs_default_class_start == Some(class_decl.span.start)
+            && (!class_decl.decorators.is_empty()
+                || class_decl.members.iter().any(|member| match &member.kind {
+                    ClassMemberKind::Method(method) => !method.decorators.is_empty(),
+                    ClassMemberKind::Property(property) => !property.decorators.is_empty(),
+                    ClassMemberKind::GetAccessor(accessor)
+                    | ClassMemberKind::SetAccessor(accessor) => !accessor.decorators.is_empty(),
+                    _ => false,
+                }))
+        {
             return false;
         }
         // Instance initialization follows one direct super call. Other
@@ -3765,10 +3812,11 @@ impl<'a> Emitter<'a> {
                 }
                 _ => return false,
             };
-            params
-                .iter()
-                .any(|param| param.dotdotdot || param.initializer.is_some())
-                && !self.can_downlevel_simple_param_initializers(params)
+            params.iter().any(|param| {
+                param.dotdotdot
+                    || param.initializer.is_some()
+                    || !matches!(param.name.kind, PatKind::Ident(_))
+            }) && !self.can_downlevel_simple_param_initializers(params)
         }) {
             return false;
         }
@@ -3850,18 +3898,14 @@ impl<'a> Emitter<'a> {
         // Method/accessor `super` requires home-object rewriting. The
         // constructor transform already handles constructor super calls; do
         // not move any other super-bearing body into an ordinary function.
+        // `super.x` / `super[x]` directly in a member body rewrite to the
+        // base class; inside a nested environment they keep the native path.
         class_decl.members.iter().all(|member| match &member.kind {
             ClassMemberKind::Method(method) => {
-                method.body.is_none()
-                    || !self
-                        .source_between(member.span.start, member.span.end)
-                        .contains("super")
+                method.body.is_none() || self.member_super_uses_are_direct(member.span)
             }
             ClassMemberKind::GetAccessor(accessor) | ClassMemberKind::SetAccessor(accessor) => {
-                accessor.body.is_none()
-                    || !self
-                        .source_between(member.span.start, member.span.end)
-                        .contains("super")
+                accessor.body.is_none() || self.member_super_uses_are_direct(member.span)
             }
             _ => true,
         })
@@ -4329,7 +4373,9 @@ impl<'a> Emitter<'a> {
         match &stmt.kind {
             StmtKind::ClassDecl(class_decl) => {
                 class_decl.modifiers & MOD_DECLARE == 0
-                    && ((Self::legacy_es5_class_shape_can_lower(class_decl)
+                    // ES5 lowers decorated derived classes with either decorator
+                    // flavour, so they need `__extends` too.
+                    && ((Self::legacy_es5_class_shape_can_lower(class_decl, true)
                         && class_decl.extends.is_some())
                         || Self::class_contents_need_legacy_extends(class_decl))
             }
@@ -4631,6 +4677,16 @@ impl<'a> Emitter<'a> {
             _ => return,
         }
         self.write(" = function (");
+        let saved_home = self.es5_super_home.clone();
+        self.es5_super_home = self.es5_class_super_name.as_ref().map(|base| {
+            if method.modifiers & MOD_STATIC != 0 {
+                base.clone()
+            } else {
+                format!("{base}.prototype")
+            }
+        });
+        let saved_rewrite = crate::source_transform::ES5_SUPER_REWRITE
+            .with(|flag| flag.replace(self.es5_super_home.is_some()));
         let downlevel_simple_params = self.can_downlevel_simple_param_initializers(&method.params);
         if downlevel_simple_params {
             self.emit_params_without_initializers(&method.params);
@@ -4645,6 +4701,8 @@ impl<'a> Emitter<'a> {
             self.emit_block_for_decl_body(body, span);
         }
         self.restore_shadowed_cjs_imports(shadowed);
+        crate::source_transform::ES5_SUPER_REWRITE.with(|flag| flag.set(saved_rewrite));
+        self.es5_super_home = saved_home;
         self.writeln(";");
     }
 
@@ -4659,7 +4717,54 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// Whether every `super` in a class member is a property access or call
+    /// directly in its body (not in a nested function, arrow or class).
+    fn member_super_uses_are_direct(&self, member_span: Span) -> bool {
+        let text = self.source_between(member_span.start, member_span.end);
+        let bytes = text.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        let mut from = 0;
+        while let Some(found) = text[from..].find("super") {
+            let at = from + found;
+            from = at + 5;
+            if (at > 0 && is_ident(bytes[at - 1]))
+                || bytes.get(at + 5).copied().is_some_and(is_ident)
+            {
+                continue;
+            }
+            let next = text[at + 5..].trim_start().chars().next();
+            if !matches!(next, Some('.') | Some('[')) {
+                return false;
+            }
+            let pos = member_span.start + at as u32;
+            if self
+                .environment_spans
+                .iter()
+                .any(|env| env.start > member_span.start && env.start <= pos && pos < env.end)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     fn emit_legacy_es5_accessor_function(&mut self, accessor: &ClassAccessor, span: Span) {
+        let saved_home = self.es5_super_home.clone();
+        self.es5_super_home = self.es5_class_super_name.as_ref().map(|base| {
+            if accessor.modifiers & MOD_STATIC != 0 {
+                base.clone()
+            } else {
+                format!("{base}.prototype")
+            }
+        });
+        let saved_rewrite = crate::source_transform::ES5_SUPER_REWRITE
+            .with(|flag| flag.replace(self.es5_super_home.is_some()));
+        self.emit_legacy_es5_accessor_function_inner(accessor, span);
+        crate::source_transform::ES5_SUPER_REWRITE.with(|flag| flag.set(saved_rewrite));
+        self.es5_super_home = saved_home;
+    }
+
+    fn emit_legacy_es5_accessor_function_inner(&mut self, accessor: &ClassAccessor, span: Span) {
         self.write("function (");
         let downlevel_params = self.can_downlevel_simple_param_initializers(&accessor.params);
         if downlevel_params {
@@ -4782,6 +4887,16 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_legacy_es5_class_decl(&mut self, class_decl: &ClassDecl, lower_metadata_class: bool) {
+        let saved_super_name = self.es5_class_super_name.take();
+        self.emit_legacy_es5_class_decl_inner(class_decl, lower_metadata_class);
+        self.es5_class_super_name = saved_super_name;
+    }
+
+    fn emit_legacy_es5_class_decl_inner(
+        &mut self,
+        class_decl: &ClassDecl,
+        lower_metadata_class: bool,
+    ) {
         let name = class_decl.name.as_deref().unwrap();
         if !class_decl.decorators.is_empty() {
             let let_prefix = format!("let {name} = ");
@@ -4790,6 +4905,7 @@ impl<'a> Emitter<'a> {
             }
         }
         let super_name = self.legacy_generated_name("_super");
+        self.es5_class_super_name = class_decl.extends.is_some().then(|| super_name.clone());
         let this_name = self.legacy_generated_name("_this");
         let field_initializers = Self::legacy_es5_instance_initializers(class_decl);
         let constructor = class_decl

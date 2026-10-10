@@ -491,14 +491,20 @@ impl TypeChecker {
                     let key = format!("{}.{}", obj, mem.property);
                     // We can't `lookup_var` a dotted path; instead resolve
                     // the receiver's property type and strip nullables.
-                    if let Some(obj_ty) = self.lookup_var(obj).cloned() {
+                    // A class name receives its static members.
+                    let receiver = self.lookup_var(obj).cloned().or_else(|| {
+                        self.class_info
+                            .contains_key(obj.as_str())
+                            .then(|| Type::Typeof(obj.as_str().into()))
+                    });
+                    if let Some(obj_ty) = receiver {
                         // A surrounding guard may already have narrowed this
                         // exact path. Compose from that fact rather than
                         // restoring the declared property union from `obj`.
                         let prop_ty = self.lookup_narrowed(&key).unwrap_or_else(|| {
                             // The property is read off the receiver's
                             // non-nullish part (`x?.p`, or `x.p` itself).
-                            self.resolve_member_on_type(
+                            self.narrowing_member_type(
                                 &self.remove_null_undefined(&obj_ty),
                                 &mem.property,
                             )
@@ -903,16 +909,49 @@ impl TypeChecker {
             let class_name = self.enclosing_class_names.last()?;
             Type::TypeReference(class_name.clone(), Arc::from([] as [Type; 0]))
         } else {
+            // A class name roots a path to its static members.
             self.lookup_narrowed(root)
-                .or_else(|| self.lookup_var(root).cloned())?
+                .or_else(|| self.lookup_var(root).cloned())
+                .or_else(|| {
+                    self.class_info
+                        .contains_key(root)
+                        .then(|| Type::Typeof(root.into()))
+                })?
         };
         for seg in segs {
             let base = self.remove_null_undefined(&cur);
             // A type parameter has its constraint's members.
             let base = self.declared_type_param_constraint(&base).unwrap_or(base);
-            cur = self.resolve_member_on_type(&base, seg);
+            cur = self.narrowing_member_type(&base, seg);
         }
         Some(cur)
+    }
+
+    /// A member's declared type for narrowing; a class value (`typeof C`)
+    /// has its static members.
+    fn narrowing_member_type(&self, receiver: &Type, property: &str) -> Type {
+        let ty = self.resolve_member_on_type(receiver, property);
+        if matches!(ty, Type::Any) {
+            if let Type::TypeReference(name, _) = receiver {
+                if let Some(class) = name.strip_prefix("typeof ") {
+                    let member = self.class_info.get(class).and_then(|info| {
+                        info.static_properties
+                            .iter()
+                            .find(|(name, _)| name == property)
+                            .map(|(_, ty)| ty.clone())
+                    });
+                    if let Some(member) = member {
+                        return match member {
+                            Type::Optional(inner) => {
+                                Type::flatten_union(vec![Type::clone(&inner), Type::Undefined])
+                            }
+                            other => other,
+                        };
+                    }
+                }
+            }
+        }
+        ty
     }
 
     /// Extract typeof narrowing: typeof x === "string" -> Some(("x", Type::String))

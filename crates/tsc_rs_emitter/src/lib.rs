@@ -19,6 +19,7 @@ mod emit_stmt_analysis;
 mod emit_stmt_const_enum;
 mod emit_stmt_helpers;
 mod enum_eval;
+mod es5_destructuring;
 mod generator;
 mod helpers;
 mod helpers_await;
@@ -1785,6 +1786,32 @@ struct Emitter<'a> {
     /// related tree-walk checks short-circuit immediately. Set once per
     /// file in `emit_source_file`.
     file_has_recovery_errors: bool,
+    /// Spans of every class declaration/expression in the file.
+    class_spans: Vec<Span>,
+    /// ES5 temps naming destructured parameters, by parameter start.
+    es5_param_temp_names: HashMap<u32, String>,
+    /// Spans of classes, functions and arrows (environment boundaries).
+    environment_spans: Vec<Span>,
+    /// ES5 `this` capture: arrows using only `this`, and `this` boundaries.
+    this_arrow_spans: Vec<Span>,
+    this_boundary_spans: Vec<Span>,
+    /// The `_this` alias of the function body being emitted, when it
+    /// captured `this` for its arrows.
+    this_capture_alias: Option<String>,
+    /// Set by a lowered arrow right before its body is emitted: the body
+    /// shares the enclosing function's `this` capture.
+    arrow_body_pending: bool,
+    /// Consumed by the next function body: print it multi-line (a `this`
+    /// capture statement was added to it).
+    force_multiline_body: bool,
+    /// Consumed by the param-initializer body prologue: the `_this` alias
+    /// to declare after the directives.
+    pending_this_capture: Option<String>,
+    /// The base-class temp of the ES5 class being lowered (`_super`).
+    es5_class_super_name: Option<String>,
+    /// While a lowered ES5 member body is emitted: how `super` reads
+    /// (`_super.prototype` for instance members, `_super` for static ones).
+    es5_super_home: Option<String>,
     /// `options.fast_emit == Some(true)`, resolved once — checked on several
     /// per-statement/per-expression hot paths.
     fast_emit: bool,
@@ -2173,6 +2200,17 @@ impl<'a> Emitter<'a> {
             system_context_fn: String::new(),
             class_expr_temp_emitted: false,
             file_has_recovery_errors: false,
+            class_spans: Vec::new(),
+            es5_param_temp_names: HashMap::new(),
+            environment_spans: Vec::new(),
+            this_arrow_spans: Vec::new(),
+            this_boundary_spans: Vec::new(),
+            this_capture_alias: None,
+            arrow_body_pending: false,
+            force_multiline_body: false,
+            pending_this_capture: None,
+            es5_class_super_name: None,
+            es5_super_home: None,
             split_multiline_function_body_temp_decls: false,
             async_var_shadow_names: None,
             async_var_shadow_blockers: Vec::new(),
@@ -5897,6 +5935,14 @@ impl<'a> Emitter<'a> {
         self.omitted_array_destructure_counter = 0;
         self.class_expr_temp_emitted = false;
         self.file_has_recovery_errors = !file.diagnostics.is_empty();
+        // The ES5 lowering gates are the only readers of these spans.
+        if self.effective_target() < ScriptTarget::ES2015 {
+            self.class_spans = tsc_source_map::class_spans(file);
+            self.environment_spans = tsc_source_map::environment_spans(file);
+            let (this_arrows, this_boundaries) = tsc_source_map::this_capture_spans(file);
+            self.this_arrow_spans = this_arrows;
+            self.this_boundary_spans = this_boundaries;
+        }
         self.collect_cjs_string_name_provenance(file);
         self.import_shadows = import_shadow::ImportShadows::collect(&file.statements);
         self.generator_catch_names.clear();

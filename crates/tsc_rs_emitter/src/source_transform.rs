@@ -2220,9 +2220,26 @@ pub(crate) fn expr_needs_transform_js(expr: &Expr) -> bool {
     }
 }
 
+thread_local! {
+    /// Set while a lowered ES5 class member is emitted: its `super`
+    /// accesses are rewritten, so they cannot be copied from the source.
+    pub(crate) static ES5_SUPER_REWRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Set while a lowered ES5 arrow prints `this` as the `_this` capture.
+    pub(crate) static ES5_THIS_REWRITE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn expr_needs_transform(expr: &Expr) -> bool {
+    let rewrite_super = ES5_SUPER_REWRITE.with(std::cell::Cell::get);
+    let rewrite_this = ES5_THIS_REWRITE.with(std::cell::Cell::get);
     let mut stack = vec![expr];
     while let Some(expr) = stack.pop() {
+        if (rewrite_super && matches!(expr.kind, ExprKind::Super))
+            || (rewrite_this && matches!(expr.kind, ExprKind::This))
+        {
+            return true;
+        }
         match &expr.kind {
             // Type assertions/casts are always erased
             ExprKind::NonNull(_) => return true,

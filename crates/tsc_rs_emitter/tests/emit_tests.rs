@@ -10755,20 +10755,31 @@ fn test_cjs_default_class_lowering_keeps_target_and_module_boundaries() {
         "{modern_cjs}"
     );
 
-    for module in [ModuleKind::ESNext, ModuleKind::System] {
-        let js = emit_ts_with(
-            source,
-            CompilerOptions {
-                target: Some(ScriptTarget::ES5),
-                module: Some(module),
-                ..Default::default()
-            },
-        );
-        assert!(
-            !js.contains("var C = /** @class */"),
-            "the CJS-local modifier normalization must not enter {module:?} emit: {js}"
-        );
-    }
+    // ES modules lower the class locally and export it, as tsc does.
+    let esm = emit_ts_with(
+        source,
+        CompilerOptions {
+            target: Some(ScriptTarget::ES5),
+            module: Some(ModuleKind::ESNext),
+            ..Default::default()
+        },
+    );
+    assert!(
+        esm.contains("var C = /** @class */") && esm.contains("export default C;"),
+        "{esm}"
+    );
+    let system = emit_ts_with(
+        source,
+        CompilerOptions {
+            target: Some(ScriptTarget::ES5),
+            module: Some(ModuleKind::System),
+            ..Default::default()
+        },
+    );
+    assert!(
+        !system.contains("var C = /** @class */"),
+        "the CJS-local modifier normalization must not enter System emit: {system}"
+    );
 
     let unsupported = emit_ts_with(
         "export default class C { [name()]() {} }",
@@ -10868,9 +10879,13 @@ fn test_es5_legacy_class_member_lowering_keeps_unsupported_boundaries_native() {
     );
     assert_node_syntax(&super_member);
     assert_eq!(execute_with_node(&super_member), "2");
+    // `super.m()` in a lowered method calls the base prototype member with
+    // this receiver, as tsc emits.
     assert!(
-        super_member.contains("class Derived extends Base"),
-        "super-bearing methods require a home object and must not be moved to ordinary functions: {super_member}"
+        super_member.contains(
+            "Derived.prototype.method = function () { return _super.prototype.method.call(this) + 1; };"
+        ),
+        "{super_member}"
     );
 
     let define_field = emit_ts_with(
@@ -15443,8 +15458,11 @@ fn test_simple_parameter_lowering_is_narrowly_gated() {
          function* generator(x = 1) { yield x; }\n\
          class Derived extends Base { constructor(x = 1) { super(); } }",
     );
+    // A destructured parameter becomes a temp flattened in the body.
     assert!(
-        es5.contains("function destructured({ x } = { x: 1 })"),
+        es5.contains(
+            "function destructured(_a) {\n    var _b = _a === void 0 ? { x: 1 } : _a, x = _b.x;"
+        ),
         "{es5}"
     );
     assert!(
@@ -15488,7 +15506,11 @@ fn test_es5_simple_arrow_bridge_excludes_lexical_and_complex_boundaries() {
         "{js}"
     );
     assert!(js.contains("(x = 1) => x"), "{js}");
-    assert!(js.contains("({ x } = { x: 1 }) =>"), "{js}");
+    assert!(
+        js.contains("var destructured = function (_a) {")
+            && js.contains("var _b = _a === void 0 ? { x: 1 } : _a, x = _b.x;"),
+        "{js}"
+    );
     assert!(!js.contains("var byThis = function"), "{js}");
     assert!(!js.contains("var byArguments = function"), "{js}");
 }

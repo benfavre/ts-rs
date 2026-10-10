@@ -613,6 +613,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn emit_expr_inner(&mut self, expr: &Expr) {
+        if self.es5_super_home.is_some() && self.emit_es5_super_access(expr) {
+            return;
+        }
         // Save and clear the expression-statement position flag so that
         // sub-expressions (recursive emit_expr calls) see it as false.
         let cjs_in_expr_stmt = self.cjs_export_in_expr_stmt;
@@ -2592,6 +2595,8 @@ impl<'a> Emitter<'a> {
                         self.emit_params(&arrow.params);
                     }
                     self.write(") ");
+                    // The loop helper's arrow body keeps its enclosing capture.
+                    self.arrow_body_pending = true;
                     let saved_alias = self.lexical_arrow_this_alias.clone();
                     let active_plan = self
                         .active_lexical_loop_helpers
@@ -2628,8 +2633,17 @@ impl<'a> Emitter<'a> {
                     self.write("function (");
                     self.emit_params_without_initializers(&arrow.params);
                     self.write(") ");
+                    // `this` reads the enclosing body's `_this` capture.
+                    let saved_lexical_this = self.lexical_arrow_this_alias.clone();
+                    let saved_this_rewrite =
+                        crate::source_transform::ES5_THIS_REWRITE.with(std::cell::Cell::get);
+                    if self.this_capture_alias.is_some() {
+                        self.lexical_arrow_this_alias = self.this_capture_alias.clone();
+                        crate::source_transform::ES5_THIS_REWRITE.with(|flag| flag.set(true));
+                    }
                     match &arrow.body {
                         ArrowBody::Block(stmts) => {
+                            self.arrow_body_pending = true;
                             self.emit_block_for_decl_body(stmts, expr.span);
                         }
                         ArrowBody::Expr(body) => {
@@ -2685,6 +2699,9 @@ impl<'a> Emitter<'a> {
                             self.temp_var_names = prev_temp_var_names;
                         }
                     }
+                    self.lexical_arrow_this_alias = saved_lexical_this;
+                    crate::source_transform::ES5_THIS_REWRITE
+                        .with(|flag| flag.set(saved_this_rewrite));
                     self.in_async_function = prev_in_async;
                     if let Some(snapshot) = prev_arrow_param_shadows {
                         self.cjs_param_shadows = snapshot;

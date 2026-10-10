@@ -189,7 +189,11 @@ impl GeneratorPlan {
                 let value = self.expression(value, context)?;
                 self.push(Operation::Throw(value));
             }
-            StmtKind::Var(vars) if vars.kind == VarKind::Var => {
+            // ES5 has already turned `let`/`const` into function-scoped
+            // bindings; the generator hoists them like `var`.
+            StmtKind::Var(vars)
+                if matches!(vars.kind, VarKind::Var | VarKind::Let | VarKind::Const) =>
+            {
                 for decl in &vars.declarations {
                     let PatKind::Ident(name) = &decl.name.kind else {
                         return None;

@@ -869,8 +869,9 @@ impl<'a> Emitter<'a> {
             Some(name) => name.clone(),
             None => return,
         };
-        let insert_in_legacy_iife =
-            self.can_emit_legacy_es5_class_decl(class) && !class.decorators.is_empty();
+        // A class lowered to an ES5 IIFE applies every decorator (class,
+        // member, parameter) inside it, before `return C;`.
+        let insert_in_legacy_iife = self.can_emit_legacy_es5_class_decl(class);
         let application_output_start = self.output.len();
         let application_temp_start = self.temp_var_names.len();
         if insert_in_legacy_iife {
