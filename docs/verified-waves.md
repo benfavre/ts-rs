@@ -1872,3 +1872,42 @@ measured again (1,805 passed). JavaScript emit stays at 100% in both
 suites. All 3,429 public Rust tests pass with 37 ignored, and `make ci`
 passes. The preceding snapshot is retained at
 `docs/compatibility-metrics-2026-10-10-d6428aa94.json`.
+
+## 2026-10-10: type-only aliases and missing-semicolon parse errors
+
+A name that reaches its declaration through `import type`, `export type`
+or `export type *` is now an error where it is used as a value: TS1361 or
+TS1362, with a note at the first type-only declaration on the way from
+the use. The chain is followed across files and through star re-exports
+(a value star wins over a type-only one), and a type-only alias of a
+declaration without a value meaning does not shadow a value of the same
+name. `export =`, `export default`, ambient declarations and computed names
+of interfaces, type literals and abstract or `declare` members may still
+name such an alias. A `type` modifier inside `import type { }` or
+`export type { }` is TS2206 or TS2207.
+
+The parser reports `';' expected` after an expression statement that
+continues on the same line. A bare word there is reported the way tsc
+reports it instead: TS1435 with a keyword suggestion, TS1434, or TS1440
+for `const`/`let`/`var`. A type reference's type arguments must start on
+the same line, so a generic call signature on the next line of a type
+literal no longer misparses. A decorator after a property name is TS1436.
+In the checker, a nested class's private name that shadows an outer
+class's is TS18014; static blocks report TS2729 for statics declared
+later; with `[[Define]]` class fields, a field initializer that reads a
+parameter property is TS2729.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,840 | 4,858 |
+| Conformance | 3,786 | 3,853 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 86.07% | 86.62% | 60.54% | 61.03% |
+| Conformance | 89.11% | 89.45% | 68.70% | 69.34% |
+
+JavaScript emit stays at 100% in both suites, and the LSP lanes are
+unchanged. All 3,429 public Rust tests pass with 37 ignored, and
+`make ci` passes. The preceding snapshot is retained at
+`docs/compatibility-metrics-2026-10-10-3f776ee67.json`.
