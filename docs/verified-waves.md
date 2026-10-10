@@ -1730,3 +1730,42 @@ were run cache-free. All 3,429 public Rust tests pass with 37 ignored, and
 installed above the temporary directory cannot enter their programs. The
 preceding snapshot is retained at
 `docs/compatibility-metrics-2026-10-02-59cbf453d.json`.
+
+## 2026-10-10: tsc source maps, project baselines and ES5 classes
+
+Source maps now carry tsc's mappings for every printed node rather than
+one per statement. Our emitter copies most text from the source, so the
+mappings are recovered after emission: source and output tokens are
+aligned, each node maps the output range of its surviving tokens, and the
+CommonJS/AMD module transform is covered by rules for the statements it
+synthesizes. The generator coalesces mappings exactly as tsc's
+SourceMapGenerator does. The harness now runs TypeScript's project
+baselines (outFile bundles with their source maps, tsc's output naming,
+root and reference checks); they pass 293 of 316 internally and are not
+yet part of the published lanes.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,793 | 4,796 |
+| Conformance | 3,646 | 3,646 |
+
+| Lane | Compiler before | After | Conformance before | After |
+|---|---:|---:|---:|---:|
+| Expanded JavaScript | 6,447 | 6,460 | 6,385 | 6,387 |
+| Expanded declarations | 5,834 | 5,843 | 6,312 | 6,313 |
+
+New diagnostics: TS1147 (import aliases of modules inside namespaces, with
+tsc's lazy resolution of the alias), TS1540 (namespaces declared with the
+`module` keyword), TS5051 (`sourceRoot` without a source map) and TS5053
+(`declarationDir` with `outFile`). Declaration files keep the quote style
+of module specifiers, and AMD/System `outFile` declaration bundles wrap
+each module in `declare module "<id>"`. ES5 output lowers classes with
+parameter properties, constructor overloads and multi-line commented
+accessor bodies. Diagnostic accuracy matches 39 more compiler
+diagnostics with 14 fewer false positives.
+
+The measured commit is public `f64b8ea63d`. All twelve baseline matrices
+were run cache-free; JavaScript emit stays at 100% in both suites; symbol,
+type and LSP results are unchanged. All 3,429 public Rust tests pass with
+37 ignored, and `make ci` passes. The preceding snapshot is retained at
+`docs/compatibility-metrics-2026-10-09-cb31e5f25.json`.
