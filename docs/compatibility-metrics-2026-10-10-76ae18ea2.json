@@ -1,16 +1,16 @@
 {
   "measured_at": "2026-10-10",
-  "source_commit": "d6428aa94690d07df185e731be6fcbc07786527e",
+  "source_commit": "76ae18ea29fc5da272d4af509b7ad95a038de59a",
   "source_build": "Public main checkout, release profile, cache-free baseline reports; unchanged upstream cases and reference baselines.",
   "pass_rate_definition": "passed / (passed + failed); skipped cases excluded, never counted as passes.",
   "baselines": {
     "compiler": {
       "errors": {
         "total": 6529,
-        "passed": 4829,
-        "failed": 1700,
+        "passed": 4805,
+        "failed": 1724,
         "skipped": 0,
-        "manifest_sha256": "e374398d827946f43d8c687ce59bef1388fd737bd1e512efebe3d39599dc7f2c",
+        "manifest_sha256": "c8705b5d32df566c15757f38365346ff8bcb61c08d7917ce0397f7b68b267395",
         "command": "target/release/baseline-report --suite compiler --baseline errors --no-cache --save-manifest /tmp/compiler-errors.json"
       },
       "js": {
@@ -31,10 +31,10 @@
       },
       "types": {
         "total": 6529,
-        "passed": 606,
-        "failed": 5828,
+        "passed": 604,
+        "failed": 5830,
         "skipped": 95,
-        "manifest_sha256": "55aa5040457c3f6fe78eb7f3d3dc2ef353235e578f15e778fb85c78f7a8926d4",
+        "manifest_sha256": "e7087fc3fa24701c95574e6d8fb858286d1bb4525ea99a868b1cb61b58c1ff83",
         "command": "target/release/baseline-report --suite compiler --baseline types --no-cache --save-manifest /tmp/compiler-types.json"
       },
       "js-expanded": {
@@ -57,10 +57,10 @@
     "conformance": {
       "errors": {
         "total": 5907,
-        "passed": 3730,
-        "failed": 2177,
+        "passed": 3650,
+        "failed": 2257,
         "skipped": 0,
-        "manifest_sha256": "b5113d09356b1565ff3a02305621dc543e84d14b49726c6e4095b0bb5a7b96f5",
+        "manifest_sha256": "081d9780df5e4e40a2d9515e4253972db3a0231d9407c93e087e7648847271e2",
         "command": "target/release/baseline-report --suite conformance --baseline errors --no-cache --save-manifest /tmp/conformance-errors.json"
       },
       "js": {
@@ -110,32 +110,32 @@
       "suite": "compiler",
       "cases_total": 7257,
       "cases_with_expected": 3512,
-      "cases_perfect": 1854,
+      "cases_perfect": 1834,
       "expected_diagnostics": 14916,
-      "matched": 8972,
-      "false_negatives": 5944,
-      "false_positives": 1454,
-      "recall": 0.6015017430946634,
-      "precision": 0.8605409553040476,
-      "loc_recall": 0.632274068114776,
-      "loc_precision": 0.9045655093036639,
-      "report_sha256": "6a077a334da876fe77efb168ce05d9e7613d2556bcdd91617253c489099c0a8c",
+      "matched": 8923,
+      "false_negatives": 5993,
+      "false_positives": 1471,
+      "recall": 0.5982166800750871,
+      "precision": 0.8584760438714643,
+      "loc_recall": 0.6293912577098418,
+      "loc_precision": 0.9032133923417356,
+      "report_sha256": "907556d7c363d8ef0c06b42d51853c7ff1a1a68c7dea22f6ce41165c2be431f9",
       "command": "target/release/typecheck-report --suite compiler --json --top 1000"
     },
     "conformance": {
       "suite": "conformance",
       "cases_total": 7694,
       "cases_with_expected": 4271,
-      "cases_perfect": 1837,
+      "cases_perfect": 1719,
       "expected_diagnostics": 28735,
-      "matched": 19534,
-      "false_negatives": 9201,
-      "false_positives": 2505,
-      "recall": 0.6797981555594224,
-      "precision": 0.8863378556195834,
-      "loc_recall": 0.7069427527405603,
-      "loc_precision": 0.9217296610554018,
-      "report_sha256": "af822b359d6bc9fafd04dcc724da1e9fcb20a1431b519bcc7de8933a73bc3868",
+      "matched": 19264,
+      "false_negatives": 9471,
+      "false_positives": 2534,
+      "recall": 0.6704019488428745,
+      "precision": 0.8837508028259473,
+      "loc_recall": 0.6977205498520967,
+      "loc_precision": 0.9197632810349573,
+      "report_sha256": "d545012eab8ca36c4a4b76aa6c9241d7f8582c9f0a71652f03a7a9a4c500aa8a",
       "command": "target/release/typecheck-report --suite conformance --json --top 1000"
     }
   },
@@ -145,9 +145,8 @@
       "passed": 301,
       "failed": 228,
       "skipped": 10,
-      "report_sha256": "b5f9b0d032ebaf68fe0a16459e41a6a0bfd8a0c37d28613f9f9a877f08e4a412",
-      "command": "target/release/lsp-report --op quickinfo --json --top 1000 --show-samples 10000",
-      "note": "Carried from the preceding sync state (private 2f278777d, two commits earlier): one case (quickInfoCanBeTruncated) needs more than 24 GB, over this run's memory cap."
+      "report_sha256": "40335bf0fa4851eabdd9837cab43b75de76fe6b159378cfd8d2c6f1d8a7540ef",
+      "command": "target/release/lsp-report --op quickinfo --json --top 1000 --show-samples 10000"
     },
     "completions": {
       "total": 1131,
@@ -188,20 +187,19 @@
     "failed": 560,
     "skipped": 3957,
     "report_sha256": "b304aaf112f524ea3136d6bd78700b71f48f17434139dd4e6d799023f24088ae",
-    "command": "target/release/lsp-report --op all --json --top 1000 --show-samples 10000",
-    "note": "Carried from 76ae18ea29: the full --op all inventory needs ~25 GB and was not re-run."
+    "command": "target/release/lsp-report --op all --json --top 1000 --show-samples 10000"
   },
   "rust_tests": {
     "total": 3466,
     "passed": 3429,
     "failed": 0,
     "skipped": 37,
-    "report_sha256": "7ce1a3f3f80d1a2d486ee354293ceaf12b24e62fcf4002605d0a43aaee0468d5",
+    "report_sha256": "b7259a22af586130a13cb4ba4adadc116d74077cf8cafeea70d23202fda72bf2",
     "command": "cargo test --workspace"
   },
   "validation": {
     "make_ci": "passed",
-    "ci_log_sha256": "89beb54b37cbd1b87473d575b9467039ce95d83148ec060d23936e26e8961a02"
+    "ci_log_sha256": "bdb9779380626d67e547dc51e73beafb7b90257a448207be8dd30681c1b68b02"
   },
   "diagnostic_accuracy_definition": "Full expanded errors inventory; matches file basename, line and TS code with multiplicity, excluding configuration-deprecation codes. Does not require exact diagnostic message or column.",
   "lsp_total_definition": "The per-operation tables cover five supported operations. The full inventory includes unsupported cases and reports their skips separately; no skip is a pass."

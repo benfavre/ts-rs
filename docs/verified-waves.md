@@ -1801,3 +1801,39 @@ commit itself. JavaScript emit stays at 100% in both suites. All 3,429
 public Rust tests pass with 37 ignored, and `make ci` passes. The
 preceding snapshot is retained at
 `docs/compatibility-metrics-2026-10-10-f64b8ea63.json`.
+
+## 2026-10-10: scanner errors, loop grammar and assignment checks
+
+The scanner now reports invalid characters (TS1127), unterminated strings
+(TS1002) and out-of-range or unterminated extended Unicode escapes
+(TS1198/TS1199), withdrawing them where a regex or JSX rescan absorbs the
+text; a file containing a U+FFFD replacement character is reported as
+binary (TS1490) and the rest is trivia, as tsc's scanner does. Loops get
+tsc's declaration grammar (TS1188/TS1091, TS1190/TS1189, TS2483/TS2404),
+and `for (target of xs)` checks each element against the target's
+declared type. Import attributes are checked against `--module` (TS2823)
+and type-only declarations (TS2857); truncated attribute clauses report
+`'{'`/`'}'` expected. An object relates to a discriminated union when every
+combination of its discriminant values does; disjoint primitive
+intersections are `never`; write-only private properties are unused;
+missing `/// <reference path>` targets report TS6053.
+
+The errors lane now matches `target=es6` variant oracles to `es2015` runs.
+Cases that had passed only against a missing oracle were fixed, not lost.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,805 | 4,829 |
+| Conformance | 3,650 | 3,730 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 85.85% | 86.05% | 59.82% | 60.15% |
+| Conformance | 88.38% | 88.63% | 67.04% | 67.98% |
+
+JavaScript emit stays at 100% in both suites, and the expanded JavaScript
+and declaration lanes are unchanged. All 3,429 public Rust tests pass with
+37 ignored, and `make ci` passes. QuickInfo is carried from the preceding
+state because one case needs more than this run's 24 GB memory cap; the
+full LSP inventory is carried for the same reason. The preceding snapshot
+is retained at `docs/compatibility-metrics-2026-10-10-76ae18ea2.json`.
