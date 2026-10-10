@@ -1837,3 +1837,38 @@ and declaration lanes are unchanged. All 3,429 public Rust tests pass with
 state because one case needs more than this run's 24 GB memory cap; the
 full LSP inventory is carried for the same reason. The preceding snapshot
 is retained at `docs/compatibility-metrics-2026-10-10-76ae18ea2.json`.
+
+## 2026-10-10: JSDoc types in checked JavaScript
+
+Checked JavaScript now reads its JSDoc types. `@type`, `@param` (either
+order, destructured parameters by position, dotted members), `@returns`
+(type predicates included), `@typedef` (object typedefs from `@property`),
+`@callback`, `@template` (constraints, defaults, `const`), `@satisfies`
+and parenthesized casts become annotations on a checker-only copy of the
+file, parsed at their own offsets so diagnostics point into the comment.
+JavaScript therefore gets implicit-any parameter errors and unresolved
+JSDoc type names, as tsc reports them; JavaScript interfaces report only
+TS8006, and exporting a type-only name is TS18043.
+
+`satisfies` now elaborates nested literals and checks excess properties on
+computed shapes (`Record`, `Partial`) named as written. Parameter
+initializers are checked against their annotation. A namespace import's
+missing member is TS2339 on `typeof import("…")`. A negated `typeof` guard
+can narrow to `never`. The quickinfo suite's memory use fell from more than
+24 GB to 1 GB (alias bodies were display-expanded without a bound).
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,829 | 4,840 |
+| Conformance | 3,730 | 3,786 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 86.05% | 86.07% | 60.15% | 60.54% |
+| Conformance | 88.63% | 89.11% | 67.98% | 68.70% |
+
+QuickInfo passes rise from 301 to 303, and the full LSP inventory is
+measured again (1,805 passed). JavaScript emit stays at 100% in both
+suites. All 3,429 public Rust tests pass with 37 ignored, and `make ci`
+passes. The preceding snapshot is retained at
+`docs/compatibility-metrics-2026-10-10-d6428aa94.json`.
