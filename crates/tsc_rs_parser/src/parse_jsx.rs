@@ -362,6 +362,7 @@ impl<'a> Parser<'a> {
             scanner.scan();
             scanner.scan_jsx_identifier();
             end = start + scanner.text_pos() as u32;
+            self.suppress_eager_scanner_diagnostics_in_span(Span::new(start, end));
         }
         while !self.is_eof() && self.cur_span().end <= end {
             self.bump();
@@ -697,6 +698,17 @@ impl<'a> Parser<'a> {
         let content_end = i.min(bytes.len());
         let content = self.source[start + 1..content_end].to_string();
         let end_u32 = end as u32;
+        // The JS scanner's reading of this text (strings cut at a line break
+        // or run past `\"`) does not apply to a JSX attribute value.
+        // That includes a string the JS scanner started at the closing quote.
+        let closing_token_end = self.tokens[self.pos..]
+            .iter()
+            .find(|token| token.span.start < end_u32 && end_u32 <= token.span.end)
+            .map_or(end_u32, |token| token.span.end);
+        self.suppress_eager_scanner_diagnostics_in_span(Span::new(
+            start as u32,
+            closing_token_end.max(end_u32),
+        ));
 
         // The scanner may have produced a single token that extends past our
         // raw string end (because it treated `\"` as an escape and kept scanning).
@@ -704,6 +716,11 @@ impl<'a> Parser<'a> {
         // to recover the tokens the scanner consumed into the string.
         if !self.is_eof() && self.cur_span().end > end_u32 {
             let token_end = self.cur_span().end as usize;
+            // The JS reading of that token (an unterminated string) is void.
+            self.suppress_eager_scanner_diagnostics_in_span(Span::new(
+                start as u32,
+                token_end as u32,
+            ));
             // Remove the current (oversized) token
             self.remove_token(self.pos);
             // Re-scan the source from end of our raw string to end of the

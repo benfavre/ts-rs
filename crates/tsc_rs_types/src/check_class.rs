@@ -563,6 +563,7 @@ impl TypeChecker {
         let mut constructor_declaration_count = 0usize;
         let mut constructor_body_count = 0usize;
         let mut instance_properties = Vec::new();
+        let mut setter_types = rustc_hash::FxHashMap::default();
         let mut optional_instance_properties: rustc_hash::FxHashSet<std::string::String> =
             rustc_hash::FxHashSet::default();
         let mut optional_static_properties: rustc_hash::FxHashSet<std::string::String> =
@@ -940,6 +941,12 @@ impl TypeChecker {
                         static_method_has_body
                             .push(method.body.as_ref().map(|_| method.name.span()));
                         static_methods.push((name, ft));
+                    } else if instance_properties
+                        .iter()
+                        .any(|(existing, _)| *existing == name)
+                    {
+                        // A method duplicating an earlier property (TS2300):
+                        // the first declaration supplies the member's type.
                     } else {
                         if method.optional {
                             optional_instance_properties.insert(name.clone());
@@ -984,6 +991,15 @@ impl TypeChecker {
                     // A write-only setter still declares the member (needed so
                     // `this.x = ...` doesn't trip TS2339). Don't overwrite a
                     // getter's read type when both exist.
+                    if let Some(annotation) = acc.params.first().and_then(|p| p.type_ann.as_ref()) {
+                        setter_types.insert(
+                            (
+                                self.prop_name_to_string(&acc.name),
+                                acc.modifiers & MOD_STATIC != 0,
+                            ),
+                            self.resolve_type_node(annotation),
+                        );
+                    }
                     if (acc.modifiers & MOD_STATIC) != 0 {
                         let name = self.prop_name_to_string(&acc.name);
                         if !static_properties.iter().any(|(n, _)| n == &name) {
@@ -1115,6 +1131,7 @@ impl TypeChecker {
         }
 
         let info = ClassInfo {
+            setter_types,
             member_locations: {
                 let mut locations = rustc_hash::FxHashMap::default();
                 let file = self

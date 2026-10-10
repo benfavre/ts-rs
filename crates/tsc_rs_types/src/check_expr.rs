@@ -1635,6 +1635,50 @@ impl TypeChecker {
         }
     }
 
+    /// The type a write to `receiver.prop` must satisfy when `prop` is a
+    /// class accessor with an annotated setter: the setter's parameter type
+    /// (with the receiver's class type arguments), which may differ from the
+    /// getter's type. `None` when no setter applies.
+    pub(super) fn setter_write_type(&mut self, member: &MemberExpr) -> Option<Type> {
+        self.setter_write_type_of(&member.object, member.property.as_str())
+    }
+
+    /// The setter parameter type for a write to `object[property]`.
+    pub(super) fn setter_write_type_of(&mut self, object: &Expr, property: &str) -> Option<Type> {
+        let diagnostics = self.diagnostics.len();
+        let receiver = self.check_expr(object);
+        self.diagnostics.truncate(diagnostics);
+        let (class, args, is_static) = match &receiver {
+            Type::TypeReference(name, args) => match name.strip_prefix("typeof ") {
+                Some(class) => (class.to_string(), args.clone(), true),
+                None => (name.to_string(), args.clone(), false),
+            },
+            _ => return None,
+        };
+        let info = self.class_info.get(class.as_str())?;
+        let setter = info
+            .setter_types
+            .get(&(property.to_string(), is_static))?
+            .clone();
+        if is_static || info.type_params.is_empty() || args.is_empty() {
+            return Some(setter);
+        }
+        let map: HashMap<std::string::String, Type> = info
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        // The annotation holds the class's type parameters as references.
+        let names: std::collections::HashSet<&str> = info
+            .type_params
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+        let setter = Self::rewrite_type_param_refs(&setter, &names);
+        Some(crate::inference::substitute(&setter, &map))
+    }
+
     pub(super) fn report_readonly_property_write(&mut self, target: &Expr) -> bool {
         let inferred_index;
         let (receiver, property, property_span) = match Self::constant_property_write_target(target)
@@ -4221,6 +4265,22 @@ impl TypeChecker {
                     }
                     // Once a digit is present, malformed braced escapes use
                     // TS1199/TS1198 rather than TS1125.
+                    let digits = pattern[digit_start..failure].trim_start_matches('0');
+                    if failure > digit_start
+                        && bytes.get(failure) == Some(&b'}')
+                        && (digits.len() > 6
+                            || u32::from_str_radix(digits, 16).is_ok_and(|value| value > 0x10FFFF))
+                    {
+                        let start = expr_span.start + 1 + digit_start as u32;
+                        self.diagnostics.push(Diagnostic {
+                            code: 1198,
+                            message: "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive.".to_string(),
+                            category: DiagnosticCategory::Error,
+                            file_name: None,
+                            span: Some(Span::new(start, expr_span.start + 1 + failure as u32)),
+                            related: None,
+                        });
+                    }
                     failure == digit_start
                 } else {
                     let required_end = if first == b'x' {
@@ -5950,7 +6010,7 @@ impl TypeChecker {
                         | "readonly" | "override" | "accessor"
                         | "declare" | "module"
                         | "is" | "asserts" | "infer" | "out" | "satisfies"
-                        | "async" | "await" | "of" | "from" | "as" | "get" | "set"
+                        | "async" | "of" | "from" | "as" | "get" | "set"
                         // Other well-known globals
                         | "eval" | "importScripts" | "postMessage"
                         | "WScript" | "ActiveXObject" | "Enumerator"
@@ -9116,7 +9176,23 @@ impl TypeChecker {
                             self.assign_lhs_declared = true;
                             let ty = self.check_expr(&assign.left);
                             self.assign_lhs_declared = false;
-                            ty
+                            // A write through a setter takes its parameter type.
+                            match &assign.left.kind {
+                                ExprKind::Member(member) => {
+                                    self.setter_write_type(member).unwrap_or(ty)
+                                }
+                                _ => ty,
+                            }
+                        }
+                        // `a['value'] = …` writes through the setter too.
+                        ExprKind::ElemAccess(access) => {
+                            let ty = self.check_expr(&assign.left);
+                            match &access.index.kind {
+                                ExprKind::StrLit(property) => self
+                                    .setter_write_type_of(&access.object, property.as_str())
+                                    .unwrap_or(ty),
+                                _ => ty,
+                            }
                         }
                         ExprKind::ObjectLit(_) | ExprKind::ArrayLit(_) => {
                             // Destructuring assignment pattern.
@@ -9640,6 +9716,13 @@ impl TypeChecker {
                             }
                         }
                         ObjLitProp::Method(m) => {
+                            if let PropName::Computed(..) = m.name {
+                                // tsc reports no TS2454 inside a method's or
+                                // accessor's computed name.
+                                self.unreachable_read_depth += 1;
+                                self.check_property_name_expression(&m.name);
+                                self.unreachable_read_depth -= 1;
+                            }
                             let name = self.prop_name_to_string(&m.name);
                             self.push_scope();
                             self.fn_nesting_depth += 1;
@@ -9735,6 +9818,13 @@ impl TypeChecker {
                         }
                         ObjLitProp::Get(acc) => {
                             self.check_getter_missing_return(&acc.name, &acc.body);
+                            if let PropName::Computed(..) = acc.name {
+                                // tsc reports no TS2454 inside a method's or
+                                // accessor's computed name.
+                                self.unreachable_read_depth += 1;
+                                self.check_property_name_expression(&acc.name);
+                                self.unreachable_read_depth -= 1;
+                            }
                             self.check_accessor_signature_grammar(
                                 true,
                                 &acc.name,
@@ -9780,6 +9870,13 @@ impl TypeChecker {
                             properties.push((name, Arc::new(getter_ty)));
                         }
                         ObjLitProp::Set(acc) => {
+                            if let PropName::Computed(..) = acc.name {
+                                // tsc reports no TS2454 inside a method's or
+                                // accessor's computed name.
+                                self.unreachable_read_depth += 1;
+                                self.check_property_name_expression(&acc.name);
+                                self.unreachable_read_depth -= 1;
+                            }
                             self.check_accessor_signature_grammar(
                                 false,
                                 &acc.name,
@@ -10388,6 +10485,52 @@ impl TypeChecker {
                     Type::String | Type::StringLiteral(_) => Type::String,
                     _ => ty,
                 }
+            }
+            ExprKind::Await(inner) if matches!(inner.kind, ExprKind::Omitted) => {
+                // `await` directly before `]`, `)`, `,` or `;`. Inside an async
+                // body tsc parses an await expression whose operand is
+                // missing (TS1109 at the next token); in a script outside one,
+                // `await` is just an unresolved identifier.
+                let in_static_block = self.static_block_fn_depths.last()
+                    == Some(&self.fn_nesting_depth)
+                    && self.return_is_async_stack.last() == Some(&false)
+                    // A field initializer is an implicit function boundary.
+                    && self.class_init_ctx.is_none();
+                let in_async = self.return_is_async_stack.last() == Some(&true) || in_static_block;
+                if in_async {
+                    let next = self.current_source.as_deref().and_then(|src| {
+                        let from = expr.span.start as usize + 5;
+                        src.get(from..)?
+                            .char_indices()
+                            .find(|(_, c)| !c.is_whitespace())
+                            .map(|(offset, _)| (from + offset) as u32)
+                    });
+                    if let Some(at) = next {
+                        self.diagnostics.push(Diagnostic {
+                            code: 1109,
+                            message: "Expression expected.".to_string(),
+                            category: DiagnosticCategory::Error,
+                            file_name: None,
+                            span: Some(Span::new(at, at + 1)),
+                            related: None,
+                        });
+                    }
+                } else if !self.file_is_module_flag {
+                    // A binding named `await` (`let await`) is what it reads.
+                    if self.lookup_declared_var("await").is_some() {
+                        return Type::Any;
+                    }
+                    self.diagnostics.push(error_cannot_find_name(
+                        "await",
+                        Span::new(expr.span.start, expr.span.start + 5),
+                    ));
+                } else if self.return_is_async_stack.last() == Some(&false) {
+                    self.diagnostics.push(error_await_in_non_async(Span::new(
+                        expr.span.start,
+                        expr.span.start + 5,
+                    )));
+                }
+                Type::Any
             }
             ExprKind::Await(inner) => {
                 // TS1308: `await` inside a non-async function-like. The
@@ -13489,6 +13632,7 @@ impl TypeChecker {
                 // TS1308: a static block is a non-async context.
                 self.return_is_async_stack.push(false);
                 self.generator_stack.push(false);
+                self.static_block_fn_depths.push(self.fn_nesting_depth);
                 self.push_scope();
                 let saved_var_first_types = std::mem::take(&mut self.var_first_types);
                 self.declare_var(ARGS_BLOCKED_MARKER, Type::Never);
@@ -13499,6 +13643,7 @@ impl TypeChecker {
                 }
                 self.var_first_types = saved_var_first_types;
                 self.pop_scope();
+                self.static_block_fn_depths.pop();
                 self.return_is_async_stack.pop();
                 self.generator_stack.pop();
                 self.class_init_ctx = saved_ctx;

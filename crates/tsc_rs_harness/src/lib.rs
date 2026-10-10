@@ -4680,32 +4680,42 @@ impl BaselineRunner {
                     let mut found_variant: Option<String> = None;
                     let mut parameterized_oracle_exists = false;
                     if let Ok(entries) = std::fs::read_dir(&baseline_dir) {
-                        let mut candidates: Vec<PathBuf> = entries
-                            .flatten()
-                            .filter_map(|entry| {
-                                let path = entry.path();
-                                let name = path.file_name()?.to_str()?;
-                                if !name.starts_with(&pat) || !name.ends_with(ext) {
-                                    return None;
-                                }
-                                parameterized_oracle_exists = true;
-                                let attributes =
-                                    parameterized_variant_attributes(name, &stem, ext)?;
-                                attributes
-                                    .iter()
-                                    .all(|(key, expected)| {
-                                        option_variant_value(
-                                            &test_case.options,
-                                            &source,
-                                            &key.to_ascii_lowercase(),
-                                        )
-                                        .is_some_and(
-                                            |actual| actual.eq_ignore_ascii_case(expected.trim()),
-                                        )
-                                    })
-                                    .then_some(path)
-                            })
-                            .collect();
+                        let mut candidates: Vec<PathBuf> =
+                            entries
+                                .flatten()
+                                .filter_map(|entry| {
+                                    let path = entry.path();
+                                    let name = path.file_name()?.to_str()?;
+                                    if !name.starts_with(&pat) || !name.ends_with(ext) {
+                                        return None;
+                                    }
+                                    parameterized_oracle_exists = true;
+                                    let attributes =
+                                        parameterized_variant_attributes(name, &stem, ext)?;
+                                    attributes
+                                        .iter()
+                                        .all(|(key, expected)| {
+                                            option_variant_value(
+                                                &test_case.options,
+                                                &source,
+                                                &key.to_ascii_lowercase(),
+                                            )
+                                            .is_some_and(|actual| {
+                                                // `es6` is tsc's alias of `es2015`.
+                                                let canonical = |value: &str| {
+                                                    let value = value.trim().to_ascii_lowercase();
+                                                    if value == "es6" {
+                                                        "es2015".to_string()
+                                                    } else {
+                                                        value
+                                                    }
+                                                };
+                                                canonical(&actual) == canonical(expected)
+                                            })
+                                        })
+                                        .then_some(path)
+                                })
+                                .collect();
                         candidates.sort();
                         if let Some(path) = candidates.first() {
                             if let Ok(raw) = std::fs::read_to_string(path) {
@@ -5859,6 +5869,49 @@ impl BaselineRunner {
                     .unwrap_or(true)
             });
 
+            // TS6053: a `/// <reference path>` naming no file of the test.
+            if effective_options.no_resolve != Some(true) {
+                let dir = Path::new(&display).parent().unwrap_or(Path::new(""));
+                let directive_comments = leading_line_comment_ranges(&file.content);
+                for (reference, start) in triple_slash_reference_path_spans(&file.content) {
+                    if reference.starts_with("/.lib/")
+                        || !directive_comments
+                            .iter()
+                            .any(|range| range.contains(&start))
+                    {
+                        continue;
+                    }
+                    let spelled = normalize_slashes(&reference);
+                    let absolute =
+                        spelled.starts_with('/') || spelled.as_bytes().get(1) == Some(&b':');
+                    let joined = if absolute {
+                        spelled
+                    } else {
+                        normalize_slashes(&dir.join(&spelled).to_string_lossy())
+                    };
+                    let target = normalize_path_segments(&joined);
+                    let exists = test_case.files.iter().any(|other| {
+                        let name = normalize_path_segments(&normalize_slashes(other.name.trim()));
+                        [".ts", ".tsx", ".d.ts", ""].iter().any(|extension| {
+                            name.trim_start_matches("./")
+                                == format!("{target}{extension}").trim_start_matches("./")
+                        })
+                    });
+                    if !exists {
+                        file_diags.push(Diagnostic {
+                            code: 6053,
+                            message: format!("File '{reference}' not found."),
+                            category: tsc_rs_ast::DiagnosticCategory::Error,
+                            file_name: Some(display.clone()),
+                            span: Some(tsc_rs_ast::Span::new(
+                                start as u32,
+                                (start + reference.len()) as u32,
+                            )),
+                            related: None,
+                        });
+                    }
+                }
+            }
             file_sources.push((display.clone(), file.content.clone()));
             all_diagnostics.push((display, file_diags));
         }
@@ -9573,6 +9626,36 @@ fn collect_project_case_files_recursive(
     }
 
     Ok(())
+}
+
+/// Byte ranges of the `//` comments before a file's first token: the only
+/// place tsc reads `/// <reference>` directives from.
+fn leading_line_comment_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
+    let bytes = source.as_bytes();
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at].is_ascii_whitespace() || source[at..].starts_with('\u{feff}') {
+            at += if bytes[at].is_ascii_whitespace() {
+                1
+            } else {
+                3
+            };
+        } else if source[at..].starts_with("//") {
+            let end = source[at..]
+                .find('\n')
+                .map_or(bytes.len(), |line| at + line);
+            ranges.push(at..end);
+            at = end;
+        } else if source[at..].starts_with("/*") {
+            at = source[at + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |close| at + 2 + close + 2);
+        } else {
+            break;
+        }
+    }
+    ranges
 }
 
 /// `/// <reference path="…">` values with the byte offset of each value.

@@ -309,6 +309,53 @@ impl TypeChecker {
                                         }
                                     }
                                 }
+                                // `instanceof Array` keeps the array members,
+                                // readonly ones included (tsc isTypeDerivedFrom
+                                // treats `readonly T[]` as derived from Array).
+                                if class_name.as_str() == "Array" && !name.contains('.') {
+                                    if let Some(Type::Union(members)) = self.lookup_var(&name) {
+                                        fn is_array(member: &Type) -> bool {
+                                            match member {
+                                                Type::Array(_) | Type::Tuple(_) => true,
+                                                Type::Readonly(inner) => is_array(inner),
+                                                Type::TypeReference(reference, args) => {
+                                                    matches!(
+                                                        reference.as_str(),
+                                                        "Array" | "ReadonlyArray"
+                                                    ) && args.len() == 1
+                                                }
+                                                _ => false,
+                                            }
+                                        }
+                                        let primitive = |member: &Type| {
+                                            matches!(
+                                                member,
+                                                Type::String
+                                                    | Type::Number
+                                                    | Type::Boolean
+                                                    | Type::BigInt
+                                                    | Type::Symbol
+                                                    | Type::Undefined
+                                                    | Type::Null
+                                                    | Type::StringLiteral(_)
+                                                    | Type::NumberLiteral(_)
+                                                    | Type::BooleanLiteral(_)
+                                                    | Type::BigIntLiteral(_)
+                                            )
+                                        };
+                                        let (arrays, others): (Vec<Type>, Vec<Type>) =
+                                            members.iter().cloned().partition(is_array);
+                                        if !arrays.is_empty()
+                                            && !others.is_empty()
+                                            && others.iter().all(primitive)
+                                        {
+                                            return (
+                                                vec![(name.clone(), Type::flatten_union(arrays))],
+                                                vec![(name, Type::flatten_union(others))],
+                                            );
+                                        }
+                                    }
+                                }
                                 // A union naming the class itself with type
                                 // arguments (`T | Promise<T>` against `Promise`)
                                 // splits into those members and the rest.

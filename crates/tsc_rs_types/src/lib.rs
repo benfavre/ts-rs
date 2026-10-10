@@ -20,6 +20,7 @@ mod diagnostics;
 mod external_helpers;
 mod function_returns;
 mod import_alias_conflicts;
+mod import_attributes;
 mod index_constraints;
 mod index_signatures;
 pub mod inference;
@@ -986,6 +987,9 @@ struct ClassInfo {
     /// Members that cannot be assigned: `readonly` properties and
     /// getter-only accessors (TS2540). Includes statics.
     readonly_members: rustc_hash::FxHashSet<std::string::String>,
+    /// Annotated setter parameter types by (name, is_static): a write goes
+    /// through the setter, whose type can differ from the getter's.
+    setter_types: rustc_hash::FxHashMap<(std::string::String, bool), Type>,
     /// Type arguments of the extends clause (`class C<T> extends Array<T>`),
     /// resolved at class-info build time. Empty when the base is non-generic.
     extends_type_args: Vec<Type>,
@@ -2916,6 +2920,13 @@ pub struct TypeChecker {
     /// Set of identifier names that have been read in expression context.
     /// Used for noUnusedLocals / noUnusedParameters checking.
     used_names: rustc_hash::FxHashSet<String>,
+    /// Property names only ever written with `obj.name = …` (a write-only
+    /// access does not reference a private property; it does reference a
+    /// setter).
+    written_member_names: rustc_hash::FxHashSet<String>,
+    /// Function depths at which enclosing class static blocks were entered:
+    /// directly inside one, `await` is the (missing-operand) keyword.
+    static_block_fn_depths: Vec<u32>,
     /// Root identifier of the JSX factory (e.g. "React" from "React.createElement").
     /// When JSX elements/fragments are present, this name is implicitly used.
     jsx_factory_root: Option<String>,
@@ -3330,6 +3341,8 @@ impl Clone for TypeChecker {
             no_unused_locals: self.no_unused_locals,
             no_unused_parameters: self.no_unused_parameters,
             used_names: self.used_names.clone(),
+            written_member_names: self.written_member_names.clone(),
+            static_block_fn_depths: self.static_block_fn_depths.clone(),
             jsx_factory_root: self.jsx_factory_root.clone(),
             jsx_fragment_root: self.jsx_fragment_root.clone(),
             file_has_jsx: self.file_has_jsx,
@@ -3539,6 +3552,8 @@ impl TypeChecker {
             no_unused_locals: false,
             no_unused_parameters: false,
             used_names: rustc_hash::FxHashSet::default(),
+            written_member_names: rustc_hash::FxHashSet::default(),
+            static_block_fn_depths: Vec::new(),
             jsx_factory_root: None,
             jsx_fragment_root: None,
             file_has_jsx: false,
@@ -12991,6 +13006,101 @@ impl TypeChecker {
     }
 
     /// Element type produced by iterating `ty` (arrays, tuples, strings).
+    /// tsc's checkGrammarForInOrForOfStatement: one declaration, without an
+    /// initializer or a type annotation (TS1188/TS1091, TS1190/TS1189,
+    /// TS2483/TS2404), reported at the offending declaration's name.
+    fn check_for_in_of_declaration_grammar(&mut self, declarations: &VarStmt, is_of: bool) {
+        let keyword = if is_of { "for...of" } else { "for...in" };
+        let (code, message, span) = if let Some(second) = declarations.declarations.get(1) {
+            (
+                if is_of { 1188 } else { 1091 },
+                format!(
+                    "Only a single variable declaration is allowed in a '{keyword}' statement."
+                ),
+                second.name.span,
+            )
+        } else if let Some(first) = declarations.declarations.first() {
+            if first.init.is_some() {
+                (
+                    if is_of { 1190 } else { 1189 },
+                    format!(
+                        "The variable declaration of a '{keyword}' statement cannot have an initializer."
+                    ),
+                    first.name.span,
+                )
+            } else if first.type_ann.is_some() {
+                (
+                    if is_of { 2483 } else { 2404 },
+                    format!(
+                        "The left-hand side of a '{keyword}' statement cannot use a type annotation."
+                    ),
+                    first.name.span,
+                )
+            } else {
+                return;
+            }
+        } else {
+            return;
+        };
+        self.diagnostics.push(Diagnostic {
+            code,
+            message,
+            category: DiagnosticCategory::Error,
+            file_name: None,
+            span: Some(span),
+            related: None,
+        });
+    }
+
+    /// tsc lists the members of a primitive union in type-id order
+    /// (`string | number`), whatever order the source wrote them in.
+    fn tsc_primitive_union_order(ty: Type) -> Type {
+        let Type::Union(members) = &ty else {
+            return ty;
+        };
+        let rank = |member: &Type| match member {
+            Type::String => Some(0),
+            Type::Number => Some(1),
+            Type::BigInt => Some(2),
+            Type::Boolean => Some(3),
+            Type::Symbol => Some(4),
+            _ => None,
+        };
+        if members.iter().any(|member| rank(member).is_none()) {
+            return ty;
+        }
+        let mut sorted: Vec<Type> = members.iter().cloned().collect();
+        sorted.sort_by_key(|member| rank(member));
+        Type::Union(sorted.into())
+    }
+
+    /// Element type a `for…of` yields: arrays, tuples, strings, lib
+    /// iterables, and unions of those (each member contributes).
+    fn for_of_element_type(&self, ty: &Type) -> Option<Type> {
+        if let Type::Union(members) = ty {
+            let mut elements: Vec<Type> = Vec::new();
+            for member in members.iter() {
+                let element = self.for_of_element_type(member)?;
+                let parts: Vec<Type> = match element {
+                    Type::Union(parts) => parts.iter().cloned().collect(),
+                    other => vec![other],
+                };
+                for part in parts {
+                    if !elements.contains(&part) {
+                        elements.push(part);
+                    }
+                }
+            }
+            return match elements.len() {
+                0 => None,
+                1 => elements.pop(),
+                _ => Some(Type::Union(elements.into())),
+            };
+        }
+        self.iterated_element_type(ty)
+            .or_else(|| Self::lib_iterable_element_type(ty))
+    }
+
     pub(crate) fn iterated_element_type(&self, ty: &Type) -> Option<Type> {
         match ty {
             Type::Array(elem) => Some(Type::clone(elem)),
@@ -14768,6 +14878,12 @@ impl TypeChecker {
             for diagnostic in &mut self.diagnostics {
                 if diagnostic.message.contains("?: ") {
                     diagnostic.message = add_undefined_to_optional_properties(&diagnostic.message);
+                }
+                // Related notes print types the same way.
+                for related in diagnostic.related.iter_mut().flatten() {
+                    if related.message.contains("?: ") {
+                        related.message = add_undefined_to_optional_properties(&related.message);
+                    }
                 }
             }
         }
@@ -19016,6 +19132,136 @@ impl TypeChecker {
         out
     }
 
+    /// `number & boolean`: an intersection of primitives from different
+    /// domains is empty, which tsc reduces to `never`.
+    fn is_disjoint_primitive_intersection(ty: &Type) -> bool {
+        let Type::Intersection(members) = ty else {
+            return false;
+        };
+        let domain = |member: &Type| match member {
+            Type::String | Type::StringLiteral(_) => Some(0),
+            Type::Number | Type::NumberLiteral(_) => Some(1),
+            Type::Boolean | Type::BooleanLiteral(_) => Some(2),
+            Type::BigInt | Type::BigIntLiteral(_) => Some(3),
+            Type::Symbol => Some(4),
+            Type::Undefined => Some(5),
+            Type::Null => Some(6),
+            _ => None,
+        };
+        let mut seen = None;
+        for member in members.iter() {
+            if let Some(current) = domain(member) {
+                match seen {
+                    Some(previous) if previous != current => return true,
+                    _ => seen = Some(current),
+                }
+            }
+        }
+        false
+    }
+
+    /// tsc's typeRelatedToDiscriminatedType: an object source whose
+    /// discriminant properties are unions relates to a union of objects when
+    /// every combination of those property values relates to some member
+    /// (`{ foo?: number }` → `{ foo?: undefined } | { foo: number }`).
+    fn related_to_discriminated_union(&self, source: &Type, target: &Type) -> bool {
+        let (Type::ObjectType(object), Type::Union(members)) = (source, target) else {
+            return false;
+        };
+        if !object.call_signatures.is_empty()
+            || !object.construct_signatures.is_empty()
+            || members.len() < 2
+            || !members
+                .iter()
+                .all(|member| matches!(member, Type::ObjectType(_)))
+        {
+            return false;
+        }
+        let strict = self.strict_null_checks;
+        let widen = |ty: &Type| -> Type {
+            match ty {
+                Type::Optional(inner) if strict => {
+                    Type::flatten_union(vec![Type::clone(inner), Type::Undefined])
+                }
+                Type::Optional(inner) => Type::clone(inner),
+                other => other.clone(),
+            }
+        };
+        let is_unit = |ty: &Type| {
+            matches!(
+                ty,
+                Type::Undefined
+                    | Type::Null
+                    | Type::StringLiteral(_)
+                    | Type::NumberLiteral(_)
+                    | Type::BooleanLiteral(_)
+                    | Type::BigIntLiteral(_)
+            )
+        };
+        let target_property = |member: &Type, name: &str| -> Option<Type> {
+            let Type::ObjectType(info) = member else {
+                return None;
+            };
+            info.properties
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, ty)| widen(ty))
+        };
+        // Discriminants: union-typed source properties that some target
+        // member types with a unit type.
+        let mut discriminants: Vec<(usize, Vec<Type>)> = Vec::new();
+        let mut combinations = 1usize;
+        for (index, (name, ty)) in object.properties.iter().enumerate() {
+            let Type::Union(parts) = widen(ty) else {
+                continue;
+            };
+            let has_unit_part = members.iter().any(|member| {
+                target_property(member, name).is_some_and(|property| match &property {
+                    Type::Union(parts) => parts.iter().any(|part| is_unit(part)),
+                    other => is_unit(other),
+                })
+            });
+            if !has_unit_part {
+                continue;
+            }
+            combinations = combinations.saturating_mul(parts.len());
+            if combinations > 25 {
+                return false;
+            }
+            discriminants.push((index, parts.iter().cloned().collect()));
+        }
+        if discriminants.is_empty() {
+            return false;
+        }
+        let mut choice = vec![0usize; discriminants.len()];
+        loop {
+            let mut variant = object.clone();
+            for (slot, (index, parts)) in discriminants.iter().enumerate() {
+                variant.properties[*index].1 = Arc::new(parts[choice[slot]].clone());
+            }
+            let variant = Type::ObjectType(variant);
+            if !members
+                .iter()
+                .any(|member| self.is_assignable_to(&variant, member))
+            {
+                return false;
+            }
+            // Next combination.
+            let mut slot = 0;
+            loop {
+                if slot == choice.len() {
+                    return true;
+                }
+                choice[slot] += 1;
+                if choice[slot] < discriminants[slot].1.len() {
+                    break;
+                }
+                choice[slot] = 0;
+                slot += 1;
+            }
+        }
+    }
+
     fn is_assignable_to(&self, source: &Type, target: &Type) -> bool {
         use std::sync::atomic::Ordering;
         // `G<any, any>` is assignable to any `G<…>`: `any` relates in every
@@ -19169,7 +19415,11 @@ impl TypeChecker {
         }
         let result = match self.lawyer_assignability_override(source, target) {
             Some(v) => v,
-            None => self.is_assignable_to_inner(source, target),
+            None => {
+                self.is_assignable_to_inner(source, target)
+                    || Self::is_disjoint_primitive_intersection(source)
+                    || self.related_to_discriminated_union(source, target)
+            }
         };
         if memoizable {
             if let Ok(mut memo) = self.assign_memo.lock() {
@@ -25397,6 +25647,7 @@ impl TypeChecker {
         // single statement's worth of work so it can't exhaust memory.
         reset_instantiation_budget();
         self.check_js_discarded_statement_decorator(stmt);
+        self.check_import_attributes(stmt);
         match &stmt.kind {
             StmtKind::Var(var_stmt) => {
                 self.check_type_declaration_computed_names(std::slice::from_ref(stmt));
@@ -26268,6 +26519,9 @@ impl TypeChecker {
                 self.pop_scope();
             }
             StmtKind::ForIn(fi) => {
+                if let ForInOfLeft::Var(declarations) = &fi.left {
+                    self.check_for_in_of_declaration_grammar(declarations, false);
+                }
                 self.push_scope();
                 // Register loop variable — for-in always yields string
                 match &fi.left {
@@ -26294,6 +26548,9 @@ impl TypeChecker {
                 self.pop_scope();
             }
             StmtKind::ForOf(fo) => {
+                if let ForInOfLeft::Var(declarations) = &fo.left {
+                    self.check_for_in_of_declaration_grammar(declarations, true);
+                }
                 // TS1103: `for await` needs an async enclosing function, or
                 // the top level of a MODULE.
                 if fo.is_await {
@@ -26331,6 +26588,22 @@ impl TypeChecker {
                         });
                     }
                 }
+                // An identifier target is assigned, not declared: remember its
+                // declared type before the loop scope shadows it.
+                let assigned_target_type = match &fo.left {
+                    ForInOfLeft::Pat(Pat {
+                        kind: PatKind::Ident(name),
+                        ..
+                    }) => self.lookup_declared_var(name),
+                    ForInOfLeft::Expr(target) if matches!(target.kind, ExprKind::Member(_)) => {
+                        let saved = self.assign_lhs_declared;
+                        self.assign_lhs_declared = true;
+                        let ty = self.check_expr(target);
+                        self.assign_lhs_declared = saved;
+                        Some(ty)
+                    }
+                    _ => None,
+                };
                 self.push_scope();
                 // Register loop variable
                 match &fo.left {
@@ -26367,6 +26640,23 @@ impl TypeChecker {
                         for decl in &vs.declarations {
                             self.check_array_pattern_iterable(&decl.name, &element);
                             self.check_binding_pattern_access(&decl.name, &element);
+                        }
+                    }
+                    // `for (v of xs)`: each element is assigned to the target.
+                    let target_span = match &fo.left {
+                        ForInOfLeft::Pat(pattern) => pattern.span,
+                        ForInOfLeft::Expr(target) => target.span,
+                        ForInOfLeft::Var(_) => Span::new(0, 0),
+                    };
+                    if let (Some(target_ty), Some(element)) =
+                        (&assigned_target_type, self.for_of_element_type(&iterated))
+                    {
+                        let element = Self::tsc_primitive_union_order(element);
+                        if !matches!(element, Type::Any | Type::Error | Type::Unknown)
+                            && !matches!(target_ty, Type::Any | Type::Error)
+                            && !self.is_assignable_to(&element, target_ty)
+                        {
+                            self.push_not_assignable(&element, target_ty, target_span);
                         }
                     }
                 }
@@ -31931,8 +32221,13 @@ impl TypeChecker {
                     ExprKind::Ident(_) => {} // write-only
                     ExprKind::Member(m) => {
                         self.collect_names_in_expr(&m.object);
-                        // Property access in LHS is still a usage (getter/setter)
-                        self.used_names.insert(m.property.to_string());
+                        // A plain write is not a read of a property (it does
+                        // use a setter); a compound one reads it too.
+                        if assign.op == AssignOp::Assign {
+                            self.written_member_names.insert(m.property.to_string());
+                        } else {
+                            self.used_names.insert(m.property.to_string());
+                        }
                     }
                     _ => self.collect_names_in_expr(&assign.left),
                 }
@@ -32653,8 +32948,9 @@ impl TypeChecker {
                 if check_decl {
                     if !self.is_name_used(&enum_decl.name, exported_names) {
                         let span = enum_decl.name_span.unwrap_or(enum_decl.span);
+                        // An enum is a type declaration to tsc: TS6196.
                         self.diagnostics
-                            .push(error_unused_local(&enum_decl.name, span));
+                            .push(error_unused_decl(&enum_decl.name, span));
                     }
                 }
             }
@@ -32815,6 +33111,21 @@ impl TypeChecker {
         // Check for unused private members (properties, methods, getters, setters)
         if self.no_unused_locals {
             for member in members.iter() {
+                // tsc reports an unused accessor pair once, on the getter.
+                if let ClassMemberKind::SetAccessor(setter) = &member.kind {
+                    let has_getter = members.iter().any(|other| {
+                        matches!(&other.kind, ClassMemberKind::GetAccessor(getter)
+                            if getter.name.ident_name().is_some()
+                                && getter.name.ident_name() == setter.name.ident_name())
+                    });
+                    if has_getter {
+                        continue;
+                    }
+                }
+                let is_accessor = matches!(
+                    member.kind,
+                    ClassMemberKind::GetAccessor(_) | ClassMemberKind::SetAccessor(_)
+                );
                 let (name_opt, modifiers, span): (Option<&str>, u32, tsc_rs_ast::Span) =
                     match &member.kind {
                         ClassMemberKind::Property(prop) => {
@@ -32841,7 +33152,9 @@ impl TypeChecker {
                     let is_private = modifiers & tsc_rs_ast::MOD_PRIVATE != 0;
                     // Also check for ES private names (#field)
                     let is_es_private = name.starts_with('#');
-                    if (is_private || is_es_private) && !self.used_names.contains(name) {
+                    let used = self.used_names.contains(name)
+                        || (is_accessor && self.written_member_names.contains(name));
+                    if (is_private || is_es_private) && !used {
                         self.diagnostics.push(error_unused_local(name, span));
                     }
                 }
@@ -38653,14 +38966,17 @@ impl TypeChecker {
             file_name: file.clone(),
             span: Some(span),
         };
+        let mut defaults: Vec<(Kind, Span)> = Vec::new();
         for statement in stmts {
             let StmtKind::Export(export) = &statement.kind else {
                 continue;
             };
-            let (kind, span) = match &export.kind {
+            // An anonymous declaration's error span is its `export` keyword.
+            let export_keyword = Span::new(statement.span.start, statement.span.start + 6);
+            let entry = match &export.kind {
                 ExportDeclKind::DefaultDecl(declaration) => match &declaration.kind {
-                    StmtKind::FnDecl(f) => (Kind::Function, f.name_span.unwrap_or(statement.span)),
-                    StmtKind::ClassDecl(c) => (Kind::Class, c.name_span.unwrap_or(statement.span)),
+                    StmtKind::FnDecl(f) => (Kind::Function, f.name_span.unwrap_or(export_keyword)),
+                    StmtKind::ClassDecl(c) => (Kind::Class, c.name_span.unwrap_or(export_keyword)),
                     StmtKind::InterfaceDecl(i) => {
                         (Kind::Interface, i.name_span.unwrap_or(statement.span))
                     }
@@ -38672,6 +38988,12 @@ impl TypeChecker {
                 }
                 _ => continue,
             };
+            defaults.push(entry);
+        }
+        // Function declarations are hoisted: tsc binds them before the
+        // other default exports, so they come "first".
+        defaults.sort_by_key(|(kind, _)| *kind != Kind::Function);
+        for (kind, span) in defaults {
             let has = |k: Kind| symbol.iter().any(|(existing, _)| *existing == k);
             let conflict = !symbol.is_empty()
                 && match kind {

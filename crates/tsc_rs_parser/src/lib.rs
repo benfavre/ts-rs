@@ -95,8 +95,21 @@ pub fn has_syntax_errors(diagnostics: &[Diagnostic]) -> bool {
 /// regardless of file extension.
 pub fn parse_with_jsx(file_name: &str, source: &str, jsx_enabled: bool) -> SourceFile {
     let scanner = Scanner::new(source);
-    let (tokens, raw_comments, conflict_markers) =
+    let (mut tokens, raw_comments, conflict_markers) =
         scanner.scan_all_with_comments_and_conflict_markers();
+    // TS1490: tsc's scanner treats everything from a U+FFFD replacement
+    // character to the end of the file as trivia of a binary file.
+    let binary_at = tokens.iter().position(|token| {
+        token.kind == TokenKind::Unknown
+            && source[token.span.start as usize..].starts_with('\u{fffd}')
+    });
+    if let Some(index) = binary_at {
+        let end = source.len() as u32;
+        let mut eof = tokens.last().cloned().expect("EOF token");
+        eof.span = Span::new(end, end);
+        tokens.truncate(index);
+        tokens.push(eof);
+    }
     let lower_file_name = file_name.to_ascii_lowercase();
     let is_declaration_file = lower_file_name.ends_with(".d.ts")
         || lower_file_name.ends_with(".d.tsx")
@@ -107,6 +120,56 @@ pub fn parse_with_jsx(file_name: &str, source: &str, jsx_enabled: bool) -> Sourc
         || lower_file_name.ends_with(".mjs")
         || lower_file_name.ends_with(".cjs");
     let mut p = Parser::new(source, tokens, jsx_enabled, is_declaration_file, is_js_file);
+    // TS1002: a string literal the scanner ended at a line break or EOF.
+    for index in 0..p.tokens.len() {
+        if p.tokens[index].kind != TokenKind::StringLiteral {
+            continue;
+        }
+        let span = p.tokens[index].span;
+        let bytes = &source.as_bytes()[span.start as usize..span.end as usize];
+        let terminated = bytes.len() >= 2
+            && bytes[bytes.len() - 1] == bytes[0]
+            && bytes[1..bytes.len() - 1]
+                .iter()
+                .rev()
+                .take_while(|&&byte| byte == b'\\')
+                .count()
+                % 2
+                == 0;
+        if !terminated {
+            p.diagnostics.push(Diagnostic {
+                code: 1002,
+                message: "Unterminated string literal.".to_string(),
+                category: DiagnosticCategory::Error,
+                file_name: Some(file_name.to_string()),
+                span: Some(Span::new(span.end, span.end)),
+                related: None,
+            });
+        }
+    }
+    if binary_at.is_some() {
+        p.diagnostics.push(Diagnostic {
+            code: 1490,
+            message: "File appears to be binary.".to_string(),
+            category: DiagnosticCategory::Error,
+            file_name: Some(file_name.to_string()),
+            span: Some(Span::new(0, 0)),
+            related: None,
+        });
+    }
+    for index in 0..p.tokens.len() {
+        if p.tokens[index].kind == TokenKind::Unknown {
+            let start = p.tokens[index].span.start;
+            p.diagnostics.push(Diagnostic {
+                code: 1127,
+                message: "Invalid character.".to_string(),
+                category: DiagnosticCategory::Error,
+                file_name: Some(file_name.to_string()),
+                span: Some(Span::new(start, start)),
+                related: None,
+            });
+        }
+    }
     let statements = p.parse_source_elements();
     let suppress_typescript_ts1206 = p.suppress_typescript_ts1206;
     let mut diagnostics = p.diagnostics;
@@ -122,6 +185,42 @@ pub fn parse_with_jsx(file_name: &str, source: &str, jsx_enabled: bool) -> Sourc
                 related: None,
             });
         }
+        diagnostics.sort_by_key(|diagnostic| diagnostic.span.map_or(0, |span| span.start));
+    }
+    // TS1127: tsc's scanner reports an invalid character (zero-length) and
+    // hands the parser an Unknown token it skips. Reported eagerly so regex
+    // and JSX-text rescans can withdraw it like the other scanner errors.
+    // A TS1002 string token that a JSX rescan replaced was never a string.
+    if jsx_enabled {
+        diagnostics.retain(|diagnostic| {
+            !(diagnostic.code == 1002 && diagnostic.message == "Unterminated string literal.")
+                || diagnostic.span.is_some_and(|span| {
+                    p.tokens.iter().any(|token| {
+                        token.kind == TokenKind::StringLiteral && token.span.end == span.end
+                    })
+                })
+        });
+    }
+    // tsc keeps one scanner error per position: an escape error inside the
+    // string (TS1125/TS1198/TS1199) reported where the string also ends wins.
+    let escape_error_starts: Vec<u32> = diagnostics
+        .iter()
+        .filter(|diagnostic| matches!(diagnostic.code, 1125 | 1198 | 1199))
+        .filter_map(|diagnostic| diagnostic.span.map(|span| span.start))
+        .collect();
+    if !escape_error_starts.is_empty() {
+        diagnostics.retain(|diagnostic| {
+            !(diagnostic.code == 1002
+                && diagnostic.message == "Unterminated string literal."
+                && diagnostic
+                    .span
+                    .is_some_and(|span| escape_error_starts.contains(&span.start)))
+        });
+    }
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == 1127
+            || (diagnostic.code == 1002 && diagnostic.message == "Unterminated string literal.")
+    }) {
         diagnostics.sort_by_key(|diagnostic| diagnostic.span.map_or(0, |span| span.start));
     }
     // TS1160: the scanner ends an unterminated template at EOF without
@@ -512,7 +611,9 @@ impl<'a> Parser<'a> {
     /// diagnostics covered by that successful reinterpretation.
     pub(crate) fn suppress_eager_scanner_diagnostics_in_span(&mut self, covered_span: Span) {
         self.diagnostics.retain(|diagnostic| {
-            !matches!(diagnostic.code, 1121 | 1125 | 18026)
+            !(matches!(diagnostic.code, 1121 | 1125 | 1127 | 18026)
+                || (diagnostic.code == 1002
+                    && diagnostic.message == "Unterminated string literal."))
                 || !diagnostic.span.is_some_and(|span| {
                     span.start >= covered_span.start && span.end <= covered_span.end
                 })
@@ -637,6 +738,7 @@ impl<'a> Parser<'a> {
         let mut hexadecimal_failure_starts = Vec::new();
         let mut suppressed_octal_starts = Vec::new();
         let mut found = Vec::new();
+        let mut extended_escape_errors: Vec<(usize, usize, u32)> = Vec::new();
 
         while offset + 1 < bytes.len() {
             if bytes[offset] != b'\\' {
@@ -676,6 +778,16 @@ impl<'a> Parser<'a> {
                     // missing closing brace is TS1199 rather than TS1125.
                     if failure == offset + 3 {
                         hexadecimal_failure_starts.push(failure);
+                    } else if bytes.get(failure) != Some(&b'}') {
+                        extended_escape_errors.push((failure, failure, 1199));
+                    } else {
+                        let digits = &self.text(span)[offset + 3..failure];
+                        let digits = digits.trim_start_matches('0');
+                        if digits.len() > 6
+                            || u32::from_str_radix(digits, 16).is_ok_and(|value| value > 0x10FFFF)
+                        {
+                            extended_escape_errors.push((offset + 3, failure, 1198));
+                        }
                     }
                     if bytes.get(failure) == Some(&b'\\') {
                         suppressed_octal_starts.push(failure);
@@ -733,6 +845,18 @@ impl<'a> Parser<'a> {
             offset = end;
         }
 
+        for (start, end, code) in extended_escape_errors {
+            let message = if code == 1198 {
+                "An extended Unicode escape value must be between 0x0 and 0x10FFFF inclusive."
+            } else {
+                "Unterminated Unicode escape sequence."
+            };
+            self.error_at_span(
+                code,
+                message.to_string(),
+                Span::new(span.start + start as u32, span.start + end as u32),
+            );
+        }
         for failure in hexadecimal_failure_starts {
             let failure = span.start + failure as u32;
             let failure_span = Span::new(failure, failure);
@@ -8225,7 +8349,7 @@ impl<'a> Parser<'a> {
         if self.at(TokenKind::With) || self.at(TokenKind::Assert) {
             self.bump(); // consume `with` / `assert`
             if self.at(TokenKind::OpenBrace) {
-                self.bump(); // consume `{`
+                let opening = self.bump(); // consume `{`
                 let mut depth = 1u32;
                 let mut template_tags = Vec::new();
                 while depth > 0 && !self.is_eof() {
@@ -8253,6 +8377,16 @@ impl<'a> Parser<'a> {
                         }
                     }
                 }
+                if depth > 0 {
+                    self.matching_delimiter_error(
+                        Some(opening),
+                        TokenKind::OpenBrace,
+                        TokenKind::CloseBrace,
+                    );
+                }
+            } else {
+                let at = self.cur_span();
+                self.error_at_span(1005, "'{' expected.".to_string(), at);
             }
         }
         has_resolution_mode
