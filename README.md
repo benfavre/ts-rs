@@ -60,14 +60,14 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-All results below were measured on 2026-10-10 at `f64b8ea63`, with the
+All results below were measured on 2026-10-10 at `76ae18ea2`, with the
 result cache disabled. Pass rates are `passed / (passed + failed)`; skipped
 cases are never counted as passes.
 
 | Lane | Compiler suite | Conformance suite | What it measures |
 |---|---:|---:|---|
 | JavaScript emit | 6,032 / 6,032 (100%) | 5,388 / 5,388 (100%) | Byte-for-byte match with the `tsc` `.js` baseline (one configuration per case) |
-| Diagnostics | 4,796 / 6,529 (73.5%) | 3,646 / 5,907 (61.7%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
+| Diagnostics | 4,805 / 6,529 (73.6%) | 3,650 / 5,907 (61.8%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
 | Symbols | 1,722 / 6,434 (26.8%) | 1,568 / 5,617 (27.9%) | Match with the `tsc` `.symbols` baseline |
 | Types | 604 / 6,434 (9.4%) | 558 / 5,617 (9.9%) | Match with the `tsc` `.types` baseline |
 | Type-check recall / precision | 59.8% / 85.8% | 67.0% / 88.4% | Per-diagnostic `(file, line, code)` match over every option variant |
@@ -97,10 +97,10 @@ Expanded option variants (14,819 identities, 1,016 skips per lane):
 
 | Lane | Passed | Failed | Pass rate |
 |---|---:|---:|---:|
-| JavaScript | 12,847 | 956 | 93.1% |
+| JavaScript | 12,938 | 865 | 93.7% |
 | Declarations | 12,156 | 1,647 | 88.1% |
 
-Remaining diagnostic mismatches: 1,733 compiler cases and 2,261 conformance
+Remaining diagnostic mismatches: 1,724 compiler cases and 2,257 conformance
 cases. Expanded emit failures are mainly ES5 transforms and declarations;
 LSP gaps include contextual typing, generics, JSDoc and cross-file information.
 Symbol and type baselines still have substantial gaps.

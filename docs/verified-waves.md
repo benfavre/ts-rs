@@ -1769,3 +1769,35 @@ were run cache-free; JavaScript emit stays at 100% in both suites; symbol,
 type and LSP results are unchanged. All 3,429 public Rust tests pass with
 37 ignored, and `make ci` passes. The preceding snapshot is retained at
 `docs/compatibility-metrics-2026-10-09-cb31e5f25.json`.
+
+## 2026-10-10: ES5 lowering and diagnostic ordering
+
+ES5 output now flattens destructuring declarations and parameters as tsc's
+flattenDestructuringBinding does (temps, direct reads for single-element
+patterns, `=== void 0` defaults), lowers classes with legacy decorators
+(applied inside the class IIFE), ES module default-exported classes and
+members reading `super` (`_super.prototype.m.call(this)`), and lowers
+arrows that read `this` through a `var _this = this` capture. Async bodies
+with `let`/`const` declarations take the ES5 generator transform.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,796 | 4,805 |
+| Conformance | 3,646 | 3,650 |
+
+| Lane | Compiler before | After | Conformance before | After |
+|---|---:|---:|---:|---:|
+| Expanded JavaScript | 6,460 | 6,494 | 6,387 | 6,444 |
+
+Errors baselines now order diagnostics as tsc's compareDiagnostics does:
+a shorter span first at one position, and every file-less diagnostic in one
+global list sorted by code. TS1011 has tsc's empty span, and a truthiness
+guard narrows a static member read through its class name.
+
+The measured commit is public `76ae18ea29`; checker lanes were measured
+before a depth limit on ES5-only span collection that does not affect
+them, and the emitter lanes, Rust tests and `make ci` were run on the
+commit itself. JavaScript emit stays at 100% in both suites. All 3,429
+public Rust tests pass with 37 ignored, and `make ci` passes. The
+preceding snapshot is retained at
+`docs/compatibility-metrics-2026-10-10-f64b8ea63.json`.
