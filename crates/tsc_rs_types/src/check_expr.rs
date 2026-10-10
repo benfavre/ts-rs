@@ -3155,6 +3155,9 @@ impl TypeChecker {
         check_initializers: bool,
         check_legacy_decorators: bool,
     ) {
+        // Only an async function's parameters parse `await` as the keyword
+        // (TS2524 in an initializer).
+        let owner_async = std::mem::take(&mut self.params_owner_async);
         // Initializers may reference parameters declared before them; those
         // names are not bound yet at this point, so they are recorded as
         // provisional and resolve to `any` instead of TS2304.
@@ -3232,11 +3235,72 @@ impl TypeChecker {
                             });
                         }
                     }
-                    self.check_expr(initializer);
+                    // TS2524 marks an `await` of this initializer itself
+                    // (not of a function nested in it).
+                    let saved_initializer = std::mem::replace(
+                        &mut self.param_initializer_async_len,
+                        owner_async.then_some(self.return_is_async_stack.len()),
+                    );
+                    // An annotated parameter's initializer must fit the
+                    // annotation (TS2322 at the parameter's name).
+                    match &parameter.type_ann {
+                        Some(annotation) if !parameter.dotdotdot => {
+                            let declared = self.resolve_type_node(annotation);
+                            let init_ty = self.check_expr_contextual(initializer, Some(&declared));
+                            self.check_parameter_initializer_type(
+                                parameter,
+                                initializer,
+                                &init_ty,
+                                &declared,
+                            );
+                        }
+                        _ => {
+                            self.check_expr(initializer);
+                        }
+                    }
+                    self.param_initializer_async_len = saved_initializer;
                 }
             }
         }
         self.provisional_param_names = saved_provisional;
+    }
+
+    fn check_parameter_initializer_type(
+        &mut self,
+        parameter: &Param,
+        initializer: &Expr,
+        init_ty: &Type,
+        declared: &Type,
+    ) {
+        if matches!(declared, Type::Any | Type::Error)
+            || matches!(init_ty, Type::Any | Type::Error)
+            || self.contains_unresolved_type_param(declared)
+        {
+            return;
+        }
+        if self.is_assignable_to(init_ty, declared) {
+            // A fresh object literal can still carry excess properties.
+            if Self::is_fresh_object_literal(initializer) {
+                let shape = self
+                    .excess_check_shape(declared)
+                    .unwrap_or_else(|| declared.clone());
+                self.check_excess_properties_named(
+                    init_ty,
+                    &shape,
+                    declared,
+                    parameter.name.span,
+                    Some(initializer),
+                );
+            }
+            return;
+        }
+        let origin = parameter.type_ann.as_ref().map(ExpectedOrigin::Node);
+        if self.elaborate_error(initializer, init_ty, declared, origin) {
+            return;
+        }
+        let shown = self.widen_for_message(Some(initializer), init_ty, declared);
+        // tsc marks the whole parameter declaration.
+        self.push_not_assignable(&shown, declared, parameter.span);
     }
 
     /// Identifier reads that execute when `expr` is evaluated (not inside
@@ -7943,6 +8007,25 @@ impl TypeChecker {
                         }
                     }
                     Type::Any | Type::Error => Type::Any,
+                    // A member of `never` is TS2339 where the `never` is
+                    // certain: a binding declared `never`, or one a negated
+                    // `typeof` guard exhausted.
+                    Type::Never
+                        if matches!(&mem.object.kind, ExprKind::Ident(name)
+                            if self.lookup_declared_var(name) == Some(Type::Never)
+                                || self.typeof_exhausted_names.lock().is_ok_and(|names| names.contains(name.as_str()))) =>
+                    {
+                        let property_span = Span::new(
+                            expr.span.end.saturating_sub(mem.property.len() as u32),
+                            expr.span.end,
+                        );
+                        self.diagnostics.push(error_property_not_exist(
+                            &mem.property,
+                            "never",
+                            property_span,
+                        ));
+                        Type::Error
+                    }
                     // Member access on a namespace import (`z.string`).
                     // The module's exports were resolved during the donor's
                     // `build_module_exports` pass and stored verbatim in the
@@ -7954,6 +8037,24 @@ impl TypeChecker {
                         {
                             ty.clone()
                         } else {
+                            // TS2339 on a namespace import of a resolved
+                            // module file: tsc names it by that file.
+                            if let Some(file) = &info.file {
+                                let shown = [".d.ts", ".d.mts", ".d.cts", ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]
+                                    .iter()
+                                    .find_map(|extension| file.strip_suffix(extension))
+                                    .unwrap_or(file)
+                                    .to_string();
+                                let property_span = Span::new(
+                                    expr.span.end.saturating_sub(mem.property.len() as u32),
+                                    expr.span.end,
+                                );
+                                self.diagnostics.push(error_property_not_exist(
+                                    &mem.property,
+                                    &format!("typeof import(\"{shown}\")"),
+                                    property_span,
+                                ));
+                            }
                             Type::Any
                         }
                     }
@@ -9239,49 +9340,64 @@ impl TypeChecker {
                 // the variable into a callable object with the new property,
                 // so subsequent structural assignments see both halves of
                 // the value (`fn.extra = value; const x: HasExtra = fn`).
-                if assign.op == AssignOp::Assign && !self.current_file_is_js() {
+                // In JavaScript a function declaration, or a function whose
+                // prototype is written, is a constructor (class-like), not an
+                // expando-carrying value.
+                let js_constructor_like = |checker: &Self, name: &str| {
+                    checker.current_file_is_js()
+                        && checker.current_source.as_deref().is_some_and(|text| {
+                            text.contains(&format!("function {name}"))
+                                || text.contains(&format!("{name}.prototype"))
+                        })
+                };
+                if assign.op == AssignOp::Assign {
                     if let ExprKind::Member(member) = &assign.left.kind {
                         if let ExprKind::Ident(name) = &member.object.kind {
-                            let expanded = self.lookup_var(name).cloned().and_then(|base| {
-                                let mut info = match base {
-                                    Type::Function(signature) => {
-                                        ObjectTypeInfo::new(ObjectTypeData {
-                                            properties: Vec::new(),
-                                            call_signatures: vec![signature],
-                                            construct_signatures: Vec::new(),
-                                            index_signature: None,
-                                            index_signature_name: None,
-                                            method_names: Vec::new(),
-                                        })
+                            let expanded = (!js_constructor_like(self, name))
+                                .then(|| self.lookup_var(name).cloned())
+                                .flatten()
+                                .and_then(|base| {
+                                    let mut info = match base {
+                                        Type::Function(signature) => {
+                                            ObjectTypeInfo::new(ObjectTypeData {
+                                                properties: Vec::new(),
+                                                call_signatures: vec![signature],
+                                                construct_signatures: Vec::new(),
+                                                index_signature: None,
+                                                index_signature_name: None,
+                                                method_names: Vec::new(),
+                                            })
+                                        }
+                                        Type::ObjectType(info)
+                                            if !info.call_signatures.is_empty() =>
+                                        {
+                                            info
+                                        }
+                                        _ => return None,
+                                    };
+                                    if !info
+                                        .properties
+                                        .iter()
+                                        .any(|(property, _)| property == &member.property)
+                                        && !matches!(
+                                            member.property.as_str(),
+                                            "length"
+                                                | "name"
+                                                | "bind"
+                                                | "call"
+                                                | "apply"
+                                                | "caller"
+                                                | "prototype"
+                                                | "toString"
+                                        )
+                                    {
+                                        info.properties.push((
+                                            member.property.to_string(),
+                                            Arc::new(self.widen_type(&right_ty)),
+                                        ));
                                     }
-                                    Type::ObjectType(info) if !info.call_signatures.is_empty() => {
-                                        info
-                                    }
-                                    _ => return None,
-                                };
-                                if !info
-                                    .properties
-                                    .iter()
-                                    .any(|(property, _)| property == &member.property)
-                                    && !matches!(
-                                        member.property.as_str(),
-                                        "length"
-                                            | "name"
-                                            | "bind"
-                                            | "call"
-                                            | "apply"
-                                            | "caller"
-                                            | "prototype"
-                                            | "toString"
-                                    )
-                                {
-                                    info.properties.push((
-                                        member.property.to_string(),
-                                        Arc::new(self.widen_type(&right_ty)),
-                                    ));
-                                }
-                                Some(Type::ObjectType(info))
-                            });
+                                    Some(Type::ObjectType(info))
+                                });
                             if let Some(expanded) = expanded {
                                 self.narrow_var(name, expanded);
                             }
@@ -9736,6 +9852,7 @@ impl TypeChecker {
                             );
                             let saved_var_first_types = std::mem::take(&mut self.var_first_types);
                             self.check_parameter_decorators(&m.params, false);
+                            self.params_owner_async = m.is_async;
                             self.check_parameter_runtime_expressions(&m.params, true, false);
                             self.declare_var("arguments", self.arguments_object_type());
                             self.declare_var(SUPER_PROPERTY_OK_MARKER, Type::Never);
@@ -9948,6 +10065,7 @@ impl TypeChecker {
                 );
                 let saved_var_first_types2 = std::mem::take(&mut self.var_first_types);
                 self.check_arrow_parameter_decorators(&arrow.params);
+                self.params_owner_async = arrow.is_async;
                 self.check_parameter_runtime_expressions(&arrow.params, true, false);
                 // TS2369: check for parameter properties in arrow functions
                 for p in &arrow.params {
@@ -10122,6 +10240,7 @@ impl TypeChecker {
                 let saved_var_first_types2 = std::mem::take(&mut self.var_first_types);
                 self.check_decorators_with_validity(&fn_decl.decorators, false);
                 self.check_parameter_decorators(&fn_decl.params, false);
+                self.params_owner_async = fn_decl.is_async;
                 self.check_parameter_runtime_expressions(
                     &fn_decl.params,
                     fn_decl.body.is_some(),
@@ -10324,7 +10443,11 @@ impl TypeChecker {
                     } else {
                         self.check_expr(&a.expr)
                     };
-                    self.check_assertion_comparability(&source_ty, &target, expr.span);
+                    self.check_assertion_comparability(
+                        &Self::base_type_of_literal(&source_ty),
+                        &target,
+                        expr.span,
+                    );
                     target
                 }
             }
@@ -10334,12 +10457,37 @@ impl TypeChecker {
                 }
                 let target_type = self.resolve_type_node(&s.type_node);
                 let expr_type = self.check_expr_contextual(&s.expr, Some(&target_type));
-                if !self.is_assignable_to(&expr_type, &target_type) {
+                // tsc elaborates into the literal first (a nested property's
+                // own error), then reports TS1360 for the whole expression.
+                let elaborated = !self.is_assignable_to(&expr_type, &target_type)
+                    && self.elaborate_error(&s.expr, &expr_type, &target_type, None);
+                // An excess property is the relation's error (TS2353), in
+                // place of TS1360. It is found on the computed shape
+                // (`Record<Keys, unknown>`) but named as written.
+                let before_excess = self.diagnostics.len();
+                if !elaborated && Self::is_fresh_object_literal(&s.expr) {
+                    let folded = self
+                        .excess_check_shape(&target_type)
+                        .unwrap_or_else(|| target_type.clone());
+                    self.check_excess_properties_named(
+                        &expr_type,
+                        &folded,
+                        &target_type,
+                        expr.span,
+                        Some(&s.expr),
+                    );
+                }
+                let excess_reported = self.diagnostics.len() > before_excess;
+                if !elaborated
+                    && !excess_reported
+                    && !self.is_assignable_to(&expr_type, &target_type)
+                {
+                    let shown = self.widen_for_message(Some(&s.expr), &expr_type, &target_type);
                     self.diagnostics.push(Diagnostic {
                         code: 1360,
                         message: format!(
                             "Type '{}' does not satisfy the expected type '{}'.",
-                            expr_type.display_string(),
+                            shown.display_string(),
                             target_type.display_string()
                         ),
                         category: DiagnosticCategory::Error,
@@ -10347,14 +10495,6 @@ impl TypeChecker {
                         span: Some(expr.span),
                         related: None,
                     });
-                }
-                if Self::is_fresh_object_literal(&s.expr) {
-                    self.check_excess_properties(
-                        &expr_type,
-                        &target_type,
-                        expr.span,
-                        Some(&s.expr),
-                    );
                 }
                 expr_type
             }
@@ -10384,7 +10524,11 @@ impl TypeChecker {
                     self.check_expr(&ta.expr)
                 };
                 if !target_has_type_error {
-                    self.check_assertion_comparability(&source_ty, &target, expr.span);
+                    self.check_assertion_comparability(
+                        &Self::base_type_of_literal(&source_ty),
+                        &target,
+                        expr.span,
+                    );
                 }
                 target
             }
@@ -10485,6 +10629,42 @@ impl TypeChecker {
                     Type::String | Type::StringLiteral(_) => Type::String,
                     _ => ty,
                 }
+            }
+            ExprKind::Await(inner)
+                if self.param_initializer_async_len == Some(self.return_is_async_stack.len()) =>
+            {
+                self.diagnostics.push(Diagnostic {
+                    code: 2524,
+                    message: "'await' expressions cannot be used in a parameter initializer."
+                        .to_string(),
+                    category: DiagnosticCategory::Error,
+                    file_name: None,
+                    span: Some(Span::new(expr.span.start, expr.span.start + 5)),
+                    related: None,
+                });
+                if !matches!(inner.kind, ExprKind::Omitted) {
+                    self.check_expr(inner);
+                } else {
+                    // The keyword's operand is missing too (TS1109).
+                    let next = self.current_source.as_deref().and_then(|src| {
+                        let from = expr.span.start as usize + 5;
+                        src.get(from..)?
+                            .char_indices()
+                            .find(|(_, c)| !c.is_whitespace())
+                            .map(|(offset, _)| (from + offset) as u32)
+                    });
+                    if let Some(at) = next {
+                        self.diagnostics.push(Diagnostic {
+                            code: 1109,
+                            message: "Expression expected.".to_string(),
+                            category: DiagnosticCategory::Error,
+                            file_name: None,
+                            span: Some(Span::new(at, at + 1)),
+                            related: None,
+                        });
+                    }
+                }
+                Type::Any
             }
             ExprKind::Await(inner) if matches!(inner.kind, ExprKind::Omitted) => {
                 // `await` directly before `]`, `)`, `,` or `;`. Inside an async
@@ -13279,6 +13459,7 @@ impl TypeChecker {
                     &method.params,
                     legacy_decorators && !class_is_expression && method.body.is_some(),
                 );
+                self.params_owner_async = method.is_async;
                 self.check_parameter_runtime_expressions(
                     &method.params,
                     has_runtime_implementation,

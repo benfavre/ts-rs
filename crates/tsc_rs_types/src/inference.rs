@@ -852,6 +852,7 @@ pub fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
 
         Type::Module(m) => Type::Module(crate::ModuleType {
             name: m.name.clone(),
+            file: m.file.clone(),
             exports: m
                 .exports
                 .iter()

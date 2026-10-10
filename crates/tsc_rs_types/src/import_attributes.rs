@@ -131,3 +131,44 @@ fn attributes_span(source: &str, stmt: Span, specifier_end: Option<u32>) -> Opti
     }
     None
 }
+
+impl TypeChecker {
+    /// TS18043: a JavaScript `export { T }` naming only a type (an
+    /// interface or type alias, with no value of that name).
+    pub(crate) fn check_js_type_only_export(&mut self, stmt: &Stmt) {
+        if !self.current_file_is_js() {
+            return;
+        }
+        let StmtKind::Export(export) = &stmt.kind else {
+            return;
+        };
+        let ExportDeclKind::Named {
+            specifiers,
+            source: None,
+            type_only: false,
+        } = &export.kind
+        else {
+            return;
+        };
+        for specifier in specifiers {
+            let name = specifier.local.as_str();
+            let names_type =
+                self.interface_info.contains_key(name) || self.type_aliases.contains_key(name);
+            if names_type && self.lookup_var(name).is_none() && !specifier.is_type {
+                self.diagnostics.push(Diagnostic {
+                    code: 18043,
+                    message: "Types cannot appear in export declarations in JavaScript files."
+                        .to_string(),
+                    category: DiagnosticCategory::Error,
+                    file_name: None,
+                    // tsc marks the local name, not `local as exported`.
+                    span: Some(Span::new(
+                        specifier.span.start,
+                        specifier.span.start + name.len() as u32,
+                    )),
+                    related: None,
+                });
+            }
+        }
+    }
+}

@@ -5352,6 +5352,15 @@ impl BaselineRunner {
                         || lower.ends_with(".mjs")
                         || lower.ends_with(".cjs")));
             let parsed = tsc_rs_parser::parse_with_jsx(&file.name, &file.content, is_jsx);
+            // Program-wide passes see a JavaScript file's JSDoc types too.
+            let is_js = [".js", ".jsx", ".mjs", ".cjs"]
+                .iter()
+                .any(|extension| lower.ends_with(extension));
+            let parsed = if is_js {
+                tsc_rs_types::desugar_jsdoc(&parsed).unwrap_or(parsed)
+            } else {
+                parsed
+            };
             if test_case.files.len() > 1 {
                 collect_top_level_names(&parsed, &mut cross_file_names);
             }
@@ -5942,7 +5951,10 @@ impl BaselineRunner {
         // (TS6054). Per-file outputs are only modeled without outDir; with
         // outFile only the bundled declaration file is modeled.
         let overwrite_related = "  Adding a tsconfig.json file will help organize projects that contain both TypeScript and JavaScript files. Learn more at https://aka.ms/tsconfig.".to_string();
-        let allow_js_inputs = effective_options.allow_js == Some(true);
+        // `allowJs` defaults to `checkJs`.
+        let allow_js_inputs = effective_options
+            .allow_js
+            .unwrap_or(effective_options.check_js == Some(true));
         let declaration_on = effective_options.declaration == Some(true)
             || effective_options.composite == Some(true);
         let emit_js = effective_options.emit_declaration_only != Some(true)

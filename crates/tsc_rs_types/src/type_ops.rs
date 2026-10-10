@@ -244,6 +244,7 @@ fn substitute_inner(ty: &Type, name: &str, replacement: &Type) -> Type {
 
         Type::Module(m) => Type::Module(crate::ModuleType {
             name: m.name.clone(),
+            file: m.file.clone(),
             exports: m
                 .exports
                 .iter()

@@ -1071,16 +1071,34 @@ impl TypeChecker {
         _narrowed_ty: &Type,
     ) -> Vec<(std::string::String, Type)> {
         // In the else branch, we remove the narrowed type from the variable's type
-        if let Some(Type::Union(members)) = self.lookup_var(name) {
-            let filtered: Vec<_> = members
-                .iter()
-                .filter(|m| m != &_narrowed_ty)
-                .cloned()
-                .collect();
-            if !filtered.is_empty() && filtered.len() < members.len() {
-                let result = Type::flatten_union(filtered);
-                return vec![(name.to_string(), result)];
+        match self.lookup_var(name) {
+            Some(Type::Union(members)) => {
+                let filtered: Vec<_> = members
+                    .iter()
+                    .filter(|m| m != &_narrowed_ty)
+                    .cloned()
+                    .collect();
+                if filtered.len() < members.len() {
+                    // Every member removed: the branch's value is `never`.
+                    let result = if filtered.is_empty() {
+                        if let Ok(mut names) = self.typeof_exhausted_names.lock() {
+                            names.insert(name.to_string());
+                        }
+                        Type::Never
+                    } else {
+                        Type::flatten_union(filtered)
+                    };
+                    return vec![(name.to_string(), result)];
+                }
             }
+            // `typeof x !== "string"` on `x: string`.
+            Some(declared) if declared == _narrowed_ty => {
+                if let Ok(mut names) = self.typeof_exhausted_names.lock() {
+                    names.insert(name.to_string());
+                }
+                return vec![(name.to_string(), Type::Never)];
+            }
+            _ => {}
         }
         vec![]
     }

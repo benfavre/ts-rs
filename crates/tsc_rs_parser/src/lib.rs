@@ -3850,7 +3850,19 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
+        let body_start = self.cur_span().start;
         let members = self.parse_object_type_members();
+        if self.is_js_file {
+            // The interface's own TS8006 covers its body: tsc reports no
+            // further TypeScript-only syntax inside it.
+            let body_end = self.span_from(start).end;
+            self.diagnostics.retain(|diagnostic| {
+                !(matches!(diagnostic.code, 8002..=8017)
+                    && diagnostic
+                        .span
+                        .is_some_and(|span| span.start >= body_start && span.end <= body_end))
+            });
+        }
         Stmt {
             kind: StmtKind::InterfaceDecl(Box::new(InterfaceDecl {
                 name: name.into(),
@@ -5410,6 +5422,25 @@ impl<'a> Parser<'a> {
     fn parse_yield_expr(&mut self, start: u32) -> Expr {
         self.bump(); // yield
         let delegate = self.eat(TokenKind::Asterisk).is_some();
+        // `yield*` requires an operand, even across a line break.
+        if delegate
+            && (self.is_eof()
+                || matches!(
+                    self.cur(),
+                    TokenKind::Semicolon
+                        | TokenKind::CloseParen
+                        | TokenKind::CloseBracket
+                        | TokenKind::CloseBrace
+                        | TokenKind::Comma
+                        | TokenKind::Colon
+                ))
+        {
+            self.error_code(1109, "Expression expected.".into());
+            return Expr {
+                kind: ExprKind::Yield(delegate, None),
+                span: self.span_from(start),
+            };
+        }
         let argument = if !self.at(TokenKind::Semicolon)
             && !self.at(TokenKind::CloseParen)
             && !self.at(TokenKind::CloseBracket)
@@ -5417,7 +5448,7 @@ impl<'a> Parser<'a> {
             && !self.at(TokenKind::Comma)
             && !self.at(TokenKind::Colon)
             && !self.is_eof()
-            && !self.is_on_new_line()
+            && (delegate || !self.is_on_new_line())
         {
             Some(Box::new(self.parse_assignment_expr()))
         } else {
@@ -6431,7 +6462,12 @@ impl<'a> Parser<'a> {
                 self.bump();
                 if self.at(TokenKind::CloseParen) {
                     // empty parens - this is arrow params, will be handled
-                    self.bump();
+                    let close = self.bump();
+                    // Not followed by an arrow: an empty parenthesized
+                    // expression, whose operand is missing at `)`.
+                    if !self.at(TokenKind::FatArrow) && !self.at(TokenKind::Colon) {
+                        self.error_at_span(1109, "Expression expected.".to_string(), close);
+                    }
                     Expr {
                         kind: ExprKind::Paren(Box::new(Expr {
                             kind: ExprKind::Omitted,
@@ -6838,6 +6874,9 @@ impl<'a> Parser<'a> {
                         && !self.peek_is(TokenKind::TemplateHead)
                 ) {
                     let sp = self.cur_span();
+                    if !matches!(self.cur(), TokenKind::Module) {
+                        self.error_code(1109, "Expression expected.".into());
+                    }
                     return Expr {
                         kind: ExprKind::Ident("<error>".into()),
                         span: Span {

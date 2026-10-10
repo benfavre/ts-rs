@@ -25,6 +25,7 @@ mod index_constraints;
 mod index_signatures;
 pub mod inference;
 mod interface_heritage;
+mod jsdoc;
 mod jump_targets;
 mod layered_map;
 pub mod narrowing;
@@ -45,6 +46,11 @@ mod use_before_decl;
 use builtins::BuiltinTypes;
 use diagnostics::*;
 pub use diagnostics::{check_deprecated_options, DeprecatedOptionDiag};
+/// A JavaScript file with its JSDoc types written in as annotations, for
+/// program-wide passes that read declarations before checking.
+pub fn desugar_jsdoc(file: &SourceFile) -> Option<SourceFile> {
+    jsdoc::desugar(file)
+}
 pub use type_computations::*;
 
 pub use assign::{is_assignable, AssignError, AssignOpts, AssignResult};
@@ -635,6 +641,15 @@ impl std::hash::Hash for ObjectTypeData {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectTypeInfo(Arc<ObjectTypeData>);
 
+/// Members that one display simplification may materialize from mapped
+/// types before leaving the rest unexpanded.
+const DISPLAY_MAPPED_MEMBER_LIMIT: usize = 5_000;
+
+thread_local! {
+    static DISPLAY_MAPPED_BUDGET: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl ObjectTypeInfo {
     pub fn new(data: ObjectTypeData) -> Self {
         Self(Arc::new(data))
@@ -832,6 +847,16 @@ pub struct NamespaceType {
 pub struct ModuleType {
     pub name: std::string::String,
     pub exports: Vec<(std::string::String, Type)>,
+    /// The resolved module file of a relative specifier: tsc names a
+    /// missing member's type `typeof import("<file without extension>")`.
+    pub file: Option<std::string::String>,
+}
+
+/// The module file a relative specifier resolved to (`None` for packages,
+/// whose resolution is not exact yet).
+pub(crate) fn relative_module_file(specifier: &str, resolved: &str) -> Option<std::string::String> {
+    (specifier.starts_with("./") || specifier.starts_with("../") || specifier.starts_with('/'))
+        .then(|| resolved.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2927,6 +2952,15 @@ pub struct TypeChecker {
     /// Function depths at which enclosing class static blocks were entered:
     /// directly inside one, `await` is the (missing-operand) keyword.
     static_block_fn_depths: Vec<u32>,
+    /// `return_is_async_stack` depth while a parameter initializer is
+    /// checked: an `await` there is TS2524.
+    param_initializer_async_len: Option<usize>,
+    /// Set by a caller of `check_parameter_runtime_expressions`: the
+    /// parameters belong to an async function.
+    params_owner_async: bool,
+    /// Bindings a negated `typeof` guard narrowed to `never` (TS2339 on
+    /// their members is certain there).
+    typeof_exhausted_names: std::sync::Mutex<rustc_hash::FxHashSet<std::string::String>>,
     /// Root identifier of the JSX factory (e.g. "React" from "React.createElement").
     /// When JSX elements/fragments are present, this name is implicitly used.
     jsx_factory_root: Option<String>,
@@ -3343,6 +3377,9 @@ impl Clone for TypeChecker {
             used_names: self.used_names.clone(),
             written_member_names: self.written_member_names.clone(),
             static_block_fn_depths: self.static_block_fn_depths.clone(),
+            param_initializer_async_len: self.param_initializer_async_len,
+            params_owner_async: false,
+            typeof_exhausted_names: Default::default(),
             jsx_factory_root: self.jsx_factory_root.clone(),
             jsx_fragment_root: self.jsx_fragment_root.clone(),
             file_has_jsx: self.file_has_jsx,
@@ -3554,6 +3591,9 @@ impl TypeChecker {
             used_names: rustc_hash::FxHashSet::default(),
             written_member_names: rustc_hash::FxHashSet::default(),
             static_block_fn_depths: Vec::new(),
+            param_initializer_async_len: None,
+            params_owner_async: false,
+            typeof_exhausted_names: Default::default(),
             jsx_factory_root: None,
             jsx_fragment_root: None,
             file_has_jsx: false,
@@ -6671,6 +6711,7 @@ impl TypeChecker {
                         let ty = Type::Module(ModuleType {
                             name: imp.source.clone(),
                             exports: target_exports.clone(),
+                            file: relative_module_file(&imp.source, &target_path),
                         });
                         local_imports.push((ns.clone(), ty));
                     }
@@ -6679,6 +6720,7 @@ impl TypeChecker {
                     let ty = Type::Module(ModuleType {
                         name: imp.source.clone(),
                         exports: target_exports.clone(),
+                        file: relative_module_file(&imp.source, &target_path),
                     });
                     local_imports.push((name.clone(), ty));
                 }
@@ -9537,6 +9579,7 @@ impl TypeChecker {
                         let module_ty = Type::Module(ModuleType {
                             name: source.clone(),
                             exports: target_exports.clone(),
+                            file: relative_module_file(source, &resolved_path),
                         });
                         if !entry.iter().any(|(n, _)| n == alias_name) {
                             entry.push((alias_name.clone(), module_ty));
@@ -11767,6 +11810,21 @@ impl TypeChecker {
         if options.no_check == Some(true) || source_file_has_ts_nocheck(file) {
             return TypeCheckOutput::semantic_checks_skipped();
         }
+        // Checked JavaScript reads its JSDoc types as annotations.
+        let desugared;
+        let file = {
+            let lower = file.file_name.to_ascii_lowercase();
+            let is_js = [".js", ".jsx", ".mjs", ".cjs"]
+                .iter()
+                .any(|extension| lower.ends_with(extension));
+            match is_js.then(|| jsdoc::desugar(file)).flatten() {
+                Some(file_with_types) => {
+                    desugared = file_with_types;
+                    &desugared
+                }
+                None => file,
+            }
+        };
         if self.current_file_name.is_none() {
             self.set_current_file_name(&file.file_name);
         }
@@ -13006,10 +13064,62 @@ impl TypeChecker {
     }
 
     /// Element type produced by iterating `ty` (arrays, tuples, strings).
+    /// tsc's checkGrammarVariableDeclaration outside ambient contexts: a
+    /// destructuring declaration needs an initializer (TS1182), and so does
+    /// a `const` / `using` / `await using` binding (TS1155).
+    fn check_missing_variable_initializers(&mut self, var_stmt: &VarStmt) {
+        // grammarErrorOnNode: silent in a file with parse errors.
+        if !self.check_index_grammar
+            || self.ambient_depth > 0
+            || self.current_file_is_declaration()
+            || var_stmt.modifiers & MOD_DECLARE != 0
+        {
+            return;
+        }
+        for declaration in &var_stmt.declarations {
+            if declaration.init.is_some()
+                || matches!(&declaration.name.kind, PatKind::Ident(name) if name.is_empty() || name == "<error>")
+            {
+                continue;
+            }
+            let (code, message) = match (&declaration.name.kind, var_stmt.kind) {
+                (PatKind::Object(_) | PatKind::Array(_), _) => (
+                    1182,
+                    "A destructuring declaration must have an initializer.".to_string(),
+                ),
+                (_, VarKind::Const) => (
+                    1155,
+                    "'const' declarations must be initialized.".to_string(),
+                ),
+                (_, VarKind::Using) => (
+                    1155,
+                    "'using' declarations must be initialized.".to_string(),
+                ),
+                (_, VarKind::AwaitUsing) => (
+                    1155,
+                    "'await using' declarations must be initialized.".to_string(),
+                ),
+                _ => continue,
+            };
+            self.diagnostics.push(Diagnostic {
+                code,
+                message,
+                category: DiagnosticCategory::Error,
+                file_name: None,
+                span: Some(declaration.name.span),
+                related: None,
+            });
+        }
+    }
+
     /// tsc's checkGrammarForInOrForOfStatement: one declaration, without an
     /// initializer or a type annotation (TS1188/TS1091, TS1190/TS1189,
     /// TS2483/TS2404), reported at the offending declaration's name.
     fn check_for_in_of_declaration_grammar(&mut self, declarations: &VarStmt, is_of: bool) {
+        // grammarErrorOnNode: silent in a file with parse errors.
+        if !self.check_index_grammar {
+            return;
+        }
         let keyword = if is_of { "for...of" } else { "for...in" };
         let (code, message, span) = if let Some(second) = declarations.declarations.get(1) {
             (
@@ -16377,9 +16487,16 @@ impl TypeChecker {
                         Type::Module(ModuleType {
                             name: import_decl.source.clone(),
                             exports: list.clone(),
+                            file: resolved_path
+                                .as_deref()
+                                .and_then(|path| relative_module_file(&import_decl.source, path)),
                         })
                     })
             });
+        // The resolved file of a relative specifier, for TS2339 naming.
+        let module_file = resolved_path
+            .as_deref()
+            .and_then(|path| relative_module_file(&import_decl.source, path));
 
         match &import_decl.specifiers {
             ImportClause::Named {
@@ -16439,6 +16556,7 @@ impl TypeChecker {
                             Type::Module(ModuleType {
                                 name: import_decl.source.clone(),
                                 exports,
+                                file: module_file.clone(),
                             })
                         }
                         _ => Type::Any,
@@ -16459,6 +16577,7 @@ impl TypeChecker {
                     Some(list) if !list.is_empty() => Type::Module(ModuleType {
                         name: import_decl.source.clone(),
                         exports: list.clone(),
+                        file: module_file.clone(),
                     }),
                     _ => Type::Any,
                 };
@@ -18097,7 +18216,15 @@ impl TypeChecker {
             if self.contains_unresolved_type_param(&target_elem) {
                 continue;
             }
-            let source_elem = self.infer_expr_type(item);
+            // The `undefined` identifier is the undefined type here.
+            let source_elem = match &item.kind {
+                ExprKind::Ident(name)
+                    if name == "undefined" && self.lookup_declared_var("undefined").is_none() =>
+                {
+                    Type::Undefined
+                }
+                _ => self.infer_expr_type(item),
+            };
             if matches!(source_elem, Type::Any | Type::Error)
                 || self.is_assignable_to(&source_elem, &target_elem)
             {
@@ -18868,6 +18995,21 @@ impl TypeChecker {
     /// TS2352: a conversion where neither side is assignable to the other
     /// "may be a mistake". `any`/`unknown`/`never`/error types on either
     /// side, and type parameters, are exempt (tsc's comparability check).
+    /// tsc getBaseTypeOfLiteralType: an assertion compares the operand's
+    /// literal as its primitive (`1 as string` converts `number`).
+    pub(crate) fn base_type_of_literal(ty: &Type) -> Type {
+        match ty {
+            Type::NumberLiteral(_) => Type::Number,
+            Type::StringLiteral(_) => Type::String,
+            Type::BooleanLiteral(_) => Type::Boolean,
+            Type::BigIntLiteral(_) => Type::BigInt,
+            Type::Union(members) => {
+                Type::flatten_union(members.iter().map(Self::base_type_of_literal).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
     fn check_assertion_comparability(&mut self, source: &Type, target: &Type, span: Span) {
         self.comparable_depth
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -20249,7 +20391,18 @@ impl TypeChecker {
     /// empty ObjectType breaks object-literal-to-union-of-mapped
     /// assignability (zod's `.refine(fn, { message: "..." })` overload).
     fn simplify_type_for_display(&self, ty: &Type) -> Type {
-        self.simplify_type_modal(ty, true)
+        let outermost = DISPLAY_MAPPED_BUDGET.with(|budget| {
+            let fresh = budget.get().is_none();
+            if fresh {
+                budget.set(Some(DISPLAY_MAPPED_MEMBER_LIMIT));
+            }
+            fresh
+        });
+        let simplified = self.simplify_type_modal(ty, true);
+        if outermost {
+            DISPLAY_MAPPED_BUDGET.with(|budget| budget.set(None));
+        }
+        simplified
     }
 
     /// `Alias<Args>` reduced to the shape it computes, when the alias is a
@@ -21165,14 +21318,34 @@ impl TypeChecker {
                 // would be unsound (keys not enumerable, or a remap stayed
                 // undecided) — keep the Mapped node intact, matching the
                 // old "constraint still abstract" bail.
-                match self.eval_mapped_display(
-                    param,
-                    constraint,
-                    template.as_deref(),
-                    name_type.as_deref(),
-                    *optional_mod,
-                    display,
-                ) {
+                // Display expansion is bounded: a mapped type over a
+                // mapped type (`{[K in keyof Foo]: {[K2 in keyof Foo]: …}}`
+                // with 500 keys) would materialize 250,000 members. tsc
+                // truncates such hovers; past the budget the rest stays
+                // unexpanded.
+                let exhausted =
+                    DISPLAY_MAPPED_BUDGET.with(|budget| budget.get().is_some_and(|left| left == 0));
+                let folded = if exhausted {
+                    None
+                } else {
+                    self.eval_mapped_display(
+                        param,
+                        constraint,
+                        template.as_deref(),
+                        name_type.as_deref(),
+                        *optional_mod,
+                        display,
+                    )
+                };
+                if let Some(Type::ObjectType(info)) = &folded {
+                    let members = info.properties.len();
+                    DISPLAY_MAPPED_BUDGET.with(|budget| {
+                        if let Some(left) = budget.get() {
+                            budget.set(Some(left.saturating_sub(members.max(1))));
+                        }
+                    });
+                }
+                match folded {
                     Some(obj) => self.simplify_type_modal(&obj, display),
                     None => {
                         let constraint_simp = self.simplify_type_modal(constraint, display);
@@ -24557,6 +24730,79 @@ impl TypeChecker {
         })))
     }
 
+    /// The shape an excess-property check reads keys from: `Partial`,
+    /// `Required` and `Readonly` keep their argument's keys, so they are
+    /// peeled before a computed argument (`Record<K, V>`) is folded.
+    pub(crate) fn excess_check_shape(&self, ty: &Type) -> Option<Type> {
+        if let Type::TypeReference(name, args) = ty {
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            if matches!(bare, "Partial" | "Required" | "Readonly") && args.len() == 1 {
+                return self
+                    .excess_check_shape(&args[0])
+                    .or_else(|| Some(args[0].clone()))
+                    .filter(|inner| matches!(inner, Type::ObjectType(_)));
+            }
+            // `Record<K, V>` over literal keys is `{ [each key]: V }`.
+            if bare == "Record" && args.len() == 2 {
+                let keys = self
+                    .resolve_type_for_assignability(&args[0])
+                    .unwrap_or_else(|| args[0].clone());
+                let members: Vec<Type> = match keys {
+                    Type::Union(members) => members.iter().cloned().collect(),
+                    single => vec![single],
+                };
+                let names: Option<Vec<String>> = members
+                    .iter()
+                    .map(|member| match member {
+                        Type::StringLiteral(name) | Type::NumberLiteral(name) => Some(name.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(names) = names {
+                    return Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                        properties: names
+                            .into_iter()
+                            .map(|name| (name, Arc::new(args[1].clone())))
+                            .collect(),
+                        call_signatures: Vec::new(),
+                        construct_signatures: Vec::new(),
+                        index_signature: None,
+                        index_signature_name: None,
+                        method_names: Vec::new(),
+                    })));
+                }
+            }
+        }
+        self.concrete_object_fold(ty)
+    }
+
+    /// `check_excess_properties` against `checked`, with TS2353 naming the
+    /// type as written (`written`) when the two differ.
+    pub(crate) fn check_excess_properties_named(
+        &mut self,
+        source_type: &Type,
+        checked: &Type,
+        written: &Type,
+        span: Span,
+        lit: Option<&Expr>,
+    ) {
+        let before = self.diagnostics.len();
+        self.check_excess_properties(source_type, checked, span, lit);
+        if checked == written {
+            return;
+        }
+        let checked_display = format!("'{}'", checked.display_string_single_line());
+        let written_display = format!("'{}'", written.display_string_single_line());
+        for diagnostic in &mut self.diagnostics[before..] {
+            if diagnostic.code == 2353
+                && diagnostic.message.ends_with(&format!("{checked_display}."))
+            {
+                let cut = diagnostic.message.len() - checked_display.len() - 1;
+                diagnostic.message = format!("{}{written_display}.", &diagnostic.message[..cut]);
+            }
+        }
+    }
+
     fn check_excess_properties(
         &mut self,
         source_type: &Type,
@@ -25648,8 +25894,10 @@ impl TypeChecker {
         reset_instantiation_budget();
         self.check_js_discarded_statement_decorator(stmt);
         self.check_import_attributes(stmt);
+        self.check_js_type_only_export(stmt);
         match &stmt.kind {
             StmtKind::Var(var_stmt) => {
+                self.check_missing_variable_initializers(var_stmt);
                 self.check_type_declaration_computed_names(std::slice::from_ref(stmt));
                 let is_const = matches!(
                     var_stmt.kind,
@@ -25694,12 +25942,14 @@ impl TypeChecker {
                         self.check_type_node_future_lib_globals(ann);
                         self.check_type_node_generic_arity(ann);
                     }
+                    let mut declared_written = None;
                     let declared_type = decl.type_ann.as_ref().map(|ann| {
                         let resolved = self.resolve_binding_annotation(
                             &decl.name,
                             ann,
                             var_stmt.kind == VarKind::Const,
                         );
+                        declared_written = Some(resolved.clone());
                         // Fold a computed / z.infer-style annotation to its
                         // concrete object here, at the top of the check where
                         // the cycle guard is clean, so assignability + excess +
@@ -25832,9 +26082,12 @@ impl TypeChecker {
                                     || matches!(init_expr.kind, ExprKind::ArrayLit(_))
                                 {
                                     let before = self.diagnostics.len();
-                                    self.check_excess_properties(
+                                    // TS2353 names the annotation as written.
+                                    let written = declared_written.as_ref().unwrap_or(decl_ty);
+                                    self.check_excess_properties_named(
                                         init_ty,
                                         decl_ty,
+                                        written,
                                         error_span,
                                         Some(init_expr),
                                     );
@@ -26717,6 +26970,7 @@ impl TypeChecker {
                             .is_some_and(|name| self.overloads.contains_key(name.as_str()));
                 self.check_decorators_with_validity(&fn_decl.decorators, false);
                 self.check_parameter_decorators(&fn_decl.params, false);
+                self.params_owner_async = fn_decl.is_async;
                 self.check_parameter_runtime_expressions(
                     &fn_decl.params,
                     has_runtime_implementation,
@@ -30615,22 +30869,26 @@ impl TypeChecker {
     }
 
     fn report_unresolved_type_name(&mut self, name: &str, span: Span) {
-        if self.current_file_is_js() || self.type_name_is_known(name) {
+        if self.type_name_is_known(name) {
             return;
         }
         // Module augmentations (`declare module "x" { }`) merge with the
         // target module's own declarations, which are not visible here; and
-        // JavaScript files can contribute JSDoc-declared types to the program.
+        // other JavaScript files can contribute JSDoc-declared types to the
+        // program (this file's own JSDoc types are desugared into it).
+        let current = self.current_file_name.clone().unwrap_or_default();
         if self
             .module_block_local_names
             .iter()
             .any(|(_, external)| *external)
             || self.available_source_files.iter().any(|file| {
                 let lower = file.to_ascii_lowercase();
-                lower.ends_with(".js")
+                (lower.ends_with(".js")
                     || lower.ends_with(".jsx")
                     || lower.ends_with(".mjs")
-                    || lower.ends_with(".cjs")
+                    || lower.ends_with(".cjs"))
+                    && !current.ends_with(file.trim_start_matches("./"))
+                    && !file.ends_with(current.trim_start_matches('/'))
             })
         {
             return;
@@ -36470,11 +36728,9 @@ impl TypeChecker {
     }
 
     fn implicit_any_enabled_for_current_file(&self) -> bool {
-        // JavaScript parameters may be contextually annotated by JSDoc even
-        // though the parser leaves `Param::type_ann` empty. The JSDoc type
-        // must be attached before this AST-level classifier can distinguish
-        // those from genuine implicit-any parameters without false positives.
-        self.no_implicit_any && !self.current_file_is_js()
+        // JavaScript parameters are annotated from their JSDoc (see
+        // `jsdoc.rs`) before checking, so an unannotated one is implicit.
+        self.no_implicit_any
     }
 
     /// Report expression-function parameters only where the surrounding AST
@@ -37394,10 +37650,18 @@ impl TypeChecker {
     pub(crate) fn current_file_is_declaration(&self) -> bool {
         self.current_file_name.as_deref().is_some_and(|file_name| {
             let lower = file_name.to_ascii_lowercase();
+            // tsc also reads `x.d.html.ts` (an arbitrary extension) as the
+            // declaration file of `x.html`.
+            let arbitrary_extension = lower.strip_suffix(".ts").is_some_and(|stem| {
+                stem.rsplit_once(".d.").is_some_and(|(_, extension)| {
+                    !extension.is_empty() && !extension.contains(['.', '/'])
+                })
+            });
             lower.ends_with(".d.ts")
                 || lower.ends_with(".d.tsx")
                 || lower.ends_with(".d.mts")
                 || lower.ends_with(".d.cts")
+                || arbitrary_extension
         })
     }
 
@@ -40259,6 +40523,17 @@ impl TypeChecker {
             Type::Union(members) | Type::Intersection(members) => members
                 .iter()
                 .any(|member| self.type_could_have_top_level_singleton_types(member)),
+            // A type alias stands for its body (`type Keys = "a" | "b"`).
+            Type::TypeReference(name, args)
+                if args.is_empty() && self.type_aliases.contains_key(name.as_str()) =>
+            {
+                match self.resolve_type_for_assignability(target) {
+                    Some(resolved) if resolved != *target => {
+                        self.type_could_have_top_level_singleton_types(&resolved)
+                    }
+                    _ => false,
+                }
+            }
             _ => false,
         }
     }
