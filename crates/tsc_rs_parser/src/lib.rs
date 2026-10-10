@@ -1229,6 +1229,22 @@ impl<'a> Parser<'a> {
     }
 
     fn error_at_span(&mut self, code: u32, message: String, span: Span) {
+        // tsc parseErrorAtPosition: no second parse error at the start of
+        // the last one. (Our parser also reports grammar errors that tsc
+        // reports from the checker; those are not deduplicated.)
+        let parse_error = |code: u32| {
+            matches!(
+                code,
+                1003 | 1005 | 1109 | 1128 | 1134 | 1135 | 1136 | 1138 | 1144
+            )
+        };
+        if parse_error(code)
+            && self.diagnostics.last().is_some_and(|last| {
+                parse_error(last.code) && last.span.is_some_and(|last| last.start == span.start)
+            })
+        {
+            return;
+        }
         self.diagnostics.push(Diagnostic {
             code,
             message,
@@ -2042,6 +2058,74 @@ impl<'a> Parser<'a> {
                 span,
             };
         }
+        // A block-bodied arrow ends its expression: a token after it on the
+        // same line (`() => { } || a`) needs a statement break first.
+        let ends_with_block_arrow = {
+            let mut tail = &expr;
+            while let ExprKind::Assign(assign) = &tail.kind {
+                tail = &assign.right;
+            }
+            matches!(&tail.kind, ExprKind::Arrow(arrow) if matches!(arrow.body, ArrowBody::Block(_)))
+        };
+        // tsc parseSemicolon: an expression statement ends at `;`, `}`, EOF
+        // or a line break; anything else on the same line is "';' expected".
+        let _ = ends_with_block_arrow;
+        // Only after a cleanly parsed expression (our error recovery differs
+        // from tsc's) that is not one of the declaration-keyword identifiers
+        // handled above.
+        let clean_expression = self.diagnostics.len() == diags_before
+            && !matches!(&expr.kind, ExprKind::Ident(name)
+                if matches!(name.as_str(), "type" | "interface" | "namespace" | "module"));
+        let here = self.cur_span().start;
+        let already_reported_here = self
+            .diagnostics
+            .iter()
+            .rev()
+            .take(4)
+            .any(|diagnostic| diagnostic.span.is_some_and(|span| span.start == here));
+        // A leading-zero literal carries a scanner error (TS1121/TS1489) at
+        // its start, which absorbs the "';' expected" there.
+        let leading_zero_literal = self.cur() == TokenKind::NumericLiteral && {
+            let span = self.cur_span();
+            let raw = self
+                .source
+                .get(span.start as usize..span.end as usize)
+                .unwrap_or("");
+            let bytes = raw.as_bytes();
+            bytes.len() > 1 && bytes[0] == b'0' && bytes[1].is_ascii_digit()
+        };
+        // `3a`: the scanner's TS1351 sits where the ';' would be expected.
+        let follows_numeric_literal = self.pos > 0
+            && self.cur().is_identifier_name()
+            && self.tokens.get(self.pos - 1).is_some_and(|previous| {
+                matches!(
+                    previous.kind,
+                    TokenKind::NumericLiteral | TokenKind::BigIntLiteral
+                ) && previous.span.end == self.cur_span().start
+            });
+        if clean_expression
+            && !leading_zero_literal
+            && !follows_numeric_literal
+            && !self.is_on_new_line()
+            && !already_reported_here
+            && self.speculation_depth == 0
+            && !matches!(
+                self.cur(),
+                TokenKind::Semicolon
+                    | TokenKind::CloseBrace
+                    | TokenKind::EndOfFile
+                    | TokenKind::CloseParen
+                    | TokenKind::Comma
+                    | TokenKind::CloseBracket
+            )
+        {
+            match &expr.kind {
+                ExprKind::Ident(name) => {
+                    self.report_missing_semicolon_after_identifier(name, expr.span)
+                }
+                _ => self.error_code(1005, "';' expected.".into()),
+            }
+        }
         if !started_on_close_brace {
             self.eat_semicolon();
         }
@@ -2057,6 +2141,63 @@ impl<'a> Parser<'a> {
             kind: StmtKind::Block(stmts),
             span: self.span_from(start),
         }
+    }
+
+    /// tsc parseErrorForMissingSemicolonAfter for an identifier: a word on
+    /// its own is not "';' expected" but a misused keyword, a misspelled
+    /// one (TS1435), or an unexpected word (TS1434).
+    fn report_missing_semicolon_after_identifier(&mut self, name: &str, span: Span) {
+        // A recovery identifier: its own error already covers the spot.
+        if name.is_empty() || name == "<error>" || span.is_empty() {
+            return;
+        }
+        match name {
+            "const" | "let" | "var" => {
+                self.error_at_span(
+                    1440,
+                    "Variable declaration not allowed at this location.".into(),
+                    span,
+                );
+                return;
+            }
+            "declare" => return,
+            // tsc reads a modifier before a declaration as a modifier; our
+            // statement parser leaves it as a word.
+            "public" | "private" | "protected" | "static" | "abstract" | "readonly"
+            | "override" | "accessor" | "export" | "async" | "default" | "in" | "out"
+                if self.cur().is_identifier_name() =>
+            {
+                return;
+            }
+            "is" => {
+                let end = self.cur_span().start;
+                self.error_at_span(
+                    1228,
+                    "A type predicate is only allowed in return type position for functions and methods."
+                        .into(),
+                    Span::new(span.start, end),
+                );
+                return;
+            }
+            _ => {}
+        }
+        if let Some(suggestion) = keyword_spelling_suggestion(name).or_else(|| {
+            VIABLE_KEYWORDS
+                .iter()
+                .find(|keyword| name.len() > keyword.len() + 2 && name.starts_with(**keyword))
+                .map(|keyword| format!("{keyword} {}", &name[keyword.len()..]))
+        }) {
+            self.error_at_span(
+                1435,
+                format!("Unknown keyword or identifier. Did you mean '{suggestion}'?"),
+                span,
+            );
+            return;
+        }
+        if self.cur() == TokenKind::Unknown {
+            return;
+        }
+        self.error_at_span(1434, "Unexpected keyword or identifier.".into(), span);
     }
 
     fn is_legacy_octal_literal(raw: &str) -> bool {
@@ -3595,6 +3736,14 @@ impl<'a> Parser<'a> {
                     1434,
                     "Unexpected keyword or identifier.".into(),
                     name.span(),
+                );
+            }
+            // tsc parseSemicolonAfterPropertyName.
+            if self.at(TokenKind::At) && !self.is_on_new_line() {
+                self.error_code(
+                    1436,
+                    "Decorators must precede the name and all keywords of property declarations."
+                        .into(),
                 );
             }
             self.eat_semicolon();
@@ -7039,6 +7188,9 @@ impl<'a> Parser<'a> {
                     });
                 }
                 if self.at(TokenKind::OpenBrace) {
+                    // `(params): T { … }` — tsc parses the arrow and expects
+                    // the missing `=>`.
+                    self.error_code(1005, "'=>' expected.".into());
                     let body = ArrowBody::Block(self.parse_block_body());
                     return Some(Expr {
                         kind: ExprKind::Arrow(Box::new(ArrowFn {
@@ -7821,12 +7973,21 @@ impl<'a> Parser<'a> {
                 element_full_start = comma_span.end;
                 continue;
             }
+            // tsc parseObjectBindingElement: only a binding identifier may
+            // stand alone; any other property name needs `: target`.
+            let token_is_binding_identifier = self.is_identifier();
             let name = if let Some(n) = self.parse_property_name() {
                 n
             } else {
                 self.error_code(1003, "Identifier expected.".into());
                 PropName::Ident("<error>".into(), self.cur_span())
             };
+            if !token_is_binding_identifier
+                && !self.at(TokenKind::Colon)
+                && !matches!(&name, PropName::Ident(n, _) if n == "<error>")
+            {
+                self.error_code(1005, "':' expected.".into());
+            }
             if self.eat(TokenKind::Colon).is_some() {
                 let pat = self.parse_binding_pattern_at(binding_full_start, track_full_start);
                 // Check for default value: { a: b = 1 }
@@ -9241,4 +9402,158 @@ fn expr_to_pat(expr: &Expr) -> Pat {
             span: expr.span,
         },
     }
+}
+
+/// tsc's keywords longer than two characters, in its keyword-table order.
+const VIABLE_KEYWORDS: &[&str] = &[
+    "abstract",
+    "accessor",
+    "any",
+    "asserts",
+    "assert",
+    "bigint",
+    "boolean",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "continue",
+    "const",
+    "constructor",
+    "debugger",
+    "declare",
+    "default",
+    "defer",
+    "delete",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "get",
+    "immediate",
+    "implements",
+    "import",
+    "infer",
+    "instanceof",
+    "interface",
+    "intrinsic",
+    "keyof",
+    "let",
+    "module",
+    "namespace",
+    "never",
+    "new",
+    "null",
+    "number",
+    "object",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "override",
+    "out",
+    "readonly",
+    "require",
+    "global",
+    "return",
+    "satisfies",
+    "set",
+    "static",
+    "string",
+    "super",
+    "switch",
+    "symbol",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "type",
+    "typeof",
+    "undefined",
+    "unique",
+    "unknown",
+    "using",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+    "async",
+    "await",
+];
+
+/// tsc getSpellingSuggestion over `VIABLE_KEYWORDS` (ties go to the
+/// lexicographically smaller keyword, as in tsgo).
+fn keyword_spelling_suggestion(name: &str) -> Option<String> {
+    let name_chars: Vec<char> = name.chars().collect();
+    let maximum_length_difference = 2usize.max((name_chars.len() as f64 * 0.34) as usize);
+    let mut best_distance = (name_chars.len() as f64 * 0.4).floor() + 0.9;
+    let mut best: Option<&str> = None;
+    for candidate in VIABLE_KEYWORDS {
+        let candidate_chars: Vec<char> = candidate.chars().collect();
+        if candidate_chars.len().abs_diff(name_chars.len()) > maximum_length_difference
+            || *candidate == name
+        {
+            continue;
+        }
+        let Some(distance) = levenshtein_with_max(&name_chars, &candidate_chars, best_distance)
+        else {
+            continue;
+        };
+        if distance < best_distance {
+            best_distance = distance;
+            best = Some(candidate);
+        } else if best.is_none_or(|current| *candidate < current) {
+            best = Some(candidate);
+        }
+    }
+    best.map(str::to_string)
+}
+
+fn levenshtein_with_max(s1: &[char], s2: &[char], max: f64) -> Option<f64> {
+    let mut previous: Vec<f64> = (0..=s2.len()).map(|i| i as f64).collect();
+    let mut current = vec![0.0; s2.len() + 1];
+    let big = max + 0.01;
+    for i in 1..=s1.len() {
+        let c1 = s1[i - 1];
+        let c1_lower = c1.to_lowercase().next();
+        let min_j = ((i as f64 - max).ceil() as i64).max(1) as usize;
+        let max_j = ((max + i as f64).floor() as i64).min(s2.len() as i64);
+        let mut col_min = i as f64;
+        current[0] = col_min;
+        for slot in current.iter_mut().take(min_j).skip(1) {
+            *slot = big;
+        }
+        let mut j = min_j as i64;
+        while j <= max_j {
+            let ju = j as usize;
+            let substitution = if c1_lower == s2[ju - 1].to_lowercase().next() {
+                previous[ju - 1] + 0.1
+            } else {
+                previous[ju - 1] + 2.0
+            };
+            let distance = if c1 == s2[ju - 1] {
+                previous[ju - 1]
+            } else {
+                (previous[ju] + 1.0).min((current[ju - 1] + 1.0).min(substitution))
+            };
+            current[ju] = distance;
+            col_min = col_min.min(distance);
+            j += 1;
+        }
+        for slot in current.iter_mut().skip((max_j + 1).max(0) as usize) {
+            *slot = big;
+        }
+        if col_min > max {
+            return None;
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    let result = previous[s2.len()];
+    (result <= max).then_some(result)
 }

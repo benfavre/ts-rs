@@ -1148,7 +1148,8 @@ impl<'a> Parser<'a> {
             }
 
             // Error recovery: if we didn't advance, skip the current token
-            if self.pos == before && !self.is_eof() {
+            let skipped_token = self.pos == before && !self.is_eof();
+            if skipped_token {
                 self.error_code(1136, "Property assignment expected.".into());
                 self.bump();
             }
@@ -1166,11 +1167,23 @@ impl<'a> Parser<'a> {
             {
                 break;
             }
-            if self.eat(TokenKind::Comma).is_none() && self.eat(TokenKind::Semicolon).is_none() {
+            if self.eat(TokenKind::Comma).is_none() {
+                // tsc parseDelimitedList: a member not followed by `,` is
+                // "',' expected" (a same-line `;` is then skipped).
+                if self.at(TokenKind::Semicolon) {
+                    self.error_code(1005, "',' expected.".into());
+                    self.bump();
+                    continue;
+                }
                 // TypeScript recovers from missing commas between object literal
                 // members if the next token could start a new property (e.g.
                 // `{ 2: 1  2: 1 }` is parsed as two properties with an implied comma).
                 if self.cur_could_start_obj_prop() {
+                    // Not right after a skipped token (its recovery owns
+                    // the position).
+                    if !skipped_token {
+                        self.error_code(1005, "',' expected.".into());
+                    }
                     continue;
                 }
                 break;
@@ -1531,7 +1544,9 @@ impl<'a> Parser<'a> {
                     span,
                 });
             } else {
-                // End of template (error recovery)
+                // End of template (error recovery): tsc's parseTemplateSpan
+                // expects the `}` that closes the substitution.
+                self.error_code(1005, "'}' expected.".into());
                 quasis.push(TemplateElement {
                     raw: String::new(),
                     cooked: Some(String::new()),

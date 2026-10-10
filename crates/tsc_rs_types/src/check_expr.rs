@@ -3698,14 +3698,78 @@ impl TypeChecker {
         let Some(class_name) = class_name else {
             return;
         };
-        let lexically_visible = self.enclosing_class_names.iter().any(|enclosing| {
-            self.class_info
-                .get(enclosing.as_str())
-                .is_some_and(|enclosing_info| {
-                    enclosing_info.own_private_members.contains(property)
-                        || enclosing_info.own_private_static_members.contains(property)
-                })
-        });
+        let declares = |checker: &Self, class: &str| {
+            checker.class_info.get(class).is_some_and(|info| {
+                info.own_private_members.contains(property)
+                    || info.own_private_static_members.contains(property)
+            })
+        };
+        // The name resolves lexically to the innermost enclosing class that
+        // declares it.
+        let lexical = self
+            .enclosing_class_names
+            .iter()
+            .rposition(|enclosing| declares(self, enclosing));
+        let lexically_visible = lexical.is_some();
+        // TS18014: the receiver's `#p` belongs to an outer class whose name
+        // a nested class's own `#p` shadows.
+        if let Some(lexical) = lexical {
+            let lexical_class = self.enclosing_class_names[lexical].clone();
+            let outer = self.enclosing_class_names[..lexical]
+                .iter()
+                .any(|enclosing| *enclosing == class_name);
+            if lexical_class != class_name
+                && outer
+                && self
+                    .reported_duplicate_spans
+                    .insert((18014, span.start, span.end))
+            {
+                let location = |checker: &Self, class: &str| {
+                    checker
+                        .class_info
+                        .get(class)
+                        .and_then(|info| info.member_locations.get(property).cloned())
+                };
+                let mut related = Vec::new();
+                if let Some((file, at)) = location(self, &lexical_class) {
+                    related.push(RelatedDiagnostic {
+                        code: 18017,
+                        message: format!(
+                            "The shadowing declaration of '{property}' is defined here"
+                        ),
+                        file_name: Some(file),
+                        span: Some(at),
+                    });
+                }
+                if let Some((file, at)) = location(self, &class_name) {
+                    related.push(RelatedDiagnostic {
+                        code: 18018,
+                        message: format!(
+                            "The declaration of '{property}' that you probably intended to use is defined here"
+                        ),
+                        file_name: Some(file),
+                        span: Some(at),
+                    });
+                }
+                let display = class_name.rsplit('.').next().unwrap_or(class_name.as_str());
+                let shown = if is_static {
+                    format!("typeof {display}")
+                } else {
+                    display.to_string()
+                };
+                self.diagnostics.push(Diagnostic {
+                    code: 18014,
+                    message: format!(
+                        "The property '{property}' cannot be accessed on type '{shown}' within this class because it is shadowed by another private identifier with the same spelling."
+                    ),
+                    category: DiagnosticCategory::Error,
+                    file_name: None,
+                    span: Some(span),
+                    related: (!related.is_empty()).then_some(related),
+                });
+                return;
+            }
+        }
         if lexically_visible
             || !self
                 .reported_duplicate_spans
@@ -3921,6 +3985,13 @@ impl TypeChecker {
     }
 
     pub(crate) fn check_type_declaration_computed_names(&mut self, statements: &[Stmt]) {
+        // A type member's computed name may name a type-only alias.
+        self.type_only_use_allowed += 1;
+        self.check_type_declaration_computed_names_inner(statements);
+        self.type_only_use_allowed -= 1;
+    }
+
+    fn check_type_declaration_computed_names_inner(&mut self, statements: &[Stmt]) {
         fn check_members(checker: &mut TypeChecker, members: &[TypeMember]) {
             fn check_signature(
                 checker: &mut TypeChecker,
@@ -5919,6 +5990,7 @@ impl TypeChecker {
                         .push(error_arguments_in_class_field(expr.span));
                     return Type::Error;
                 }
+                self.check_type_only_value_use(name, expr.span);
                 // TS2708: a namespace with no value meaning in value position.
                 if self.uninstantiated_namespace_names.contains(name.as_str())
                     && self.binding_scope_is_root(name).unwrap_or(true)
@@ -10624,7 +10696,9 @@ impl TypeChecker {
                             | "WeakMap",
                             [],
                         ) => Type::Any,
-                        _ => Self::lib_iterable_element_type(&ty).unwrap_or_else(|| ty.clone()),
+                        _ => Self::lib_iterable_element_type(&ty)
+                            .or_else(|| self.iterator_protocol_element_type(&ty))
+                            .unwrap_or_else(|| ty.clone()),
                     },
                     Type::String | Type::StringLiteral(_) => Type::String,
                     _ => ty,
@@ -10864,6 +10938,7 @@ impl TypeChecker {
                     self.in_callee_position || unreachable_allowed || jsx_siblings || recovered;
                 let mut last = Type::Any;
                 let mut chain_free = true;
+                let mut narrowed_scope = false;
                 for (i, e) in exprs.iter().enumerate() {
                     // `a, b, c` is `((a, b), c)`: the left of each comma is
                     // the whole chain so far, side-effect free only if every
@@ -10877,6 +10952,20 @@ impl TypeChecker {
                             )));
                     }
                     last = self.check_expr(e);
+                    // An assertion call narrows the operands after it (kept
+                    // to this expression's own scope).
+                    if i + 1 < exprs.len() {
+                        if let ExprKind::Call(call) = &e.kind {
+                            if !narrowed_scope {
+                                self.push_scope();
+                                narrowed_scope = true;
+                            }
+                            self.apply_assertion_call_narrowing(call);
+                        }
+                    }
+                }
+                if narrowed_scope {
+                    self.pop_scope();
                 }
                 last
             }
@@ -11344,16 +11433,35 @@ impl TypeChecker {
                                 .cloned()
                                 .collect();
                             if !unsolved.is_empty() {
-                                let from_return = self.infer_type_arguments_for_call(
-                                    std::slice::from_ref(&contextual),
-                                    &[("__return".to_string(), Type::clone(&ft.return_type))],
-                                    &ft.type_params,
-                                );
+                                let infer_from = |checker: &Self, source: &Type| {
+                                    checker.infer_type_arguments_for_call(
+                                        std::slice::from_ref(source),
+                                        &[("__return".to_string(), Type::clone(&ft.return_type))],
+                                        &ft.type_params,
+                                    )
+                                };
+                                let from_return = infer_from(self, &contextual);
+                                // The signature's return type may already be an
+                                // alias body (`readonly T[] | "x"`) while the
+                                // context names the alias (`PropOfRaw<string>`).
+                                let from_resolved = self
+                                    .resolve_type_for_assignability(&contextual)
+                                    .filter(|resolved| *resolved != contextual)
+                                    .map(|resolved| infer_from(self, &resolved));
                                 for name in unsolved {
-                                    if let Some(candidate) = from_return.get(&name) {
-                                        if !matches!(candidate, Type::Unknown) {
-                                            map.insert(name, candidate.clone());
-                                        }
+                                    let candidate = from_return
+                                        .get(&name)
+                                        .filter(|candidate| !matches!(candidate, Type::Unknown))
+                                        .or_else(|| {
+                                            from_resolved
+                                                .as_ref()
+                                                .and_then(|map| map.get(&name))
+                                                .filter(|candidate| {
+                                                    !matches!(candidate, Type::Unknown)
+                                                })
+                                        });
+                                    if let Some(candidate) = candidate {
+                                        map.insert(name, candidate.clone());
                                     }
                                 }
                             }
@@ -13099,6 +13207,7 @@ impl TypeChecker {
     /// is resolved like a bare identifier; tsc words the "cannot find name"
     /// error (TS2304/TS2552) for this position as TS18004.
     fn check_shorthand_name_exists(&mut self, name: &str, span: Span) {
+        self.check_type_only_value_use(name, Span::new(span.start, span.start + name.len() as u32));
         if self.lookup_var(name).is_some()
             || crate::strict_reserved::is_reserved_word(name)
             // A type-only import reports TS1361 instead.
@@ -13286,7 +13395,11 @@ impl TypeChecker {
                     PropName::Computed(key, _)
                         if matches!(&key.kind, ExprKind::Binary(b) if b.op == BinaryOp::In)
                 );
+                // An abstract or `declare` member's name may name a type-only alias.
+                let type_only_name_ok = prop.modifiers & (MOD_ABSTRACT | MOD_DECLARE) != 0;
+                self.type_only_use_allowed += u32::from(type_only_name_ok);
                 self.check_property_name_expression_in(&prop.name, mapped_type_shape);
+                self.type_only_use_allowed -= u32::from(type_only_name_ok);
                 self.fn_nesting_depth -= 1;
                 if let Some(ref init) = prop.initializer {
                     // Undecorated ambient properties are checked by the parser.
@@ -13357,6 +13470,29 @@ impl TypeChecker {
                             if declared_later || uninitialized {
                                 if let Some(name) = Self::propname_text_opt(&other.name) {
                                     pending.insert(name, other.name.span());
+                                }
+                            }
+                        }
+                        // [[Define]] fields run before the constructor
+                        // assigns its parameter properties.
+                        if !ctor_locals_capture_initializers {
+                            for sibling in siblings {
+                                let ClassMemberKind::Constructor(ctor) = &sibling.kind else {
+                                    continue;
+                                };
+                                if ctor.body.is_none() {
+                                    continue;
+                                }
+                                for param in &ctor.params {
+                                    if param.modifiers
+                                        & (MOD_PUBLIC | MOD_PRIVATE | MOD_PROTECTED | MOD_READONLY)
+                                        == 0
+                                    {
+                                        continue;
+                                    }
+                                    if let PatKind::Ident(name) = &param.name.kind {
+                                        pending.entry(name.to_string()).or_insert(param.span);
+                                    }
                                 }
                             }
                         }
@@ -13443,7 +13579,11 @@ impl TypeChecker {
                 // A class member's computed name has its own control-flow
                 // container (tsc), so outer variables are assumed assigned.
                 self.fn_nesting_depth += 1;
+                // An abstract or `declare` member's name may name a type-only alias.
+                let type_only_name_ok = method.modifiers & (MOD_ABSTRACT | MOD_DECLARE) != 0;
+                self.type_only_use_allowed += u32::from(type_only_name_ok);
                 self.check_property_name_expression(&method.name);
+                self.type_only_use_allowed -= u32::from(type_only_name_ok);
                 self.fn_nesting_depth -= 1;
                 let method_name = Self::propname_text_opt(&method.name);
                 let has_runtime_implementation = method.body.is_some()
@@ -13679,7 +13819,11 @@ impl TypeChecker {
                 // A class member's computed name has its own control-flow
                 // container (tsc), so outer variables are assumed assigned.
                 self.fn_nesting_depth += 1;
+                // An abstract or `declare` member's name may name a type-only alias.
+                let type_only_name_ok = acc.modifiers & (MOD_ABSTRACT | MOD_DECLARE) != 0;
+                self.type_only_use_allowed += u32::from(type_only_name_ok);
                 self.check_property_name_expression(&acc.name);
+                self.type_only_use_allowed -= u32::from(type_only_name_ok);
                 self.fn_nesting_depth -= 1;
                 let is_setter = matches!(member.kind, ClassMemberKind::SetAccessor(_));
                 self.check_parameter_decorators(

@@ -202,6 +202,8 @@ impl TypeChecker {
                         let ty = self.resolve_type_node(&e.type_node);
                         if e.dotdotdot {
                             Type::Rest(Arc::new(ty))
+                        } else if e.optional {
+                            Type::Optional(Arc::new(ty))
                         } else {
                             ty
                         }
@@ -1586,7 +1588,15 @@ impl TypeChecker {
                         p.initializer
                             .as_ref()
                             .map(|init| widen_literal(self.infer_expr_type(init)))
-                            .unwrap_or(Type::Any)
+                            .unwrap_or_else(|| {
+                                // An array binding pattern implies a tuple
+                                // (tsc getTypeFromArrayBindingPattern).
+                                if p.dotdotdot {
+                                    Type::Any
+                                } else {
+                                    implied_array_pattern_type(&p.name).unwrap_or(Type::Any)
+                                }
+                            })
                     });
                 (pname, self.declared_optional_param_type(p, pty))
             })
@@ -3119,4 +3129,27 @@ impl TypeChecker {
             _ => Type::Any,
         }
     }
+}
+
+/// The type an array binding pattern implies when nothing else types it:
+/// `[a, b]` is `[any, any]`, a defaulted element is optional, a rest element
+/// is `...any[]`, and nested array patterns nest.
+pub(crate) fn implied_array_pattern_type(pattern: &Pat) -> Option<Type> {
+    let PatKind::Array(elements) = &pattern.kind else {
+        return None;
+    };
+    let types = elements
+        .iter()
+        .map(|element| match element {
+            None => Type::Any,
+            Some(ArrayPatElem::Rest(_)) => Type::Rest(Arc::new(Type::Array(Arc::new(Type::Any)))),
+            Some(ArrayPatElem::Pat(inner)) => match &inner.kind {
+                PatKind::Assign(target, _) => Type::Optional(Arc::new(
+                    implied_array_pattern_type(target).unwrap_or(Type::Any),
+                )),
+                _ => implied_array_pattern_type(inner).unwrap_or(Type::Any),
+            },
+        })
+        .collect::<Vec<_>>();
+    Some(Type::Tuple(types.into()))
 }

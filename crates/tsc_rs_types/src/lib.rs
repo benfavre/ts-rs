@@ -38,6 +38,7 @@ mod stdlib;
 mod strict_reserved;
 mod type_computations;
 pub mod type_facts;
+mod type_only_aliases;
 pub mod type_ops;
 mod unreachable_exprs;
 mod unused_type_params;
@@ -2729,6 +2730,20 @@ pub struct TypeChecker {
     /// find the declaring file of an interface imported through a barrel.
     ambiguous_interface_names: Arc<rustc_hash::FxHashSet<std::string::String>>,
     module_reexports: Arc<rustc_hash::FxHashMap<std::string::String, FileReexports>>,
+    /// Every program file's exports as far as type-only-ness goes (see
+    /// `type_only_aliases`), by normalized file name.
+    type_only_exports:
+        Arc<rustc_hash::FxHashMap<std::string::String, type_only_aliases::TypeOnlyExports>>,
+    /// The checked file's import bindings that are type-only, with where
+    /// they became so (TS1361/TS1362 on a value use).
+    type_only_bindings:
+        rustc_hash::FxHashMap<std::string::String, type_only_aliases::TypeOnlyOrigin>,
+    /// Inside a position where a type-only alias may be named as a value
+    /// (`export =`, `export default`, a type-only computed member name).
+    pub(crate) type_only_use_allowed: u32,
+    /// The bare identifier of the `export =` / `export default` being
+    /// checked: it may name a type-only alias.
+    pub(crate) type_only_allowed_span: Option<Span>,
     /// For the file whose syntax is being resolved (injected or checked):
     /// the ambiguous interface names it declares itself, or imports from
     /// the declaring module, mapped to their file-scoped keys. A type
@@ -3300,6 +3315,10 @@ impl Clone for TypeChecker {
             alias_evaluations: std::sync::Mutex::default(),
             ambiguous_interface_names: Arc::clone(&self.ambiguous_interface_names),
             module_reexports: Arc::clone(&self.module_reexports),
+            type_only_exports: Arc::clone(&self.type_only_exports),
+            type_only_bindings: rustc_hash::FxHashMap::default(),
+            type_only_use_allowed: 0,
+            type_only_allowed_span: None,
             scoped_type_keys: rustc_hash::FxHashMap::default(),
             // A clone checks a file.
             donor_only: false,
@@ -3539,6 +3558,10 @@ impl TypeChecker {
             alias_evaluations: std::sync::Mutex::default(),
             ambiguous_interface_names: Arc::default(),
             module_reexports: Arc::default(),
+            type_only_exports: Arc::default(),
+            type_only_bindings: rustc_hash::FxHashMap::default(),
+            type_only_use_allowed: 0,
+            type_only_allowed_span: None,
             scoped_type_keys: rustc_hash::FxHashMap::default(),
             donor_only: false,
             file_local_bindings: None,
@@ -4410,6 +4433,7 @@ impl TypeChecker {
             Arc::make_mut(&mut self.ambiguous_interface_keys).extend(ambiguous);
             Arc::make_mut(&mut self.module_reexports).extend(Self::collect_module_reexports(files));
         }
+        Arc::make_mut(&mut self.type_only_exports).extend(Self::collect_type_only_exports(files));
         stage("prepare");
         Self::inject_pass(self, files, true);
         stage("pass .d.ts");
@@ -11726,6 +11750,7 @@ impl TypeChecker {
             self.check_stmt(stmt);
         }
         self.check_external_emit_helpers(file);
+        self.drop_unresolved_type_only_uses();
         self.unqualify_relation_message_types();
         self.attach_type_parameter_constraint_notes();
         let stable_types = self.stable_type_display_map();
@@ -12042,6 +12067,7 @@ impl TypeChecker {
         self.backfill_var_types(&file.statements);
 
         self.check_external_emit_helpers(file);
+        self.drop_unresolved_type_only_uses();
         self.unqualify_relation_message_types();
         self.attach_type_parameter_constraint_notes();
         let stable_types = self.stable_type_display_map();
@@ -13112,6 +13138,44 @@ impl TypeChecker {
         }
     }
 
+    /// An assertion signature narrows what follows the call: a plain
+    /// `asserts x` applies the argument's truthiness facts
+    /// (`assert(x !== undefined)`), `asserts x is T` narrows the argument
+    /// path (identifier or member path) to `T`.
+    pub(crate) fn apply_assertion_call_narrowing(&mut self, call: &tsc_rs_ast::CallExpr) {
+        let callee_ty = self.infer_expr_type(&call.callee);
+        let signature = match &callee_ty {
+            Type::Function(ft) => Some(ft.clone()),
+            Type::Intersection(members) => members.iter().find_map(|m| match m {
+                Type::Function(ft) if ft.type_predicate.as_ref().is_some_and(|p| p.is_asserts) => {
+                    Some(ft.clone())
+                }
+                _ => None,
+            }),
+            _ => None,
+        };
+        let Some(ft) = signature else {
+            return;
+        };
+        let Some(pred) = ft.type_predicate.as_ref().filter(|pred| pred.is_asserts) else {
+            return;
+        };
+        let param_idx = ft
+            .params
+            .iter()
+            .position(|(n, _)| n.trim_start_matches('?') == pred.param_name);
+        if let Some(arg) = param_idx.and_then(|idx| call.args.get(idx)) {
+            if matches!(pred.target_type.as_ref(), Type::Any) {
+                let (truthy_facts, _) = self.analyze_narrowing(arg);
+                for (name, ty) in truthy_facts {
+                    self.narrow_var(&name, ty);
+                }
+            } else if let Some(path) = Self::member_path(arg) {
+                self.narrow_var(&path, Type::clone(&pred.target_type));
+            }
+        }
+    }
+
     /// tsc's checkGrammarForInOrForOfStatement: one declaration, without an
     /// initializer or a type annotation (TS1188/TS1091, TS1190/TS1189,
     /// TS2483/TS2404), reported at the offending declaration's name.
@@ -13209,6 +13273,34 @@ impl TypeChecker {
         }
         self.iterated_element_type(ty)
             .or_else(|| Self::lib_iterable_element_type(ty))
+            .or_else(|| self.iterator_protocol_element_type(ty))
+    }
+
+    /// The element type of a user iterable through the iterator protocol:
+    /// `[Symbol.iterator]()` returns an iterator whose `next()` returns
+    /// `{ value: T }`.
+    pub(crate) fn iterator_protocol_element_type(&self, ty: &Type) -> Option<Type> {
+        let returns = |method: Type| -> Option<Type> {
+            match method {
+                Type::Function(function) => Some(Type::clone(&function.return_type)),
+                Type::ObjectType(info) => info
+                    .call_signatures
+                    .first()
+                    .map(|signature| Type::clone(&signature.return_type)),
+                _ => None,
+            }
+        };
+        let iterator = returns(self.extract_member_type_opt(ty, "[Symbol.iterator]")?)?;
+        // `[Symbol.iterator]() { return this; }` (inferred as `this`, or
+        // unknown here) on a type with its own `next` is itself the iterator.
+        let iterator = match iterator {
+            Type::This => ty.clone(),
+            Type::Any if self.extract_member_type_opt(ty, "next").is_some() => ty.clone(),
+            other => other,
+        };
+        let result = returns(self.extract_member_type_opt(&iterator, "next")?)?;
+        let value = self.extract_member_type_opt(&result, "value")?;
+        Some(self.widen_type(&value))
     }
 
     pub(crate) fn iterated_element_type(&self, ty: &Type) -> Option<Type> {
@@ -14126,13 +14218,7 @@ impl TypeChecker {
                 self.hoist_var_declaration_from_stmt(&fo.body);
             }
             StmtKind::ForOf(fo) => {
-                if let ForInOfLeft::Var(ref vs) = fo.left {
-                    if vs.kind == VarKind::Var {
-                        for decl in &vs.declarations {
-                            self.declare_pattern_vars(&decl.name, Type::Any);
-                        }
-                    }
-                }
+                self.hoist_for_of_var(fo);
                 self.hoist_var_declaration_from_stmt(&fo.body);
             }
             StmtKind::While(w) => {
@@ -14162,6 +14248,43 @@ impl TypeChecker {
                 self.hoist_var_declaration_from_stmt(&with.body);
             }
             _ => {}
+        }
+    }
+
+    /// A `for (var v of xs)` binding is hoisted with the element type and,
+    /// until the loop assigns it, is unassigned (TS2454 on an earlier read).
+    fn hoist_for_of_var(&mut self, fo: &ForOfStmt) {
+        let ForInOfLeft::Var(ref vs) = fo.left else {
+            return;
+        };
+        if vs.kind != VarKind::Var {
+            return;
+        }
+        for decl in &vs.declarations {
+            let PatKind::Ident(name) = &decl.name.kind else {
+                self.declare_pattern_vars(&decl.name, Type::Any);
+                continue;
+            };
+            let element = if fo.is_await {
+                None
+            } else {
+                let iterated = self.infer_expr_type(&fo.right);
+                self.for_of_element_type(&iterated)
+            };
+            match element {
+                Some(element)
+                    if self.check_definite_assignment
+                        && !matches!(element, Type::Any | Type::Unknown | Type::Error)
+                        && !Self::type_includes_undefined(&element) =>
+                {
+                    self.declare_var(name, element);
+                    self.uninitialized_vars.insert(
+                        name.to_string(),
+                        (self.fn_nesting_depth, self.current_scope),
+                    );
+                }
+                _ => self.declare_var(name, Type::Any),
+            }
         }
     }
 
@@ -14229,13 +14352,7 @@ impl TypeChecker {
                 self.hoist_var_declaration_from_stmt(&fo.body);
             }
             StmtKind::ForOf(fo) => {
-                if let ForInOfLeft::Var(ref vs) = fo.left {
-                    if vs.kind == VarKind::Var {
-                        for decl in &vs.declarations {
-                            self.declare_pattern_vars(&decl.name, Type::Any);
-                        }
-                    }
-                }
+                self.hoist_for_of_var(fo);
                 self.hoist_var_declaration_from_stmt(&fo.body);
             }
             StmtKind::While(w) => {
@@ -15892,11 +16009,13 @@ impl TypeChecker {
             self.imported_type_sources.clear();
             self.imported_namespace_export_names.clear();
             self.scoped_type_keys.clear();
+            self.type_only_bindings.clear();
             return;
         };
         self.scoped_type_keys = self.collect_scoped_type_keys(file, cf, true);
         self.imported_type_sources = self.collect_type_import_sources(file, cf);
         self.imported_namespace_export_names = self.collect_namespace_import_export_names(file, cf);
+        self.type_only_bindings = self.collect_type_only_bindings(file, cf);
     }
 
     fn collect_namespace_import_export_names(
@@ -22580,10 +22699,15 @@ impl TypeChecker {
                     .direct_constructor_static_members(target)
                     .unwrap_or_default();
                 return target_statics.iter().all(|(target_name, target_ty)| {
-                    source_statics
+                    match source_statics
                         .iter()
                         .find(|(source_name, _)| source_name == target_name)
-                        .is_some_and(|(_, source_ty)| self.is_assignable_to(source_ty, target_ty))
+                    {
+                        Some((_, source_ty)) => self.is_assignable_to(source_ty, target_ty),
+                        // Every constructor has a `prototype` (a class's is its
+                        // instance type, with `any` type arguments).
+                        None => target_name.trim_start_matches('?') == "prototype",
+                    }
                 });
             }
             return false;
@@ -24179,7 +24303,12 @@ impl TypeChecker {
                     self.is_assignable_to(source_element, rest_element)
                 });
             }
-            if s_elems.len() == t_elems.len() {
+            // A shorter source may omit trailing optional target elements.
+            if s_elems.len() <= t_elems.len()
+                && t_elems[s_elems.len()..]
+                    .iter()
+                    .all(|element| matches!(element, Type::Optional(_)))
+            {
                 return s_elems
                     .iter()
                     .zip(t_elems.iter())
@@ -25894,6 +26023,7 @@ impl TypeChecker {
         reset_instantiation_budget();
         self.check_js_discarded_statement_decorator(stmt);
         self.check_import_attributes(stmt);
+        self.check_redundant_type_modifiers(stmt);
         self.check_js_type_only_export(stmt);
         match &stmt.kind {
             StmtKind::Var(var_stmt) => {
@@ -26440,43 +26570,9 @@ impl TypeChecker {
                 if matches!(ty, Type::Never) && self.completion_explicit_call(expr) {
                     self.completion_never_calls.insert(expr.span.start);
                 }
-                // Assertion signatures narrow the rest of the block: a plain
-                // `asserts x` applies the argument's TRUTHINESS facts
-                // (`assert(x !== undefined)`), `asserts x is T` narrows the
-                // argument path (identifier or member path) to `T`.
+                // Assertion signatures narrow the rest of the block.
                 if let ExprKind::Call(call) = &expr.kind {
-                    let callee_ty = self.infer_expr_type(&call.callee);
-                    let signature = match &callee_ty {
-                        Type::Function(ft) => Some(ft.clone()),
-                        Type::Intersection(members) => members.iter().find_map(|m| match m {
-                            Type::Function(ft)
-                                if ft.type_predicate.as_ref().is_some_and(|p| p.is_asserts) =>
-                            {
-                                Some(ft.clone())
-                            }
-                            _ => None,
-                        }),
-                        _ => None,
-                    };
-                    if let Some(ft) = signature {
-                        if let Some(ref pred) = ft.type_predicate {
-                            if pred.is_asserts {
-                                let param_idx = ft.params.iter().position(|(n, _)| {
-                                    n.trim_start_matches('?') == pred.param_name
-                                });
-                                if let Some(arg) = param_idx.and_then(|idx| call.args.get(idx)) {
-                                    if matches!(pred.target_type.as_ref(), Type::Any) {
-                                        let (truthy_facts, _) = self.analyze_narrowing(arg);
-                                        for (name, ty) in truthy_facts {
-                                            self.narrow_var(&name, ty);
-                                        }
-                                    } else if let Some(path) = Self::member_path(arg) {
-                                        self.narrow_var(&path, Type::clone(&pred.target_type));
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    self.apply_assertion_call_narrowing(call);
                 }
             }
             StmtKind::Return(Some(ref e)) => {
@@ -26866,6 +26962,10 @@ impl TypeChecker {
                             if let Some(initializer) = &decl.init {
                                 self.check_expr(initializer);
                             }
+                            // The loop assigns the binding.
+                            if let PatKind::Ident(name) = &decl.name.kind {
+                                self.uninitialized_vars.remove(name.as_str());
+                            }
                             self.declare_pattern_vars(&decl.name, Type::Any);
                         }
                     }
@@ -27091,6 +27191,10 @@ impl TypeChecker {
                 self.pop_scope();
             }
             StmtKind::ClassDecl(class_decl) => {
+                // A `declare class` is an ambient context: its heritage may
+                // name a type-only alias.
+                let declare_class = u32::from(class_decl.modifiers & MOD_DECLARE != 0);
+                self.type_only_use_allowed += declare_class;
                 if let Some(name) = &class_decl.name {
                     self.check_reserved_type_name(name, class_decl.name_span, 2414, "Class");
                 }
@@ -27389,6 +27493,7 @@ impl TypeChecker {
                     self.check_strict_property_initialization(class_decl);
                 }
                 self.pop_active_type_param_names(pushed_type_param_names);
+                self.type_only_use_allowed -= declare_class;
             }
             StmtKind::Switch(sw) => {
                 let discriminant_type = self.check_expr(&sw.discriminant);
@@ -27720,6 +27825,9 @@ impl TypeChecker {
                     self.export_declaration_not_permitted_in_namespace(export_decl.span, Some(""));
                 }
                 ExportDeclKind::Default(expr) => {
+                    if matches!(expr.kind, ExprKind::Ident(_)) {
+                        self.type_only_allowed_span = Some(expr.span);
+                    }
                     self.check_ambient_export_assignment(expr);
                     // `export default N` aliases every meaning of `N`; a type-only
                     // namespace is fine there (not TS2708).
@@ -27844,6 +27952,9 @@ impl TypeChecker {
                 }
             },
             StmtKind::ExportAssign(expr) => {
+                if matches!(expr.kind, ExprKind::Ident(_)) {
+                    self.type_only_allowed_span = Some(expr.span);
+                }
                 self.check_ambient_export_assignment(expr);
                 // `export = X` names a VALUE (or a type/namespace); an
                 // unresolvable bare identifier is TS2304.
@@ -38195,9 +38306,15 @@ impl TypeChecker {
                 ExprKind::Member(m) => {
                     if let ExprKind::Ident(ref base) = m.object.kind {
                         out.push((base.to_string(), m.property.to_string(), e.span));
+                    } else if matches!(m.object.kind, ExprKind::This) {
+                        out.push(("this".to_string(), m.property.to_string(), e.span));
                     } else {
                         member_refs(&m.object, out);
                     }
+                }
+                ExprKind::Assign(a) => {
+                    member_refs(&a.left, out);
+                    member_refs(&a.right, out);
                 }
                 ExprKind::Call(c) => {
                     member_refs(&c.callee, out);
@@ -38248,18 +38365,37 @@ impl TypeChecker {
             let class_start = inner.span.start;
             let own_statics = static_properties(class_decl);
             for member in &class_decl.members {
-                let ClassMemberKind::Property(prop) = &member.kind else {
-                    continue;
-                };
-                if prop.modifiers & tsc_rs_ast::MOD_STATIC == 0 {
-                    continue;
-                }
-                let Some(ref init) = prop.initializer else {
-                    continue;
-                };
                 let mut refs = Vec::new();
-                member_refs(init, &mut refs);
+                match &member.kind {
+                    ClassMemberKind::Property(prop) => {
+                        if prop.modifiers & tsc_rs_ast::MOD_STATIC == 0 {
+                            continue;
+                        }
+                        let Some(ref init) = prop.initializer else {
+                            continue;
+                        };
+                        member_refs(init, &mut refs);
+                    }
+                    // A static block runs where it stands, too.
+                    ClassMemberKind::StaticBlock(body) => {
+                        for statement in body {
+                            if let StmtKind::Expr(expression) = &statement.kind {
+                                member_refs(expression, &mut refs);
+                            }
+                        }
+                    }
+                    _ => continue,
+                }
                 for (base, property, span) in refs {
+                    // `this` in a static initializer is the class itself.
+                    let base = if base == "this" {
+                        match class_decl.name.as_deref() {
+                            Some(name) => name.to_string(),
+                            None => continue,
+                        }
+                    } else {
+                        base
+                    };
                     let property_span =
                         Span::new(span.end.saturating_sub(property.len() as u32), span.end);
                     let base_span = Span::new(span.start, span.start + base.len() as u32);
@@ -42453,6 +42589,7 @@ impl TypeChecker {
                     | Type::Number
                     | Type::Boolean
                     | Type::BigInt
+                    | Type::Symbol
                     | Type::StringLiteral(_)
                     | Type::NumberLiteral(_)
                     | Type::BooleanLiteral(_)

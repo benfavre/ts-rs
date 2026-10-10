@@ -730,7 +730,7 @@ impl TypeChecker {
                                     };
                                     let (array_side, non_array_side) = source_ty
                                         .as_ref()
-                                        .map(Self::partition_array_guard_type)
+                                        .map(|ty| self.partition_array_guard_type(ty))
                                         .unwrap_or((None, None));
                                     let target = if is_member_path {
                                         array_side
@@ -892,17 +892,43 @@ impl TypeChecker {
     /// side, and nested unions are flattened recursively. Keeping the real
     /// array constituent (instead of manufacturing `any[]`) is essential for
     /// recursive members such as `Where | Where[]`.
-    fn partition_array_guard_type(ty: &Type) -> (Option<Type>, Option<Type>) {
-        fn collect(ty: &Type, arrays: &mut Vec<Type>, non_arrays: &mut Vec<Type>) {
+    fn partition_array_guard_type(&self, ty: &Type) -> (Option<Type>, Option<Type>) {
+        fn collect(
+            checker: &TypeChecker,
+            ty: &Type,
+            arrays: &mut Vec<Type>,
+            non_arrays: &mut Vec<Type>,
+            depth: u32,
+        ) {
             match ty {
                 Type::Array(_) | Type::Tuple(_) => arrays.push(ty.clone()),
+                Type::TypeReference(name, args)
+                    if matches!(name.as_str(), "Array" | "ReadonlyArray") && args.len() == 1 =>
+                {
+                    arrays.push(ty.clone())
+                }
                 Type::Optional(inner) => {
-                    collect(inner, arrays, non_arrays);
+                    collect(checker, inner, arrays, non_arrays, depth);
                     non_arrays.push(Type::Undefined);
                 }
                 Type::Union(members) => {
                     for member in members.iter() {
-                        collect(member, arrays, non_arrays);
+                        collect(checker, member, arrays, non_arrays, depth);
+                    }
+                }
+                // A type alias partitions by its body (`type Foo = A | A[]`).
+                Type::TypeReference(name, _)
+                    if depth < 8 && checker.type_aliases.contains_key(name.as_str()) =>
+                {
+                    // Only a union or array body is partitioned: an object
+                    // alias stays named (`Where | Where[]` keeps `Where`).
+                    match checker.resolve_type_for_assignability(ty) {
+                        Some(resolved @ (Type::Union(_) | Type::Array(_) | Type::Tuple(_)))
+                            if resolved != *ty =>
+                        {
+                            collect(checker, &resolved, arrays, non_arrays, depth + 1)
+                        }
+                        _ => non_arrays.push(ty.clone()),
                     }
                 }
                 other => non_arrays.push(other.clone()),
@@ -911,7 +937,7 @@ impl TypeChecker {
 
         let mut arrays = Vec::new();
         let mut non_arrays = Vec::new();
-        collect(ty, &mut arrays, &mut non_arrays);
+        collect(self, ty, &mut arrays, &mut non_arrays, 0);
         let finish = |members: Vec<Type>| {
             if members.is_empty() {
                 None

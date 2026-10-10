@@ -5738,7 +5738,16 @@ impl BaselineRunner {
             // JSON is data; anything else without a TypeScript/JavaScript
             // extension (README.md, .css, ...) is present on disk but is
             // never parsed as source by tsc.
-            if lower.ends_with(".json") || !is_source_extension {
+            // A JavaScript file under node_modules is outside the program
+            // at the default `maxNodeModuleJsDepth` of 0: tsc never reads it.
+            let js_in_node_modules = lower.contains("node_modules/")
+                && [".js", ".jsx", ".mjs", ".cjs"]
+                    .iter()
+                    .any(|extension| lower.ends_with(extension))
+                && !test_case.options.other.iter().any(|(key, value)| {
+                    key.eq_ignore_ascii_case("maxNodeModuleJsDepth") && value.trim() != "0"
+                });
+            if lower.ends_with(".json") || !is_source_extension || js_in_node_modules {
                 file_sources.push((display.clone(), file.content.clone()));
                 all_diagnostics.push((display, Vec::new()));
                 continue;

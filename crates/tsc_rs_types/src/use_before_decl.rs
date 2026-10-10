@@ -30,13 +30,20 @@ struct Decl {
     /// Inside a destructuring pattern a later binding element may use an
     /// earlier one: uses within this window are fine.
     pattern_window: Option<(u32, u32)>,
+    /// The declaration gives the binding a type that does not admit
+    /// `undefined` (an initializer or annotation): a read before it is also
+    /// TS2454.
+    typed: bool,
 }
 
 struct Walker {
+    /// Inside a class property initializer or static block: a separate
+    /// control-flow container, so dead-zone reads are not also TS2454.
+    class_initializer_depth: u32,
     scopes: Vec<FxHashMap<String, Decl>>,
     /// Scope depths at which deferred (function-like) contexts begin.
     boundaries: Vec<usize>,
-    findings: Vec<(DeclKind, String, Span, Span)>,
+    findings: Vec<(DeclKind, String, Span, Span, bool)>,
     /// Names used immediately (outside any function) that no scope of this
     /// file declares: candidates for a declaration in a later outFile file.
     unresolved_immediate: Vec<(String, Span)>,
@@ -53,6 +60,10 @@ impl Walker {
     }
 
     fn declare_pattern(&mut self, pattern: &Pat, kind: DeclKind, ready_at: u32) {
+        self.declare_pattern_typed(pattern, kind, ready_at, false);
+    }
+
+    fn declare_pattern_typed(&mut self, pattern: &Pat, kind: DeclKind, ready_at: u32, typed: bool) {
         let mut bound = Vec::new();
         TypeChecker::pattern_binding_spans(pattern, &mut bound);
         let destructuring = !matches!(pattern.kind, PatKind::Ident(_));
@@ -73,6 +84,7 @@ impl Walker {
                     ready_at,
                     scope_depth: 0,
                     pattern_window: destructuring.then_some((initialized_from, pattern.span.end)),
+                    typed,
                 },
             );
         }
@@ -97,7 +109,39 @@ impl Walker {
                             DeclKind::BlockVar
                         };
                     for declarator in &var.declarations {
-                        self.declare_pattern(&declarator.name, kind, declarator.span.end);
+                        let typed = declarator.type_ann.as_ref().is_some_and(|annotation| {
+                            !matches!(
+                                annotation.kind,
+                                TypeNodeKind::Keyword(
+                                    KeywordTypeKind::Any | KeywordTypeKind::Unknown
+                                )
+                            )
+                        }) || declarator.init.as_ref().is_some_and(|init| {
+                            // Only initializers whose type is evident from
+                            // syntax (an `any`-typed one is exempt).
+                            matches!(
+                                &init.kind,
+                                ExprKind::NumLit(_)
+                                    | ExprKind::StrLit(_)
+                                    | ExprKind::BoolLit(_)
+                                    | ExprKind::BigIntLit(_)
+                                    | ExprKind::NoSubstTemplate(_)
+                                    | ExprKind::Template(_)
+                                    | ExprKind::RegexpLit(_)
+                                    | ExprKind::ObjectLit(_)
+                                    | ExprKind::ArrayLit(_)
+                                    | ExprKind::New(_)
+                                    | ExprKind::Arrow(_)
+                                    | ExprKind::FnExpr(_)
+                                    | ExprKind::ClassExpr(_)
+                            )
+                        });
+                        self.declare_pattern_typed(
+                            &declarator.name,
+                            kind,
+                            declarator.span.end,
+                            typed,
+                        );
                     }
                 }
                 StmtKind::ClassDecl(class) => {
@@ -110,6 +154,7 @@ impl Walker {
                                 ready_at: inner.span.start,
                                 scope_depth: 0,
                                 pattern_window: None,
+                                typed: false,
                             },
                         );
                     }
@@ -124,6 +169,7 @@ impl Walker {
                                 ready_at: 0,
                                 scope_depth: 0,
                                 pattern_window: None,
+                                typed: false,
                             },
                         );
                     }
@@ -136,6 +182,7 @@ impl Walker {
                         ready_at: 0,
                         scope_depth: 0,
                         pattern_window: None,
+                        typed: false,
                     },
                 ),
                 StmtKind::ModuleDecl(module) => {
@@ -148,6 +195,7 @@ impl Walker {
                                 ready_at: 0,
                                 scope_depth: 0,
                                 pattern_window: None,
+                                typed: false,
                             },
                         );
                     }
@@ -160,6 +208,7 @@ impl Walker {
                         ready_at: 0,
                         scope_depth: 0,
                         pattern_window: None,
+                        typed: false,
                     },
                 ),
                 StmtKind::Import(import) => {
@@ -173,6 +222,7 @@ impl Walker {
                                     ready_at: 0,
                                     scope_depth: 0,
                                     pattern_window: None,
+                                    typed: false,
                                 },
                             );
                         }
@@ -185,6 +235,7 @@ impl Walker {
                                     ready_at: 0,
                                     scope_depth: 0,
                                     pattern_window: None,
+                                    typed: false,
                                 },
                             );
                         }
@@ -225,8 +276,13 @@ impl Walker {
         {
             return;
         }
-        self.findings
-            .push((decl.kind, name.to_string(), span, decl.name_span));
+        self.findings.push((
+            decl.kind,
+            name.to_string(),
+            span,
+            decl.name_span,
+            decl.typed && self.class_initializer_depth == 0,
+        ));
     }
 
     fn visit_stmts(&mut self, stmts: &[Stmt]) {
@@ -322,7 +378,9 @@ impl Walker {
                         if !is_static {
                             self.boundaries.push(self.scopes.len());
                         }
+                        self.class_initializer_depth += 1;
                         self.visit_expr(init);
+                        self.class_initializer_depth -= 1;
                         if !is_static {
                             self.boundaries.pop();
                         }
@@ -343,7 +401,11 @@ impl Walker {
                     }
                     self.visit_function(&accessor.params, accessor.body.as_deref(), true);
                 }
-                ClassMemberKind::StaticBlock(stmts) => self.visit_stmts(stmts),
+                ClassMemberKind::StaticBlock(stmts) => {
+                    self.class_initializer_depth += 1;
+                    self.visit_stmts(stmts);
+                    self.class_initializer_depth -= 1;
+                }
                 ClassMemberKind::IndexSignature(_) | ClassMemberKind::SemicolonClassElement => {}
             }
         }
@@ -644,6 +706,7 @@ impl Walker {
                             ready_at: 0,
                             scope_depth: 0,
                             pattern_window: None,
+                            typed: false,
                         },
                     );
                 }
@@ -675,6 +738,7 @@ impl Walker {
                             ready_at: 0,
                             scope_depth: 0,
                             pattern_window: None,
+                            typed: false,
                         },
                     );
                 }
@@ -766,6 +830,7 @@ impl TypeChecker {
             return;
         }
         let mut walker = Walker {
+            class_initializer_depth: 0,
             scopes: Vec::new(),
             boundaries: Vec::new(),
             findings: Vec::new(),
@@ -774,7 +839,7 @@ impl TypeChecker {
         walker.visit_stmts(stmts);
         self.report_later_file_block_scoped_uses(stmts, &walker.unresolved_immediate);
         let file = self.current_file_name.clone();
-        for (kind, name, span, name_span) in walker.findings {
+        for (kind, name, span, name_span, typed) in walker.findings {
             let code = if kind == DeclKind::Class { 2449 } else { 2448 };
             if !self
                 .reported_duplicate_spans
@@ -800,6 +865,23 @@ impl TypeChecker {
                     span: Some(name_span),
                 }]),
             });
+            // A typed binding read in its dead zone is also unassigned.
+            if kind == DeclKind::BlockVar
+                && typed
+                && self.check_definite_assignment
+                && self
+                    .reported_duplicate_spans
+                    .insert((2454, span.start, span.end))
+            {
+                self.diagnostics.push(Diagnostic {
+                    code: 2454,
+                    message: format!("Variable '{name}' is used before being assigned."),
+                    category: DiagnosticCategory::Error,
+                    file_name: None,
+                    span: Some(span),
+                    related: None,
+                });
+            }
         }
     }
 }

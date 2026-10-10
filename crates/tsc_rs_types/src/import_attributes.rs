@@ -172,3 +172,56 @@ impl TypeChecker {
         }
     }
 }
+
+impl TypeChecker {
+    /// TS2206/TS2207: a `type` modifier on a specifier of a declaration that
+    /// is already `import type` / `export type`.
+    pub(crate) fn check_redundant_type_modifiers(&mut self, stmt: &Stmt) {
+        // grammarErrorOnNode: silent in a file with parse errors.
+        if !self.check_index_grammar {
+            return;
+        }
+        let spans: Vec<Span> = match &stmt.kind {
+            StmtKind::Import(import) if import.type_only => match &import.specifiers {
+                ImportClause::Named { named, .. } => named
+                    .iter()
+                    .filter(|specifier| specifier.is_type)
+                    .map(|specifier| specifier.span)
+                    .collect(),
+                _ => Vec::new(),
+            },
+            StmtKind::Export(export) => match &export.kind {
+                ExportDeclKind::Named {
+                    specifiers,
+                    type_only: true,
+                    ..
+                } => specifiers
+                    .iter()
+                    .filter(|specifier| specifier.is_type)
+                    .map(|specifier| specifier.span)
+                    .collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        let (code, kind) = if matches!(stmt.kind, StmtKind::Import(_)) {
+            (2206, "import")
+        } else {
+            (2207, "export")
+        };
+        for span in spans {
+            // tsc marks the `type` keyword.
+            let span = Span::new(span.start, span.start + 4);
+            self.diagnostics.push(Diagnostic {
+                code,
+                message: format!(
+                    "The 'type' modifier cannot be used on a named {kind} when '{kind} type' is used on its {kind} statement."
+                ),
+                category: DiagnosticCategory::Error,
+                file_name: None,
+                span: Some(span),
+                related: None,
+            });
+        }
+    }
+}
