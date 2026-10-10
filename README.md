@@ -76,7 +76,7 @@ JavaScript emit skips 497 compiler and 519 conformance cases without a `.js`
 oracle (mostly `noEmit`); diagnostics exercises all of them. Symbols and types
 skip 95 compiler and 290 conformance cases without a uniquely selected oracle.
 
-Public workspace validation: **3,429 Rust tests passed**, zero failed, and
+Public workspace validation: **3,430 Rust tests passed**, zero failed, and
 37 ignored; `make ci` passes.
 
 Language server, against the `fourslash` suite:

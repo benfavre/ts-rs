@@ -1911,3 +1911,36 @@ JavaScript emit stays at 100% in both suites, and the LSP lanes are
 unchanged. All 3,429 public Rust tests pass with 37 ignored, and
 `make ci` passes. The preceding snapshot is retained at
 `docs/compatibility-metrics-2026-10-10-3f776ee67.json`.
+
+## 2026-10-10: parser recovery parity and real-world false positives
+
+The parser follows tsc's recovery more closely. An invalid character
+absorbs a parse error at its own position and spans the character. A
+missing parameter name before `)` or `,` consumes nothing, and a missing
+`(` before `}` or `;` leaves an empty parameter list. An object literal
+member followed by `;` on a new line abandons the literal. `export =
+undefined` and re-exports of type-only imports are no longer reported as
+unknown names.
+
+A smoke test over 41,000 real-world `.ts`/`.tsx` files found syntax errors
+that tsc does not report, and all of them are fixed. An apostrophe in JSX
+text no longer leaves an unterminated-string or invalid-character error.
+A regular expression may start with `>` or contain `</`.
+`import("m").default` is a valid import type. A typed arrow parameter
+inside a conditional may name a qualified type. The same files now
+transpile with no diagnostics.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,858 | 4,865 |
+| Conformance | 3,853 | 3,865 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 86.62% | 86.73% | 61.03% | 61.03% |
+| Conformance | 89.45% | 89.51% | 69.34% | 69.33% |
+
+JavaScript emit stays at 100% in both suites, and the LSP lanes are
+unchanged. All 3,430 public Rust tests pass with 37 ignored, and
+`make ci` passes. The preceding snapshot is retained at
+`docs/compatibility-metrics-2026-10-10-06a23c635.json`.
