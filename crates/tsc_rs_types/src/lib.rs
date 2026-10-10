@@ -27906,7 +27906,10 @@ impl TypeChecker {
                             || self.imported_type_sources.contains_key(local)
                             || stdlib::is_future_lib_global_diagnostic_name(local)
                             || self.enum_info.contains_key(local)
-                            || self.overloads.contains_key(local);
+                            || self.overloads.contains_key(local)
+                            // A type-only import may be re-exported.
+                            || self.type_only_bindings.contains_key(local)
+                            || self.file_import_binding_names.contains(local);
                         if !known {
                             self.diagnostics
                                 .push(diagnostics::error_cannot_find_name(local, local_span));
@@ -27981,7 +27984,13 @@ impl TypeChecker {
                             .module_block_local_names
                             .iter()
                             .any(|(names, _)| names.contains(name.as_str()))
-                        || Self::name_shadows_js_builtin(name);
+                        || Self::name_shadows_js_builtin(name)
+                        // `undefined` is a global value; `<error>` is the
+                        // parser's missing expression (already reported).
+                        || name == "undefined"
+                        || name == "<error>"
+                        || self.file_import_binding_names.contains(name.as_str())
+                        || self.type_only_bindings.contains_key(name.as_str());
                     if !known {
                         self.diagnostics
                             .push(diagnostics::error_cannot_find_name_in_expression(

@@ -131,10 +131,12 @@ impl<'a> Scanner<'a> {
                             && {
                                 let next_pos = self.inner.text_pos();
                                 next_pos >= self.inner.source_len()
-                                    || !matches!(
-                                        self.inner.source_byte_at(next_pos),
-                                        b')' | b'>' | b']'
-                                    )
+                                    || !(matches!(self.inner.source_byte_at(next_pos), b')' | b']')
+                                        // `{...props} />` closes a JSX tag;
+                                        // elsewhere `/>…/` is a regex
+                                        // (`[/>\s*\/dev\//]`).
+                                        || (self.inner.source_byte_at(next_pos) == b'>'
+                                            && prev_non_trivia_kind == TokenKind::CloseBrace))
                             }
                     {
                         self.inner.publish_batch_token(scan_pos, kind);

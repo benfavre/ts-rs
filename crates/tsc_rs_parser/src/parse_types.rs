@@ -682,7 +682,14 @@ impl<'a> Parser<'a> {
                 let has_resolution_mode = self.skip_import_type_options();
                 self.expect(TokenKind::CloseParen);
                 let qualifier = if self.eat(TokenKind::Dot).is_some() {
-                    Some(Box::new(self.parse_entity_name()))
+                    // tsc parseEntityName(allowReservedWords): `import("m").default`.
+                    if self.cur().is_identifier_name() {
+                        let start = self.cur_span().start;
+                        let (name, span) = self.bump_identifier_unchecked();
+                        Some(Box::new(self.parse_entity_name_rest(start, name, span)))
+                    } else {
+                        Some(Box::new(self.parse_entity_name()))
+                    }
                 } else {
                     None
                 };

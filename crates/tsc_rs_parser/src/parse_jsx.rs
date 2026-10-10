@@ -1010,11 +1010,25 @@ impl<'a> Parser<'a> {
             // hence "expected CloseBrace, got StringLiteral", and recovery then
             // emitted invalid JavaScript. Re-scan the whole tail instead.
             let mut straddles_boundary = false;
+            let mut straddle_end = text_end;
             while self.pos < self.tokens.len() && self.tokens[self.pos].span.start < text_end {
-                straddles_boundary |= self.tokens[self.pos].span.end > text_end;
+                let end = self.tokens[self.pos].span.end;
+                if end > text_end {
+                    straddles_boundary = true;
+                    straddle_end = straddle_end.max(end);
+                }
                 self.pos += 1;
             }
             if straddles_boundary {
+                // A lone apostrophe (`<p>it's</p>`) made the JS scanner run a
+                // string to the end of the line and report TS1002 there, past
+                // the text span. The literal was never a string: withdraw it.
+                self.diagnostics.retain(|diagnostic| {
+                    !(diagnostic.code == 1002
+                        && diagnostic
+                            .span
+                            .is_some_and(|span| span.start > text_end && span.end <= straddle_end))
+                });
                 self.rescan_tail_from(text_end);
             }
             // If the next remaining token starts after text_end, the scanner
@@ -1172,6 +1186,11 @@ impl<'a> Parser<'a> {
                 // "',' expected" (a same-line `;` is then skipped).
                 if self.at(TokenKind::Semicolon) {
                     self.error_code(1005, "',' expected.".into());
+                    // On its own line the `;` can start a statement, so
+                    // the literal is abandoned there.
+                    if self.is_on_new_line() {
+                        break;
+                    }
                     self.bump();
                     continue;
                 }
@@ -1336,6 +1355,19 @@ impl<'a> Parser<'a> {
             // recovers a comma-terminated signature as an empty method. Do
             // not let block recovery consume the following method's body.
             let body = if self.at(TokenKind::Comma) {
+                Vec::new()
+            } else if self.at(TokenKind::Semicolon)
+                && self.speculation_depth == 0
+                && self.tokens.get(self.pos + 1).is_some_and(|next| {
+                    next.kind == TokenKind::CloseBrace
+                        && !self.source[self.cur_span().end as usize..next.span.start as usize]
+                            .contains('\n')
+                })
+            {
+                // tsc parseFunctionBlockOrSemicolon takes the `;` as the
+                // end of a bodiless method.
+                self.error_code(1005, "'{' expected.".into());
+                self.bump();
                 Vec::new()
             } else {
                 self.parse_block_body()

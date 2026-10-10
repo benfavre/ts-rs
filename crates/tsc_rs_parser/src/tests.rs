@@ -4157,6 +4157,25 @@ fn jsx_text_apostrophe_before_quoted_expression_container() {
 }
 
 #[test]
+fn jsx_text_lone_apostrophe_is_not_an_unterminated_string() {
+    // Regression: the JS scanner's unpaired `'` runs to the end of the line
+    // and reports TS1002 there, outside the JSX text span; the rescan must
+    // withdraw it (bext treated the file as failed and served raw ESM).
+    for src in [
+        "const x = <div>it's</div>;",
+        "const x = (\n  <div>\n    <span>Vous n'avez pas accès.</span>\n  </div>\n);\nconst y = 1;",
+        "const x = <p>L'un <b>et</b> l'autre</p>;",
+    ] {
+        let sf = parse_tsx_src(src);
+        assert!(
+            sf.diagnostics.is_empty(),
+            "unexpected diagnostics for {src:?}: {:?}",
+            sf.diagnostics
+        );
+    }
+}
+
+#[test]
 fn jsx_text_apostrophes_around_repeated_containers() {
     // Two containers, an apostrophe on each side: every `{' '}` must survive.
     let src = r#"const x = <p>L'un{' '}et{' '}l'autre</p>;"#;

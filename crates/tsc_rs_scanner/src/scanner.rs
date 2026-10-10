@@ -374,7 +374,22 @@ impl<'a> TsScanner<'a> {
                 // misidentified as regex body (e.g., `&lt;/head&gt;</code>`).
                 // Bare `<` without `/` is valid in regex (e.g., /<link/).
                 if ch == b'<' && !in_char_class {
-                    if self.pos + 1 < self.end && self.at(self.pos + 1) == b'/' {
+                    // Only a real closing tag (`</name>`, `</>`): in
+                    // `/a"></g` the `/` after `<` ends the regex.
+                    let closing_tag = self.pos + 1 < self.end && self.at(self.pos + 1) == b'/' && {
+                        let mut at = self.pos + 2;
+                        while at < self.end
+                            && (self.at(at).is_ascii_alphanumeric()
+                                || matches!(self.at(at), b'-' | b'.' | b':' | b'_' | b'$'))
+                        {
+                            at += 1;
+                        }
+                        while at < self.end && matches!(self.at(at), b' ' | b'\t') {
+                            at += 1;
+                        }
+                        at < self.end && self.at(at) == b'>'
+                    };
+                    if closing_tag {
                         // `</` — closing tag, not regex; revert to the
                         // slash-ish token we started with.
                         self.pos = original_pos;

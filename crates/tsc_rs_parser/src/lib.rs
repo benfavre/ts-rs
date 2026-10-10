@@ -160,12 +160,18 @@ pub fn parse_with_jsx(file_name: &str, source: &str, jsx_enabled: bool) -> Sourc
     for index in 0..p.tokens.len() {
         if p.tokens[index].kind == TokenKind::Unknown {
             let start = p.tokens[index].span.start;
+            // tsc's default scanner branch reports the character itself;
+            // `\` and `#` paths report a zero-length error.
+            let end = match source[start as usize..].chars().next() {
+                Some(ch) if ch != '\\' && ch != '#' => start + ch.len_utf8() as u32,
+                _ => start,
+            };
             p.diagnostics.push(Diagnostic {
                 code: 1127,
                 message: "Invalid character.".to_string(),
                 category: DiagnosticCategory::Error,
                 file_name: Some(file_name.to_string()),
-                span: Some(Span::new(start, start)),
+                span: Some(Span::new(start, end)),
                 related: None,
             });
         }
@@ -191,6 +197,23 @@ pub fn parse_with_jsx(file_name: &str, source: &str, jsx_enabled: bool) -> Sourc
     // hands the parser an Unknown token it skips. Reported eagerly so regex
     // and JSX-text rescans can withdraw it like the other scanner errors.
     // A TS1002 string token that a JSX rescan replaced was never a string.
+    // A TS1127 from the up-front scan survives only where the final
+    // (rescanned) token stream still has the Unknown token: JSX text and
+    // regex rescans re-lex what an apostrophe in JSX text threw off.
+    if diagnostics.iter().any(|diagnostic| diagnostic.code == 1127) {
+        let unknown_starts: std::collections::HashSet<u32> = p
+            .tokens
+            .iter()
+            .filter(|token| token.kind == TokenKind::Unknown)
+            .map(|token| token.span.start)
+            .collect();
+        diagnostics.retain(|diagnostic| {
+            diagnostic.code != 1127
+                || diagnostic
+                    .span
+                    .is_some_and(|span| unknown_starts.contains(&span.start))
+        });
+    }
     if jsx_enabled {
         diagnostics.retain(|diagnostic| {
             !(diagnostic.code == 1002 && diagnostic.message == "Unterminated string literal.")
@@ -1238,10 +1261,28 @@ impl<'a> Parser<'a> {
                 1003 | 1005 | 1109 | 1128 | 1134 | 1135 | 1136 | 1138 | 1144
             )
         };
+        // Scanner errors go through the same check in tsc.
+        let scanner_error = |code: u32| {
+            matches!(
+                code,
+                1002 | 1010 | 1125 | 1126 | 1127 | 1160 | 1161 | 1198 | 1199 | 1351 | 1490
+            )
+        };
+        let same_start = |diagnostic: &Diagnostic| {
+            diagnostic
+                .span
+                .is_some_and(|other| other.start == span.start)
+        };
+        // TS1127 is recorded up front, not as its token is reached (tsc
+        // reports it when the token is scanned, before any parse error
+        // there).
         if parse_error(code)
-            && self.diagnostics.last().is_some_and(|last| {
-                parse_error(last.code) && last.span.is_some_and(|last| last.start == span.start)
-            })
+            && (self.diagnostics.last().is_some_and(|last| {
+                (parse_error(last.code) || scanner_error(last.code)) && same_start(last)
+            }) || self
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == 1127 && same_start(diagnostic)))
         {
             return;
         }
@@ -5283,7 +5324,16 @@ impl<'a> Parser<'a> {
     // -----------------------------------------------------------------------
 
     fn parse_param_list(&mut self) -> Vec<Param> {
-        self.expect(TokenKind::OpenParen);
+        // tsc parseParameters: without `(` the list is missing (no `)`
+        // expected after it).
+        if self.eat(TokenKind::OpenParen).is_none() {
+            self.expect(TokenKind::OpenParen);
+            // Only where the declaration visibly goes on without a list;
+            // elsewhere the list recovery below makes the progress.
+            if matches!(self.cur(), TokenKind::CloseBrace | TokenKind::Semicolon) {
+                return Vec::new();
+            }
+        }
         let mark = self.scratch_params.len();
         let mut last_pos = usize::MAX;
         let mut recovering_type_predicate_as_params = false;
@@ -5433,7 +5483,20 @@ impl<'a> Parser<'a> {
         if self.at(TokenKind::Colon) && self.peek_is_ident_or_keyword() {
             self.bump(); // consume stray `:`
         }
-        let name = recovered_name_from_decorator.unwrap_or_else(|| self.parse_binding_pattern());
+        let name = recovered_name_from_decorator.unwrap_or_else(|| {
+            // tsc's missing identifier consumes nothing: the list goes on
+            // at the `)` or `,` (`function f(...) {}`).
+            if matches!(self.cur(), TokenKind::CloseParen | TokenKind::Comma) {
+                let at = self.cur_span().start;
+                self.error_code(1003, "Identifier expected.".into());
+                Pat {
+                    kind: PatKind::Ident("<error>".into()),
+                    span: Span::new(at, at),
+                }
+            } else {
+                self.parse_binding_pattern()
+            }
+        });
         if matches!(&name.kind, PatKind::Ident(name) if name == "this") {
             if let Some(decorator) = decorators.first() {
                 let span = self.decorator_diagnostic_span(decorator, true);
@@ -7526,7 +7589,29 @@ impl<'a> Parser<'a> {
             let mut pd = 0i32;
             let mut bd = 0i32;
             let mut bk = 0i32;
+            // As above: past a parameter's `:` or `=` the operators belong
+            // to its type or initializer (`(p: N<typeof c.P>[number]) =>`).
+            let mut in_type_or_initializer = false;
+            let mut ad = 0i32;
             for (idx, tok) in inner.iter().enumerate() {
+                if pd == 0 && bd == 0 && bk == 0 {
+                    match tok.kind {
+                        TokenKind::Colon | TokenKind::Equals => in_type_or_initializer = true,
+                        TokenKind::Comma if ad == 0 => in_type_or_initializer = false,
+                        TokenKind::LessThan if in_type_or_initializer => ad += 1,
+                        TokenKind::GreaterThan if ad > 0 => ad -= 1,
+                        TokenKind::GreaterGreater if ad > 0 => ad = (ad - 2).max(0),
+                        _ => {}
+                    }
+                    if in_type_or_initializer
+                        && !matches!(
+                            tok.kind,
+                            TokenKind::OpenParen | TokenKind::OpenBrace | TokenKind::OpenBracket
+                        )
+                    {
+                        continue;
+                    }
+                }
                 match tok.kind {
                     TokenKind::OpenParen => pd += 1,
                     TokenKind::CloseParen => pd -= 1,
