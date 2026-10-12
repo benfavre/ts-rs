@@ -1974,3 +1974,32 @@ All 3,759 public Rust tests pass, with 37 ignored, and `make ci` passes.
 The measured compiler commit is `17d96efab`. The preceding
 snapshot, measured on 2026-10-10, is retained at
 `docs/compatibility-metrics-2026-10-12-86b97a639.json`.
+
+## 2026-10-12: decorator arguments, return types and constructor inference
+
+Legacy decorators now validate argument types and return types, preserving
+private static member identity when comparing class constructors. Generic
+inference uses class prototypes and parameterless callback return candidates
+while preserving union arguments and contextual callback inference.
+Bare construct signatures retain an untyped prototype. Upstream test cases
+and reference baselines are unchanged.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,936 | 4,939 |
+| Conformance | 3,999 | 4,004 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 86.99% | 87.03% | 63.44% | 63.58% |
+| Conformance | 90.06% | 90.06% | 71.43% | 71.48% |
+
+Cache-free reports cover JavaScript, diagnostics, symbols, types, expanded
+JavaScript/declarations, diagnostic accuracy and all LSP operations. JavaScript
+emit still matches every available default baseline in both suites. Skips are
+excluded from pass rates. LSP totals are refreshed in the same snapshot.
+
+All 3,786 public Rust tests pass, with 37 ignored, and `make ci` passes.
+The measured compiler commit is `1eb8300a4`. The preceding
+snapshot, measured on 2026-10-12, is retained at
+`docs/compatibility-metrics-2026-10-12-17d96efab.json`.
