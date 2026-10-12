@@ -154,6 +154,7 @@ impl TypeChecker {
     }
 
     pub(crate) fn completion_mark_annotation(&mut self, name: &str, annotation: &TypeNode) {
+        self.mark_tuple_annotation(name, annotation);
         // Scalar annotations cannot provide a callable dotted name.
         if !matches!(
             annotation.kind,

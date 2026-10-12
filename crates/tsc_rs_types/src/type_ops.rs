@@ -808,6 +808,11 @@ pub fn resolve_keyof(ty: &Type) -> Type {
 /// - `Tuple[NumberLiteral]`      -> specific element type
 /// - `Union` index               -> union of results
 pub fn resolve_indexed_access(object_type: &Type, index_type: &Type) -> Type {
+    if let Some(value) =
+        crate::tuple_access::indexed_type(object_type, index_type, true, false, false)
+    {
+        return value;
+    }
     // Union index: T[A | B] = T[A] | T[B]
     if let Type::Union(members) = index_type {
         let results: Vec<Type> = members

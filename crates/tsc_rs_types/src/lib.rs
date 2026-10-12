@@ -52,6 +52,7 @@ mod resolve_types;
 mod static_overrides;
 mod stdlib;
 mod strict_reserved;
+mod tuple_access;
 mod type_computations;
 pub mod type_facts;
 mod type_only_aliases;
@@ -2473,6 +2474,7 @@ struct CheckerScope {
     /// Class receiver captured by a local binding whose type remains the
     /// polymorphic `this` type, including aliases used from nested classes.
     this_alias_receivers: rustc_hash::FxHashMap<String, Type>,
+    tuple_metadata: rustc_hash::FxHashMap<String, tuple_access::TupleBindingMetadata>,
     /// The exact scope introduced by a namespace/module block. Nested
     /// functions and ordinary blocks do not inherit its declaration context.
     module_body_kind: Option<ModuleBodyKind>,
@@ -3608,6 +3610,7 @@ impl TypeChecker {
             condition_aliases: rustc_hash::FxHashMap::default(),
             readonly_namespace_aliases: rustc_hash::FxHashMap::default(),
             this_alias_receivers: rustc_hash::FxHashMap::default(),
+            tuple_metadata: rustc_hash::FxHashMap::default(),
             module_body_kind: None,
             parent: None,
         };
@@ -5205,6 +5208,24 @@ impl TypeChecker {
         }
         self.resolve_local_export_aliases(&mut exports);
         Self::resolve_namespace_unique_aliases(&mut exports);
+        // The export table retains type-only proxies alongside values. A
+        // merged declaration may put its alias proxy first (`export type A;
+        // function A() {}; export { A }`). Value imports and namespace reads
+        // must select the value, independently of declaration order.
+        let type_proxy = |name: &str, ty: &Type| matches!(ty, Type::TypeReference(reference, args) if reference == name && args.is_empty());
+        let mut first_exports: rustc_hash::FxHashMap<String, usize> =
+            rustc_hash::FxHashMap::default();
+        for index in 0..exports.len() {
+            if let Some(first) = first_exports.get(&exports[index].0).copied() {
+                if type_proxy(&exports[first].0, &exports[first].1)
+                    && !type_proxy(&exports[index].0, &exports[index].1)
+                {
+                    exports.swap(first, index);
+                }
+            } else {
+                first_exports.insert(exports[index].0.clone(), index);
+            }
+        }
         exports
     }
 
@@ -11707,7 +11728,7 @@ impl TypeChecker {
                 if shadowing {
                     self.active_type_param_names.push(own_params);
                 }
-                let raw = self.resolve_type_node(&ta.type_ann);
+                let raw = self.resolve_alias_body(&ta.type_ann);
                 if shadowing {
                     self.active_type_param_names.pop();
                 }
@@ -12468,6 +12489,7 @@ impl TypeChecker {
             condition_aliases: rustc_hash::FxHashMap::default(),
             readonly_namespace_aliases: rustc_hash::FxHashMap::default(),
             this_alias_receivers: rustc_hash::FxHashMap::default(),
+            tuple_metadata: rustc_hash::FxHashMap::default(),
             module_body_kind: None,
             parent: Some(self.current_scope),
         });
@@ -15850,6 +15872,7 @@ impl TypeChecker {
                         var_stmt.kind == VarKind::Const,
                     );
                     self.mark_widening_literal_binding(decl, is_const);
+                    self.mark_tuple_initializer(decl);
                 }
             }
             StmtKind::FnDecl(fn_decl) => {
@@ -16110,7 +16133,7 @@ impl TypeChecker {
                     .as_ref()
                     .map(|tps| tps.iter().filter(|tp| tp.default.is_none()).count())
                     .unwrap_or(0);
-                let resolved_raw = self.resolve_type_node(&type_alias.type_ann);
+                let resolved_raw = self.resolve_alias_body(&type_alias.type_ann);
                 // Inside the alias body, references to the alias's own type
                 // parameters resolve as `TypeReference(name, [])` because the
                 // resolver has no scope-aware view of which names are bound.
@@ -22227,7 +22250,20 @@ impl TypeChecker {
                         return resolved;
                     }
                 }
-                let resolved = crate::type_ops::resolve_indexed_access(&obj_struct, &idx_simp);
+                let resolved = self
+                    .tuple_index_receiver(&obj_struct, 0)
+                    .and_then(|tuple| {
+                        tuple_access::indexed_type(
+                            &tuple,
+                            &idx_simp,
+                            self.strict_null_checks,
+                            false,
+                            false,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        crate::type_ops::resolve_indexed_access(&obj_struct, &idx_simp)
+                    });
                 // If the resolver couldn't pin a property, it returns the
                 // same IndexedAccess wrapper. Avoid recursing infinitely.
                 if matches!(&resolved, Type::IndexedAccess(o, _) if o.as_ref() == obj.as_ref()) {
@@ -27561,6 +27597,7 @@ impl TypeChecker {
                         self.narrow_var(name, value);
                     }
                     self.mark_widening_literal_binding(decl, is_const);
+                    self.mark_tuple_initializer(decl);
                     if let (PatKind::Ident(name), Some(receiver)) = (&decl.name.kind, this_receiver)
                     {
                         self.scopes[self.current_scope]
@@ -31969,6 +32006,7 @@ impl TypeChecker {
                 self.check_type_node_future_lib_globals(object);
                 self.check_type_node_future_lib_globals(index);
                 self.check_global_indexed_access_type(object, index);
+                self.check_tuple_indexed_access_type(object, index);
             }
             TypeNodeKind::Infer(name, constraint) => {
                 self.check_reserved_type_parameter_name(name, node.span);
@@ -42201,7 +42239,8 @@ impl TypeChecker {
             | Type::Null
             | Type::EnumVariant { .. }
             | Type::TemplateLiteral { .. }
-            | Type::UniqueSymbol(_) => true,
+            | Type::UniqueSymbol(_)
+            | Type::Never => true,
             Type::Union(members) | Type::Intersection(members) => members
                 .iter()
                 .any(|member| self.type_could_have_top_level_singleton_types(member)),

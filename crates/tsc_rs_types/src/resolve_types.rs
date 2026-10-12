@@ -20,6 +20,19 @@ fn widen_literal(ty: Type) -> Type {
 }
 
 impl TypeChecker {
+    /// Keep computed alias bodies deferred until their declaration context is
+    /// available. This also distinguishes a computed union from a named union
+    /// when displaying an indexed-access result.
+    pub(super) fn resolve_alias_body(&self, node: &TypeNode) -> Type {
+        if let TypeNodeKind::IndexedAccess(object, index) = &node.kind {
+            Type::IndexedAccess(
+                Arc::new(self.resolve_type_node(object)),
+                Arc::new(self.resolve_type_node(index)),
+            )
+        } else {
+            self.resolve_type_node(node)
+        }
+    }
     // -----------------------------------------------------------------------
     // Type annotation resolution
     // -----------------------------------------------------------------------

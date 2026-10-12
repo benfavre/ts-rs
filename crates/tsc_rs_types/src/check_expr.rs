@@ -6491,7 +6491,15 @@ impl TypeChecker {
                     {
                         Type::Error
                     } else {
-                        ty
+                        let intrinsic = self.display_type_through_primitive_alias(&ty);
+                        if intrinsic != ty {
+                            intrinsic
+                        } else if matches!(&ty, Type::TypeReference(name, _) if self.type_aliases.get(name.as_str()).is_some_and(|(_, body, _)| matches!(body, Type::IndexedAccess(..))))
+                        {
+                            self.simplify_type(&ty)
+                        } else {
+                            ty
+                        }
                     }
                 } else {
                     // Special built-in identifiers
@@ -9723,6 +9731,15 @@ impl TypeChecker {
                         ty
                     }
                 };
+                if let Some(value) = self.check_tuple_element_access(
+                    ea,
+                    &obj_ty,
+                    &idx_ty,
+                    self.assignment_target_span == Some(expr.span),
+                    unchecked && self.strict_null_checks,
+                ) {
+                    return value;
+                }
                 if let Some(member) = self.known_literal_index_read(&obj_ty, &idx_ty, 0) {
                     self.record_expr_type(expr.span.start, &member);
                     return member;
@@ -10377,6 +10394,12 @@ impl TypeChecker {
                     if let Some(path) = property_path {
                         self.clear_narrowed_var(&path);
                         self.clear_narrowed_paths_under(&path);
+                        if matches!(right_ty, Type::Null | Type::Undefined)
+                            && !matches!(left_ty, Type::Any | Type::Error)
+                            && self.is_assignable_to(&right_ty, &left_ty)
+                        {
+                            self.narrow_var(&path, right_ty.clone());
+                        }
                         if !matches!(right_ty, Type::Any | Type::Error)
                             && !Self::type_is_nullish(&right_ty)
                             && !self.type_admits_nullish(&right_ty)
