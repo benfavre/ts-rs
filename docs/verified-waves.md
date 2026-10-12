@@ -2259,7 +2259,7 @@ reference baselines are unchanged.
 | Compiler | 641 | 721 |
 | Conformance | 614 | 737 |
 
-| Diagnostic baseline | Passes before | After |
+| Suite | Diagnostic passes before | After |
 |---|---:|---:|
 | Compiler | 4,969 | 4,971 |
 | Conformance | 4,041 | 4,044 |
