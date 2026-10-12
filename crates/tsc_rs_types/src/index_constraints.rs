@@ -23,6 +23,37 @@ impl TypeChecker {
             .collect()
     }
 
+    pub(super) fn inherited_element_index_type(&self, receiver: &Type, key: &Type) -> Option<Type> {
+        if let Type::Union(keys) = key {
+            return keys
+                .iter()
+                .map(|key| self.inherited_element_index_type(receiver, key))
+                .collect::<Option<Vec<_>>>()
+                .map(Type::flatten_union);
+        }
+        let indices = self.inherited_index_constraints(receiver, &mut HashSet::new());
+        let mut specific = Vec::new();
+        let mut string_index = None;
+        for index in indices {
+            if self.index_applies_to_property(key, &index.key)
+                || matches!(key, Type::Any) && matches!(index.key, Type::Number | Type::String)
+            {
+                if matches!(index.key, Type::String) {
+                    string_index = Some(index.value);
+                } else {
+                    specific.push(index.value);
+                }
+            }
+        }
+        if specific.is_empty() || matches!(key, Type::Any) && string_index.is_some() {
+            string_index
+        } else if specific.len() == 1 {
+            specific.pop()
+        } else {
+            Some(Type::Intersection(specific.into()))
+        }
+    }
+
     pub(super) fn known_literal_index_read(
         &self,
         receiver: &Type,
@@ -44,9 +75,18 @@ impl TypeChecker {
                 .collect::<Option<Vec<_>>>()
                 .map(Type::flatten_union);
         }
+        let keys = self.element_index_keys(index);
+        if keys.iter().any(|(key, _)| key != index) {
+            return keys
+                .iter()
+                .map(|(key, _)| self.known_literal_index_read(receiver, key, depth + 1))
+                .collect::<Option<Vec<_>>>()
+                .map(Type::flatten_union);
+        }
         let key = match index {
             Type::StringLiteral(key) => key.clone(),
             Type::NumberLiteral(key) => Self::canonical_numeric_property_name(key),
+            Type::UniqueSymbol(identity) => Self::unique_symbol_property_key(identity),
             _ => return None,
         };
         match receiver {
@@ -62,12 +102,71 @@ impl TypeChecker {
                     })
             }
             Type::TypeReference(name, args) => {
+                if name.starts_with("typeof ") {
+                    return self
+                        .direct_constructor_static_members(receiver)?
+                        .into_iter()
+                        .find(|(name, _)| name == &key)
+                        .map(|(_, ty)| ty);
+                }
+                if matches!(name.as_str(), "Array" | "ReadonlyArray")
+                    && args.len() == 1
+                    && !self.interface_info.contains_key(name)
+                    && !self.class_info.contains_key(name)
+                    && !self.type_aliases.contains_key(name)
+                    && stdlib::stdlib_member_availability(&self.compiler_options)
+                        .is_some_and(|library| library.declares_member(name, &key) == Some(true))
+                {
+                    return self
+                        .builtins
+                        .lookup_array_method_typed(&args[0], &key)
+                        .or_else(|| self.builtins.lookup_instance_property("Array", &key));
+                }
                 let shape = self
                     .resolve_type_reference_to_object(name, args)
                     .or_else(|| self.resolve_type_for_assignability(receiver))?;
-                (shape != *receiver)
+                let known = (shape != *receiver)
                     .then(|| self.known_literal_index_read(&shape, index, depth + 1))
-                    .flatten()
+                    .flatten();
+                if known.is_some() {
+                    return known;
+                }
+                let (parameters, bases) = if let Some(info) = self.interface_info.get(name) {
+                    (
+                        &info.type_params,
+                        info.extends
+                            .iter()
+                            .map(|(name, args)| Type::TypeReference(name.clone(), args.clone()))
+                            .collect::<Vec<_>>(),
+                    )
+                } else if let Some(info) = self.class_info.get(name) {
+                    (
+                        &info.type_params,
+                        info.extends
+                            .iter()
+                            .map(|name| {
+                                Type::TypeReference(
+                                    name.clone(),
+                                    info.extends_type_args.clone().into(),
+                                )
+                            })
+                            .collect(),
+                    )
+                } else {
+                    return None;
+                };
+                let substitutions = parameters
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect::<HashMap<_, _>>();
+                bases.iter().find_map(|base| {
+                    self.known_literal_index_read(
+                        &Self::substitute(base, &substitutions),
+                        index,
+                        depth + 1,
+                    )
+                })
             }
             Type::Mapped { .. } => {
                 let shape = self.simplify_type(receiver);
@@ -176,6 +275,13 @@ impl TypeChecker {
     ) -> Vec<IndexConstraint> {
         let Type::TypeReference(name, arguments) = ty else {
             return match ty {
+                Type::Array(element) => vec![IndexConstraint {
+                    key: Type::Number,
+                    value: Type::clone(element),
+                    is_static: false,
+                    local_span: None,
+                }],
+                Type::Readonly(inner) => self.inherited_index_constraints(inner, seen),
                 Type::ObjectType(object) => object
                     .index_signature
                     .iter()
@@ -226,10 +332,22 @@ impl TypeChecker {
                 .collect();
             (&info.type_params, own, bases)
         } else {
-            let result = self
-                .expand_type_alias_once(name, arguments)
-                .map(|expanded| self.inherited_index_constraints(&expanded, seen))
-                .unwrap_or_default();
+            let result = if let Some(expanded) = self.expand_type_alias_once(name, arguments) {
+                self.inherited_index_constraints(&expanded, seen)
+            } else if matches!(name.as_str(), "Array" | "ReadonlyArray" | "ArrayLike")
+                && arguments.len() == 1
+                && stdlib::stdlib_member_availability(&self.compiler_options)
+                    .is_some_and(|library| library.declares_global_type(name))
+            {
+                vec![IndexConstraint {
+                    key: Type::Number,
+                    value: arguments[0].clone(),
+                    is_static: false,
+                    local_span: None,
+                }]
+            } else {
+                Vec::new()
+            };
             seen.remove(name);
             return result;
         };

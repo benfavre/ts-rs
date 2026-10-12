@@ -40,7 +40,21 @@ impl TypeChecker {
     }
 
     pub(super) fn report_unknown_object_spread(&mut self, ty: &Type, span: Span) -> bool {
-        if !self.is_unknown_receiver(ty) {
+        if !self.is_unknown_receiver(ty)
+            && !matches!(
+                ty,
+                Type::Boolean
+                    | Type::BooleanLiteral(_)
+                    | Type::Number
+                    | Type::NumberLiteral(_)
+                    | Type::String
+                    | Type::StringLiteral(_)
+                    | Type::BigInt
+                    | Type::BigIntLiteral(_)
+                    | Type::Symbol
+                    | Type::UniqueSymbol(_)
+            )
+        {
             return false;
         }
         self.diagnostics.push(Diagnostic {

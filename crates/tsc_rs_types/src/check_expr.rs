@@ -2944,6 +2944,55 @@ impl TypeChecker {
         }
     }
 
+    /// Short-circuiting retains the falsy constituents of the left operand.
+    /// Keeping them also prevents conditional spreads from appearing definite.
+    pub(super) fn logical_and_type(&self, left: &Type, right: Type) -> Type {
+        fn falsy(checker: &TypeChecker, ty: &Type, depth: usize) -> Type {
+            if depth >= 16 {
+                return Type::Never;
+            }
+            match ty {
+                Type::Any | Type::Unknown | Type::Null | Type::Undefined | Type::Void => ty.clone(),
+                Type::Boolean => Type::BooleanLiteral(false),
+                Type::Number => Type::NumberLiteral("0".into()),
+                Type::BigInt => Type::BigIntLiteral("0".into()),
+                Type::String => Type::StringLiteral(String::new()),
+                Type::Union(parts) => Type::flatten_union(
+                    parts
+                        .iter()
+                        .map(|ty| falsy(checker, ty, depth + 1))
+                        .collect(),
+                ),
+                Type::Optional(inner) => {
+                    Type::flatten_union(vec![falsy(checker, inner, depth + 1), Type::Undefined])
+                }
+                ty if TypeChecker::is_always_falsy(ty) => ty.clone(),
+                Type::TypeReference(..) => checker
+                    .resolve_type_for_assignability(ty)
+                    .filter(|resolved| resolved != ty)
+                    .map(|resolved| falsy(checker, &resolved, depth + 1))
+                    .unwrap_or(Type::Never),
+                _ => Type::Never,
+            }
+        }
+        if self.strict_null_checks && matches!(left, Type::Any | Type::Unknown)
+            || Self::is_always_falsy(left)
+            || Self::enum_literal_truthiness(left) == Some(false)
+        {
+            return left.clone();
+        }
+        if self.strict_null_checks {
+            Type::flatten_union(vec![falsy(self, left, 0), right])
+        } else {
+            // Without strict null checks, tsc takes falsy constituents from
+            // the right operand's widened type, not from the left operand.
+            Type::flatten_union(vec![
+                falsy(self, &self.widen_literals_for_display(&right), 0),
+                right,
+            ])
+        }
+    }
+
     fn check_syntactic_truthiness(&mut self, expr: &Expr) {
         let (code, message) = match Self::syntactic_truthiness(expr) {
             Some(SyntacticTruthiness::Always) => {
@@ -3680,6 +3729,73 @@ impl TypeChecker {
         }
         if let Some(return_type) = return_type {
             self.check_type_node_generic_arity(return_type);
+        }
+    }
+
+    /// Required spread properties overwrite earlier explicit members.
+    pub(super) fn report_object_spread_overwrites(
+        &mut self,
+        properties: &[ObjLitProp],
+        spread: Span,
+        ty: &Type,
+    ) {
+        if !self.strict_null_checks || self.assignment_pattern_depth > 0 {
+            return;
+        }
+        let mut spread_properties = Vec::new();
+        let _ = self.merge_spread_into_object_properties(ty, &mut spread_properties);
+        let mut written = HashMap::new();
+        for property in properties {
+            let (key, span) = match property {
+                ObjLitProp::Property(property) => {
+                    (self.pattern_property_name(&property.key), property.span)
+                }
+                ObjLitProp::Shorthand(name, span) | ObjLitProp::ShorthandDefault(name, _, span) => {
+                    (Some(name.to_string()), *span)
+                }
+                ObjLitProp::Method(method) => {
+                    (self.pattern_property_name(&method.name), method.name.span())
+                }
+                ObjLitProp::Get(accessor) | ObjLitProp::Set(accessor) => (
+                    self.pattern_property_name(&accessor.name),
+                    accessor.name.span(),
+                ),
+                ObjLitProp::Spread(_, span) => (None, *span),
+            };
+            if span.start >= spread.start {
+                break;
+            }
+            if let Some(key) = key {
+                written.insert(key, span);
+            }
+        }
+        for (name, ty) in spread_properties {
+            if matches!(ty.as_ref(), Type::Optional(_)) {
+                continue;
+            }
+            let Some(span) = written.get(&name) else {
+                continue;
+            };
+            if self
+                .reported_duplicate_spans
+                .insert((2783, span.start, span.end))
+            {
+                self.diagnostics.push(Diagnostic {
+                    code: 2783,
+                    message: format!(
+                        "'{name}' is specified more than once, so this usage will be overwritten."
+                    ),
+                    category: DiagnosticCategory::Error,
+                    file_name: None,
+                    span: Some(*span),
+                    related: Some(vec![RelatedDiagnostic {
+                        code: 2785,
+                        message: "This spread always overwrites this property.".to_string(),
+                        file_name: self.current_file_name.clone(),
+                        span: Some(spread),
+                    }]),
+                });
+            }
         }
     }
 
@@ -6958,11 +7074,7 @@ impl TypeChecker {
                     }
                     BinaryOp::LogAnd => {
                         self.check_syntactic_truthiness(&bin.left);
-                        if Self::enum_literal_truthiness(&left_ty) == Some(false) {
-                            left_ty
-                        } else {
-                            right_ty
-                        }
+                        self.logical_and_type(&left_ty, right_ty)
                     }
                     BinaryOp::LogOr => {
                         self.check_syntactic_truthiness(&bin.left);
@@ -7079,8 +7191,12 @@ impl TypeChecker {
                 }
                 let readonly_write = self.report_readonly_property_write(&up.argument);
                 let saved_target = self.assignment_target_span;
-                if matches!(up.argument.kind, ExprKind::Member(_)) {
-                    self.assignment_target_span = Some(up.argument.span);
+                let update_target = Self::skip_reference_wrappers(&up.argument);
+                if matches!(
+                    update_target.kind,
+                    ExprKind::Member(_) | ExprKind::ElemAccess(_)
+                ) {
+                    self.assignment_target_span = Some(update_target.span);
                 }
                 let operand = self.check_expr(&up.argument);
                 self.assignment_target_span = saved_target;
@@ -8228,6 +8344,7 @@ impl TypeChecker {
                     }
                 };
                 obj_ty = self.widen_fresh_array_type(&mem.object, obj_ty);
+                obj_ty = self.fresh_index_receiver_type(&mem.object, obj_ty);
                 if self.is_global_object_type(&obj_ty) && !self.current_file_is_js() {
                     if let Some(ty) = self.global_this_member_type(&property_name, property_span) {
                         return ty;
@@ -9469,6 +9586,7 @@ impl TypeChecker {
                 }
                 let obj_ty = self.check_expr(&ea.object);
                 let obj_ty = self.widen_fresh_array_type(&ea.object, obj_ty);
+                let obj_ty = self.fresh_index_receiver_type(&ea.object, obj_ty);
                 let idx_ty = self.check_expr(&ea.index);
                 if (self.is_global_object_expression(&ea.object)
                     || self.is_global_object_type(&obj_ty))
@@ -9560,19 +9678,20 @@ impl TypeChecker {
                 };
                 let syntactic_nullish = matches!(&ea.index.kind, ExprKind::NullLit)
                     || matches!(&ea.index.kind, ExprKind::Ident(name) if name == "undefined");
-                let offending_index = if invalid_index_constituent(&idx_ty) {
-                    Some(idx_ty.clone())
-                } else if let Type::Union(members) = &idx_ty {
-                    // tsc checks each constituent and names the offender.
-                    members
-                        .iter()
-                        .find(|member| invalid_index_constituent(member))
-                        .cloned()
-                } else if syntactic_nullish && matches!(idx_ty, Type::Undefined | Type::Null) {
-                    Some(idx_ty.clone())
-                } else {
-                    None
-                };
+                let offending_index =
+                    if invalid_index_constituent(&idx_ty) || self.is_named_object_index(&idx_ty) {
+                        Some(idx_ty.clone())
+                    } else if let Type::Union(members) = &idx_ty {
+                        // tsc checks each constituent and names the offender.
+                        members
+                            .iter()
+                            .find(|member| invalid_index_constituent(member))
+                            .cloned()
+                    } else if syntactic_nullish && matches!(idx_ty, Type::Undefined | Type::Null) {
+                        Some(idx_ty.clone())
+                    } else {
+                        None
+                    };
                 if let Some(offending) = offending_index {
                     // A bigint literal index reports its base type.
                     let shown = match offending {
@@ -9583,6 +9702,7 @@ impl TypeChecker {
                         &shown.display_string(),
                         ea.index.span,
                     ));
+                    return Type::Any;
                 }
                 // `noUncheckedIndexedAccess`: any indexed access via a
                 // dynamic index (number on Array / string on index-signed
@@ -9607,8 +9727,23 @@ impl TypeChecker {
                     self.record_expr_type(expr.span.start, &member);
                     return member;
                 }
-                if self.report_missing_element_index(expr, &obj_ty, &idx_ty) {
-                    return Type::Any;
+                if self.assignment_target_span != Some(expr.span) {
+                    if let Some(value) = self.fresh_dynamic_index_type(&ea.object, &obj_ty, &idx_ty)
+                    {
+                        return value;
+                    }
+                }
+                if let Some(result) = self.report_missing_element_index(expr, &obj_ty, &idx_ty) {
+                    return result;
+                }
+                if matches!(obj_ty, Type::TypeReference(..)) {
+                    if let Some(value) = self.inherited_element_index_type(&obj_ty, &idx_ty) {
+                        return if self.assignment_target_span == Some(expr.span) {
+                            value
+                        } else {
+                            wrap_undef(value)
+                        };
+                    }
                 }
                 // A program alias of an object type (and `Record<string, V>`)
                 // indexes like the object type it names. Its index-signature
@@ -9843,7 +9978,10 @@ impl TypeChecker {
                 };
                 if (assign.op == AssignOp::Assign
                     && matches!(written_target.kind, ExprKind::Ident(_)))
-                    || matches!(written_target.kind, ExprKind::Member(_))
+                    || matches!(
+                        written_target.kind,
+                        ExprKind::Member(_) | ExprKind::ElemAccess(_)
+                    )
                 {
                     self.assignment_target_span = Some(written_target.span);
                 }
@@ -10272,6 +10410,11 @@ impl TypeChecker {
                             && !Self::type_is_nullish(&right_ty)
                         {
                             if let Some(declared) = self.lookup_declared_var(name) {
+                                if matches!(declared, Type::Boolean)
+                                    && matches!(right_ty, Type::BooleanLiteral(_))
+                                {
+                                    self.narrow_var(name, right_ty.clone());
+                                }
                                 // tsc getAssignmentReducedType: keep the declared
                                 // constituents the assigned value fits; an invalid
                                 // assignment leaves the declared type in place.
@@ -10304,7 +10447,28 @@ impl TypeChecker {
                         }
                     }
                 }
-                right_ty
+                match assign.op {
+                    AssignOp::AddAssign => {
+                        if self.binary_operator_type_is_string_like(&left_ty)
+                            || self.binary_operator_type_is_string_like(&right_ty)
+                        {
+                            Type::String
+                        } else if self.binary_operator_type_is_dynamic(&left_ty)
+                            || self.binary_operator_type_is_dynamic(&right_ty)
+                            || self.binary_operator_type_has_unknown(&left_ty)
+                            || self.binary_operator_type_has_unknown(&right_ty)
+                        {
+                            Type::Any
+                        } else if self.binary_operator_type_is_bigint_like(&left_ty)
+                            && self.binary_operator_type_is_bigint_like(&right_ty)
+                        {
+                            Type::BigInt
+                        } else {
+                            Type::Number
+                        }
+                    }
+                    _ => right_ty,
+                }
             }
             ExprKind::ArrayLit(elems) => {
                 if self.assignment_pattern_depth > 0 && elems.is_empty() {
@@ -10489,6 +10653,7 @@ impl TypeChecker {
                                 any_spread_plain = true;
                             }
                             let before = properties.len();
+                            self.report_object_spread_overwrites(props, *span, &spread_ty);
                             let _ = self
                                 .merge_spread_into_object_properties(&spread_ty, &mut properties);
                             // If the spread couldn't surface ANY structural

@@ -1714,23 +1714,19 @@ impl TypeChecker {
             self.resolve_type_node(rt)
         } else if let Some(ref body) = fn_decl.body {
             // Hoisting can resolve a signature outside its parameter scope.
-            // A default initializer still supplies the parameter's body type.
-            let defaults = fn_decl
+            // Formal parameters, including default initializers, supply the
+            // body bindings even before the function has been checked.
+            let bindings = fn_decl
                 .params
                 .iter()
                 .zip(&params)
-                .filter_map(|(parameter, (_, ty))| {
-                    if parameter.initializer.is_none() {
-                        return None;
-                    }
-                    match &parameter.name.kind {
-                        PatKind::Ident(name) => Some((name.to_string(), ty.clone())),
-                        _ => None,
-                    }
+                .filter_map(|(parameter, (_, ty))| match &parameter.name.kind {
+                    PatKind::Ident(name) => Some((name.to_string(), ty.clone())),
+                    _ => None,
                 })
                 .collect();
             let inferred =
-                crate::with_infer_param_scope(defaults, || self.infer_return_type_from_stmts(body));
+                crate::with_infer_param_scope(bindings, || self.infer_return_type_from_stmts(body));
             // An async function ALWAYS returns a Promise. When the return type
             // is inferred (no annotation), wrap the body-completion type in
             // `Promise<…>` — otherwise a bare `return;` / fall-through leaves
@@ -2447,7 +2443,10 @@ impl TypeChecker {
                 | BinaryOp::Ge
                 | BinaryOp::InstanceOf
                 | BinaryOp::In => Type::Boolean,
-                BinaryOp::LogAnd => self.infer_expr_type(&bin.right),
+                BinaryOp::LogAnd => self.logical_and_type(
+                    &self.infer_expr_type(&bin.left),
+                    self.infer_expr_type(&bin.right),
+                ),
                 BinaryOp::LogOr | BinaryOp::NullCoal => {
                     // The left operand only yields its non-nullish values.
                     let left = self.remove_null_undefined(&self.infer_expr_type(&bin.left));
@@ -2964,6 +2963,7 @@ impl TypeChecker {
                 }
                 let obj_ty = self.infer_expr_type(&mem.object);
                 let obj_ty = self.widen_fresh_array_type(&mem.object, obj_ty);
+                let obj_ty = self.fresh_index_receiver_type(&mem.object, obj_ty);
                 match &obj_ty {
                     Type::ObjectType(info) => {
                         info.properties
@@ -3057,6 +3057,15 @@ impl TypeChecker {
             ExprKind::ElemAccess(ea) => {
                 let obj_ty = self.infer_expr_type(&ea.object);
                 let obj_ty = self.widen_fresh_array_type(&ea.object, obj_ty);
+                let obj_ty = self.fresh_index_receiver_type(&ea.object, obj_ty);
+                let index = self.infer_expr_type(&ea.index);
+                if let Some(value) = self
+                    .known_literal_index_read(&obj_ty, &index, 0)
+                    .or_else(|| self.inherited_element_index_type(&obj_ty, &index))
+                    .or_else(|| self.fresh_dynamic_index_type(&ea.object, &obj_ty, &index))
+                {
+                    return value;
+                }
                 match &obj_ty {
                     Type::Array(elem) => Type::clone(&elem),
                     Type::Tuple(elems) => {

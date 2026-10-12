@@ -14525,6 +14525,17 @@ impl TypeChecker {
             }
             StmtKind::Var(var_stmt) => {
                 for decl in &var_stmt.declarations {
+                    // Top-level registration may already know this binding's
+                    // declared type. Hoisting must not erase it before a
+                    // following function infers its return from that value.
+                    if let PatKind::Ident(name) = &decl.name.kind {
+                        if self.scopes[self.current_scope]
+                            .vars
+                            .contains_key(name.as_str())
+                        {
+                            continue;
+                        }
+                    }
                     self.declare_pattern_vars(&decl.name, Type::Any);
                 }
                 // `var` declarations are function-scoped, so also hoist from nested
@@ -14557,8 +14568,11 @@ impl TypeChecker {
                     }
                     // Resolve actual function type so argument type checking (TS2345)
                     // works correctly instead of losing type info with Type::Any
+                    let pushed_type_params =
+                        self.push_active_type_param_names(fn_decl.type_params.as_deref());
                     let ft = self.resolve_fn_type(fn_decl);
                     let ft = self.refine_fn_return_through_callbacks(fn_decl, ft);
+                    self.pop_active_type_param_names(pushed_type_params);
                     self.declare_var(name, Type::Function(ft));
                 }
             }
@@ -15844,6 +15858,8 @@ impl TypeChecker {
                     // infer_return_type_from_stmts can resolve references to them
                     // (e.g. `function f<T>(t: T) { return makeA(t); }` needs `t: T`).
                     self.push_scope();
+                    let pushed_type_params =
+                        self.push_active_type_param_names(fn_decl.type_params.as_deref());
                     for p in &fn_decl.params {
                         let pty = p
                             .type_ann
@@ -15859,6 +15875,7 @@ impl TypeChecker {
                     }
                     let ft = self.resolve_fn_type(fn_decl);
                     let ft = self.refine_fn_return_through_callbacks(fn_decl, ft);
+                    self.pop_active_type_param_names(pushed_type_params);
                     self.pop_scope();
                     // Store parameter metadata for TS2554 arg count checking.
                     // Skip if the function body uses `arguments` (variadic).
@@ -27210,6 +27227,10 @@ impl TypeChecker {
                         }
                     });
                     self.report_variable_widening(decl, var_stmt);
+                    let initial_boolean_literal = init_type
+                        .as_ref()
+                        .filter(|ty| matches!(ty, Type::BooleanLiteral(_)))
+                        .cloned();
                     let condition_alias = if is_const
                         && matches!(&decl.name.kind, PatKind::Ident(_))
                         && init_type
@@ -27525,11 +27546,20 @@ impl TypeChecker {
                     } else {
                         None
                     };
+                    let boolean_flow = matches!(ty, Type::Boolean)
+                        .then_some(initial_boolean_literal)
+                        .flatten();
                     self.declare_pattern_vars_with_defaults(
                         &decl.name,
                         ty,
                         var_stmt.kind == VarKind::Const,
                     );
+                    // Boolean is a union of two literals. Its declaration
+                    // widens, but a checked initializer still establishes the
+                    // current flow constituent until a subsequent write.
+                    if let (PatKind::Ident(name), Some(value)) = (&decl.name.kind, boolean_flow) {
+                        self.narrow_var(name, value);
+                    }
                     self.mark_widening_literal_binding(decl, is_const);
                     if let (PatKind::Ident(name), Some(receiver)) = (&decl.name.kind, this_receiver)
                     {

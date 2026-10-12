@@ -39,7 +39,7 @@ fn object_literal_missing_string() {
     verify(
         "const result = {}[\"missing\"];",
         true,
-        "any",
+        "undefined",
         &[(
             2339,
             "Property 'missing' does not exist on type '{}'.",
@@ -53,7 +53,7 @@ fn object_literal_missing_number() {
     verify(
         "const result = {}[3];",
         true,
-        "any",
+        "undefined",
         &[(2339, "Property '3' does not exist on type '{}'.", "{}[3]")],
     );
 }
@@ -151,7 +151,7 @@ fn dynamic_index_on_fresh_object_is_permitted() {
     verify(
         "declare const key:string;const result = {}[key];",
         true,
-        "any",
+        "undefined",
         &[],
     );
 }
@@ -313,7 +313,7 @@ fn fresh_property_suggestion() {
     verify(
         "const result={present:1}[\"presnt\"];",
         true,
-        "any",
+        "undefined",
         &[(
             2339,
             "Property 'presnt' does not exist on type '{ present: number; }'.",
@@ -352,7 +352,7 @@ fn fresh_const_property() {
     verify(
         "const result={present:1 as const}[\"missing\"];",
         true,
-        "any",
+        "undefined",
         &[(
             2339,
             "Property 'missing' does not exist on type '{ present: 1; }'.",
