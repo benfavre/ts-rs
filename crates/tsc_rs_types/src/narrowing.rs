@@ -471,7 +471,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         let b = Type::ObjectType(crate::ObjectTypeInfo::new(crate::ObjectTypeData {
             properties: vec![("kind".into(), Arc::new(Type::StringLiteral("b".into())))],
@@ -481,7 +481,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         let ty = Type::Union(vec![a.clone(), b.clone()].into());
 

@@ -589,7 +589,7 @@ fn constructor_types_display_with_valid_precedence_and_parameter_syntax() {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         },
     ));
     assert_eq!(
@@ -622,7 +622,7 @@ fn constructor_types_display_with_valid_precedence_and_parameter_syntax() {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         },
     ));
     assert_eq!(returns_function.display_string(), "new () => () => string");

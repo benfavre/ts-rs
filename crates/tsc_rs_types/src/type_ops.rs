@@ -337,7 +337,7 @@ fn substitute_object(obj: &ObjectTypeInfo, name: &str, replacement: &Type) -> Ob
         index_signature_name: obj.index_signature_name.clone(),
         readonly_names: obj.readonly_names.clone(),
         method_names: obj.method_names.clone(),
-        node_method_names: obj.node_method_names.clone(),
+        node_source: obj.node_source.clone(),
     })
 }
 
@@ -677,7 +677,7 @@ pub fn expand_mapped(
         index_signature_name: None,
         readonly_names: Vec::new(),
         method_names: Vec::new(),
-        node_method_names: Vec::new(),
+        node_source: Default::default(),
     }))
 }
 
@@ -1388,7 +1388,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         let result = resolve_keyof(&obj);
         assert_eq!(
@@ -1426,7 +1426,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         let result = resolve_indexed_access(&obj, &Type::StringLiteral("name".into()));
         assert_eq!(result, Type::String);
@@ -1459,7 +1459,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         let idx = Type::Union(
             vec![

@@ -166,7 +166,7 @@ pub(crate) fn substitute_inner(ty: &Type, type_args: &HashMap<std::string::Strin
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: info.node_source.clone(),
             }))
         }
         Type::Conditional {
@@ -1008,7 +1008,7 @@ pub(crate) fn evaluate_mapped_type_inner(
         index_signature_name: None,
         readonly_names: Vec::new(),
         method_names: Vec::new(),
-        node_method_names: Vec::new(),
+        node_source: Default::default(),
     }))
 }
 
@@ -1171,7 +1171,7 @@ mod tests {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }))]
             .into(),
         );
@@ -1208,7 +1208,7 @@ mod tests {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }))]
             .into(),
         );

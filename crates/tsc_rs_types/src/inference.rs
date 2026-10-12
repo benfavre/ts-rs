@@ -702,7 +702,7 @@ pub fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
             index_signature_name: obj.index_signature_name.clone(),
             readonly_names: obj.readonly_names.clone(),
             method_names: obj.method_names.clone(),
-            node_method_names: obj.node_method_names.clone(),
+            node_source: obj.node_source.clone(),
         })),
 
         Type::TypeReference(name, args) => Type::TypeReference(
@@ -1034,7 +1034,7 @@ mod tests {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }))],
             &[Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![("value".to_string(), Arc::new(Type::Boolean))],
@@ -1044,7 +1044,7 @@ mod tests {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }))],
         );
         assert_eq!(result.get("T"), Some(&Type::Boolean));

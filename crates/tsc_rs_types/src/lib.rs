@@ -60,7 +60,7 @@ mod type_computations;
 pub mod type_facts;
 mod type_nodes;
 mod type_only_aliases;
-pub use type_nodes::SignatureSource;
+pub use type_nodes::{ObjectSource, SignatureSource};
 pub mod type_ops;
 mod unknown_receivers;
 mod unreachable_exprs;
@@ -636,9 +636,9 @@ pub struct ObjectTypeData {
     /// `fn: () => T`), for display only: tsc prints them in method style.
     /// Ignored by equality and hashing — it never changes type identity.
     pub method_names: Vec<std::string::String>,
-    /// Object-literal method declarations for the opt-in type-node printer.
+    /// Member declarations for the opt-in type-node printer.
     /// Kept separate from hover spelling and excluded from structural identity.
-    pub node_method_names: Vec<std::string::String>,
+    pub node_source: ObjectSource,
     /// Readonly property declarations, retained for display and write checks.
     /// Like method spelling, ignored by structural equality and hashing.
     pub readonly_names: Vec<std::string::String>,
@@ -4063,7 +4063,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
-                    node_method_names: Vec::new(),
+                    node_source: Default::default(),
                 }),
                 optional_props: Vec::new(),
                 member_locations: rustc_hash::FxHashMap::default(),
@@ -7181,7 +7181,7 @@ impl TypeChecker {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }));
             *class_type = Type::Intersection(vec![static_surface, class_type.clone()].into());
         }
@@ -7624,7 +7624,7 @@ impl TypeChecker {
                 index_signature_name: object.index_signature_name.clone(),
                 readonly_names: object.readonly_names.clone(),
                 method_names: object.method_names.clone(),
-                node_method_names: object.node_method_names.clone(),
+                node_source: object.node_source.clone(),
             })),
             Type::Intersection(members) => Type::Intersection(
                 members
@@ -9146,7 +9146,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }))
     }
 
@@ -9182,7 +9182,7 @@ impl TypeChecker {
                                 index_signature_name: None,
                                 readonly_names: Vec::new(),
                                 method_names: Vec::new(),
-                                node_method_names: Vec::new(),
+                                node_source: Default::default(),
                             })),
                         ));
                     }
@@ -9491,7 +9491,7 @@ impl TypeChecker {
                                 index_signature_name: None,
                                 readonly_names: Vec::new(),
                                 method_names: Vec::new(),
-                                node_method_names: Vec::new(),
+                                node_source: Default::default(),
                             }));
                         Type::Intersection(vec![static_surface, nominal].into())
                     } else {
@@ -9780,7 +9780,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         *value = Type::Intersection(vec![static_surface, nominal].into());
         Ok(())
@@ -20910,7 +20910,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
-                    node_method_names: Vec::new(),
+                    node_source: Default::default(),
                 }));
                 return Some(self.is_assignable_to(&shape, target));
             }
@@ -21066,6 +21066,7 @@ impl TypeChecker {
             let own_index_sig = info.object_type.index_signature.clone();
             let own_props: Vec<_> = info.object_type.properties.clone();
             let optional_props = info.optional_props.clone();
+            let mut node_source = info.object_type.node_source.clone();
             let mut method_names: Vec<std::string::String> = info.object_type.method_names.clone();
             // First collect inherited members from extended interfaces.
             // tsc resolveObjectTypeMembers lists own members first, then
@@ -21092,6 +21093,9 @@ impl TypeChecker {
                     // The heritage checker diagnoses the conflict separately.
                     for property in &ext_obj.properties {
                         if !inherited_props.iter().any(|(name, _)| name == &property.0) {
+                            if !own_props.iter().any(|(name, _)| name == &property.0) {
+                                node_source.copy_property_from(&ext_obj.node_source, &property.0);
+                            }
                             inherited_props.push(property.clone());
                         }
                     }
@@ -21099,6 +21103,7 @@ impl TypeChecker {
                     construct_sigs.extend(ext_obj.construct_signatures.clone());
                     if index_sig.is_none() {
                         index_sig = ext_obj.index_signature.clone();
+                        node_source.copy_index_from(&ext_obj.node_source);
                     }
                     for name in &ext_obj.method_names {
                         if !method_names.contains(name)
@@ -21143,6 +21148,7 @@ impl TypeChecker {
             construct_sigs.extend(own_construct_sigs);
             if own_index_sig.is_some() {
                 index_sig = own_index_sig;
+                node_source.copy_index_from(&info.object_type.node_source);
             }
 
             let mut obj_type = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
@@ -21153,7 +21159,7 @@ impl TypeChecker {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names,
-                node_method_names: Vec::new(),
+                node_source,
             }));
 
             // Substitute type args in own properties
@@ -21429,7 +21435,7 @@ impl TypeChecker {
                 index_signature_name: info.index_signature_name.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
-                node_method_names: info.node_method_names.clone(),
+                node_source: info.node_source.clone(),
             })),
             Type::Optional(inner) => {
                 Type::Optional(Arc::new(Self::substitute_this(inner, receiver)))
@@ -21678,7 +21684,7 @@ impl TypeChecker {
                 index_signature_name: info.index_signature_name.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
-                node_method_names: info.node_method_names.clone(),
+                node_source: info.node_source.clone(),
             })),
             Type::Conditional {
                 check,
@@ -22335,7 +22341,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         })))
     }
 
@@ -22750,7 +22756,7 @@ impl TypeChecker {
                     index_signature_name: info.index_signature_name.clone(),
                     readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
-                    node_method_names: info.node_method_names.clone(),
+                    node_source: info.node_source.clone(),
                 }))
             }
             // Keyof: simplify the inner and, if it became a concrete
@@ -22919,7 +22925,7 @@ impl TypeChecker {
                 None => Vec::new(),
             };
             Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
-                node_method_names: info.node_method_names.clone(),
+                node_source: info.node_source.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info
                     .method_names
@@ -23212,7 +23218,7 @@ impl TypeChecker {
                 index_signature_name: info.index_signature_name.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
-                node_method_names: info.node_method_names.clone(),
+                node_source: info.node_source.clone(),
             })),
             Type::Constructor(constructor) => Type::Constructor(ConstructorType {
                 source: constructor.source.clone(),
@@ -23485,7 +23491,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
-                    node_method_names: Vec::new(),
+                    node_source: Default::default(),
                 })))
             }
             _ => None,
@@ -24060,7 +24066,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
-                    node_method_names: Vec::new(),
+                    node_source: Default::default(),
                 }));
                 return self.is_assignable_to(&surface, target);
             }
@@ -26254,7 +26260,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         })))
     }
 
@@ -26298,7 +26304,7 @@ impl TypeChecker {
                         index_signature_name: None,
                         readonly_names: Vec::new(),
                         method_names: Vec::new(),
-                        node_method_names: Vec::new(),
+                        node_source: Default::default(),
                     })));
                 }
             }
@@ -42460,7 +42466,7 @@ impl TypeChecker {
                 index_signature_name: info.index_signature_name.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
-                node_method_names: info.node_method_names.clone(),
+                node_source: info.node_source.clone(),
             })),
             Type::Union(members) => Type::flatten_union(members.iter().map(widen_leaf).collect()),
             other => other.clone(),
@@ -42814,7 +42820,7 @@ impl TypeChecker {
                 index_signature_name: info.index_signature_name.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
-                node_method_names: info.node_method_names.clone(),
+                node_source: info.node_source.clone(),
             })),
             Type::Function(function) => Type::Function(erase_function(function)),
             Type::Array(element) => {
@@ -43224,7 +43230,7 @@ impl TypeChecker {
             index_signature_name: after.index_signature_name.clone(),
             readonly_names: after.readonly_names.clone(),
             method_names: after.method_names.clone(),
-            node_method_names: after.node_method_names.clone(),
+            node_source: after.node_source.clone(),
         }))
     }
 
@@ -43264,7 +43270,7 @@ impl TypeChecker {
                     index_signature_name: info.index_signature_name.clone(),
                     readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
-                    node_method_names: info.node_method_names.clone(),
+                    node_source: info.node_source.clone(),
                 }))
             }
             Type::Array(elem) => Type::Array(Arc::new(Self::widen_nested_literals(elem))),
@@ -43351,7 +43357,7 @@ impl TypeChecker {
                     index_signature_name: info.index_signature_name.clone(),
                     readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
-                    node_method_names: info.node_method_names.clone(),
+                    node_source: info.node_source.clone(),
                 }))
             }
             Type::Union(members) => {
@@ -44543,7 +44549,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
-                    node_method_names: Vec::new(),
+                    node_source: info.node_source.clone(),
                 }))
             }
             Type::TypeReference(name, args) => Type::TypeReference(
@@ -48027,7 +48033,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }))
     }
 

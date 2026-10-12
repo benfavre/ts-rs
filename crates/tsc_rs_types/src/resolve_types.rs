@@ -738,6 +738,7 @@ impl TypeChecker {
                     }
                 }
                 let ty = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                    node_source: self.object_declaration_source(members, &props),
                     properties: props,
                     call_signatures: call_sigs,
                     construct_signatures: construct_sigs,
@@ -745,7 +746,6 @@ impl TypeChecker {
                     index_signature_name: index_sig_name,
                     readonly_names,
                     method_names,
-                    node_method_names: Vec::new(),
                 }));
                 self.record_type_literal_member_locations(&ty, members);
                 ty
@@ -2420,6 +2420,7 @@ impl TypeChecker {
                     return Type::Any;
                 }
                 Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                    node_source: self.object_literal_source(props, &properties),
                     properties,
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
@@ -2427,7 +2428,6 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names,
-                    node_method_names: Vec::new(),
                 }))
             }
             ExprKind::Ident(name) => crate::infer_param_binding(name)
@@ -3452,7 +3452,7 @@ pub(crate) fn implied_binding_pattern_type(pattern: &Pat) -> Option<Type> {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
-                    node_method_names: Vec::new(),
+                    node_source: Default::default(),
                 })))
             }
             _ => None,

@@ -1654,7 +1654,7 @@ impl TypeChecker {
                 .unwrap_or_default(),
             is_global: !self.file_is_module_flag,
             object_type: ObjectTypeInfo::new(ObjectTypeData {
-                node_method_names: Vec::new(),
+                node_source: self.object_declaration_source(&iface_decl.members, &props),
                 properties: props,
                 call_signatures: call_sigs,
                 construct_signatures: construct_sigs,
@@ -3096,7 +3096,7 @@ impl TypeChecker {
                         index_signature_name: iface.object_type.index_signature_name.clone(),
                         readonly_names: Vec::new(),
                         method_names,
-                        node_method_names: Vec::new(),
+                        node_source: Default::default(),
                     }));
                 }
                 return Type::TypeReference(class_name.to_string(), Arc::from([] as [Type; 0]));
@@ -3213,7 +3213,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names,
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }))
     }
 

@@ -813,7 +813,7 @@ impl TypeChecker {
                         index_signature_name: None,
                         readonly_names: Vec::new(),
                         method_names: Vec::new(),
-                        node_method_names: Vec::new(),
+                        node_source: Default::default(),
                     }))),
                 ),
                 (
@@ -847,7 +847,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }))
     }
 
@@ -5528,6 +5528,7 @@ impl TypeChecker {
                     return Type::Any;
                 }
                 return Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                    node_source: self.object_literal_source(props, &properties),
                     properties: Self::dedup_object_props_last_wins(properties),
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
@@ -5535,7 +5536,6 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
-                    node_method_names: self.object_node_method_names(props),
                 }));
             }
             ExprKind::ArrayLit(elems) if contextual_type.is_some() => {
@@ -10318,7 +10318,7 @@ impl TypeChecker {
                                                 index_signature_name: None,
                                                 readonly_names: Vec::new(),
                                                 method_names: Vec::new(),
-                                                node_method_names: Vec::new(),
+                                                node_source: Default::default(),
                                             })
                                         }
                                         Type::ObjectType(info)
@@ -11079,7 +11079,16 @@ impl TypeChecker {
                             self.return_type_stack.pop();
                             self.var_first_types = saved_var_first_types;
                             self.pop_scope();
-                            properties.push((name, Arc::new(Type::Any)));
+                            // A paired setter supplies the write type; it must
+                            // not replace the getter's read type with `any`.
+                            if !props.iter().any(|property| matches!(property,
+                                ObjLitProp::Get(getter) if self.prop_name_to_string(&getter.name) == name)) {
+                                let setter_ty = acc.params.first()
+                                    .and_then(|parameter| parameter.type_ann.as_ref())
+                                    .map(|node| self.resolve_type_node(node))
+                                    .unwrap_or(Type::Any);
+                                properties.push((name, Arc::new(setter_ty)));
+                            }
                         }
                     }
                 }
@@ -11090,6 +11099,7 @@ impl TypeChecker {
                     return Type::Any;
                 }
                 Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                    node_source: self.object_literal_source(props, &properties),
                     properties: Self::dedup_object_props_last_wins(properties),
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
@@ -11097,7 +11107,6 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
-                    node_method_names: self.object_node_method_names(props),
                 }))
             }
             ExprKind::Arrow(arrow) => {
@@ -13582,7 +13591,7 @@ impl TypeChecker {
                             index_signature_name: None,
                             readonly_names: Vec::new(),
                             method_names: Vec::new(),
-                            node_method_names: Vec::new(),
+                            node_source: Default::default(),
                         }));
                     }
                 }

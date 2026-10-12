@@ -275,7 +275,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -304,7 +304,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -321,7 +321,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -590,7 +590,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -686,7 +686,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -743,7 +743,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -796,7 +796,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -836,7 +836,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -858,7 +858,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -879,7 +879,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -911,7 +911,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 
@@ -1024,7 +1024,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             })),
         );
 
@@ -1047,7 +1047,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             })),
         );
 
@@ -1083,7 +1083,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             })),
         );
 
@@ -1176,7 +1176,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
         static_members.insert(
@@ -1199,7 +1199,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
         static_members.insert(
@@ -1238,7 +1238,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
         static_members.insert(
@@ -1313,7 +1313,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
-                node_method_names: Vec::new(),
+                node_source: Default::default(),
             }),
         );
 

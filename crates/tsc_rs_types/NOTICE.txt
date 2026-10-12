@@ -41,3 +41,9 @@ excluded from structural equality and hashing; unchanged annotations are
 serialized from the native AST. Generic substitutions retain the declaration
 provenance, while changed types are synthesized. An opt-in dual text writer
 records UTF-16 synthetic-node underlining independently of hover formatting.
+
+Object property and accessor serialization also adapts propertyToTypeNode and
+indexInfoToIndexSignatureDeclarationHelper (nodebuilder_impl_p3.rs and
+nodebuilder_impl_p2.rs). Native object metadata retains the original member
+annotations across spreads and substitutions, independently of hover output
+and structural identity. Index signatures are synthesized, including readonly.

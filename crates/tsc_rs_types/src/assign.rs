@@ -541,7 +541,7 @@ fn assign_inner(
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
-                    node_method_names: Vec::new(),
+                    node_source: Default::default(),
                 }));
             return assign_to_object(target_obj, target, &source_object, opts, dejavu);
         }
@@ -1373,7 +1373,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         let obj2 = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![("y".into(), Arc::new(Type::String))],
@@ -1383,7 +1383,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         let target = Type::Intersection(vec![obj1.clone(), obj2.clone()].into());
         let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
@@ -1397,7 +1397,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         assert!(is_assignable(&target, &source));
     }
@@ -1517,7 +1517,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![
@@ -1530,7 +1530,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         assert!(is_assignable(&target, &source));
     }
@@ -1548,7 +1548,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![("name".into(), Arc::new(Type::String))],
@@ -1558,7 +1558,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
-            node_method_names: Vec::new(),
+            node_source: Default::default(),
         }));
         assert!(!is_assignable(&target, &source));
     }
