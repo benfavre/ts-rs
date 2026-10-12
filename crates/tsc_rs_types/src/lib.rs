@@ -13781,6 +13781,7 @@ impl TypeChecker {
 
     pub(crate) fn iterated_element_type(&self, ty: &Type) -> Option<Type> {
         match ty {
+            Type::Readonly(inner) => self.iterated_element_type(inner),
             Type::Array(elem) => Some(Type::clone(elem)),
             Type::Tuple(elems) if !elems.is_empty() => Some(Type::Union(elems.clone())),
             Type::String | Type::StringLiteral(_) => Some(Type::String),
@@ -23537,6 +23538,16 @@ impl TypeChecker {
     }
 
     fn is_assignable_to_inner(&self, source: &Type, target: &Type) -> bool {
+        if let Type::Readonly(inner) = target {
+            let source = match source {
+                Type::Readonly(inner) => inner.as_ref(),
+                other => other,
+            };
+            return self.is_assignable_to(source, inner);
+        }
+        if let Type::Readonly(inner) = source {
+            return self.is_assignable_to(inner, target);
+        }
         // Arrays and callable/constructable values are non-primitive objects.
         if matches!(target, Type::Object)
             && matches!(
@@ -27467,11 +27478,10 @@ impl TypeChecker {
                         // const preserves literal types for primitives;
                         // object/array property types are widened (no `as const`).
                         // let/var widens everything.
-                        if decl
-                            .init
-                            .as_deref()
-                            .is_some_and(Self::is_const_assertion_expr)
-                        {
+                        if decl.init.as_deref().is_some_and(|init| {
+                            Self::is_const_assertion_expr(init)
+                                || self.is_readonly_tuple_expression(init)
+                        }) {
                             init_ty
                         } else if is_const {
                             match &init_ty {
@@ -43324,7 +43334,19 @@ impl TypeChecker {
     }
 
     fn resolve_member_on_type_impl(&self, ty: &Type, property: &str) -> Type {
+        if let Some(value) = self.tuple_index_receiver(ty, 0).and_then(|shape| {
+            crate::tuple_access::indexed_type(
+                &shape,
+                &Type::StringLiteral(property.to_owned()),
+                self.strict_null_checks,
+                false,
+                false,
+            )
+        }) {
+            return value;
+        }
         match ty {
+            Type::Readonly(inner) => self.resolve_member_on_type(inner, property),
             Type::ObjectType(info) => {
                 if let Some((_, prop_ty)) = info.properties.iter().find(|(n, _)| n == property) {
                     match prop_ty.as_ref() {

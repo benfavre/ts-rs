@@ -1189,6 +1189,9 @@ impl TypeChecker {
     /// a property access (TS2703); under strictNullChecks a deleted declared
     /// property must admit `undefined` (TS2790).
     fn check_delete_operand(&mut self, operand: &Expr) {
+        if self.report_readonly_tuple_write(operand, true).is_some() {
+            return;
+        }
         let mut inner = operand;
         while let ExprKind::Paren(e) = &inner.kind {
             inner = e;
@@ -1778,6 +1781,9 @@ impl TypeChecker {
     }
 
     pub(super) fn report_readonly_property_write(&mut self, target: &Expr) -> bool {
+        if let Some(readonly) = self.report_readonly_tuple_write(target, false) {
+            return readonly;
+        }
         let inferred_index;
         let (receiver, property, property_span) = match Self::constant_property_write_target(target)
         {
@@ -8593,7 +8599,12 @@ impl TypeChecker {
                 };
                 let alias_source = alias_receiver.is_some().then(|| member_obj.clone());
                 let member_obj = alias_receiver.unwrap_or(member_obj);
+                let member_obj = match self.tuple_index_receiver(&member_obj, 0) {
+                    Some(readonly @ Type::Readonly(_)) => readonly,
+                    _ => member_obj,
+                };
                 let member_ty = lazy_alias_member.unwrap_or_else(|| match &member_obj {
+                    Type::Readonly(inner) => self.resolve_member_on_type(inner, &mem.property),
                     Type::ObjectType(info) => {
                         if let Some((_, prop_ty)) =
                             info.properties.iter().find(|(n, _)| n == &mem.property)
@@ -10148,6 +10159,21 @@ impl TypeChecker {
                 // compatibility, operator, and excess-property diagnostics.
                 if readonly_write {
                     self.report_invalid_reference(&assign.left, false);
+                    // The write error does not prevent control-flow narrowing
+                    // of a known optional tuple slot after a compatible value.
+                    if assign.op == AssignOp::Assign
+                        && matches!(written_target.kind, ExprKind::ElemAccess(_))
+                        && !self.type_admits_nullish(&right_ty)
+                        && !matches!(right_ty, Type::Any | Type::Error)
+                        && self.is_assignable_to(&right_ty, &left_ty)
+                    {
+                        if let Some(path) = self
+                            .known_element_path(written_target)
+                            .or_else(|| Self::element_path(written_target))
+                        {
+                            self.narrow_var(&path, self.remove_null_undefined(&left_ty));
+                        }
+                    }
                     return right_ty;
                 }
                 // Property assignments can declare expando members on a
@@ -11466,6 +11492,11 @@ impl TypeChecker {
             ExprKind::Instantiation(inst) => self.check_expr(&inst.expr),
             ExprKind::Spread(inner) => {
                 let ty = self.check_expr(inner);
+                if let Type::Readonly(inner) = &ty {
+                    if let Some(element) = self.iterated_element_type(inner) {
+                        return element;
+                    }
+                }
                 // TS2802: below ES2015 without --downlevelIteration, spreading
                 // a non-array iterable (Iterable/Set/Map/Generator, or a
                 // string) cannot be downleveled.

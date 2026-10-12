@@ -111,7 +111,9 @@ pub(crate) fn indexed_type(
                 ),
             })
             .collect::<Option<Vec<_>>>()
-            .map(|values| combine(values, writing));
+            // A union receiver exposes the union of its property types, even
+            // for a write. A union of possible keys still intersects above.
+            .map(Type::flatten_union);
     }
     let items = elements(receiver)?;
     let rest = items.iter().position(|ty| matches!(ty, Type::Rest(_)));
@@ -306,6 +308,121 @@ impl TypeChecker {
         }
     }
 
+    pub(super) fn is_readonly_tuple_expression(&self, expression: &Expr) -> bool {
+        self.tuple_expression_metadata(expression)
+            .is_some_and(|metadata| metadata.readonly)
+    }
+
+    /// Tuple slots are named readonly properties; the rest of the numeric
+    /// domain uses the tuple's readonly index signature. Keep these separate:
+    /// an out-of-bounds write still has its ordinary type and bounds errors.
+    pub(super) fn report_readonly_tuple_write(
+        &mut self,
+        target: &Expr,
+        deleting: bool,
+    ) -> Option<bool> {
+        let target = Self::skip_reference_wrappers(target);
+        let (object, index, key_span) = match &target.kind {
+            ExprKind::ElemAccess(access) => (
+                access.object.as_ref(),
+                self.infer_expr_type(&access.index),
+                access.index.span,
+            ),
+            ExprKind::Member(member) => (
+                member.object.as_ref(),
+                Type::StringLiteral(member.property.to_string()),
+                Span::new(
+                    target.span.end - member.property.len() as u32,
+                    target.span.end,
+                ),
+            ),
+            _ => return None,
+        };
+        let receiver = self.infer_expr_type(object);
+        let shape = self.tuple_index_receiver(&self.remove_null_undefined(&receiver), 0)?;
+        let metadata = self.tuple_expression_metadata(object);
+        let syntax_readonly = metadata.as_ref().is_some_and(|metadata| metadata.readonly);
+        let members = match &shape {
+            Type::Union(members) => members.as_ref(),
+            _ => std::slice::from_ref(&shape),
+        };
+        let readonly = members
+            .iter()
+            .filter(|member| syntax_readonly || matches!(member, Type::Readonly(_)))
+            .filter_map(elements)
+            .collect::<Vec<_>>();
+        if readonly.is_empty() {
+            return None;
+        }
+        let mut fixed = false;
+        let mut index_signature = false;
+        for (index, _) in self.element_index_keys(&index) {
+            let key = numeric_key(&index);
+            let length = matches!(&index, Type::StringLiteral(key) if key == "length");
+            if length
+                || readonly.iter().any(|items| {
+                    key.as_ref().is_some_and(|key| {
+                        key.parse::<usize>().is_ok_and(|index| {
+                            index
+                                < items
+                                    .iter()
+                                    .position(|item| matches!(item, Type::Rest(_)))
+                                    .unwrap_or(items.len())
+                        })
+                    })
+                })
+            {
+                fixed = true;
+                if !deleting {
+                    self.diagnostics.push(error_cannot_assign_readonly(
+                        if length {
+                            "length"
+                        } else {
+                            key.as_deref().unwrap()
+                        },
+                        key_span,
+                    ));
+                }
+            } else if (key.is_some() || matches!(index, Type::Number | Type::Any))
+                && !(key
+                    .as_ref()
+                    .is_some_and(|key| key.parse::<f64>().is_ok_and(|value| value < 0.0))
+                    && !matches!(shape, Type::Union(_))
+                    && members.iter().all(|member| {
+                        elements(member).is_some_and(|items| {
+                            !items.iter().any(|item| matches!(item, Type::Rest(_)))
+                        })
+                    }))
+            {
+                index_signature = true;
+            }
+        }
+        if deleting && fixed && !index_signature {
+            self.diagnostics
+                .push(crate::diagnostics::error_delete_operand(2704, target.span));
+        }
+        if index_signature {
+            let shown = metadata
+                .map(|metadata| metadata.display)
+                .unwrap_or_else(|| {
+                    self.tuple_diagnostic_name(
+                        &self
+                            .declared_type_param_constraint(&receiver)
+                            .unwrap_or(receiver),
+                    )
+                });
+            self.diagnostics.push(Diagnostic {
+                code: 2542,
+                message: format!("Index signature in type '{shown}' only permits reading."),
+                category: DiagnosticCategory::Error,
+                file_name: None,
+                span: Some(target.span),
+                related: None,
+            });
+        }
+        Some(fixed)
+    }
+
     pub(super) fn check_tuple_element_access(
         &mut self,
         access: &ElemAccessExpr,
@@ -318,20 +435,6 @@ impl TypeChecker {
         let non_nullish = self.remove_null_undefined(receiver);
         let nullable = access.optional && non_nullish != *receiver;
         let receiver = if nullable { &non_nullish } else { receiver };
-        if writing && metadata.as_ref().is_some_and(|metadata| metadata.readonly) {
-            if let Some(key) = numeric_key(index) {
-                let shape = self.tuple_index_receiver(receiver, 0)?;
-                if elements(&shape).is_some_and(|items| {
-                    key.parse::<usize>().is_ok_and(|index| {
-                        index < items.len() && !matches!(items[index], Type::Rest(_))
-                    })
-                }) {
-                    self.diagnostics
-                        .push(error_cannot_assign_readonly(&key, access.index.span));
-                    return Some(Type::Any);
-                }
-            }
-        }
         let result = self.tuple_element_access(
             receiver,
             index,

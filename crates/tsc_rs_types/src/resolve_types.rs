@@ -872,9 +872,7 @@ impl TypeChecker {
                 None => Type::Any,
             },
             TypeNodeKind::Unique(inner) => self.resolve_type_node(inner),
-            // `readonly T[]` relates like `T[]` here; the readonly wrapper is
-            // not modelled through assignability yet.
-            TypeNodeKind::Readonly(inner) => self.resolve_type_node(inner),
+            TypeNodeKind::Readonly(inner) => self.resolve_readonly_type_node(inner),
             TypeNodeKind::Infer(name, _) => Type::Infer(name.clone()),
             TypeNodeKind::TemplateLit(tl) => {
                 let quasis: Vec<std::string::String> = tl
@@ -898,9 +896,18 @@ impl TypeChecker {
             TypeNodeKind::TypeOperator(op, inner) => match op {
                 TypeOperatorKind::Keyof => self.resolve_keyof_type_node(inner),
                 TypeOperatorKind::Unique => self.resolve_type_node(inner),
-                TypeOperatorKind::Readonly => self.resolve_type_node(inner),
+                TypeOperatorKind::Readonly => self.resolve_readonly_type_node(inner),
             },
             TypeNodeKind::NamedTupleMember(member) => self.resolve_type_node(&member.type_node),
+        }
+    }
+
+    fn resolve_readonly_type_node(&self, inner: &TypeNode) -> Type {
+        let ty = self.resolve_type_node(inner);
+        if matches!(ty, Type::Tuple(_)) {
+            Type::Readonly(Arc::new(ty))
+        } else {
+            ty
         }
     }
 
@@ -1289,6 +1296,9 @@ impl TypeChecker {
             return Some(value);
         }
         match owner {
+            Type::Readonly(inner) => {
+                self.qualified_property_type(Type::clone(&inner), property_name)
+            }
             Type::Namespace(info) => info
                 .exports
                 .iter()
@@ -3128,6 +3138,11 @@ impl TypeChecker {
             }
             ExprKind::Spread(inner) => {
                 let ty = self.infer_expr_type(inner);
+                if let Type::Readonly(inner) = &ty {
+                    if let Some(element) = self.iterated_element_type(inner) {
+                        return element;
+                    }
+                }
                 if let Some(element) = Self::lib_iterable_element_type(&ty) {
                     return element;
                 }
