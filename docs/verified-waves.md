@@ -1944,3 +1944,33 @@ JavaScript emit stays at 100% in both suites, and the LSP lanes are
 unchanged. All 3,430 public Rust tests pass with 37 ignored, and
 `make ci` passes. The preceding snapshot is retained at
 `docs/compatibility-metrics-2026-10-10-06a23c635.json`.
+
+## 2026-10-12: namespace imports, control flow and decorator checking
+
+The checker now validates more namespace and import aliases, ambient module
+augmentations, inherited private members, and property spelling suggestions.
+Control-flow checks cover enum members, constant comparisons and unknown
+receivers. Decorator checks resolve callable signatures, validate argument
+counts and overloads, and report missing global types and parameter locations.
+Parser recovery and JavaScript emission fixes are included in the same
+public snapshot. Upstream test cases and reference baselines are unchanged.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,865 | 4,936 |
+| Conformance | 3,865 | 3,999 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 86.73% | 86.99% | 61.03% | 63.44% |
+| Conformance | 89.51% | 90.06% | 69.33% | 71.43% |
+
+Cache-free reports cover JavaScript, diagnostics, symbols, types, expanded
+JavaScript/declarations, diagnostic accuracy and all LSP operations. JavaScript
+emit still matches every available default baseline in both suites. Skips are
+excluded from pass rates. The LSP totals remain unchanged.
+
+All 3,759 public Rust tests pass, with 37 ignored, and `make ci` passes.
+The measured compiler commit is `17d96efab`. The preceding
+snapshot, measured on 2026-10-10, is retained at
+`docs/compatibility-metrics-2026-10-12-86b97a639.json`.

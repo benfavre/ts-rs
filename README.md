@@ -24,7 +24,7 @@ test suites (`compiler`, `conformance`, `fourslash`), with the real `tsc`
 baselines as the oracle.
 
 - **Emit matches `tsc` byte for byte** on all 11,420 JavaScript baselines.
-- **Diagnostics reproduce `tsc`'s messages, positions and codes**; two thirds
+- **Diagnostics reproduce `tsc`'s messages, positions and codes**; 71.8%
   of the upstream cases match in full, and the rest is the active front.
 - **Language server and VS Code extension**: hover, go-to-definition,
   references, completions, signature help, rename, formatting.
@@ -60,37 +60,37 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-All results below were measured on 2026-10-10 at `76ae18ea2`, with the
+All results below were measured on 2026-10-12 at `17d96efab`, with the
 result cache disabled. Pass rates are `passed / (passed + failed)`; skipped
 cases are never counted as passes.
 
 | Lane | Compiler suite | Conformance suite | What it measures |
 |---|---:|---:|---|
-| JavaScript emit | 6,032 / 6,032 (100%) | 5,388 / 5,388 (100%) | Byte-for-byte match with the `tsc` `.js` baseline (one configuration per case) |
-| Diagnostics | 4,805 / 6,529 (73.6%) | 3,650 / 5,907 (61.8%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
-| Symbols | 1,722 / 6,434 (26.8%) | 1,568 / 5,617 (27.9%) | Match with the `tsc` `.symbols` baseline |
-| Types | 604 / 6,434 (9.4%) | 558 / 5,617 (9.9%) | Match with the `tsc` `.types` baseline |
-| Type-check recall / precision | 59.8% / 85.8% | 67.0% / 88.4% | Per-diagnostic `(file, line, code)` match over every option variant |
+| JavaScript emit | 6,032 / 6,032 (100.0%) | 5,388 / 5,388 (100.0%) | Byte-for-byte match with the `tsc` `.js` baseline (one configuration per case) |
+| Diagnostics | 4,936 / 6,529 (75.6%) | 3,999 / 5,907 (67.7%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
+| Symbols | 1,731 / 6,434 (26.9%) | 1,589 / 5,617 (28.3%) | Match with the `tsc` `.symbols` baseline |
+| Types | 619 / 6,434 (9.6%) | 560 / 5,617 (10.0%) | Match with the `tsc` `.types` baseline |
+| Type-check recall / precision | 63.4% / 87.0% | 71.4% / 90.1% | Per-diagnostic `(file, line, code)` match over every option variant |
 
 JavaScript emit skips 497 compiler and 519 conformance cases without a `.js`
 oracle (mostly `noEmit`); diagnostics exercises all of them. Symbols and types
 skip 95 compiler and 290 conformance cases without a uniquely selected oracle.
 
-Public workspace validation: **3,430 Rust tests passed**, zero failed, and
+Public workspace validation: **3,759 Rust tests passed**, zero failed, and
 37 ignored; `make ci` passes.
 
 Language server, against the `fourslash` suite:
 
 | Operation | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| QuickInfo (hover) | 301 | 228 | 10 | 56.9% |
+| QuickInfo (hover) | 303 | 226 | 10 | 57.3% |
 | Completions | 859 | 272 | 0 | 76.0% |
 | Go-to-definition | 191 | 20 | 2 | 90.5% |
 | Find-all-references | 329 | 18 | 0 | 94.8% |
 | Signature help | 123 | 22 | 7 | 84.8% |
-| **Supported operations** | **1,803** | **560** | **19** | **76.3%** |
+| **Supported operations** | **1,805** | **558** | **19** | **76.4%** |
 
-The full inventory contains 6,320 cases: 1,803 pass, 560 fail, and 3,957 are
+The full inventory contains 6,320 cases: 1,805 pass, 558 fail, and 3,957 are
 skipped, including unsupported operations.
 
 Expanded option variants (14,819 identities, 1,016 skips per lane):
@@ -98,10 +98,10 @@ Expanded option variants (14,819 identities, 1,016 skips per lane):
 | Lane | Passed | Failed | Pass rate |
 |---|---:|---:|---:|
 | JavaScript | 12,938 | 865 | 93.7% |
-| Declarations | 12,156 | 1,647 | 88.1% |
+| Declarations | 12,158 | 1,645 | 88.1% |
 
-Remaining diagnostic mismatches: 1,724 compiler cases and 2,257 conformance
-cases. Expanded emit failures are mainly ES5 transforms and declarations;
+Remaining diagnostic mismatches: 1,593 compiler cases and 1,908 conformance
+cases. Expanded emit failures include ES5 transforms and declarations;
 LSP gaps include contextual typing, generics, JSDoc and cross-file information.
 Symbol and type baselines still have substantial gaps.
 
