@@ -188,14 +188,14 @@ pub(crate) fn compile_indices_for_require_last_unit(
         return vec![root];
     }
 
-    let mut path_to_idx = HashMap::new();
+    let mut path_to_idx = HashMap::default();
     for (idx, file) in test_case.files.iter().enumerate() {
         path_to_idx.insert(normalize_header_path(&file.name), idx);
     }
     apply_link_path_aliases(&mut path_to_idx, test_case, link_path_mappings);
 
     let allowed: HashSet<usize> = compile_indices.iter().copied().collect();
-    let mut deps: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut deps: HashMap<usize, Vec<usize>> = HashMap::default();
     for idx in compile_indices {
         let file = &test_case.files[*idx];
         let parsed = parsed_sources
@@ -213,7 +213,7 @@ pub(crate) fn compile_indices_for_require_last_unit(
         deps.insert(*idx, d);
     }
 
-    let mut reachable: HashSet<usize> = HashSet::new();
+    let mut reachable: HashSet<usize> = HashSet::default();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if !reachable.insert(node) {
@@ -241,13 +241,13 @@ pub(crate) fn compute_emit_order(
     link_path_mappings: &[(String, String)],
     module_kind: Option<tsc_rs_ast::ModuleKind>,
 ) -> Vec<usize> {
-    let mut path_to_idx = HashMap::new();
+    let mut path_to_idx = HashMap::default();
     for (idx, file) in test_case.files.iter().enumerate() {
         path_to_idx.insert(normalize_header_path(&file.name), idx);
     }
     apply_link_path_aliases(&mut path_to_idx, test_case, link_path_mappings);
 
-    let mut deps: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut deps: HashMap<usize, Vec<usize>> = HashMap::default();
     for idx in compile_indices {
         let file = &test_case.files[*idx];
         let parsed = parsed_sources
@@ -262,7 +262,7 @@ pub(crate) fn compute_emit_order(
     // Stable topological sort:
     // - edge dep -> importer
     // - among ready nodes, preserve original source-file order.
-    let mut pos = HashMap::new();
+    let mut pos = HashMap::default();
     for (i, idx) in compile_indices.iter().enumerate() {
         pos.insert(*idx, i);
     }
@@ -343,7 +343,7 @@ pub(crate) fn compute_emit_order(
         }
     }
 
-    let root_rank: HashMap<usize, usize> = HashMap::new();
+    let root_rank: HashMap<usize, usize> = HashMap::default();
     let sort_key = |idx: &usize| {
         (
             root_rank.get(idx).copied().unwrap_or(usize::MAX),
@@ -351,8 +351,8 @@ pub(crate) fn compute_emit_order(
         )
     };
 
-    let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut indegree: HashMap<usize, usize> = HashMap::new();
+    let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::default();
+    let mut indegree: HashMap<usize, usize> = HashMap::default();
     for idx in compile_indices {
         indegree.insert(*idx, 0);
     }
@@ -584,7 +584,7 @@ fn reorder_node_module_triplet(order: &mut [usize], test_case: &TestCase) {
     // package subpath specifiers (e.g. "package/cjs", "package/mjs", "inner/cjs").
     // Tests that import from a single specifier (e.g. just "package") keep
     // source order.
-    let mut all_specs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_specs: std::collections::HashSet<String> = std::collections::HashSet::default();
     for (_, idx) in &non_nm {
         let content = &test_case.files[*idx].content;
         for line in content.lines() {
@@ -647,7 +647,7 @@ fn node_triplet_extension_rank(name: &str, default_rank: usize, esm_rank: usize)
 }
 
 fn reorder_explicit_relative_node_triplets(order: &mut [usize], test_case: &TestCase) {
-    let mut groups: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut groups: HashMap<String, Vec<(usize, usize)>> = HashMap::default();
     for (position, idx) in order.iter().copied().enumerate() {
         let name = normalize_header_path(&test_case.files[idx].name);
         groups
@@ -739,8 +739,8 @@ fn order_remaining_via_scc(
     pos: &HashMap<usize, usize>,
 ) -> Vec<usize> {
     let rem_set: HashSet<usize> = remaining.iter().copied().collect();
-    let mut forward: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut reverse: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut forward: HashMap<usize, Vec<usize>> = HashMap::default();
+    let mut reverse: HashMap<usize, Vec<usize>> = HashMap::default();
     for node in remaining {
         forward.entry(*node).or_default();
         reverse.entry(*node).or_default();
@@ -794,13 +794,13 @@ fn order_remaining_via_scc(
         }
     }
 
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut finish = Vec::new();
     for node in &nodes {
         dfs1(*node, &forward, &mut seen, &mut finish);
     }
 
-    let mut seen_rev = HashSet::new();
+    let mut seen_rev = HashSet::default();
     let mut components: Vec<Vec<usize>> = Vec::new();
     for node in finish.into_iter().rev() {
         if seen_rev.contains(&node) {
@@ -812,15 +812,15 @@ fn order_remaining_via_scc(
         components.push(comp);
     }
 
-    let mut comp_of: HashMap<usize, usize> = HashMap::new();
+    let mut comp_of: HashMap<usize, usize> = HashMap::default();
     for (cid, comp) in components.iter().enumerate() {
         for node in comp {
             comp_of.insert(*node, cid);
         }
     }
 
-    let mut comp_adj: HashMap<usize, HashSet<usize>> = HashMap::new();
-    let mut comp_indegree: HashMap<usize, usize> = HashMap::new();
+    let mut comp_adj: HashMap<usize, HashSet<usize>> = HashMap::default();
+    let mut comp_indegree: HashMap<usize, usize> = HashMap::default();
     for cid in 0..components.len() {
         comp_adj.entry(cid).or_default();
         comp_indegree.entry(cid).or_insert(0);
@@ -895,7 +895,7 @@ fn order_remaining_via_dependency_postorder(
     let mut nodes = remaining.to_vec();
     nodes.sort_by_key(|idx| pos.get(idx).copied().unwrap_or(usize::MAX));
 
-    let mut state: HashMap<usize, u8> = HashMap::new();
+    let mut state: HashMap<usize, u8> = HashMap::default();
     let mut ordered = Vec::with_capacity(remaining.len());
     for root in nodes {
         let mut stack = vec![(root, false)];
@@ -1295,12 +1295,12 @@ pub(crate) fn referenced_json_dependency_indices(
         return Vec::new();
     }
 
-    let mut path_to_idx = HashMap::new();
+    let mut path_to_idx = HashMap::default();
     for (idx, file) in test_case.files.iter().enumerate() {
         path_to_idx.insert(normalize_header_path(&file.name), idx);
     }
 
-    let mut referenced: HashSet<usize> = HashSet::new();
+    let mut referenced: HashSet<usize> = HashSet::default();
     for idx in compile_indices {
         let file = &test_case.files[*idx];
         let parsed = parsed_sources
@@ -1332,7 +1332,7 @@ fn root_dependency_postorder(
     deps: &HashMap<usize, Vec<usize>>,
 ) -> Vec<usize> {
     let allowed: HashSet<usize> = compile_indices.iter().copied().collect();
-    let mut state: HashMap<usize, u8> = HashMap::new();
+    let mut state: HashMap<usize, u8> = HashMap::default();
     let mut order = Vec::new();
     let mut stack = vec![(root, false)];
     while let Some((node, expanded)) = stack.pop() {

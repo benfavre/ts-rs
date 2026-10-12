@@ -77,6 +77,32 @@ pub(crate) fn merge_overloaded_function_props(
 }
 
 impl TypeChecker {
+    pub(super) fn register_class_initializer_shapes(&mut self, declaration: &ClassDecl) {
+        for member in &declaration.members {
+            let ClassMemberKind::Property(property) = &member.kind else {
+                continue;
+            };
+            let Some(initializer) = &property.initializer else {
+                continue;
+            };
+            let ExprKind::ClassExpr(class) = &initializer.kind else {
+                continue;
+            };
+            let identity = format!("__class_expression_{}", initializer.span.start);
+            self.push_scope();
+            if let Some(name) = &class.name {
+                self.declare_var(
+                    name,
+                    Type::TypeReference(format!("typeof {identity}"), Arc::from([])),
+                );
+            }
+            let info = self.build_class_info(class);
+            self.insert_class_info(identity, info);
+            self.register_class_initializer_shapes(class);
+            self.pop_scope();
+        }
+    }
+
     /// Accessor signatures have stricter grammar than ordinary functions.
     pub(crate) fn check_accessor_signature_grammar(
         &mut self,
@@ -575,6 +601,7 @@ impl TypeChecker {
         let mut own_protected_members = rustc_hash::FxHashSet::default();
         let mut own_private_static_members: rustc_hash::FxHashSet<std::string::String> =
             rustc_hash::FxHashSet::default();
+        let mut private_identifiers = rustc_hash::FxHashSet::default();
         let mut readonly_members: rustc_hash::FxHashSet<std::string::String> =
             rustc_hash::FxHashSet::default();
         let mut setter_names: rustc_hash::FxHashSet<std::string::String> =
@@ -617,6 +644,10 @@ impl TypeChecker {
                 _ => None,
             };
             if let Some((name, modifiers)) = declaration {
+                if matches!(name, PropName::Private(..)) {
+                    private_identifiers
+                        .insert((self.prop_name_to_string(name), modifiers & MOD_STATIC != 0));
+                }
                 if modifiers & MOD_STATIC == 0 {
                     let name = self.prop_name_to_string(name);
                     if !instance_member_modifiers.iter().any(|(n, _)| n == &name) {
@@ -1099,7 +1130,7 @@ impl TypeChecker {
                 }));
         for member in &class_decl.members {
             match &member.kind {
-                ClassMemberKind::Constructor(ctor) => {
+                ClassMemberKind::Constructor(ctor) if js_file => {
                     if let Some(ref body) = ctor.body {
                         self.collect_this_assignments_props(body, &mut instance_properties);
                     }
@@ -1214,6 +1245,7 @@ impl TypeChecker {
             own_private_members,
             own_protected_members,
             own_private_static_members,
+            private_identifiers,
             instance_methods,
             overloaded_methods,
             static_properties,

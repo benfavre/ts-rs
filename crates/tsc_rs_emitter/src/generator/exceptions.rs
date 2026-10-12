@@ -150,7 +150,7 @@ impl GeneratorPlan {
 
 impl Emitter<'_> {
     pub(super) fn prepare_generator_catches(&mut self, plan: &mut GeneratorPlan) {
-        let mut names = HashMap::new();
+        let mut names = HashMap::default();
         for &id in &plan.catch_bindings {
             let name = if let Some(name) = self.generator_catch_names.get(&id) {
                 name.clone()

@@ -16,6 +16,9 @@ impl TypeChecker {
         match &expr.kind {
             // typeof x === "string" narrows x to string in consequent
             ExprKind::Binary(bin) => {
+                if let Some(facts) = self.top_type_equality_narrowing(bin) {
+                    return facts;
+                }
                 match bin.op {
                     BinaryOp::StrictEq | BinaryOp::Eq => {
                         if let Some((equal, not_equal)) =
@@ -206,6 +209,21 @@ impl TypeChecker {
                             (&bin.left.kind, &bin.right.kind)
                         {
                             if let Some(declared) = self.lookup_var(name).cloned() {
+                                if self.is_unknown_receiver(&declared)
+                                    || matches!(&declared, Type::ObjectType(info) if info.is_non_nullish_unknown())
+                                {
+                                    // Successful membership proves this is
+                                    // an object, not merely a non-null value.
+                                    let object =
+                                        Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                                            properties: vec![(
+                                                key.to_string(),
+                                                Arc::new(Type::Unknown),
+                                            )],
+                                            ..ObjectTypeData::default()
+                                        }));
+                                    return (vec![(name.to_string(), object)], vec![]);
+                                }
                                 let known = !matches!(
                                     self.resolve_member_on_type(&declared, key),
                                     Type::Any | Type::Error | Type::Never
@@ -414,7 +432,14 @@ impl TypeChecker {
                             // clobber a concrete shape the left established
                             // (`x && typeof x === "object"` on a `{a?:T}` keeps
                             // `{a?:T}`, not `object`).
-                            if consequent.iter().any(|(n, _)| *n == name) {
+                            if let Some((_, left)) = consequent.iter_mut().find(|(n, _)| *n == name)
+                            {
+                                // A truthy unknown is merely non-nullish; the
+                                // right-hand guard can establish its shape.
+                                if matches!(left, Type::ObjectType(info) if info.is_non_nullish_unknown())
+                                {
+                                    *left = self.remove_null_undefined(&ty);
+                                }
                                 continue;
                             }
                             // `typeof x === "object"` yields a wide `object`; it
@@ -463,6 +488,23 @@ impl TypeChecker {
                         return (consequent, alternate);
                     }
                     _ => {}
+                }
+                // Comparing a guard's boolean result retains its facts.
+                // `guard === false` and `guard !== true` reverse the branches.
+                if matches!(
+                    bin.op,
+                    BinaryOp::Eq | BinaryOp::StrictEq | BinaryOp::Ne | BinaryOp::StrictNe
+                ) {
+                    let compared = match (&bin.left.kind, &bin.right.kind) {
+                        (_, ExprKind::BoolLit(value)) => Some((&bin.left, *value)),
+                        (ExprKind::BoolLit(value), _) => Some((&bin.right, *value)),
+                        _ => None,
+                    };
+                    if let Some((guard, value)) = compared {
+                        let (yes, no) = self.analyze_narrowing(guard);
+                        let equal = matches!(bin.op, BinaryOp::Eq | BinaryOp::StrictEq);
+                        return if value == equal { (yes, no) } else { (no, yes) };
+                    }
                 }
             }
             // Truthiness narrowing: if (x) -> remove null/undefined from x
@@ -592,6 +634,11 @@ impl TypeChecker {
                                     .filter(|member| {
                                         let member_prop =
                                             self.resolve_member_on_type(member, &mem.property);
+                                        let member_prop = if self.strict_null_checks {
+                                            self.truthiness_apparent_type(&member_prop, 0)
+                                        } else {
+                                            member_prop
+                                        };
                                         !matches!(
                                             narrow_by_truthiness(&member_prop, is_truthy),
                                             Type::Never
@@ -826,6 +873,16 @@ impl TypeChecker {
             // `xs[0]` (a literal index on a nameable array): truthy means
             // that element is there.
             ExprKind::ElemAccess(access) => {
+                if let Some(path) = self.known_element_path(expr) {
+                    let object = self.infer_expr_type(&access.object);
+                    let index = self.infer_expr_type(&access.index);
+                    if let Some(member) = self.known_literal_index_read(&object, &index, 0) {
+                        let present = self.remove_null_undefined(&member);
+                        if present != member && !matches!(present, Type::Never | Type::Any) {
+                            return (vec![(path, present)], vec![]);
+                        }
+                    }
+                }
                 if let Some(key) = Self::element_path(expr) {
                     let object = self.infer_expr_type(&access.object);
                     let object = match &object {
@@ -852,6 +909,20 @@ impl TypeChecker {
                     return (roots, vec![]);
                 }
             }
+            ExprKind::Assign(assignment) if assignment.op == AssignOp::Assign => {
+                let (mut yes, mut no) = self.analyze_narrowing(&assignment.right);
+                // Assigning the guard's result to another variable/property
+                // preserves its operand facts, except any path overwritten
+                // by the assignment itself.
+                if let Some(written) = Self::member_path(&assignment.left) {
+                    let unaffected = |(name, _): &(String, Type)| {
+                        name != &written && !name.starts_with(&format!("{written}."))
+                    };
+                    yes.retain(unaffected);
+                    no.retain(unaffected);
+                }
+                return (yes, no);
+            }
             ExprKind::Paren(inner) => return self.analyze_narrowing(inner),
             _ => {}
         }
@@ -875,15 +946,55 @@ impl TypeChecker {
         Some(format!("{base}[{index}]"))
     }
 
+    pub(super) fn known_element_path(&self, expr: &Expr) -> Option<String> {
+        let ExprKind::ElemAccess(access) = &expr.kind else {
+            return None;
+        };
+        let base = Self::member_path(&access.object)?;
+        let index = self.infer_expr_type(&access.index);
+        let key = match index {
+            Type::StringLiteral(key) => key,
+            Type::NumberLiteral(key) => Self::canonical_numeric_property_name(&key),
+            _ => return None,
+        };
+        Some(format!("{base}[{key:?}]"))
+    }
+
     pub(crate) fn member_path(expr: &Expr) -> Option<std::string::String> {
         match &expr.kind {
             ExprKind::Ident(name) => Some(name.to_string()),
             ExprKind::This => Some("this".to_string()),
+            ExprKind::NonNull(inner) | ExprKind::Paren(inner) => Self::member_path(inner),
             ExprKind::Member(mem) => {
                 let base = Self::member_path(&mem.object)?;
                 Some(format!("{}.{}", base, mem.property))
             }
             _ => None,
+        }
+    }
+
+    fn truthiness_apparent_type(&self, ty: &Type, depth: usize) -> Type {
+        if depth >= 16 || self.active_type_parameter_name(ty).is_some() {
+            return ty.clone();
+        }
+        match ty {
+            Type::TypeReference(name, args) => self
+                .resolve_type_for_assignability(ty)
+                .or_else(|| self.resolve_type_reference_to_object(name, args))
+                .filter(|resolved| resolved != ty)
+                .map(|resolved| self.truthiness_apparent_type(&resolved, depth + 1))
+                .unwrap_or_else(|| ty.clone()),
+            Type::Union(members) => Type::flatten_union(
+                members
+                    .iter()
+                    .map(|member| self.truthiness_apparent_type(member, depth + 1))
+                    .collect(),
+            ),
+            Type::Optional(inner) => Type::flatten_union(vec![
+                self.truthiness_apparent_type(inner, depth + 1),
+                Type::Undefined,
+            ]),
+            _ => ty.clone(),
         }
     }
 
@@ -1241,11 +1352,35 @@ impl TypeChecker {
     /// A property path only gets it when its type is known to admit that
     /// value; an unresolvable or `any` path stays as it is.
     fn exactly_nullish(&self, name: &str, nullish: Type) -> Vec<(std::string::String, Type)> {
+        if let Some(ty) = self
+            .nullish_comparison_source(name)
+            .filter(|ty| self.active_type_parameter_name(ty).is_some())
+        {
+            // An unconstrained generic keeps its identity in this branch.
+            // Concrete constraints can still establish or exclude nullish
+            // values, as in `T extends string | undefined`.
+            let constraint = self.typeparam_constraint_apparent(&ty);
+            if !self.strict_null_checks
+                || constraint.as_ref().is_none_or(|constraint| {
+                    matches!(constraint, Type::Any | Type::Unknown)
+                        || self.is_unknown_receiver(constraint)
+                })
+            {
+                return vec![];
+            }
+            if constraint
+                .as_ref()
+                .is_some_and(|constraint| !self.is_assignable_to(&nullish, constraint))
+            {
+                return vec![(name.to_string(), Type::Never)];
+            }
+        }
         if name.contains('.') {
             let admits = self
                 .nullish_comparison_source(name)
                 .is_some_and(|ty| match &ty {
                     Type::Union(members) => members.contains(&nullish),
+                    Type::Unknown => true,
                     other => *other == nullish,
                 });
             if !admits {
@@ -1293,7 +1428,33 @@ impl TypeChecker {
         to_remove: &Type,
     ) -> Vec<(std::string::String, Type)> {
         if let Some(ty) = self.nullish_comparison_source(name).as_ref() {
+            if matches!(
+                to_remove,
+                Type::StringLiteral(_)
+                    | Type::NumberLiteral(_)
+                    | Type::BooleanLiteral(_)
+                    | Type::BigIntLiteral(_)
+            ) {
+                let remaining = self.exclude_equality_literal(ty, to_remove, 0);
+                return (remaining != *ty)
+                    .then(|| (name.to_string(), remaining))
+                    .into_iter()
+                    .collect();
+            }
             let result = match ty {
+                Type::Unknown
+                    if self.strict_null_checks
+                        && matches!(to_remove, Type::Null | Type::Undefined) =>
+                {
+                    Type::flatten_union(vec![
+                        Type::ObjectType(ObjectTypeInfo::non_nullish_unknown()),
+                        if matches!(to_remove, Type::Null) {
+                            Type::Undefined
+                        } else {
+                            Type::Null
+                        },
+                    ])
+                }
                 Type::Union(members) => {
                     let filtered: Vec<_> = members
                         .iter()
@@ -1330,6 +1491,9 @@ impl TypeChecker {
     pub(crate) fn keep_nullish_of_var(&self, name: &str) -> Vec<(std::string::String, Type)> {
         if let Some(ty) = self.nullish_comparison_source(name).as_ref() {
             let kept: Type = match ty {
+                Type::Unknown if self.strict_null_checks => {
+                    Type::flatten_union(vec![Type::Null, Type::Undefined])
+                }
                 Type::Union(members) => Type::flatten_union(
                     members
                         .iter()
@@ -1349,6 +1513,9 @@ impl TypeChecker {
 
     /// Remove null and undefined from a type
     pub(crate) fn remove_null_undefined(&self, ty: &Type) -> Type {
+        if self.strict_null_checks && self.is_unknown_receiver(ty) {
+            return Type::ObjectType(ObjectTypeInfo::non_nullish_unknown());
+        }
         match ty {
             Type::Union(members) => {
                 let filtered: Vec<_> = members
@@ -1398,14 +1565,15 @@ impl TypeChecker {
     }
 
     /// Emit TS2531/TS2532/TS2533 for nullable member access under strict null checks
-    pub(crate) fn check_nullable_access(&mut self, ty: &Type, object: &Expr) {
+    /// Whether a diagnostic was reported.
+    pub(crate) fn check_nullable_access(&mut self, ty: &Type, object: &Expr) -> bool {
         if !self.strict_null_checks || !self.has_control_flow_narrowing {
-            return;
+            return false;
         }
         let has_null = self.type_contains_null(ty);
         let has_undefined = self.type_contains_undefined(ty);
         if !has_null && !has_undefined {
-            return;
+            return false;
         }
         let span = object.span;
         // tsc (reportObjectPossiblyNullOrUndefinedError): an entity name —
@@ -1439,6 +1607,7 @@ impl TypeChecker {
         } else {
             self.diagnostics.push(error_possibly_undefined(span));
         }
+        true
     }
 
     // -----------------------------------------------------------------------

@@ -500,7 +500,7 @@ impl<'a> Emitter<'a> {
             return Vec::new();
         }
         // Snapshot the keys before scanning
-        let keys_before: std::collections::HashSet<(String, String)> =
+        let keys_before: HashSet<(String, String)> =
             self.const_enum_values.keys().cloned().collect();
         // Save current values for any const enum names that might be overwritten
         let mut saved = Vec::new();
@@ -1979,8 +1979,7 @@ impl<'a> Emitter<'a> {
     pub(super) fn scan_needed_helpers(&mut self, stmts: &[Stmt]) {
         // Pre-scan for namespace declarations — when `import * as X` merges with
         // `namespace X`, TSC elides the import and uses only the namespace.
-        let mut namespace_decl_names: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
+        let mut namespace_decl_names: HashSet<&str> = HashSet::default();
         for stmt in stmts {
             if let StmtKind::ModuleDecl(md) = &stmt.kind {
                 if let ModuleName::Ident(name) = &md.name {
@@ -2560,16 +2559,16 @@ impl<'a> Emitter<'a> {
         let should_elide = self.should_elide_imports();
 
         // Collect all imported names and map import sources to their local bindings.
-        let mut imported_names: HashSet<AstString> = HashSet::new();
-        let mut source_binding_names: HashMap<AstString, Vec<AstString>> = HashMap::new();
+        let mut imported_names: HashSet<AstString> = HashSet::default();
+        let mut source_binding_names: HashMap<AstString, Vec<AstString>> = HashMap::default();
         // Separately track all require-import names (even those excluded by
         // global_type_only_names) so JSX factory detection can find them.
-        let mut all_require_import_names: HashSet<AstString> = HashSet::new();
+        let mut all_require_import_names: HashSet<AstString> = HashSet::default();
         // Track names from exported imports — these must never be elided.
-        let mut exported_import_names: HashSet<AstString> = HashSet::new();
+        let mut exported_import_names: HashSet<AstString> = HashSet::default();
         // Track namespace imports from type-only external modules so JSX
         // factory detection can find them even when they're not in imported_names.
-        let mut all_namespace_import_names: HashSet<AstString> = HashSet::new();
+        let mut all_namespace_import_names: HashSet<AstString> = HashSet::default();
         for stmt in stmts {
             let (import_decl, is_exported) = match &stmt.kind {
                 StmtKind::Import(import_decl) => (Some(import_decl), false),
@@ -2705,7 +2704,7 @@ impl<'a> Emitter<'a> {
         // references should NOT count as value uses of imported bindings.
         let type_shadowed_import_equals: HashSet<String> = {
             // Collect all type-only declaration names in the file.
-            let mut type_names: HashSet<String> = HashSet::new();
+            let mut type_names: HashSet<String> = HashSet::default();
             for s in stmts {
                 match &s.kind {
                     StmtKind::TypeAlias(t) => {
@@ -2731,7 +2730,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             // Find import-equals names that also have a type-only declaration.
-            let mut shadowed: HashSet<String> = HashSet::new();
+            let mut shadowed: HashSet<String> = HashSet::default();
             for s in stmts {
                 if let StmtKind::ImportEquals(ie) = &s.kind {
                     if type_names.contains(ie.name.as_str()) {
@@ -2759,9 +2758,9 @@ impl<'a> Emitter<'a> {
         // that declares `const X = init`, scan the init for import refs first,
         // THEN remove `X` from imported_names so subsequent statements don't
         // count their `X` references as import uses.
-        let mut value_used: HashSet<AstString> = HashSet::new();
-        let mut value_used_non_member: HashSet<AstString> = HashSet::new();
-        let mut value_used_export: HashSet<AstString> = HashSet::new();
+        let mut value_used: HashSet<AstString> = HashSet::default();
+        let mut value_used_non_member: HashSet<AstString> = HashSet::default();
+        let mut value_used_export: HashSet<AstString> = HashSet::default();
         // The loop below only ever SHRINKS imported_names (local shadowing), so
         // the first-byte mask computed once here stays a sound superset for
         // every per-statement re-borrow (stale bits are documented as safe).
@@ -2882,8 +2881,8 @@ impl<'a> Emitter<'a> {
                     _ => {}
                 },
                 StmtKind::ExportAssign(expr) => {
-                    let mut export_refs: HashSet<AstString> = HashSet::new();
-                    let mut export_refs_non_member: HashSet<AstString> = HashSet::new();
+                    let mut export_refs: HashSet<AstString> = HashSet::default();
+                    let mut export_refs_non_member: HashSet<AstString> = HashSet::default();
                     collect_value_refs_expr(
                         expr,
                         &nf2,
@@ -2906,10 +2905,10 @@ impl<'a> Emitter<'a> {
             HashSet<AstString>,
             HashSet<AstString>,
         ) = {
-            let mut init_refs: HashSet<AstString> = HashSet::new();
-            let mut init_refs_nm: HashSet<AstString> = HashSet::new();
-            let mut outside_refs: HashSet<AstString> = HashSet::new();
-            let mut outside_refs_nm: HashSet<AstString> = HashSet::new();
+            let mut init_refs: HashSet<AstString> = HashSet::default();
+            let mut init_refs_nm: HashSet<AstString> = HashSet::default();
+            let mut outside_refs: HashSet<AstString> = HashSet::default();
+            let mut outside_refs_nm: HashSet<AstString> = HashSet::default();
             for stmt in stmts {
                 let en = match &stmt.kind {
                     StmtKind::EnumDecl(e) => Some(e),
@@ -3100,7 +3099,7 @@ impl<'a> Emitter<'a> {
             && self.options.experimental_decorators == Some(true)
         {
             let mut metadata_serialized: Vec<String> = Vec::new();
-            let mut metadata_type_refs: HashSet<String> = HashSet::new();
+            let mut metadata_type_refs: HashSet<String> = HashSet::default();
             let type_only_import_names_ref = &self.type_only_import_names;
             let global_type_only_names_ref = &self.global_type_only_names;
             let enum_decl_names_ref = &self.enum_decl_names;
@@ -3763,7 +3762,7 @@ impl<'a> Emitter<'a> {
         }
 
         // Preserve first-seen order while removing duplicates.
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         temps.retain(|t| seen.insert(t.clone()));
         temps
     }

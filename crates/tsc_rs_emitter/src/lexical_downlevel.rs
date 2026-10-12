@@ -318,7 +318,7 @@ impl Analyzer {
             continue_stack: Vec::new(),
             labels: Vec::new(),
             raw_controls: Vec::new(),
-            reserved_names: HashSet::new(),
+            reserved_names: HashSet::default(),
             normal_function_depth: 0,
             loop_normal_depths: Vec::new(),
             loop_function_depths: Vec::new(),
@@ -326,7 +326,7 @@ impl Analyzer {
             down_level_iteration,
             preserve_const_enums,
             suppress_array_spread: false,
-            erased_type_only_import_equals: HashSet::new(),
+            erased_type_only_import_equals: HashSet::default(),
         }
     }
 
@@ -391,8 +391,8 @@ impl Analyzer {
             kind,
             function_depth,
             owns_arguments: false,
-            bindings: HashMap::new(),
-            emitted_names: HashSet::new(),
+            bindings: HashMap::default(),
+            emitted_names: HashSet::default(),
         });
         id
     }
@@ -1152,11 +1152,11 @@ impl Analyzer {
             captured_bindings: Vec::new(),
             body_local_captures: Vec::new(),
             copy_out_bindings: Vec::new(),
-            copy_out_names: HashMap::new(),
+            copy_out_names: HashMap::default(),
             controls: Vec::new(),
             captures_this: false,
             new_target_name: None,
-            new_target_references: HashSet::new(),
+            new_target_references: HashSet::default(),
             iterator_destructure: false,
             simple_iterator_array_comment_range: None,
             supported: !self

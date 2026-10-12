@@ -5537,38 +5537,11 @@ impl<'a> Emitter<'a> {
                             self.write(">");
                         }
                     }
-                    // If JSX elements are unterminated in the source, append
-                    // one recovery close per open element. At EOF TypeScript
-                    // puts the synthetic closes after a blank line.
-                    {
-                        let s = expr.span.start as usize;
-                        let e = expr.span.end as usize;
-                        if e <= self.source.len() {
-                            let missing_closes = self.count_unclosed_jsx_elements(expr);
-                            if missing_closes == 0 {
-                                // All opening elements have a corresponding
-                                // closing tag in the recovery tree.
-                            } else if self.source[e..].trim().is_empty() {
-                                let has_any_source_close = self.source[s..e].contains("</");
-                                if has_any_source_close {
-                                    if !self.output.ends_with('\n') {
-                                        self.newline();
-                                    }
-                                } else if self.output.ends_with('\n') {
-                                    self.newline();
-                                } else {
-                                    self.newline();
-                                    self.newline();
-                                }
-                                for _ in 0..missing_closes {
-                                    self.write("</>");
-                                }
-                            } else {
-                                for _ in 0..missing_closes {
-                                    self.write("</>");
-                                }
-                            }
-                        }
+                    // Missing closing tags follow the final JSX child. Any
+                    // line breaks belong to that child's text and have already
+                    // been copied; synthetic closes do not add blank lines.
+                    for _ in 0..self.count_unclosed_jsx_elements(expr) {
+                        self.write("</>");
                     }
                     // Collapse multiline JSX expression containers to single
                     // lines (post-processing). TypeScript compacts containers
@@ -7740,6 +7713,14 @@ impl<'a> Emitter<'a> {
             return;
         }
         let src = &self.source[start..end];
+        // Fast emit keeps the source layout; and a line inside a multi-line
+        // template literal is string text, which the per-line trim and
+        // normalization below rewrote (`<div>` -> `<div >`). copy_expr_span
+        // copies verbatim under fast emit and skips template lines otherwise.
+        if self.fast_emit || crate::template_text_lines(src, src.lines().count()).contains(&true) {
+            self.copy_expr_span(span);
+            return;
+        }
         let mut first = true;
         for line in src.lines() {
             let trimmed = line.trim();
@@ -7774,6 +7755,12 @@ impl<'a> Emitter<'a> {
             return;
         }
         let src = &self.source[start..end];
+        // Same as emit_compact_multiline_arrow_binary_expr: template text and
+        // fast emit go through copy_expr_span.
+        if self.fast_emit || crate::template_text_lines(src, src.lines().count()).contains(&true) {
+            self.copy_expr_span(span);
+            return;
+        }
         let mut first = true;
         for line in src.lines() {
             let trimmed = line.trim();
@@ -9892,6 +9879,10 @@ impl<'a> Emitter<'a> {
     /// Check if an expression tree contains an ObjectLit whose consecutive
     /// properties have a missing comma in the source (parser error recovery).
     pub(super) fn expr_has_obj_lit_missing_commas(&self, expr: &Expr) -> bool {
+        // A missing comma is a parse error.
+        if !self.file_has_recovery_errors {
+            return false;
+        }
         let mut stack = vec![expr];
         while let Some(e) = stack.pop() {
             if let ExprKind::ObjectLit(props) = &e.kind {
@@ -10981,6 +10972,15 @@ impl<'a> Emitter<'a> {
     ) -> bool {
         if self.lexical_downlevel_plan.loop_preserves_native(span) {
             return false;
+        }
+        if matches!(&fo.left, ForInOfLeft::Var(vs) if vs.declarations.is_empty()) {
+            let discard = self.next_inline_temp_var();
+            self.write("var ");
+            self.write(&discard);
+            self.write(" = ");
+            self.write(value);
+            self.writeln(";");
+            return true;
         }
         let Some(declaration) = crate::analysis::eligible_es5_for_of_declaration(&fo.left) else {
             return false;
@@ -12523,7 +12523,12 @@ fn normalize_nested_jsx_self_closing_line_comment_layout(text: &str) -> String {
     let mut index = 0usize;
     while index < lines.len() {
         let line = lines[index];
-        if line.contains('<') && line.contains("//") && !line.trim_start().starts_with("//") {
+        let attribute_comment = line.find("//").is_some_and(|comment| {
+            line[..comment]
+                .rfind('<')
+                .is_some_and(|opening| find_jsx_opening_gt(&line[opening..comment]).is_none())
+        });
+        if attribute_comment && !line.trim_start().starts_with("//") {
             output.push(line.to_string());
             index += 1;
             let mut collected_attribute = false;

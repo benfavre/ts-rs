@@ -7,6 +7,7 @@
 
 mod accessor_flow;
 mod alias_cycles;
+mod ambient_modules;
 pub mod assign;
 mod await_bindings;
 mod builtins;
@@ -16,20 +17,33 @@ mod check_narrowing;
 mod check_uncalled;
 mod constructor_signatures;
 pub mod control_flow;
+mod decorator_types;
 mod diagnostics;
+mod enum_conditions;
+mod equality_conditions;
+mod equality_narrowing;
 mod external_helpers;
 mod function_returns;
+mod global_access;
+mod global_import_aliases;
 mod import_alias_conflicts;
 mod import_attributes;
 mod index_constraints;
 mod index_signatures;
 pub mod inference;
+mod inference_shapes;
 mod interface_heritage;
+mod intersection_reduction;
+mod javascript_aliases;
 mod jsdoc;
 mod jump_targets;
 mod layered_map;
+mod module_augmentations;
+mod module_resolution_diagnostics;
 pub mod narrowing;
 mod overload_compatibility;
+mod private_names;
+mod property_suggestions;
 mod protected_access;
 mod reserved_type_names;
 mod resolve_types;
@@ -40,6 +54,7 @@ mod type_computations;
 pub mod type_facts;
 mod type_only_aliases;
 pub mod type_ops;
+mod unknown_receivers;
 mod unreachable_exprs;
 mod unused_type_params;
 mod use_before_decl;
@@ -47,6 +62,7 @@ mod use_before_decl;
 use builtins::BuiltinTypes;
 use diagnostics::*;
 pub use diagnostics::{check_deprecated_options, DeprecatedOptionDiag};
+use module_augmentations::ModuleBodyKind;
 /// A JavaScript file with its JSDoc types written in as annotations, for
 /// program-wide passes that read declarations before checking.
 pub fn desugar_jsdoc(file: &SourceFile) -> Option<SourceFile> {
@@ -593,7 +609,7 @@ type OverloadImplementations =
 type MemberLocations = rustc_hash::FxHashMap<std::string::String, (std::string::String, Span)>;
 
 /// The members of an object type. Held behind [`ObjectTypeInfo`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ObjectTypeData {
     pub properties: Vec<(std::string::String, Arc<Type>)>,
     pub call_signatures: Vec<FunctionType>,
@@ -640,7 +656,7 @@ impl std::hash::Hash for ObjectTypeData {
 /// refcount bump; a write through `DerefMut` copies the data only when it
 /// is shared.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ObjectTypeInfo(Arc<ObjectTypeData>);
+pub struct ObjectTypeInfo(Arc<ObjectTypeData>, bool);
 
 /// Members that one display simplification may materialize from mapped
 /// types before leaving the rest unexpanded.
@@ -653,7 +669,17 @@ thread_local! {
 
 impl ObjectTypeInfo {
     pub fn new(data: ObjectTypeData) -> Self {
-        Self(Arc::new(data))
+        Self(Arc::new(data), false)
+    }
+
+    /// TypeScript retains the origin of `unknown` after a non-nullish guard.
+    /// It displays as `{}`, but can still represent a primitive for `in`.
+    pub(crate) fn non_nullish_unknown() -> Self {
+        Self(Arc::new(ObjectTypeData::default()), true)
+    }
+
+    pub(crate) fn is_non_nullish_unknown(&self) -> bool {
+        self.1
     }
 
     /// The members by value: moved out when this handle is the only one,
@@ -1028,6 +1054,9 @@ struct ClassInfo {
     own_protected_members: rustc_hash::FxHashSet<std::string::String>,
     /// Private members on the constructor/static side.
     own_private_static_members: rustc_hash::FxHashSet<std::string::String>,
+    /// Actual `#name` declarations, distinguished from quoted string keys
+    /// and TypeScript's `private` modifier. The bool selects the static side.
+    private_identifiers: rustc_hash::FxHashSet<(String, bool)>,
     /// Declaring file and name span of each own member (for "declared here"
     /// related notes).
     member_locations: rustc_hash::FxHashMap<std::string::String, (std::string::String, Span)>,
@@ -1520,7 +1549,13 @@ impl Type {
                     args[0].display_into(buf);
                     buf.push_str("[]");
                 } else if args.is_empty() {
-                    buf.push_str(scoped_interface_display_name(name));
+                    match name.strip_prefix("typeof ") {
+                        Some(value) if value.starts_with(FILE_INTERFACE_KEY_PREFIX) => {
+                            buf.push_str("typeof ");
+                            buf.push_str(scoped_interface_display_name(value));
+                        }
+                        _ => buf.push_str(scoped_interface_display_name(name)),
+                    }
                 } else {
                     buf.push_str(scoped_interface_display_name(name));
                     buf.push('<');
@@ -1782,7 +1817,14 @@ impl Type {
             }
             Type::Keyof(inner) => {
                 buf.push_str("keyof ");
+                let needs_parens = matches!(inner.as_ref(), Type::Union(_) | Type::Intersection(_));
+                if needs_parens {
+                    buf.push('(');
+                }
                 inner.display_into(buf);
+                if needs_parens {
+                    buf.push(')');
+                }
             }
             Type::Typeof(name) => {
                 buf.push_str("typeof ");
@@ -1899,11 +1941,13 @@ impl Type {
     /// Flatten nested unions for canonical form.
     pub fn flatten_union(types: Vec<Type>) -> Type {
         let mut flat = Vec::new();
-        for ty in types.iter() {
+        let mut pending = types;
+        pending.reverse();
+        while let Some(ty) = pending.pop() {
             match ty {
-                Type::Union(inner) => flat.extend(inner.iter().cloned()),
+                Type::Union(inner) => pending.extend(inner.iter().rev().cloned()),
                 Type::Never => {} // never is the identity for union
-                other => flat.push(other.clone()),
+                other => flat.push(other),
             }
         }
         // `any` absorbs everything in a union (TS: `any | T = any`). Bail
@@ -1912,6 +1956,15 @@ impl Type {
         // constituent.
         if flat.iter().any(|t| matches!(t, Type::Any)) {
             return Type::Any;
+        }
+        if flat.iter().any(|t| matches!(t, Type::Unknown))
+            || (flat
+                .iter()
+                .any(|t| matches!(t, Type::ObjectType(info) if info.is_non_nullish_unknown()))
+                && flat.contains(&Type::Null)
+                && flat.contains(&Type::Undefined))
+        {
+            return Type::Unknown;
         }
         // Deduplicate and remove Never
         let mut deduped: Vec<Type> = Vec::new();
@@ -1965,8 +2018,9 @@ impl Type {
             Type::Void => 5,
             Type::Null => 6,
             Type::Undefined => 7,
-            Type::Never => 8,
-            _ => 9,
+            Type::Object => 8,
+            Type::Never => 9,
+            _ => 10,
         });
         match deduped.len() {
             0 => Type::Never,
@@ -2406,6 +2460,12 @@ struct CheckerScope {
     /// deliberately broad value type so ordinary property checks do not gain
     /// false precision; the full namespace also resolves alias chains.
     readonly_namespace_aliases: rustc_hash::FxHashMap<std::string::String, NamespaceType>,
+    /// Class receiver captured by a local binding whose type remains the
+    /// polymorphic `this` type, including aliases used from nested classes.
+    this_alias_receivers: rustc_hash::FxHashMap<String, Type>,
+    /// The exact scope introduced by a namespace/module block. Nested
+    /// functions and ordinary blocks do not inherit its declaration context.
+    module_body_kind: Option<ModuleBodyKind>,
     parent: Option<usize>,
 }
 
@@ -2574,6 +2634,9 @@ pub struct TypeChecker {
     /// Top-level namespaces of this file with no value meaning (every block
     /// uninstantiated, no same-named value): TS2708 in value positions.
     uninstantiated_namespace_names: rustc_hash::FxHashSet<std::string::String>,
+    /// Imported interfaces/type aliases in JavaScript still have no runtime
+    /// value, even when the import resolver creates a variable binding.
+    javascript_erased_type_imports: rustc_hash::FxHashSet<std::string::String>,
     /// Top-level names this file declares only as values (TS2749 in type
     /// positions).
     value_only_top_level_names: rustc_hash::FxHashSet<std::string::String>,
@@ -2640,6 +2703,7 @@ pub struct TypeChecker {
     /// key(s): `type A<X = D> = …` → `[Some(D)]`. Only aliases with at
     /// least one default are recorded.
     alias_type_param_defaults: layered_map::LayeredMap<Vec<Option<Type>>>,
+    global_import_type_targets: layered_map::LayeredMap<String>,
     /// Type names (interface / class / type-alias) defined more than once
     /// across the injected program. Excess-property checking resolves a named
     /// target to its member names ONLY when the name is unambiguous — name
@@ -2667,6 +2731,7 @@ pub struct TypeChecker {
     /// Enum metadata: name → list of (member_name, optional_value_type).
     /// `Arc`-shared across per-file clones — see `class_info`.
     enum_info: layered_map::LayeredMap<Vec<(std::string::String, Type)>>,
+    enum_member_locations: layered_map::LayeredMap<MemberLocations>,
     /// Imported namespace-like bindings (`import * as ns`, `import x = require(...)`).
     imported_namespace_bindings: rustc_hash::FxHashSet<std::string::String>,
     /// Per-file namespace import binding → statically known exported names.
@@ -2687,6 +2752,9 @@ pub struct TypeChecker {
     /// declaring `foo` as `Type::Any`.
     module_exports:
         Arc<rustc_hash::FxHashMap<std::string::String, Vec<(std::string::String, Type)>>>,
+    /// Logical module identities for string-named ambient declarations. All
+    /// declaration fragments share one identity, separate from real files.
+    ambient_module_paths: Arc<rustc_hash::FxHashMap<String, String>>,
     /// Per-file names exported in the type namespace. Kept separately from
     /// `module_exports`, whose resolved `Type` alone cannot distinguish
     /// `export type Foo = string` from `export const Foo: string`.
@@ -2699,6 +2767,9 @@ pub struct TypeChecker {
     /// from genuinely missing exports without claiming runtime availability.
     module_known_exports:
         Arc<rustc_hash::FxHashMap<std::string::String, rustc_hash::FxHashSet<std::string::String>>>,
+    /// Declaration meanings of import/export targets, independent of their
+    /// inferred types and of whether an alias explicitly uses `type` syntax.
+    javascript_alias_meanings: Arc<javascript_aliases::AliasMeanings>,
     /// Normalized view of the three export maps' keys, built on first use by
     /// `program_file_for_relative_specifier` and reset whenever a map is
     /// replaced. Normalizing every key per lookup made each relative import
@@ -2920,6 +2991,22 @@ pub struct TypeChecker {
     /// Local names introduced by this file's top-level import declarations
     /// (default, namespace, named and `= require` bindings) and import-equals.
     file_import_binding_names: rustc_hash::FxHashSet<std::string::String>,
+    /// While a file's declarations are injected: the declared types of its
+    /// top-level `const X: { … }` bindings that one of its type aliases
+    /// reads as `keyof typeof X` (module-local values are not in scope
+    /// during injection).
+    injection_typeof_bindings: rustc_hash::FxHashMap<std::string::String, Type>,
+    /// The file declaring each top-level type alias of the program, by its
+    /// bare name (the first declaration when several files declare it).
+    type_alias_decl_files: layered_map::LayeredMap<std::string::String>,
+    /// Names the checked file binds from a value asserted `any`
+    /// (`const { Svc } = (await import(p)) as any`): such a binding is not
+    /// the program's same-named class.
+    explicit_any_bindings: rustc_hash::FxHashSet<std::string::String>,
+    /// The checked file's named imports: local binding → (imported name,
+    /// resolved module path).
+    file_named_import_sources:
+        rustc_hash::FxHashMap<std::string::String, (std::string::String, std::string::String)>,
     /// Declared names of the ambient external module blocks
     /// (`declare module "m" { }`) currently being checked, innermost last.
     module_block_local_names: Vec<(rustc_hash::FxHashSet<std::string::String>, bool)>,
@@ -2939,6 +3026,12 @@ pub struct TypeChecker {
     /// provided." note under TS2554).
     function_param_spans:
         rustc_hash::FxHashMap<std::string::String, Vec<(std::string::String, Span)>>,
+    /// Full parameter declarations for decorator arity notes, including
+    /// ambient functions and overloads in the current file.
+    decorator_parameter_notes: rustc_hash::FxHashMap<
+        (std::string::String, usize),
+        Vec<Vec<tsc_rs_ast::RelatedDiagnostic>>,
+    >,
     /// Global type/value declarations contributed by non-lib program files.
     /// These remain authoritative across script files and `declare global`
     /// augmentations, unlike omitted declarations from a newer stdlib donor.
@@ -3277,6 +3370,7 @@ impl Clone for TypeChecker {
             external_top_level_bindings: self.external_top_level_bindings.clone(),
             external_file_order: self.external_file_order.clone(),
             uninstantiated_namespace_names: self.uninstantiated_namespace_names.clone(),
+            javascript_erased_type_imports: self.javascript_erased_type_imports.clone(),
             value_only_top_level_names: self.value_only_top_level_names.clone(),
             external_top_level_type_decls: self.external_top_level_type_decls.clone(),
             namespace_paths: self.namespace_paths.clone(),
@@ -3296,17 +3390,21 @@ impl Clone for TypeChecker {
             interface_info: self.interface_info.clone(),
             type_aliases: self.type_aliases.clone(),
             alias_type_param_defaults: self.alias_type_param_defaults.clone(),
+            global_import_type_targets: self.global_import_type_targets.clone(),
             duplicate_type_names: Arc::clone(&self.duplicate_type_names),
             global_type_names: Arc::clone(&self.global_type_names),
             namespace_type_names: Arc::clone(&self.namespace_type_names),
             type_resolution_namespace: self.type_resolution_namespace.clone(),
             enum_info: self.enum_info.clone(),
+            enum_member_locations: self.enum_member_locations.clone(),
             imported_namespace_bindings: self.imported_namespace_bindings.clone(),
             imported_namespace_export_names: self.imported_namespace_export_names.clone(),
             alias_cycle_diagnostics: self.alias_cycle_diagnostics.clone(),
             module_exports: Arc::clone(&self.module_exports),
+            ambient_module_paths: Arc::clone(&self.ambient_module_paths),
             module_type_exports: Arc::clone(&self.module_type_exports),
             module_known_exports: Arc::clone(&self.module_known_exports),
+            javascript_alias_meanings: Arc::clone(&self.javascript_alias_meanings),
             program_file_index: Arc::clone(&self.program_file_index),
             stdlib_alias_marker_count: self.stdlib_alias_marker_count,
             checked_member_object: None,
@@ -3365,11 +3463,16 @@ impl Clone for TypeChecker {
             local_type_only_names: rustc_hash::FxHashSet::default(),
             local_value_names: rustc_hash::FxHashSet::default(),
             file_import_binding_names: rustc_hash::FxHashSet::default(),
+            injection_typeof_bindings: rustc_hash::FxHashMap::default(),
+            type_alias_decl_files: self.type_alias_decl_files.clone(),
+            file_named_import_sources: rustc_hash::FxHashMap::default(),
+            explicit_any_bindings: rustc_hash::FxHashSet::default(),
             module_block_local_names: Vec::new(),
             instance_initializer_pending_props: None,
             file_hoisted_binding_names: rustc_hash::FxHashSet::default(),
             file_has_module_syntax: false,
             function_param_spans: rustc_hash::FxHashMap::default(),
+            decorator_parameter_notes: rustc_hash::FxHashMap::default(),
             user_global_type_names: self.user_global_type_names.clone(),
             user_global_value_names: self.user_global_value_names.clone(),
             // dedup_map is intentionally NOT cloned. The donor's arena IS
@@ -3485,6 +3588,8 @@ impl TypeChecker {
             narrowed: rustc_hash::FxHashMap::default(),
             condition_aliases: rustc_hash::FxHashMap::default(),
             readonly_namespace_aliases: rustc_hash::FxHashMap::default(),
+            this_alias_receivers: rustc_hash::FxHashMap::default(),
+            module_body_kind: None,
             parent: None,
         };
         Self {
@@ -3523,6 +3628,7 @@ impl TypeChecker {
             external_top_level_bindings: rustc_hash::FxHashMap::default(),
             external_file_order: Vec::new(),
             uninstantiated_namespace_names: rustc_hash::FxHashSet::default(),
+            javascript_erased_type_imports: rustc_hash::FxHashSet::default(),
             value_only_top_level_names: rustc_hash::FxHashSet::default(),
             external_top_level_type_decls: rustc_hash::FxHashMap::default(),
             namespace_paths: std::collections::HashSet::new(),
@@ -3539,17 +3645,21 @@ impl TypeChecker {
             interface_info: Default::default(),
             type_aliases: Default::default(),
             alias_type_param_defaults: Default::default(),
+            global_import_type_targets: Default::default(),
             duplicate_type_names: Arc::new(rustc_hash::FxHashSet::default()),
             global_type_names: Arc::new(rustc_hash::FxHashSet::default()),
             namespace_type_names: Arc::new(rustc_hash::FxHashSet::default()),
             type_resolution_namespace: None,
             enum_info: Default::default(),
+            enum_member_locations: Default::default(),
             imported_namespace_bindings: rustc_hash::FxHashSet::default(),
             imported_namespace_export_names: rustc_hash::FxHashMap::default(),
             alias_cycle_diagnostics: None,
             module_exports: Arc::new(rustc_hash::FxHashMap::default()),
+            ambient_module_paths: Arc::default(),
             module_type_exports: Arc::new(rustc_hash::FxHashMap::default()),
             module_known_exports: Arc::new(rustc_hash::FxHashMap::default()),
+            javascript_alias_meanings: Arc::default(),
             program_file_index: Arc::new(std::sync::OnceLock::new()),
             stdlib_alias_marker_count: 0,
             checked_member_object: None,
@@ -3600,11 +3710,16 @@ impl TypeChecker {
             local_type_only_names: rustc_hash::FxHashSet::default(),
             local_value_names: rustc_hash::FxHashSet::default(),
             file_import_binding_names: rustc_hash::FxHashSet::default(),
+            injection_typeof_bindings: rustc_hash::FxHashMap::default(),
+            type_alias_decl_files: Default::default(),
+            file_named_import_sources: rustc_hash::FxHashMap::default(),
+            explicit_any_bindings: rustc_hash::FxHashSet::default(),
             module_block_local_names: Vec::new(),
             instance_initializer_pending_props: None,
             file_hoisted_binding_names: rustc_hash::FxHashSet::default(),
             file_has_module_syntax: false,
             function_param_spans: rustc_hash::FxHashMap::default(),
+            decorator_parameter_notes: rustc_hash::FxHashMap::default(),
             user_global_type_names: rustc_hash::FxHashSet::default(),
             user_global_value_names: rustc_hash::FxHashSet::default(),
             dedup_map: rustc_hash::FxHashMap::default(),
@@ -4081,7 +4196,7 @@ impl TypeChecker {
         }
         let mut candidate_owner = owner;
         loop {
-            let candidate = format!("{candidate_owner}.{name}");
+            let candidate = Self::namespace_member_type_key(candidate_owner, name);
             if self.namespace_type_names.contains(&candidate) {
                 return candidate;
             }
@@ -4130,7 +4245,11 @@ impl TypeChecker {
                 let nested_name = match &nested.name {
                     ModuleName::Ident(name) | ModuleName::String(name) => name,
                 };
-                Self::collect_namespace_type_names(nested, &format!("{path}.{nested_name}"), names);
+                Self::collect_namespace_type_names(
+                    nested,
+                    &Self::namespace_member_type_key(path, nested_name),
+                    names,
+                );
             }
             return;
         };
@@ -4151,13 +4270,17 @@ impl TypeChecker {
                 _ => None,
             };
             if let Some(name) = name {
-                names.insert(format!("{path}.{name}"));
+                names.insert(Self::namespace_member_type_key(path, name));
             }
             if let StmtKind::ModuleDecl(nested) = &declaration.kind {
                 let nested_name = match &nested.name {
                     ModuleName::Ident(name) | ModuleName::String(name) => name,
                 };
-                Self::collect_namespace_type_names(nested, &format!("{path}.{nested_name}"), names);
+                Self::collect_namespace_type_names(
+                    nested,
+                    &Self::namespace_member_type_key(path, nested_name),
+                    names,
+                );
             }
         }
     }
@@ -4435,6 +4558,7 @@ impl TypeChecker {
         }
         Arc::make_mut(&mut self.type_only_exports).extend(Self::collect_type_only_exports(files));
         stage("prepare");
+        self.prepare_ambient_modules(files, true);
         Self::inject_pass(self, files, true);
         stage("pass .d.ts");
         Self::close_reexports(self, files, true);
@@ -4443,6 +4567,7 @@ impl TypeChecker {
         stage("pass sources");
         Self::close_reexports(self, files, false);
         stage("reexports src");
+        self.prepare_ambient_modules(files, false);
         // After all top-level declarations are injected into the global
         // scope, build per-file exports for namespace import resolution.
         // Has to run last because it consults the now-populated scope[0],
@@ -4457,6 +4582,9 @@ impl TypeChecker {
         self.build_module_type_exports(files);
         stage("type exports");
         self.declare_umd_globals(files);
+        for file in files {
+            self.inject_global_import_aliases(file);
+        }
         // The project-wide registries are complete: share them, so the
         // per-file checkers cloned from this one copy nothing.
         self.freeze_registries();
@@ -4467,8 +4595,11 @@ impl TypeChecker {
         self.class_info.freeze();
         self.interface_info.freeze();
         self.type_aliases.freeze();
+        self.type_alias_decl_files.freeze();
         self.alias_type_param_defaults.freeze();
+        self.global_import_type_targets.freeze();
         self.enum_info.freeze();
+        self.enum_member_locations.freeze();
     }
 
     /// `export as namespace Foo;` in a module makes the module's value a
@@ -5208,6 +5339,11 @@ impl TypeChecker {
         for (file_name, exports) in direct_entries {
             direct.insert(file_name, exports);
         }
+        for path in self.ambient_module_paths.values() {
+            if let Some(exports) = self.module_exports.get(path) {
+                direct.insert(path.clone(), exports.clone());
+            }
+        }
         phase("direct done");
         self.merge_module_augmentation_exports(files, &mut direct);
         phase("augmentations done");
@@ -5350,6 +5486,9 @@ impl TypeChecker {
         enclosing_scopes: &[&[Stmt]],
         namespace_prefixes: &[Vec<String>],
     ) -> (bool, bool) {
+        if enclosing_scopes.is_empty() && Self::file_global_object_alias(statements, module_ref) {
+            return (false, true);
+        }
         fn entity_segments(expression: &Expr, output: &mut Vec<String>) -> bool {
             match &expression.kind {
                 ExprKind::Ident(name) => {
@@ -6105,6 +6244,14 @@ impl TypeChecker {
         let mut local_known = ExportNameMap::default();
         let mut direct_types = ExportNameMap::default();
         let mut direct_known = ExportNameMap::default();
+        for path in self.ambient_module_paths.values() {
+            if let Some(names) = self.module_type_exports.get(path) {
+                direct_types.insert(path.clone(), names.clone());
+            }
+            if let Some(names) = self.module_known_exports.get(path) {
+                direct_known.insert(path.clone(), names.clone());
+            }
+        }
         let mut explicit_exports = ExportNameMap::default();
         // Program files are virtual under the test harness; relative
         // re-exports resolve against these names when the filesystem
@@ -6194,6 +6341,26 @@ impl TypeChecker {
             explicit_exports.insert(file.file_name.clone(), file_explicit_exports);
             let type_entry = direct_types.entry(file.file_name.clone()).or_default();
             let known_entry = direct_known.entry(file.file_name.clone()).or_default();
+            for statement in &file.statements {
+                let StmtKind::ImportEquals(alias) = &Self::unwrap_export_stmt(statement).kind
+                else {
+                    continue;
+                };
+                if alias.modifiers & MOD_EXPORT != 0
+                    || matches!(statement.kind, StmtKind::Export(_))
+                {
+                    if local_type_names.contains(&alias.name) {
+                        type_entry.insert(alias.name.clone());
+                    }
+                    if local_known_names.contains(&alias.name) {
+                        known_entry.insert(alias.name.clone());
+                    }
+                    explicit_exports
+                        .entry(file.file_name.clone())
+                        .or_default()
+                        .insert(alias.name.clone());
+                }
+            }
             // Mark module files so consumers can tell "module with no
             // exports" (`export {}`) from a script.
             if file.statements.iter().any(|statement| {
@@ -6663,6 +6830,7 @@ impl TypeChecker {
         self.module_type_exports = Arc::new(type_map);
         self.module_known_exports = Arc::new(known_map);
         self.program_file_index = Arc::new(std::sync::OnceLock::new());
+        self.build_javascript_alias_meanings(files);
     }
 
     /// `export { z }` (no source) where `z` is bound to `import * as z`
@@ -8454,6 +8622,17 @@ impl TypeChecker {
         // Each binding is in scope for the initializers after it
         // (`const t = make(); export const p = t.procedure;`).
         self.push_scope();
+        // Entity aliases are hoisted. Resolve them from this file before
+        // evaluating initializers, and cache them alongside ordinary bindings.
+        for statement in &file.statements {
+            if let StmtKind::ImportEquals(alias) = &Self::unwrap_export_stmt(statement).kind {
+                if Self::file_global_object_alias(&file.statements, &alias.module_ref) {
+                    let ty = Type::Typeof("globalThis".into());
+                    self.declare_var(&alias.name, ty.clone());
+                    bindings.push((alias.name.clone(), ty));
+                }
+            }
+        }
         for statement in &file.statements {
             let declaration = match &statement.kind {
                 StmtKind::Export(export) => match &export.kind {
@@ -8850,48 +9029,7 @@ impl TypeChecker {
 
     fn enum_export_value(&self, enum_decl: &tsc_rs_ast::EnumDecl) -> Type {
         let mut properties = Vec::new();
-        let mut auto_value = Some(0.0f64);
-        for member in &enum_decl.members {
-            let name = match &member.name {
-                PropName::Ident(_, _) | PropName::String(_, _) => {
-                    self.prop_name_to_string(&member.name)
-                }
-                _ => continue,
-            };
-            let value_type = if let Some(initializer) = &member.initializer {
-                match &initializer.kind {
-                    ExprKind::StrLit(value) => {
-                        auto_value = None;
-                        Type::StringLiteral(self.cooked_property_literal(value, initializer.span))
-                    }
-                    ExprKind::NumLit(value) => {
-                        let canonical = Self::canonical_numeric_property_name(value);
-                        auto_value = canonical.parse::<f64>().ok().map(|value| value + 1.0);
-                        Type::NumberLiteral(canonical)
-                    }
-                    ExprKind::Unary(unary)
-                        if matches!(unary.op, UnaryOp::Pos | UnaryOp::Neg)
-                            && matches!(&unary.argument.kind, ExprKind::NumLit(_)) =>
-                    {
-                        let canonical =
-                            self.computed_property_name(initializer).unwrap_or_default();
-                        auto_value = canonical.parse::<f64>().ok().map(|value| value + 1.0);
-                        Type::NumberLiteral(canonical)
-                    }
-                    _ => {
-                        auto_value = None;
-                        Type::Number
-                    }
-                }
-            } else {
-                match auto_value {
-                    Some(value) => {
-                        auto_value = Some(value + 1.0);
-                        Type::NumberLiteral(value.to_string())
-                    }
-                    None => Type::Number,
-                }
-            };
+        for (name, value_type) in self.enum_declaration_values(enum_decl, self.ambient_depth > 0) {
             // The member's own type (`E.A`), as a member access types it in
             // the declaring file: a bare literal is not assignable to a
             // string enum, so an imported `E.A` could not be passed where
@@ -8958,6 +9096,13 @@ impl TypeChecker {
                             continue;
                         }
                         let exported = spec.exported.as_ref().unwrap_or(&spec.local);
+                        if let Some(ty) = self
+                            .file_local_binding_type(file, &spec.local)
+                            .filter(|ty| self.is_global_object_type(ty))
+                        {
+                            out.push((exported.clone(), ty));
+                            continue;
+                        }
                         // The global scope is shared across all files and
                         // gets polluted by every project file's top-level
                         // declarations (e.g. `mock-db.ts` registers a
@@ -8985,6 +9130,10 @@ impl TypeChecker {
                             .statements
                             .iter()
                             .any(|s| Self::stmt_declares_name(s, &spec.local));
+                        if let Some(value) = self.scoped_class_value(file, &spec.local) {
+                            out.push((exported.clone(), value));
+                            continue;
+                        }
                         if declared_in_this_file {
                             if let Some(ty) = self
                                 .file_local_binding_type(file, &spec.local)
@@ -8994,9 +9143,17 @@ impl TypeChecker {
                                 continue;
                             }
                         }
-                        if self.interface_info.contains_key(&spec.local)
-                            || self.class_info.contains_key(&spec.local)
-                            || self.type_aliases.contains_key(&spec.local)
+                        // An imported name that several program files declare
+                        // (`import { zr as TRPCError } …; export { TRPCError }`)
+                        // is left to the imported-names pass, which follows the
+                        // import to its declaring file; the bare-name proxy
+                        // would name whichever declaration the registry holds.
+                        let ambiguous_import = self.ambiguous_interface_names.contains(&spec.local)
+                            && Self::import_binding_names(&file.statements).contains(&spec.local);
+                        if !ambiguous_import
+                            && (self.interface_info.contains_key(&spec.local)
+                                || self.class_info.contains_key(&spec.local)
+                                || self.type_aliases.contains_key(&spec.local))
                         {
                             // Pure type — store as a TypeReference proxy so
                             // import-side TypeRef resolution can chase it.
@@ -9010,7 +9167,9 @@ impl TypeChecker {
                 tsc_rs_ast::ExportDeclKind::Default(expr) => {
                     let ty = match &expr.kind {
                         ExprKind::Ident(name) => self
-                            .file_local_unique_symbol_type(file, name)
+                            .file_local_binding_type(file, name)
+                            .filter(|ty| self.is_global_object_type(ty))
+                            .or_else(|| self.file_local_unique_symbol_type(file, name))
                             .or_else(|| self.lookup_var(name).cloned())
                             .unwrap_or(Type::Any),
                         _ => self.infer_expr_type(expr),
@@ -9019,6 +9178,9 @@ impl TypeChecker {
                 }
                 _ => {} // re-exports handled in the second pass
             },
+            StmtKind::ImportEquals(alias) if alias.modifiers & MOD_EXPORT != 0 => {
+                self.collect_exports_from_inner_decl(stmt, file, out);
+            }
             StmtKind::ExportAssign(expr) => {
                 let mut ty = match &expr.kind {
                     ExprKind::Ident(name) => self
@@ -9097,6 +9259,33 @@ impl TypeChecker {
     /// overload sigs for FnDecl so multi-decl `function string()` /
     /// `function string<T>()` chains stay together in the exports map
     /// instead of collapsing to one signature.
+    /// The value of class `name` declared by `file` when other files of the
+    /// program declare a type of that name too: the class's file-scoped
+    /// registry key (`typeof <key>`), so importers construct this
+    /// declaration rather than whichever one the bare-name registry holds.
+    fn scoped_class_value(&self, file: &SourceFile, name: &str) -> Option<Type> {
+        let declares_class = file.statements.iter().any(|statement| {
+            matches!(&Self::unwrap_export_stmt(statement).kind,
+                StmtKind::ClassDecl(class) if class.name.as_deref() == Some(name))
+        });
+        // A name the global scope binds to another value (`var Buffer:
+        // BufferConstructor`) keeps resolving as before: a module class that
+        // shadows it is often reached through a module resolution tsc would
+        // not take (`node:buffer` → the npm `buffer` package).
+        let global_value = self.lookup_var(name).is_some_and(|value| {
+            !matches!(value, Type::Any)
+                && !matches!(value, Type::TypeReference(reference, _)
+                    if reference == name || reference.strip_prefix("typeof ") == Some(name))
+        });
+        if !declares_class || global_value || self.global_type_names.contains(name) {
+            return None;
+        }
+        let key = Self::file_interface_registry_key(&file.file_name, name);
+        self.class_info
+            .contains_key(&key)
+            .then(|| Type::TypeReference(format!("typeof {key}"), Arc::from([] as [Type; 0])))
+    }
+
     fn collect_exports_from_inner_decl(
         &mut self,
         decl: &Stmt,
@@ -9104,6 +9293,11 @@ impl TypeChecker {
         out: &mut Vec<(String, Type)>,
     ) {
         match &decl.kind {
+            StmtKind::ImportEquals(alias) => {
+                if let Some(ty) = self.file_local_binding_type(file, &alias.name) {
+                    out.push((alias.name.clone(), ty));
+                }
+            }
             StmtKind::FnDecl(fn_decl) => {
                 if let Some(ref name) = fn_decl.name {
                     let sigs = self.collect_file_fn_overloads(file, name);
@@ -9131,18 +9325,22 @@ impl TypeChecker {
             }
             StmtKind::ClassDecl(class_decl) => {
                 if let Some(ref name) = class_decl.name {
+                    // See `scoped_class_value` (`TRPCError` is declared by
+                    // `@trpc/server` and by test files alike).
+                    let scoped_value = self.scoped_class_value(file, name);
                     // A placeholder `any` binding (cross-file name
                     // registration) is not the class value.
-                    let nominal = self
-                        .lookup_var(name)
-                        .filter(|ty| !matches!(ty, Type::Any))
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            Type::TypeReference(
-                                format!("typeof {name}"),
-                                Arc::from([] as [Type; 0]),
-                            )
-                        });
+                    let nominal = scoped_value.unwrap_or_else(|| {
+                        self.lookup_var(name)
+                            .filter(|ty| !matches!(ty, Type::Any))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                Type::TypeReference(
+                                    format!("typeof {name}"),
+                                    Arc::from([] as [Type; 0]),
+                                )
+                            })
+                    });
                     let mut properties = self.local_class_unique_static_surface(
                         file,
                         class_decl,
@@ -9215,6 +9413,19 @@ impl TypeChecker {
                 }
             }
             StmtKind::InterfaceDecl(iface) => {
+                // An interface merged with a same-named variable
+                // (`export interface ZodError …; export declare const
+                // ZodError: $constructor<ZodError>`): the value export is the
+                // variable's, whichever declaration comes first.
+                let merged_with_variable = file.statements.iter().any(|statement| {
+                    matches!(&Self::unwrap_export_stmt(statement).kind, StmtKind::Var(variable)
+                        if variable.declarations.iter().any(|declaration| {
+                            matches!(&declaration.name.kind, PatKind::Ident(name) if name == &iface.name)
+                        }))
+                });
+                if merged_with_variable {
+                    return;
+                }
                 // Resolve through the source-qualified registry first. It
                 // contains every fragment from this declaration module,
                 // whereas rebuilding `iface` here would expose only the one
@@ -9343,12 +9554,8 @@ impl TypeChecker {
                 self.ambient_depth += 1;
                 let mut augmentation: Vec<(String, Type)> = Vec::new();
                 for inner in body {
-                    let declaration = match &inner.kind {
-                        StmtKind::Export(export) => match &export.kind {
-                            ExportDeclKind::Decl(declaration) => declaration.as_ref(),
-                            _ => continue,
-                        },
-                        _ => inner,
+                    let Some(declaration) = Self::augmentation_declaration(body, inner) else {
+                        continue;
                     };
                     if matches!(
                         declaration.kind,
@@ -9626,6 +9833,9 @@ impl TypeChecker {
     /// the current containing file as the resolution anchor. Returns
     /// `None` if resolution fails.
     fn resolve_module_to_path(&self, specifier: &str, containing_file: &str) -> Option<String> {
+        if let Some(path) = self.ambient_module_paths.get(specifier) {
+            return Some(path.clone());
+        }
         if let Some(path) = self
             .virtual_module_paths
             .get(&Self::resolvable_specifier_key(containing_file))
@@ -10127,6 +10337,7 @@ impl TypeChecker {
             this.imported_type_sources = this.collect_type_import_sources(file, &file.file_name);
             let scoped_keys = this.collect_scoped_type_keys(file, &file.file_name, false);
             let previous_scoped_keys = std::mem::replace(&mut this.scoped_type_keys, scoped_keys);
+            this.injection_typeof_bindings = this.collect_keyof_typeof_bindings(file);
             // Preserve namespace-import context while declaration bodies are
             // lifted into the project-wide donor.  A stored alias such as
             //
@@ -10192,6 +10403,13 @@ impl TypeChecker {
                 let Some(ModuleBody::Block(outer_body)) = &outer.body else {
                     continue;
                 };
+                // Augmented members retain the surrounding ambient module's
+                // import bindings when their types are injected into the donor.
+                let mut outer_file = (*file).clone();
+                outer_file.statements = outer_body.clone();
+                let outer_keys = this.collect_scoped_type_keys(&outer_file, &file.file_name, false);
+                let previous_outer_keys = this.scoped_type_keys.clone();
+                this.scoped_type_keys.extend(outer_keys);
                 for inner in outer_body {
                     let StmtKind::ModuleDecl(augmentation) = &inner.kind else {
                         continue;
@@ -10204,14 +10422,23 @@ impl TypeChecker {
                     };
                     let qualifier = Self::augmented_export_namespace(this, files, specifier, file);
                     for declaration in body {
-                        let declaration = Self::unwrap_export_stmt(declaration);
+                        let Some(declaration) = Self::augmentation_declaration(body, declaration)
+                        else {
+                            continue;
+                        };
                         let StmtKind::InterfaceDecl(interface) = &declaration.kind else {
                             continue;
                         };
                         let mut target = interface.as_ref().clone();
                         if let Some(qualifier) = &qualifier {
-                            target.name = format!("{qualifier}.{}", interface.name);
+                            target.name =
+                                Self::namespace_member_type_key(qualifier, &interface.name);
                         }
+                        this.register_ambient_augmentation_export(
+                            specifier,
+                            &interface.name,
+                            &target.name,
+                        );
                         this.inject_augmentation_interface(
                             target,
                             declaration.span,
@@ -10219,6 +10446,7 @@ impl TypeChecker {
                         );
                     }
                 }
+                this.scoped_type_keys = previous_outer_keys;
             }
             for stmt in &file.statements {
                 if is_module {
@@ -10259,14 +10487,10 @@ impl TypeChecker {
                                 Self::augmented_export_namespace(this, files, specifier, file);
                             if let Some(ModuleBody::Block(body)) = &module.body {
                                 for augmentation in body {
-                                    let declaration = match &augmentation.kind {
-                                        StmtKind::Export(export) => match &export.kind {
-                                            ExportDeclKind::Decl(declaration) => {
-                                                declaration.as_ref()
-                                            }
-                                            _ => continue,
-                                        },
-                                        _ => augmentation,
+                                    let Some(declaration) =
+                                        Self::augmentation_declaration(body, augmentation)
+                                    else {
+                                        continue;
                                     };
                                     let StmtKind::InterfaceDecl(interface) = &declaration.kind
                                     else {
@@ -10274,8 +10498,16 @@ impl TypeChecker {
                                     };
                                     let mut target = interface.as_ref().clone();
                                     if let Some(qualifier) = &qualifier {
-                                        target.name = format!("{qualifier}.{}", interface.name);
+                                        target.name = Self::namespace_member_type_key(
+                                            qualifier,
+                                            &interface.name,
+                                        );
                                     }
+                                    this.register_ambient_augmentation_export(
+                                        specifier,
+                                        &interface.name,
+                                        &target.name,
+                                    );
                                     this.inject_augmentation_interface(
                                         target,
                                         declaration.span,
@@ -10313,6 +10545,7 @@ impl TypeChecker {
             this.file_shadows_global_array = previous_array_shadow;
             this.imported_type_sources = previous_type_sources;
             this.scoped_type_keys = previous_scoped_keys;
+            this.injection_typeof_bindings.clear();
             this.injected_decl_file = previous_decl_file;
             this.current_source = previous_source;
         }
@@ -10328,6 +10561,51 @@ impl TypeChecker {
                 eprintln!("[inject]   slow file {ms:>8.0}ms {name}");
             }
         }
+    }
+
+    /// See `injection_typeof_bindings`: for each top-level alias of `file`
+    /// written `keyof typeof X`, the declared type of the file's top-level
+    /// `X` when it is annotated.
+    fn collect_keyof_typeof_bindings(
+        &self,
+        file: &SourceFile,
+    ) -> rustc_hash::FxHashMap<std::string::String, Type> {
+        let mut bindings = rustc_hash::FxHashMap::default();
+        let mut targets: Vec<&str> = Vec::new();
+        for statement in &file.statements {
+            let StmtKind::TypeAlias(alias) = &Self::unwrap_export_stmt(statement).kind else {
+                continue;
+            };
+            let operand = match &alias.type_ann.kind {
+                TypeNodeKind::Keyof(inner)
+                | TypeNodeKind::TypeOperator(TypeOperatorKind::Keyof, inner) => inner,
+                _ => continue,
+            };
+            if let TypeNodeKind::TypeQuery(expr) = &operand.kind {
+                if let ExprKind::Ident(name) = &expr.kind {
+                    targets.push(name.as_str());
+                }
+            }
+        }
+        if targets.is_empty() {
+            return bindings;
+        }
+        for statement in &file.statements {
+            let StmtKind::Var(variable) = &Self::unwrap_export_stmt(statement).kind else {
+                continue;
+            };
+            for declaration in &variable.declarations {
+                let (PatKind::Ident(name), Some(annotation)) =
+                    (&declaration.name.kind, &declaration.type_ann)
+                else {
+                    continue;
+                };
+                if targets.contains(&name.as_str()) {
+                    bindings.insert(name.to_string(), self.resolve_type_node(annotation));
+                }
+            }
+        }
+        bindings
     }
 
     /// Injects the statements of a `declare global { … }` body as globals.
@@ -10451,6 +10729,32 @@ impl TypeChecker {
         augmenting: &SourceFile,
     ) -> Option<String> {
         let target = this.resolve_module_to_path(specifier, &augmenting.file_name)?;
+        if this.ambient_module_paths.get(specifier) == Some(&target) {
+            let owner = Self::file_interface_registry_key(&target, "");
+            for file in files.iter().filter(|file| !Self::file_is_module(file)) {
+                for statement in &file.statements {
+                    let StmtKind::ModuleDecl(module) = &statement.kind else {
+                        continue;
+                    };
+                    if !matches!(&module.name, ModuleName::String(name) if name == specifier) {
+                        continue;
+                    }
+                    let Some(ModuleBody::Block(body)) = &module.body else {
+                        continue;
+                    };
+                    for statement in body {
+                        let StmtKind::ExportAssign(expression) = &statement.kind else {
+                            continue;
+                        };
+                        let name = this.expr_to_name(expression);
+                        if body.iter().any(|statement| matches!(&Self::unwrap_export_stmt(statement).kind, StmtKind::ModuleDecl(module) if matches!(&module.name, ModuleName::Ident(local) if local == &name))) {
+                            return Some(Self::namespace_member_type_key(&owner, &name));
+                        }
+                    }
+                }
+            }
+            return Some(owner);
+        }
         let alternatives = Self::module_path_alternatives(&target);
         let target_file = files
             .iter()
@@ -10593,7 +10897,17 @@ impl TypeChecker {
     fn file_is_module(file: &SourceFile) -> bool {
         for stmt in &file.statements {
             match &stmt.kind {
-                StmtKind::Import(_) | StmtKind::Export(_) => return true,
+                StmtKind::Import(_) | StmtKind::Export(_) | StmtKind::ExportAssign(_) => {
+                    return true
+                }
+                StmtKind::ImportEquals(import) => {
+                    if import.modifiers & MOD_EXPORT != 0
+                        || matches!(&import.module_ref.kind, ExprKind::Call(call)
+                            if matches!(&call.callee.kind, ExprKind::Ident(name) if name == "require"))
+                    {
+                        return true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -11019,7 +11333,10 @@ impl TypeChecker {
     fn merge_interface_registry_entry(&mut self, key: String, info: InterfaceInfo) {
         let map = (&mut self.interface_info);
         if let Some(existing) = map.get_mut(&key) {
-            debug_assert!(Self::interface_infos_share_owner(existing, &info));
+            debug_assert!(
+                Self::interface_infos_share_owner(existing, &info)
+                    || Self::is_ambient_module_type_key(&key)
+            );
             Self::merge_interface_info(existing, info);
         } else {
             map.insert(key, info);
@@ -11035,14 +11352,29 @@ impl TypeChecker {
         module: &tsc_rs_ast::ModuleDecl,
         namespace_path: &str,
     ) {
+        self.inject_namespace_type_members_with_ambient(
+            module,
+            namespace_path,
+            self.ambient_depth > 0,
+        );
+    }
+
+    fn inject_namespace_type_members_with_ambient(
+        &mut self,
+        module: &ModuleDecl,
+        namespace_path: &str,
+        inherited_ambient: bool,
+    ) {
+        let ambient = inherited_ambient || module.modifiers & MOD_DECLARE != 0;
         let Some(ModuleBody::Block(body)) = &module.body else {
             if let Some(ModuleBody::Module(nested)) = &module.body {
                 let nested_name = match &nested.name {
                     ModuleName::Ident(name) | ModuleName::String(name) => name,
                 };
-                self.inject_namespace_type_members(
+                self.inject_namespace_type_members_with_ambient(
                     nested,
-                    &format!("{namespace_path}.{nested_name}"),
+                    &Self::namespace_member_type_key(namespace_path, nested_name),
+                    ambient,
                 );
             }
             return;
@@ -11062,7 +11394,7 @@ impl TypeChecker {
                 .replace(namespace_path.to_string());
             match &declaration.kind {
                 StmtKind::InterfaceDecl(interface) => {
-                    let key = format!("{namespace_path}.{}", interface.name);
+                    let key = Self::namespace_member_type_key(namespace_path, &interface.name);
                     let info = self.build_interface_info(interface);
                     // Own-file check (not injection): the first registration
                     // replaces this file's stale injected copy.
@@ -11076,6 +11408,7 @@ impl TypeChecker {
                     if !stale_injected_copy
                         && self.interface_info.get(&key).is_some_and(|existing| {
                             Self::interface_infos_share_owner(existing, &info)
+                                || Self::is_ambient_module_type_key(&key)
                         })
                     {
                         self.merge_interface_registry_entry(key, info);
@@ -11118,32 +11451,30 @@ impl TypeChecker {
                         Self::rewrite_type_param_refs(&raw, &names)
                     };
                     (&mut self.type_aliases).insert(
-                        format!("{namespace_path}.{}", alias.name),
+                        Self::namespace_member_type_key(namespace_path, &alias.name),
                         (type_params, ty, required),
                     );
                 }
                 StmtKind::ClassDecl(class) => {
                     if let Some(name) = &class.name {
                         let info = self.build_class_info(class);
-                        self.insert_class_info(format!("{namespace_path}.{name}"), info);
+                        self.insert_class_info(
+                            Self::namespace_member_type_key(namespace_path, name),
+                            info,
+                        );
                     }
                 }
                 StmtKind::EnumDecl(enumeration) => {
-                    let members = enumeration
-                        .members
-                        .iter()
-                        .filter_map(|member| {
-                            let name = match &member.name {
-                                PropName::Ident(_, _) | PropName::String(_, _) => {
-                                    self.prop_name_to_string(&member.name)
-                                }
-                                _ => return None,
-                            };
-                            Some((name, Type::Number))
-                        })
-                        .collect();
-                    (&mut self.enum_info)
-                        .insert(format!("{namespace_path}.{}", enumeration.name), members);
+                    self.record_enum_member_locations(
+                        &Self::namespace_member_type_key(namespace_path, &enumeration.name),
+                        enumeration,
+                    );
+                    let members = self.enum_declaration_values(enumeration, ambient);
+                    Self::merge_enum_members(
+                        &mut self.enum_info,
+                        Self::namespace_member_type_key(namespace_path, &enumeration.name),
+                        members,
+                    );
                 }
                 _ => {}
             }
@@ -11153,9 +11484,10 @@ impl TypeChecker {
                 let nested_name = match &nested.name {
                     ModuleName::Ident(name) | ModuleName::String(name) => name,
                 };
-                self.inject_namespace_type_members(
+                self.inject_namespace_type_members_with_ambient(
                     nested,
-                    &format!("{namespace_path}.{nested_name}"),
+                    &Self::namespace_member_type_key(namespace_path, nested_name),
+                    ambient,
                 );
             }
         }
@@ -11425,6 +11757,12 @@ impl TypeChecker {
                         .as_deref()
                         .is_some_and(|file| !stdlib::is_typescript_standard_library_file(file));
                 if !shadows_lib_utility {
+                    if let Some(file) = self.injected_decl_file.as_deref() {
+                        if !self.type_alias_decl_files.contains_key(ta.name.as_str()) {
+                            (&mut self.type_alias_decl_files)
+                                .insert(ta.name.clone(), file.to_string());
+                        }
+                    }
                     if let Some(defaults) = defaults {
                         (&mut self.alias_type_param_defaults).insert(ta.name.clone(), defaults);
                     }
@@ -11475,72 +11813,10 @@ impl TypeChecker {
                 }
             }
             StmtKind::EnumDecl(enum_decl) => {
+                self.record_enum_member_locations(&enum_decl.name, enum_decl);
                 if !self.enum_info.contains_key(&enum_decl.name) {
-                    let mut members = Vec::new();
-                    let mut auto_value = Some(0.0f64);
-                    for member in &enum_decl.members {
-                        let name = match &member.name {
-                            PropName::Ident(_, _) | PropName::String(_, _) => {
-                                self.prop_name_to_string(&member.name)
-                            }
-                            _ => continue,
-                        };
-                        let value_type = if let Some(ref init) = member.initializer {
-                            // Constant expressions fold (`1 << 1`, `A * 2`); a
-                            // non-constant initializer is an opaque `number`.
-                            if let Some(folded) =
-                                Self::evaluate_enum_constant(init, &enum_decl.name, &members)
-                            {
-                                auto_value = Some(folded + 1.0);
-                                members.push((
-                                    name,
-                                    Type::NumberLiteral(Self::enum_value_text(folded)),
-                                ));
-                                continue;
-                            }
-                            match &init.kind {
-                                ExprKind::StrLit(s) => {
-                                    auto_value = None;
-                                    Type::StringLiteral(self.cooked_property_literal(s, init.span))
-                                }
-                                ExprKind::NumLit(n) => {
-                                    let canonical = Self::canonical_numeric_property_name(n);
-                                    if let Ok(v) = canonical.parse::<f64>() {
-                                        auto_value = Some(v + 1.0);
-                                    } else {
-                                        auto_value = None;
-                                    }
-                                    Type::NumberLiteral(canonical)
-                                }
-                                ExprKind::Unary(unary)
-                                    if matches!(unary.op, UnaryOp::Pos | UnaryOp::Neg)
-                                        && matches!(&unary.argument.kind, ExprKind::NumLit(_)) =>
-                                {
-                                    let canonical =
-                                        self.computed_property_name(init).unwrap_or_default();
-                                    if let Ok(v) = canonical.parse::<f64>() {
-                                        auto_value = Some(v + 1.0);
-                                    } else {
-                                        auto_value = None;
-                                    }
-                                    Type::NumberLiteral(canonical)
-                                }
-                                _ => {
-                                    auto_value = None;
-                                    Type::Number
-                                }
-                            }
-                        } else {
-                            match auto_value {
-                                Some(value) => {
-                                    auto_value = Some(value + 1.0);
-                                    Type::NumberLiteral(value.to_string())
-                                }
-                                None => Type::Number,
-                            }
-                        };
-                        members.push((name, value_type));
-                    }
+                    let members = self.enum_declaration_values(enum_decl, self.ambient_depth > 0);
+                    self.declare_var(&Self::enum_marker_name(&enum_decl.name), Type::Never);
                     Self::merge_enum_members(
                         (&mut self.enum_info),
                         enum_decl.name.clone(),
@@ -11672,15 +11948,17 @@ impl TypeChecker {
         self.file_shadows_global_symbol = Self::file_shadows_global_symbol(file);
         self.file_shadows_global_intl = Self::file_shadows_global_intl(file);
         self.file_shadows_global_array = Self::file_shadows_global_array(file);
-        self.check_expression_grammar = file
-            .diagnostics
-            .iter()
-            .all(|diagnostic| diagnostic.code == 2371);
+        self.check_expression_grammar = file.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code == 2371 || tsc_rs_parser::is_grammar_diagnostic(diagnostic.code)
+        });
         self.syntax_error_starts = {
             let mut starts: Vec<u32> = file
                 .diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code != 2371)
+                .filter(|diagnostic| {
+                    diagnostic.code != 2371
+                        && !tsc_rs_parser::is_grammar_diagnostic(diagnostic.code)
+                })
                 .filter_map(|diagnostic| diagnostic.span.map(|span| span.start))
                 .collect();
             starts.sort_unstable();
@@ -11694,6 +11972,7 @@ impl TypeChecker {
             .filter_map(|d| d.span.map(|span| span.start))
             .collect();
         self.current_source = Some(file.text.clone());
+        self.prepare_augmentation_module_detection(file);
         self.check_strict_reserved_words(file);
         self.check_node18_resolution_mode_requirements(&file.statements);
         self.check_statement_grammar_contexts(&file.statements);
@@ -11707,10 +11986,11 @@ impl TypeChecker {
         self.check_bigint_member_names(&file.statements);
         self.build_merged_namespace_exports(&file.statements);
         self.build_namespace_path_exports(&file.statements);
-        self.surface_binder_diagnostics(symbols);
+        self.surface_binder_diagnostics(file, symbols);
         // Check for missing function implementations (TS2391)
         self.check_missing_function_implementations(&file.statements);
-        self.check_nolib_globals(symbols);
+        self.prepare_decorator_parameter_notes(file);
+        self.check_nolib_globals(file);
         self.check_arguments_rest_collision(&file.statements);
         self.check_block_scoped_use_before_declaration(&file.statements);
         self.check_namespace_before_merge(&file.statements);
@@ -11735,6 +12015,7 @@ impl TypeChecker {
         self.check_alias_cycles(file);
         self.resolve_top_level_import_equals_entities(&file.statements);
         self.record_import_equals_readonly_aliases(&file.statements);
+        self.inject_global_import_aliases(file);
         self.check_cross_file_block_scoped_conflicts(file);
         self.check_import_alias_value_conflicts(&file.statements);
         self.check_builtin_global_redeclarations(file);
@@ -11931,15 +12212,17 @@ impl TypeChecker {
         self.file_shadows_global_symbol = Self::file_shadows_global_symbol(file);
         self.file_shadows_global_intl = Self::file_shadows_global_intl(file);
         self.file_shadows_global_array = Self::file_shadows_global_array(file);
-        self.check_expression_grammar = file
-            .diagnostics
-            .iter()
-            .all(|diagnostic| diagnostic.code == 2371);
+        self.check_expression_grammar = file.diagnostics.iter().all(|diagnostic| {
+            diagnostic.code == 2371 || tsc_rs_parser::is_grammar_diagnostic(diagnostic.code)
+        });
         self.syntax_error_starts = {
             let mut starts: Vec<u32> = file
                 .diagnostics
                 .iter()
-                .filter(|diagnostic| diagnostic.code != 2371)
+                .filter(|diagnostic| {
+                    diagnostic.code != 2371
+                        && !tsc_rs_parser::is_grammar_diagnostic(diagnostic.code)
+                })
                 .filter_map(|diagnostic| diagnostic.span.map(|span| span.start))
                 .collect();
             starts.sort_unstable();
@@ -11953,6 +12236,7 @@ impl TypeChecker {
             .filter_map(|d| d.span.map(|span| span.start))
             .collect();
         self.current_source = Some(file.text.clone());
+        self.prepare_augmentation_module_detection(file);
         self.check_strict_reserved_words(file);
         self.check_node18_resolution_mode_requirements(&file.statements);
         self.check_statement_grammar_contexts(&file.statements);
@@ -11970,10 +12254,11 @@ impl TypeChecker {
         self.check_bigint_member_names(&file.statements);
         self.build_merged_namespace_exports(&file.statements);
         self.build_namespace_path_exports(&file.statements);
-        self.surface_binder_diagnostics(symbols);
+        self.surface_binder_diagnostics(file, symbols);
         // Check for missing function implementations (TS2391)
         self.check_missing_function_implementations(&file.statements);
-        self.check_nolib_globals(symbols);
+        self.prepare_decorator_parameter_notes(file);
+        self.check_nolib_globals(file);
         self.check_arguments_rest_collision(&file.statements);
         self.check_block_scoped_use_before_declaration(&file.statements);
         self.check_namespace_before_merge(&file.statements);
@@ -11998,6 +12283,7 @@ impl TypeChecker {
         self.check_alias_cycles(file);
         self.resolve_top_level_import_equals_entities(&file.statements);
         self.record_import_equals_readonly_aliases(&file.statements);
+        self.inject_global_import_aliases(file);
         self.check_cross_file_block_scoped_conflicts(file);
         self.check_import_alias_value_conflicts(&file.statements);
         self.check_builtin_global_redeclarations(file);
@@ -12155,6 +12441,8 @@ impl TypeChecker {
             narrowed: rustc_hash::FxHashMap::default(),
             condition_aliases: rustc_hash::FxHashMap::default(),
             readonly_namespace_aliases: rustc_hash::FxHashMap::default(),
+            this_alias_receivers: rustc_hash::FxHashMap::default(),
+            module_body_kind: None,
             parent: Some(self.current_scope),
         });
         self.current_scope = idx;
@@ -12167,6 +12455,9 @@ impl TypeChecker {
     }
 
     fn declare_var(&mut self, name: &str, ty: Type) {
+        self.scopes[self.current_scope]
+            .this_alias_receivers
+            .remove(name);
         let id = self.intern_type(ty);
         self.scopes[self.current_scope]
             .vars
@@ -12556,11 +12847,11 @@ impl TypeChecker {
         if !matches!(name, "arguments" | "eval") || !self.source_file_is_strict() {
             return;
         }
-        // Class-member binding checks use the more specific TS1210. They run
-        // before statement checking, so do not add a second, generic error at
-        // the same binding.
+        // Class and module binding checks use the more specific TS1210 and
+        // TS1215. They run before statement checking, so do not add a second,
+        // generic error at the same binding.
         if self.diagnostics.iter().any(|diagnostic| {
-            matches!(diagnostic.code, 1100 | 1210)
+            matches!(diagnostic.code, 1100 | 1210 | 1215)
                 && diagnostic.span.is_some_and(|existing| existing == span)
         }) {
             return;
@@ -13413,8 +13704,6 @@ impl TypeChecker {
 
     /// tsc computes at most ten spelling suggestions per checker; every
     /// unresolved name consumes a slot whether or not one is found.
-    /// tsc maximumSuggestionCount: at most 10 suggestions per file, counting
-    /// only names for which a suggestion was actually found.
     pub(crate) fn attempt_spelling_suggestion(
         &mut self,
         name: &str,
@@ -13422,11 +13711,8 @@ impl TypeChecker {
         if self.unresolved_name_count >= 10 {
             return None;
         }
-        let found = self.spelling_suggestion(name);
-        if found.is_some() {
-            self.unresolved_name_count += 1;
-        }
-        found
+        self.unresolved_name_count += 1;
+        self.spelling_suggestion(name)
     }
 
     fn lookup_var_id(&self, name: &str) -> Option<TypeId> {
@@ -13550,6 +13836,9 @@ impl TypeChecker {
     fn arithmetic_operand_invalid_inner(&self, ty: &Type, depth: u8) -> bool {
         let w = self.widen_type(ty);
         match &w {
+            // Strict checking reports the unknown operand itself (TS18046).
+            // Otherwise the ordinary arithmetic operand diagnostic applies.
+            Type::Unknown => !self.strict_null_checks,
             Type::String
             | Type::StringLiteral(_)
             | Type::Boolean
@@ -14166,6 +14455,7 @@ impl TypeChecker {
                 }
             }
             StmtKind::EnumDecl(enum_decl) => {
+                self.declare_var(&Self::enum_marker_name(&enum_decl.name), Type::Never);
                 self.declare_var(
                     &enum_decl.name,
                     Type::TypeReference(enum_decl.name.clone(), Arc::from([] as [Type; 0])),
@@ -14566,10 +14856,9 @@ impl TypeChecker {
     }
 
     fn record_import_equals_readonly_aliases(&mut self, statements: &[Stmt]) {
-        // `import Alias = Namespace.Path` is hoisted as `any` so references
-        // are order-independent and unrelated member access remains lenient.
         // Once every namespace value in this lexical scope has been registered,
-        // retain its resolved namespace evidence on the alias's lexical scope.
+        // `import Alias = Namespace.Path` resolves its value and retains
+        // readonly namespace evidence on the alias's lexical scope.
         // A parameter/local named `Alias` then shadows both the value and this
         // evidence, while shadowing the source-path root at a later use site
         // cannot change the already-resolved alias target.
@@ -14595,10 +14884,15 @@ impl TypeChecker {
                 .namespace_alias_type_for_binding(name)
                 .cloned()
                 .map(Type::Namespace)
-                .or_else(|| self.lookup_var(name).cloned()),
+                .or_else(|| self.lookup_var(name).cloned())
+                .or_else(|| (name == "globalThis").then(|| Type::Typeof(name.to_string()))),
             ExprKind::Member(member) => {
                 let owner = self.import_equals_namespace_target_type(&member.object)?;
-                self.qualified_property_type(owner, &member.property)
+                if self.is_global_object_type(&owner) {
+                    self.global_this_known_property(&member.property)
+                } else {
+                    self.qualified_property_type(owner, &member.property)
+                }
             }
             ExprKind::Paren(inner) | ExprKind::NonNull(inner) => {
                 self.import_equals_namespace_target_type(inner)
@@ -14758,10 +15052,19 @@ impl TypeChecker {
         } else {
             Vec::new()
         };
-        // Ambient namespaces (`declare module M {}`) implicitly export
-        // every top-level member.
+        // Ambient namespaces implicitly export top-level members unless an
+        // export clause or assignment explicitly selects the visible names.
         let ambient = inherited_ambient || module_decl.modifiers & MOD_DECLARE != 0;
         if let Some(tsc_rs_ast::ModuleBody::Block(ref body)) = module_decl.body {
+            let implicit_exports = ambient
+                && !body.iter().any(|statement| match &statement.kind {
+                    StmtKind::ExportAssign(_) => true,
+                    StmtKind::Export(export) => !matches!(
+                        export.kind,
+                        ExportDeclKind::Decl(_) | ExportDeclKind::DefaultDecl(_)
+                    ),
+                    _ => false,
+                });
             let namespace_shadows_symbol = body
                 .iter()
                 .any(|statement| Self::stmt_declares_value_name(statement, "Symbol"));
@@ -14791,16 +15094,12 @@ impl TypeChecker {
                         }
                         _ => continue,
                     },
-                    _ => (member, ambient),
+                    _ => (member, implicit_exports),
                 };
                 match &inner.kind {
                     StmtKind::EnumDecl(enumeration) => {
                         let ty = Type::TypeReference(
-                            if ambient {
-                                self.namespace_owned_type_name(&enumeration.name)
-                            } else {
-                                enumeration.name.clone()
-                            },
+                            self.namespace_owned_type_name(&enumeration.name),
                             Arc::from([] as [Type; 0]),
                         );
                         ns_locals.push((enumeration.name.clone(), ty.clone()));
@@ -14967,7 +15266,8 @@ impl TypeChecker {
                         let nested_name = match &nested.name {
                             ModuleName::Ident(name) | ModuleName::String(name) => name,
                         };
-                        let nested_qualified = format!("{namespace_name}.{nested_name}");
+                        let nested_qualified =
+                            Self::namespace_member_type_key(namespace_name, nested_name);
                         let nested_value = self.nested_namespace_value_with_seed(
                             nested,
                             &nested_qualified,
@@ -15563,50 +15863,20 @@ impl TypeChecker {
                 }
             }
             StmtKind::EnumDecl(enum_decl) => {
-                // Build enum member info with inferred value types
-                let mut members = Vec::new();
-                let mut auto_value = Some(0.0f64);
-                for member in &enum_decl.members {
-                    let name = match &member.name {
-                        PropName::Ident(_, _) | PropName::String(_, _) => {
-                            self.prop_name_to_string(&member.name)
-                        }
-                        _ => continue,
-                    };
-                    let folded = member.initializer.as_ref().and_then(|init| {
-                        // Constant expressions fold (`1 << 1`, `A * 2`); a
-                        // non-constant initializer is an opaque `number`.
-                        Self::evaluate_enum_constant(init, &enum_decl.name, &members)
-                    });
-                    let value_type = if let Some(folded) = folded {
-                        auto_value = Some(folded + 1.0);
-                        Type::NumberLiteral(Self::enum_value_text(folded))
-                    } else if let Some(ref init) = member.initializer {
-                        match &init.kind {
-                            ExprKind::StrLit(s) => {
-                                auto_value = None;
-                                Type::StringLiteral(self.cooked_property_literal(s, init.span))
-                            }
-                            _ => {
-                                auto_value = None;
-                                Type::Number
-                            }
-                        }
-                    } else {
-                        match auto_value {
-                            Some(value) => {
-                                auto_value = Some(value + 1.0);
-                                Type::NumberLiteral(value.to_string())
-                            }
-                            None => Type::Number,
-                        }
-                    };
-                    // Record member value type at member name span for hover
-                    let name_span = member.name.span();
+                self.record_enum_member_locations(&enum_decl.name, enum_decl);
+                let members = self.enum_declaration_values(enum_decl, self.ambient_depth > 0);
+                for (member, (_, value_type)) in enum_decl
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        matches!(member.name, PropName::Ident(_, _) | PropName::String(_, _))
+                    })
+                    .zip(&members)
+                {
                     self.expression_types
-                        .insert(name_span.start, value_type.display_string());
-                    members.push((name, value_type));
+                        .insert(member.name.span().start, value_type.display_string());
                 }
+                self.declare_var(&Self::enum_marker_name(&enum_decl.name), Type::Never);
                 Self::merge_enum_members((&mut self.enum_info), enum_decl.name.clone(), members);
                 self.declare_var(
                     &enum_decl.name,
@@ -15755,7 +16025,7 @@ impl TypeChecker {
         require_registered: bool,
     ) -> rustc_hash::FxHashMap<std::string::String, std::string::String> {
         let mut keys = rustc_hash::FxHashMap::default();
-        if self.ambiguous_interface_keys.is_empty() {
+        if self.ambiguous_interface_keys.is_empty() && self.ambient_module_paths.is_empty() {
             return keys;
         }
         let scoped = |name: &str, declaring_file: &str| -> Option<std::string::String> {
@@ -15820,6 +16090,32 @@ impl TypeChecker {
         require_registered: bool,
         hops: u8,
     ) -> Option<std::string::String> {
+        if self
+            .ambient_module_paths
+            .values()
+            .any(|ambient| ambient == path)
+            && self
+                .module_type_exports
+                .get(path)
+                .is_some_and(|names| names.contains(name))
+        {
+            let key = Self::file_interface_registry_key(path, name);
+            if self.class_info.contains_key(&key)
+                || self.interface_info.contains_key(&key)
+                || self.type_aliases.contains_key(&key)
+                || self.enum_info.contains_key(&key)
+            {
+                return Some(key);
+            }
+            if let Some(Type::TypeReference(key, _)) = self
+                .module_exports
+                .get(path)
+                .and_then(|exports| exports.iter().find(|(exported, _)| exported == name))
+                .map(|(_, ty)| ty)
+            {
+                return Some(key.strip_prefix("typeof ").unwrap_or(key).to_string());
+            }
+        }
         if !self.ambiguous_interface_names.contains(name) {
             // Renamed on the way (`export { A as B }`) is still followed
             // below; a name no module declares ambiguously ends here.
@@ -16253,6 +16549,29 @@ impl TypeChecker {
             );
         }
         self.file_import_binding_names = Self::import_binding_names(&file.statements);
+        self.file_named_import_sources = rustc_hash::FxHashMap::default();
+        self.explicit_any_bindings.clear();
+        for statement in &file.statements {
+            let StmtKind::Import(import) = &statement.kind else {
+                continue;
+            };
+            let ImportClause::Named { named, .. } = &import.specifiers else {
+                continue;
+            };
+            if named.is_empty() {
+                continue;
+            }
+            let Some(path) = self.resolve_module_to_path(&import.source, &file.file_name) else {
+                continue;
+            };
+            for specifier in named {
+                let imported = specifier.imported.as_deref().unwrap_or(&specifier.local);
+                self.file_named_import_sources.insert(
+                    specifier.local.clone(),
+                    (imported.to_string(), path.clone()),
+                );
+            }
+        }
         self.file_hoisted_binding_names =
             Self::constructor_local_names(&[], Some(&file.statements))
                 .into_iter()
@@ -16470,6 +16789,34 @@ impl TypeChecker {
             }
         }
         Some(Type::Any)
+    }
+
+    /// Whether a bare type-alias name written in the checked file means the
+    /// alias the program registry holds under that name: the file declares
+    /// it, or imports it under the same name straight from the declaring
+    /// module. (A renamed import, an import of an unregistered module's
+    /// type, or a leftover type parameter may share the name.)
+    pub(crate) fn alias_name_means_registered_alias(&self, name: &str) -> bool {
+        if name.starts_with(FILE_INTERFACE_KEY_PREFIX) {
+            return true;
+        }
+        if name.contains('.')
+            || self.duplicate_type_names.contains(name)
+            || self.type_param_name_is_active(name)
+        {
+            return false;
+        }
+        if self.local_type_alias_names.contains(name) {
+            return true;
+        }
+        let Some((imported, source)) = self.file_named_import_sources.get(name) else {
+            return false;
+        };
+        imported == name
+            && self
+                .type_alias_decl_files
+                .get(name)
+                .is_some_and(|declaring| Self::paths_refer_to_same_file(declaring, source))
     }
 
     fn paths_refer_to_same_file(left: &str, right: &str) -> bool {
@@ -16768,6 +17115,142 @@ impl TypeChecker {
             _ => {
                 self.check_expr(expression);
             }
+        }
+    }
+
+    fn report_for_in_target_error(&mut self, code: u32, message: &str, span: Span) {
+        self.diagnostics.push(Diagnostic {
+            code,
+            message: message.into(),
+            category: DiagnosticCategory::Error,
+            file_name: None,
+            span: Some(span),
+            related: None,
+        });
+    }
+
+    fn for_in_key_type(&self, object_type: &Type) -> Type {
+        fn string_keys(keys: Type) -> Type {
+            match keys {
+                Type::String
+                | Type::StringLiteral(_)
+                | Type::TemplateLiteral { .. }
+                | Type::StringMapping { .. } => keys,
+                Type::Any | Type::Error => Type::String,
+                Type::Union(members) => {
+                    Type::flatten_union(members.iter().cloned().map(string_keys).collect())
+                }
+                Type::TypeParameter(_) | Type::TypeReference(_, _) | Type::Keyof(_) => {
+                    Type::Intersection(vec![keys, Type::String].into())
+                }
+                _ => Type::Never,
+            }
+        }
+        let expanded = self.evaluate_instantiated_alias(object_type.clone());
+        let expanded = self.resolve_for_simplify(&expanded).unwrap_or(expanded);
+        let keys = match &expanded {
+            Type::Mapped {
+                constraint,
+                name_type: None,
+                ..
+            } => constraint.as_ref().clone(),
+            Type::Any | Type::Error | Type::Unknown => Type::String,
+            Type::ObjectType(object) => {
+                let mut keys: Vec<Type> = object
+                    .properties
+                    .iter()
+                    .map(|(name, _)| {
+                        Type::StringLiteral(name.strip_prefix('?').unwrap_or(name).to_string())
+                    })
+                    .collect();
+                if let Some((index, _)) = &object.index_signature {
+                    keys.push(index.as_ref().clone());
+                }
+                Type::flatten_union(keys)
+            }
+            _ => type_ops::resolve_keyof(&expanded),
+        };
+        match string_keys(keys) {
+            Type::Never => Type::String,
+            keys => keys,
+        }
+    }
+
+    fn check_for_in_expression(&mut self, expression: &Expr, key_type: &Type, readonly: bool) {
+        let reference = Self::skip_reference_wrappers(expression);
+        let saved_target = self.assignment_target_span;
+        self.assignment_target_span = Some(reference.span);
+        let mut target_type = self.check_expr(expression);
+        self.assignment_target_span = saved_target;
+        let mut binding = expression;
+        while let ExprKind::Paren(inner) | ExprKind::NonNull(inner) = &binding.kind {
+            binding = inner;
+        }
+        if let ExprKind::Ident(name) = &binding.kind {
+            // An existing variable is assigned here, not redeclared or read.
+            self.uninitialized_vars.remove(name.as_str());
+            if let Some(declared) = self.lookup_declared_var(name) {
+                target_type = declared;
+            }
+        }
+        // A readonly access has already failed as an assignment target.
+        // Its error type prevents a second, cascading type mismatch.
+        if readonly {
+            target_type = Type::Error;
+        }
+        if matches!(
+            expression.kind,
+            ExprKind::ObjectLit(_) | ExprKind::ArrayLit(_)
+        ) {
+            self.report_for_in_target_error(
+                2491,
+                "The left-hand side of a 'for...in' statement cannot be a destructuring pattern.",
+                expression.span,
+            );
+        } else if matches!(target_type, Type::This)
+            || !self.is_assignable_to(key_type, &target_type)
+        {
+            self.report_for_in_target_error(
+                2405,
+                "The left-hand side of a 'for...in' statement must be of type 'string' or 'any'.",
+                expression.span,
+            );
+        } else if !matches!(
+            reference.kind,
+            ExprKind::Ident(_) | ExprKind::Member(_) | ExprKind::ElemAccess(_)
+        ) {
+            self.report_for_in_target_error(
+                2406,
+                "The left-hand side of a 'for...in' statement must be a variable or a property access.",
+                expression.span,
+            );
+        } else if Self::reference_is_optional_chain(reference) {
+            self.report_for_in_target_error(
+                2780,
+                "The left-hand side of a 'for...in' statement may not be an optional property access.",
+                expression.span,
+            );
+        } else if let ExprKind::Ident(name) = &binding.kind {
+            if !matches!(target_type, Type::Any | Type::Error) {
+                self.narrow_var(name, key_type.clone());
+            }
+        }
+    }
+
+    fn reference_is_optional_chain(expression: &Expr) -> bool {
+        match &expression.kind {
+            ExprKind::Member(member) => {
+                member.optional || Self::reference_is_optional_chain(&member.object)
+            }
+            ExprKind::ElemAccess(access) => {
+                access.optional || Self::reference_is_optional_chain(&access.object)
+            }
+            ExprKind::Call(call) => {
+                call.optional || Self::reference_is_optional_chain(&call.callee)
+            }
+            ExprKind::NonNull(inner) => Self::reference_is_optional_chain(inner),
+            // Parentheses end a chain before a subsequent property access.
+            _ => false,
         }
     }
 
@@ -18805,6 +19288,41 @@ impl TypeChecker {
                 ));
             }
         } else {
+            // TS2820: a string literal that misspells a member of a
+            // string-literal union target (tsc
+            // getSuggestedTypeForNonexistentStringLiteralType).
+            if let Type::StringLiteral(value) = source {
+                let union_target = match target {
+                    Type::Union(_) => Some(target.clone()),
+                    Type::TypeReference(_, args) if args.is_empty() => {
+                        self.resolve_type_for_assignability(target)
+                    }
+                    _ => None,
+                };
+                if let Some(Type::Union(members)) = union_target {
+                    let suggestion = spelling_suggestion(
+                        value,
+                        members.iter().filter_map(|member| match member {
+                            Type::StringLiteral(candidate) => Some(candidate.as_str()),
+                            _ => None,
+                        }),
+                    );
+                    if let Some(suggestion) = suggestion {
+                        self.diagnostics.push(Diagnostic {
+                            code: 2820,
+                            message: format!(
+                                "Type '{src_disp}' is not assignable to type '{tgt_disp}'. Did you mean '{}'?",
+                                Type::StringLiteral(suggestion).display_string()
+                            ),
+                            category: DiagnosticCategory::Error,
+                            file_name: None,
+                            span: Some(span),
+                            related: None,
+                        });
+                        return;
+                    }
+                }
+            }
             let mut diagnostic = diagnostics::error_not_assignable(&src_disp, &tgt_disp, span);
             if let Some((suffix, note)) = self.opaque_type_param_notes(source, target) {
                 diagnostic.message.push_str(&suffix);
@@ -21302,6 +21820,11 @@ impl TypeChecker {
                 let obj_struct = self
                     .resolve_for_simplify(&obj_simp)
                     .unwrap_or_else(|| obj_simp.clone());
+                if matches!(&obj_struct, Type::Typeof(name) if name == "globalThis") {
+                    if let Some(resolved) = self.global_this_indexed_type(&idx_simp) {
+                        return resolved;
+                    }
+                }
                 let resolved = crate::type_ops::resolve_indexed_access(&obj_struct, &idx_simp);
                 // If the resolver couldn't pin a property, it returns the
                 // same IndexedAccess wrapper. Avoid recursing infinitely.
@@ -21538,11 +22061,18 @@ impl TypeChecker {
             // Writeable-style `Mapped & {}` collapses to its mapped form
             // first, then the surrounding code can read it as the
             // mapped result.
-            Type::Intersection(members) if display => {
+            Type::Intersection(members) if !display => {
+                self.reduce_nullish_intersection(members.to_vec())
+            }
+            Type::Intersection(members) => {
                 let simplified: Vec<Type> = members
                     .iter()
                     .map(|m| self.simplify_type_modal(m, display))
                     .collect();
+                let reduced = self.reduce_nullish_intersection(simplified);
+                let Type::Intersection(simplified) = reduced else {
+                    return reduced;
+                };
                 // If the result has exactly one non-empty-object member,
                 // collapse — TypeScript displays `T & {}` as `T` for
                 // most purposes, and the empty-object intersection is a
@@ -21562,7 +22092,7 @@ impl TypeChecker {
                 if non_empty.len() == 1 {
                     return non_empty.into_iter().next().unwrap().clone();
                 }
-                Type::Intersection(simplified.into())
+                Type::Intersection(simplified)
             }
             // Union / Optional: recurse into members in display mode so a
             // nested reference produced by a folded mapped template
@@ -22527,6 +23057,19 @@ impl TypeChecker {
     }
 
     fn is_assignable_to_inner(&self, source: &Type, target: &Type) -> bool {
+        // Arrays and callable/constructable values are non-primitive objects.
+        if matches!(target, Type::Object)
+            && matches!(
+                source,
+                Type::ObjectType(_)
+                    | Type::Array(_)
+                    | Type::Tuple(_)
+                    | Type::Function(_)
+                    | Type::Constructor(_)
+            )
+        {
+            return true;
+        }
         // Unwrap Optional(T) to T | undefined for standalone comparison
         // (Optional is only meaningful as an object property marker)
         if let Type::Optional(inner) = source {
@@ -22595,7 +23138,8 @@ impl TypeChecker {
             {
                 match source {
                     Type::Null | Type::Undefined => return !self.strict_null_checks,
-                    Type::Void | Type::Unknown => return false,
+                    Type::Unknown => return !self.strict_null_checks,
+                    Type::Void => return false,
                     Type::String
                     | Type::Number
                     | Type::Boolean
@@ -22608,12 +23152,20 @@ impl TypeChecker {
                     | Type::BigIntLiteral(_)
                     | Type::EnumType(_)
                     | Type::EnumVariant { .. }
+                    | Type::Object
                     | Type::ObjectType(_)
                     | Type::Array(_)
                     | Type::Tuple(_)
                     | Type::Function(_)
                     | Type::Constructor(_) => return true,
                     _ => {}
+                }
+                if self.active_type_parameter_name(source).is_some() {
+                    return !self.strict_null_checks
+                        || self.declared_type_param_constraint(source).map_or_else(
+                            || !self.source_type_param_declared_unconstrained(source),
+                            |constraint| self.is_assignable_to(&constraint, target),
+                        );
                 }
             }
         }
@@ -23206,6 +23758,50 @@ impl TypeChecker {
                 if let Some(elem) = self.array_base_element(src_name, src_args) {
                     let as_array = Type::Array(Arc::new(elem));
                     return self.is_assignable_to(&as_array, target);
+                }
+            }
+        }
+
+        // A literal source against an alias of a literal union (an imported
+        // `type Code = "A" | "B"`, or one a library type names such as
+        // `TRPC_ERROR_CODE_KEY = keyof typeof CODES`): the comparison is
+        // exact, unlike a widened `string` source, which keeps the lenient
+        // path below.
+        if let Type::TypeReference(name, args) = target {
+            let literal = |ty: &Type| {
+                matches!(
+                    ty,
+                    Type::StringLiteral(_) | Type::NumberLiteral(_) | Type::BooleanLiteral(_)
+                )
+            };
+            let literal_source = literal(source)
+                || matches!(source, Type::Union(members) if members.iter().all(literal));
+            // A library's own alias (`TRPC_ERROR_CODE_KEY`, reached through
+            // the constructor of an imported class) counts as well when its
+            // name is declared once.
+            let declared_by_library = || {
+                !name.contains('.')
+                    && !self.duplicate_type_names.contains(name.as_str())
+                    && !self.type_param_name_is_active(name)
+                    && self
+                        .type_alias_decl_files
+                        .get(name.as_str())
+                        .is_some_and(|file| {
+                            file.ends_with(".d.ts")
+                                || file.ends_with(".d.mts")
+                                || file.ends_with(".d.cts")
+                        })
+            };
+            let unambiguous = !self.class_info.contains_key(name.as_str())
+                && !self.interface_info.contains_key(name.as_str())
+                && !self.enum_info.contains_key(name.as_str())
+                && (self.alias_name_means_registered_alias(name) || declared_by_library());
+            if args.is_empty() && literal_source && unambiguous {
+                if let Some(resolved @ Type::Union(_)) = self.resolve_type_for_assignability(target)
+                {
+                    if matches!(&resolved, Type::Union(members) if members.iter().all(literal)) {
+                        return self.is_assignable_to(source, &resolved);
+                    }
                 }
             }
         }
@@ -23894,7 +24490,10 @@ impl TypeChecker {
         if self.active_type_parameter_name(source).is_some()
             && matches!(
                 target,
-                Type::String
+                Type::Object
+                    | Type::Null
+                    | Type::Undefined
+                    | Type::String
                     | Type::Number
                     | Type::Boolean
                     | Type::BigInt
@@ -24102,6 +24701,11 @@ impl TypeChecker {
 
         // Union target: source must be assignable to at least one member
         if let Type::Union(members) = target {
+            // `{}` covers the non-nullish part of unknown. Together with
+            // null and undefined this union accepts the entire unknown type.
+            if matches!(source, Type::Unknown) && self.unknown_union_coverage(target, 0) == 7 {
+                return true;
+            }
             return members.iter().any(|m| self.is_assignable_to(source, m));
         }
 
@@ -24503,11 +25107,6 @@ impl TypeChecker {
                     .iter()
                     .all(|sig| self.is_assignable_to(source, &Type::Function(sig.clone())));
             }
-            return true;
-        }
-
-        // Object is assignable to Object
-        if matches!(source, Type::ObjectType(_)) && matches!(target, Type::Object) {
             return true;
         }
 
@@ -25148,7 +25747,8 @@ impl TypeChecker {
                     .filter(|n| direct.as_ref().is_none_or(|d| d.contains(n)))
                     .collect();
                 let target_disp = target_type.display_string_single_line();
-                for prop in excess {
+                // tsc stops at the literal's first excess property.
+                if let Some(prop) = excess.into_iter().next() {
                     let psp = self.excess_property_span(lit, &prop, span);
                     self.push_excess_property(
                         &prop,
@@ -25156,8 +25756,6 @@ impl TypeChecker {
                         psp,
                         target_names.iter().copied(),
                     );
-                    // tsc stops at the literal's first excess property.
-                    break;
                 }
             }
             Type::Union(members) => {
@@ -26008,6 +26606,57 @@ impl TypeChecker {
         }
     }
 
+    // Catch annotations are checked by their resolved type, including aliases
+    // and unions/intersections that reduce to `any` or `unknown`.
+    fn normalize_catch_annotation_type(&self, ty: &Type) -> Type {
+        if !self.enter_recursion() {
+            return Type::Any;
+        }
+        let result = match ty {
+            Type::TypeReference(..) => self
+                .resolve_for_simplify(ty)
+                .filter(|resolved| resolved != ty)
+                .map(|resolved| self.normalize_catch_annotation_type(&resolved))
+                .unwrap_or_else(|| match ty {
+                    Type::TypeReference(name, _) if !self.type_name_is_known(name) => Type::Any,
+                    _ => ty.clone(),
+                }),
+            Type::Union(members) => {
+                let members: Vec<_> = members
+                    .iter()
+                    .map(|member| self.normalize_catch_annotation_type(member))
+                    .collect();
+                if members
+                    .iter()
+                    .any(|member| matches!(member, Type::Any | Type::Error))
+                {
+                    Type::Any
+                } else if members.iter().any(|member| matches!(member, Type::Unknown)) {
+                    Type::Unknown
+                } else {
+                    Type::flatten_union(members)
+                }
+            }
+            Type::Intersection(members) => type_ops::simplify_intersection(
+                members
+                    .iter()
+                    .map(|member| self.normalize_catch_annotation_type(member))
+                    .collect(),
+            ),
+            Type::Error => Type::Any,
+            _ => {
+                let simplified = self.simplify_type(ty);
+                if simplified == *ty {
+                    simplified
+                } else {
+                    self.normalize_catch_annotation_type(&simplified)
+                }
+            }
+        };
+        self.exit_recursion();
+        result
+    }
+
     fn check_stmt(&mut self, stmt: &Stmt) {
         let pushed = self.enter_jump_target(stmt);
         self.check_stmt_inner(stmt);
@@ -26025,6 +26674,8 @@ impl TypeChecker {
         self.check_import_attributes(stmt);
         self.check_redundant_type_modifiers(stmt);
         self.check_js_type_only_export(stmt);
+        self.check_javascript_type_import(stmt);
+        self.check_augmentation_statement(stmt);
         match &stmt.kind {
             StmtKind::Var(var_stmt) => {
                 self.check_missing_variable_initializers(var_stmt);
@@ -26036,6 +26687,28 @@ impl TypeChecker {
                 let is_ambient_var =
                     self.ambient_depth > 0 || var_stmt.modifiers & tsc_rs_ast::MOD_DECLARE != 0;
                 for decl in &var_stmt.declarations {
+                    let mut init = decl.init.as_deref();
+                    while let Some(Expr {
+                        kind: ExprKind::Paren(inner),
+                        ..
+                    }) = init
+                    {
+                        init = Some(inner);
+                    }
+                    if let Some(Expr {
+                        kind: ExprKind::As(assertion),
+                        ..
+                    }) = init
+                    {
+                        if matches!(
+                            assertion.type_node.kind,
+                            TypeNodeKind::Keyword(KeywordTypeKind::Any)
+                        ) {
+                            let mut bound = Vec::new();
+                            Self::collect_pattern_binding_names(&decl.name, &mut bound);
+                            self.explicit_any_bindings.extend(bound);
+                        }
+                    }
                     self.check_binding_pattern_runtime_expressions(&decl.name);
                     self.check_strict_mode_binding_pattern(&decl.name);
                     if self.implicit_any_enabled_for_current_file()
@@ -26316,13 +26989,21 @@ impl TypeChecker {
                                 Type::ObjectType(_)
                                 | Type::Array(_)
                                 | Type::Tuple(_)
-                                | Type::Function(_) => Self::widen_nested_literals(&init_ty),
+                                | Type::Function(_) => Self::keep_const_asserted_properties(
+                                    decl.init.as_deref(),
+                                    &init_ty,
+                                    Self::widen_nested_literals(&init_ty),
+                                ),
                                 // const primitive: preserve literal type
                                 _ => init_ty,
                             }
                         } else {
                             // let/var: widen everything including nested literals
-                            Self::widen_nested_literals(&init_ty)
+                            Self::keep_const_asserted_properties(
+                                decl.init.as_deref(),
+                                &init_ty,
+                                Self::widen_nested_literals(&init_ty),
+                            )
                         }
                     } else {
                         Type::Any
@@ -26444,11 +27125,24 @@ impl TypeChecker {
                         self.check_array_pattern_iterable(&decl.name, &ty);
                     }
                     self.check_binding_pattern_access(&decl.name, &ty);
+                    let this_receiver = if matches!(ty, Type::This) {
+                        decl.init
+                            .as_deref()
+                            .and_then(|init| self.this_receiver_origin(init))
+                    } else {
+                        None
+                    };
                     self.declare_pattern_vars_with_defaults(
                         &decl.name,
                         ty,
                         var_stmt.kind == VarKind::Const,
                     );
+                    if let (PatKind::Ident(name), Some(receiver)) = (&decl.name.kind, this_receiver)
+                    {
+                        self.scopes[self.current_scope]
+                            .this_alias_receivers
+                            .insert(name.to_string(), receiver);
+                    }
                     // Preserve readonly property evidence from an inline type
                     // literal. ObjectTypeInfo intentionally carries only
                     // structural types, so a scope marker keeps assignment
@@ -26666,17 +27360,22 @@ impl TypeChecker {
                             self.widen_for_message(Some(e), &effective_ret, &expected_ret);
                         // TypeScript underlines `return` keyword (6 chars) for return-type mismatches
                         let return_kw_span = Span::new(stmt.span.start, stmt.span.start + 6);
-                        let mut diagnostic = error_not_assignable(
-                            &widened.display_string(),
-                            &expected_ret.display_string(),
-                            return_kw_span,
-                        );
-                        if let Some(line) = self.type_parameter_elaboration(&widened, &expected_ret)
-                        {
-                            diagnostic.message.push_str("\n  ");
-                            diagnostic.message.push_str(&line);
+                        if matches!(widened, Type::Union(_)) {
+                            self.push_not_assignable(&widened, &expected_ret, return_kw_span);
+                        } else {
+                            let mut diagnostic = error_not_assignable(
+                                &widened.display_string(),
+                                &expected_ret.display_string(),
+                                return_kw_span,
+                            );
+                            if let Some(line) =
+                                self.type_parameter_elaboration(&widened, &expected_ret)
+                            {
+                                diagnostic.message.push_str("\n  ");
+                                diagnostic.message.push_str(&line);
+                            }
+                            self.diagnostics.push(diagnostic);
                         }
-                        self.diagnostics.push(diagnostic);
                     }
                 }
             }
@@ -26876,6 +27575,13 @@ impl TypeChecker {
                 match &fi.left {
                     ForInOfLeft::Var(vs) => {
                         for decl in &vs.declarations {
+                            if matches!(decl.name.kind, PatKind::Array(_) | PatKind::Object(_)) {
+                                self.report_for_in_target_error(
+                                    2491,
+                                    "The left-hand side of a 'for...in' statement cannot be a destructuring pattern.",
+                                    decl.name.span,
+                                );
+                            }
                             self.declare_pattern_vars(&decl.name, Type::String);
                             // Record in expression_types for hover
                             self.expression_types
@@ -26888,11 +27594,15 @@ impl TypeChecker {
                         self.declare_pattern_vars(pat, Type::String);
                     }
                     ForInOfLeft::Expr(expression) => {
-                        self.report_readonly_property_write(expression);
-                        self.check_for_in_of_target(expression);
+                        let object_type = self.check_expr(&fi.right);
+                        let key_type = self.for_in_key_type(&object_type);
+                        let readonly = self.report_readonly_property_write(expression);
+                        self.check_for_in_expression(expression, &key_type, readonly);
                     }
                 }
-                self.check_expr(&fi.right);
+                if !matches!(fi.left, ForInOfLeft::Expr(_)) {
+                    self.check_expr(&fi.right);
+                }
                 self.check_stmt(&fi.body);
                 self.pop_scope();
             }
@@ -26936,6 +27646,13 @@ impl TypeChecker {
                             related: None,
                         });
                     }
+                }
+                // For a declaration initializer, the iterable is checked while
+                // determining each binding's type. An empty recovered list has
+                // no binding to check, but its loop body is still checked.
+                if matches!(&fo.left, ForInOfLeft::Var(vs) if vs.declarations.is_empty()) {
+                    self.check_stmt(&fo.body);
+                    return;
                 }
                 // An identifier target is assigned, not declared: remember its
                 // declared type before the loop scope shadows it.
@@ -27216,11 +27933,16 @@ impl TypeChecker {
                 self.check_static_property_name_conflicts(class_decl, None);
                 let pushed_type_param_names =
                     self.push_active_type_param_names(class_decl.type_params.as_deref());
+                self.register_class_initializer_shapes(class_decl);
                 self.report_js_checked_export_decorator_position(
                     class_decl.span,
                     &class_decl.decorators,
                 );
-                self.check_decorators_with_validity(&class_decl.decorators, true);
+                self.check_decorators_at_site(
+                    &class_decl.decorators,
+                    true,
+                    decorator_types::DecoratorSite::Class,
+                );
                 if class_decl.name.as_deref() == Some("Object")
                     && class_decl.modifiers & MOD_DECLARE == 0
                     && self.ambient_depth == 0
@@ -27338,22 +28060,30 @@ impl TypeChecker {
                 if is_declare_class {
                     self.ambient_depth += 1;
                 }
-                // TS1183: an ambient class declares signatures only — a member
-                // with a body is an implementation, which is not allowed.
-                if is_declare_class || self.ambient_depth > 0 {
-                    for m in &class_decl.members {
-                        let has_body = match &m.kind {
-                            tsc_rs_ast::ClassMemberKind::Method(me) => me.body.is_some(),
-                            tsc_rs_ast::ClassMemberKind::Constructor(c) => c.body.is_some(),
-                            tsc_rs_ast::ClassMemberKind::GetAccessor(a)
-                            | tsc_rs_ast::ClassMemberKind::SetAccessor(a) => a.body.is_some(),
-                            _ => false,
-                        };
-                        if has_body {
-                            let span = self.ambient_member_body_open_span(m.span).unwrap_or(m.span);
-                            self.diagnostics
-                                .push(diagnostics::error_implementation_in_ambient(span));
+                // TS1183: ambient classes and explicitly declared methods
+                // cannot contain implementations. For a constructor or an
+                // accessor, an invalid `declare` modifier ends its grammar
+                // check before the implementation check.
+                for m in &class_decl.members {
+                    let (has_body, declared_method) = match &m.kind {
+                        ClassMemberKind::Method(method) => {
+                            (method.body.is_some(), method.modifiers & MOD_DECLARE != 0)
                         }
+                        ClassMemberKind::Constructor(ctor) => (ctor.body.is_some(), false),
+                        ClassMemberKind::GetAccessor(accessor)
+                        | ClassMemberKind::SetAccessor(accessor) => {
+                            (accessor.body.is_some(), false)
+                        }
+                        _ => continue,
+                    };
+                    if has_body
+                        && (is_declare_class
+                            || self.ambient_depth > 0
+                            || self.check_index_grammar && declared_method)
+                    {
+                        let span = self.ambient_member_body_open_span(m.span).unwrap_or(m.span);
+                        self.diagnostics
+                            .push(diagnostics::error_implementation_in_ambient(span));
                     }
                 }
                 let class_type_param_frame = pushed_type_param_names
@@ -27715,6 +28445,7 @@ impl TypeChecker {
                     .filter_map(switch_case_literal)
                     .collect();
 
+                let mut scalar_fallthrough: Option<Type> = None;
                 for case in &sw.cases {
                     // An enum member test (`case En.A:`, `case En["B"]:`)
                     // narrows an enum-typed discriminant to that member.
@@ -27753,6 +28484,15 @@ impl TypeChecker {
                         let narrowed = if let Some(ref test) = case.test {
                             switch_case_literal(test)
                                 .or_else(|| enum_member_case.clone())
+                                .or_else(|| {
+                                    self.is_unknown_receiver(base_ty)
+                                        .then(|| {
+                                            test_ty.as_ref().and_then(|ty| {
+                                                self.unknown_equality_candidate_for_expr(test, ty)
+                                            })
+                                        })
+                                        .flatten()
+                                })
                                 .map(|case_ty| {
                                     if self.is_assignable_to(&case_ty, base_ty) {
                                         case_ty
@@ -27774,12 +28514,21 @@ impl TypeChecker {
                             })
                         };
                         if let Some(narrowed) = narrowed {
-                            self.narrow_var(var_name, narrowed);
+                            let entry = match scalar_fallthrough.take() {
+                                Some(prior) => Type::flatten_union(vec![prior, narrowed]),
+                                None => narrowed,
+                            };
+                            self.narrow_var(var_name, entry);
                         }
                     }
                     for s in &case.consequent {
                         self.check_stmt(s);
                     }
+                    scalar_fallthrough = scalar_switch_info.as_ref().and_then(|(name, _)| {
+                        (!case.consequent.iter().any(Self::stmt_always_terminates))
+                            .then(|| self.lookup_var(name).cloned())
+                            .flatten()
+                    });
                     self.pop_scope();
                 }
                 self.scopes[switch_scope].type_names = saved_type_names;
@@ -27795,11 +28544,59 @@ impl TypeChecker {
                     self.push_scope();
                     if let Some(ref param) = handler.param {
                         self.check_binding_pattern_runtime_expressions(param);
-                        let ty = handler
+                        let mut ty = handler
                             .param_type
                             .as_ref()
                             .map(|t| self.resolve_type_node(t))
-                            .unwrap_or(Type::Any);
+                            .unwrap_or_else(|| {
+                                if self
+                                    .compiler_options
+                                    .use_unknown_in_catch_variables
+                                    .unwrap_or(self.compiler_options.strict != Some(false))
+                                {
+                                    Type::Unknown
+                                } else {
+                                    Type::Any
+                                }
+                            });
+                        if let Some(annotation) = &handler.param_type {
+                            let resolved = self.normalize_catch_annotation_type(&ty);
+                            ty = resolved.clone();
+                            if !matches!(resolved, Type::Any | Type::Unknown) {
+                                if self.check_index_grammar {
+                                    let span = self
+                                        .current_source
+                                        .as_deref()
+                                        .and_then(|source| {
+                                            source.get(
+                                                annotation.span.start as usize
+                                                    ..annotation.span.end as usize,
+                                            )
+                                        })
+                                        .map(|source| {
+                                            let mut scanner =
+                                                tsc_rs_scanner::TsScanner::new(source);
+                                            scanner.scan();
+                                            Span::new(
+                                                annotation.span.start + scanner.token_pos() as u32,
+                                                annotation.span.start + scanner.text_pos() as u32,
+                                            )
+                                        })
+                                        .unwrap_or(annotation.span);
+                                    self.diagnostics.push(Diagnostic {
+                                        code: 1196,
+                                        message: "Catch clause variable type annotation must be 'any' or 'unknown' if specified.".into(),
+                                        category: DiagnosticCategory::Error,
+                                        file_name: None,
+                                        span: Some(span),
+                                        related: None,
+                                    });
+                                }
+                                // Invalid catch annotations do not constrain the
+                                // binding or cause secondary errors in the body.
+                                ty = Type::Any;
+                            }
+                        }
                         self.declare_pattern_vars(param, ty);
                     }
                     self.hoist_block_declarations(&handler.body);
@@ -27816,13 +28613,36 @@ impl TypeChecker {
                 }
             }
             StmtKind::Throw(expr) => {
-                self.check_expr(expr);
+                if matches!(&expr.kind, ExprKind::Ident(name) if name.is_empty()) {
+                    // The parser leaves a missing operand after a line break.
+                    // It has no name to resolve. Parse errors or an ambient
+                    // statement error take precedence over this grammar error.
+                    if self.check_index_grammar
+                        && !self.ambient_statement_starts.contains(&stmt.span.start)
+                    {
+                        self.diagnostics.push(Diagnostic {
+                            code: 1142,
+                            message: "Line break not permitted here.".to_string(),
+                            category: DiagnosticCategory::Error,
+                            file_name: None,
+                            span: Some(expr.span),
+                            related: None,
+                        });
+                    }
+                } else {
+                    self.check_expr(expr);
+                }
             }
             StmtKind::Export(export_decl) => match &export_decl.kind {
                 ExportDeclKind::Decl(decl) => self.check_stmt(decl),
                 ExportDeclKind::DefaultDecl(decl) => self.check_stmt(decl),
-                ExportDeclKind::All { .. } => {
-                    self.export_declaration_not_permitted_in_namespace(export_decl.span, Some(""));
+                ExportDeclKind::All { source, .. } => {
+                    if !self.export_declaration_not_permitted_in_namespace(
+                        export_decl.span,
+                        Some(source),
+                    ) {
+                        self.check_augmentation_reexport_resolution(export_decl, source);
+                    }
                 }
                 ExportDeclKind::Default(expr) => {
                     if matches!(expr.kind, ExprKind::Ident(_)) {
@@ -27847,6 +28667,9 @@ impl TypeChecker {
                         export_decl.span,
                         Some(source),
                     ) {
+                        return;
+                    }
+                    if self.check_augmentation_reexport_resolution(export_decl, source) {
                         return;
                     }
                     let members: Vec<(std::string::String, Span)> = specifiers
@@ -27909,7 +28732,10 @@ impl TypeChecker {
                             || self.overloads.contains_key(local)
                             // A type-only import may be re-exported.
                             || self.type_only_bindings.contains_key(local)
-                            || self.file_import_binding_names.contains(local);
+                            || self.file_import_binding_names.contains(local)
+                            || local == "globalThis"
+                            || stdlib::stdlib_member_availability(&self.compiler_options)
+                                .is_some_and(|lib| lib.declares_global(local));
                         if !known {
                             self.diagnostics
                                 .push(diagnostics::error_cannot_find_name(local, local_span));
@@ -28099,11 +28925,8 @@ impl TypeChecker {
                                 (ambient, used)
                             });
                     if self.check_module_resolution && used && !ambient {
-                        let diag = if self.effective_module_resolution_is_classic() {
-                            error_cannot_find_module_classic(specifier, _import_decl.source_span)
-                        } else {
-                            error_cannot_find_module(specifier, _import_decl.source_span)
-                        };
+                        let diag =
+                            self.missing_module_diagnostic(specifier, _import_decl.source_span);
                         self.diagnostics.push(diag);
                     }
                     namespace_require = true;
@@ -28173,48 +28996,46 @@ impl TypeChecker {
                     // TS2835 / TS2834 replace the module-not-found report.
                 } else if self.check_module_resolution
                     && !namespace_require
-                    && !self.can_resolve_module(&_import_decl.source)
+                    && !self
+                        .augmentation_import_resolution(&_import_decl.source)
+                        .unwrap_or_else(|| self.can_resolve_module(&_import_decl.source))
                 {
                     // tsc picks the code by import shape and effective module
                     // resolution: a side-effect import (`import "./x"`) gets
                     // TS2882; under CLASSIC resolution (explicit, or module ∈
                     // None/AMD/UMD/System with moduleResolution unspecified)
                     // the plain form gets the suggestion-bearing TS2792;
+                    // Node built-ins suggest installing their types, and
                     // everything else keeps TS2307.
-                    let classic = self.effective_module_resolution_is_classic();
                     let diag = if _import_decl.is_side_effect {
                         error_cannot_find_module_side_effect(
                             &_import_decl.source,
                             _import_decl.source_span,
                         )
-                    } else if classic {
-                        error_cannot_find_module_classic(
+                    } else {
+                        self.missing_module_diagnostic(
                             &_import_decl.source,
                             _import_decl.source_span,
                         )
-                    } else {
-                        error_cannot_find_module(&_import_decl.source, _import_decl.source_span)
                     };
                     self.diagnostics.push(diag);
                 }
             }
             StmtKind::ImportEquals(ie) => {
                 // `import x = require("m")` participates in module resolution
-                // like a plain import: unresolved targets get TS2792 under
-                // classic resolution (aliasesInSystemModule1/2), else TS2307.
+                // like a plain import, including Node typings suggestions
+                // and the classic resolution variant of module-not-found.
                 if self.check_module_resolution {
                     if let ExprKind::Call(call) = &ie.module_ref.kind {
                         if matches!(&call.callee.kind, ExprKind::Ident(n) if n == "require") {
                             if let Some(arg) = call.args.first() {
                                 if let ExprKind::StrLit(src) = &arg.kind {
                                     self.report_require_of_esm(src, arg.span);
-                                    if !self.can_resolve_module(src) {
-                                        let diag = if self.effective_module_resolution_is_classic()
-                                        {
-                                            error_cannot_find_module_classic(src, arg.span)
-                                        } else {
-                                            error_cannot_find_module(src, arg.span)
-                                        };
+                                    if !self
+                                        .augmentation_import_resolution(src)
+                                        .unwrap_or_else(|| self.can_resolve_module(src))
+                                    {
+                                        let diag = self.missing_module_diagnostic(src, arg.span);
                                         self.diagnostics.push(diag);
                                     }
                                 }
@@ -28230,6 +29051,55 @@ impl TypeChecker {
                     2431,
                     "Enum",
                 );
+                for member in &enumeration.members {
+                    let mut numeric_name = false;
+                    let mut text_name = None;
+                    match &member.name {
+                        PropName::Number(value, _) => {
+                            numeric_name = value.ends_with('n');
+                            text_name = Some(Self::canonical_numeric_property_name(value));
+                        }
+                        PropName::Ident(value, _) | PropName::String(value, _) => {
+                            text_name = Some(value.to_string());
+                        }
+                        _ => {}
+                    }
+                    if let PropName::Computed(expression, span) = &member.name {
+                        match &expression.kind {
+                            ExprKind::StrLit(value) | ExprKind::NoSubstTemplate(value) => {
+                                text_name = Some(value.to_string());
+                            }
+                            ExprKind::NumLit(value) => {
+                                text_name = Some(Self::canonical_numeric_property_name(value));
+                            }
+                            _ => {
+                                self.diagnostics.push(Diagnostic {
+                                    code: 1164,
+                                    message: "Computed property names are not allowed in enums."
+                                        .into(),
+                                    category: DiagnosticCategory::Error,
+                                    file_name: None,
+                                    span: Some(*span),
+                                    related: None,
+                                });
+                            }
+                        }
+                    }
+                    numeric_name |= text_name.as_deref().is_some_and(|name| {
+                        name.parse::<f64>().is_ok_and(f64::is_finite)
+                            && Self::canonical_numeric_property_name(name) == name
+                    });
+                    if numeric_name {
+                        self.diagnostics.push(Diagnostic {
+                            code: 2452,
+                            message: "An enum member cannot have a numeric name.".into(),
+                            category: DiagnosticCategory::Error,
+                            file_name: None,
+                            span: Some(member.name.span()),
+                            related: None,
+                        });
+                    }
+                }
                 // Member initializers are expressions (unknown names are
                 // TS2304); sibling members are in scope inside the body.
                 if enumeration
@@ -28691,6 +29561,8 @@ impl TypeChecker {
     /// exports of every same-path block visible through the enclosing
     /// namespace value (`declare_namespace_object_members`).
     fn check_namespace_declaration(&mut self, module_decl: &ModuleDecl) {
+        self.check_global_augmentation_context(module_decl);
+        let module_body_kind = self.module_declaration_body_kind(module_decl);
         // `namespace A.B { … }`: enter `A` (its merged exports visible, as
         // for a block body) and check the inner declaration nested in it.
         if let Some(tsc_rs_ast::ModuleBody::Module(ref nested)) = module_decl.body {
@@ -28706,6 +29578,7 @@ impl TypeChecker {
             let previous_type_resolution_namespace =
                 self.type_resolution_namespace.replace(namespace_path);
             self.push_scope();
+            self.scopes[self.current_scope].module_body_kind = Some(ModuleBodyKind::Namespace);
             if outer_is_top_level {
                 if let Some(exports) = self.merged_namespace_exports.get(namespace_name).cloned() {
                     for (n, t) in exports {
@@ -28751,6 +29624,7 @@ impl TypeChecker {
             let previous_type_resolution_namespace =
                 self.type_resolution_namespace.replace(namespace_path);
             self.push_scope();
+            self.scopes[self.current_scope].module_body_kind = Some(module_body_kind);
             // A namespace body is its own var-scoped container. Names
             // declared in a different namespace (or the source-file
             // scope) must not participate in TS2403 comparisons here.
@@ -28804,7 +29678,7 @@ impl TypeChecker {
             // body's own declarations.
             let mut block_names = Self::top_level_declared_names(body);
             block_names.extend(Self::constructor_local_names(&[], Some(body)));
-            let ambient_external_module = matches!(module_decl.name, ModuleName::String(_));
+            let ambient_external_module = !matches!(module_body_kind, ModuleBodyKind::Namespace);
             self.module_block_local_names
                 .push((block_names, ambient_external_module));
             // A namespace body compiles to its own function: definite
@@ -29051,6 +29925,9 @@ impl TypeChecker {
 
     /// Check if a module specifier can be resolved to an available file.
     fn can_resolve_module(&self, specifier: &str) -> bool {
+        if self.ambient_module_paths.contains_key(specifier) {
+            return true;
+        }
         if let Some(current_file_name) = self.current_file_name.as_deref() {
             if self
                 .resolvable_specifiers
@@ -29259,6 +30136,12 @@ impl TypeChecker {
         ie: &tsc_rs_ast::ImportEqualsDecl,
         report_errors: bool,
     ) -> bool {
+        if let Some(ty) = self.import_equals_namespace_target_type(&ie.module_ref) {
+            if self.is_global_object_type(&ty) {
+                self.declare_var(&ie.name, ty);
+                return true;
+            }
+        }
         if self.import_equals_aliases.contains_key(&ie.name) {
             return true;
         }
@@ -29332,6 +30215,11 @@ impl TypeChecker {
             return false;
         }
         if self.namespace_paths.contains(&path) {
+            if let Some(ty @ Type::Namespace(_)) =
+                self.import_equals_namespace_target_type(&ie.module_ref)
+            {
+                self.declare_var(&ie.name, ty);
+            }
             self.import_equals_aliases
                 .entry(ie.name.clone())
                 .or_insert(path);
@@ -30495,6 +31383,7 @@ impl TypeChecker {
                     }
                     let name = name.to_string();
                     self.report_unresolved_type_name(&name, type_ref.name.span);
+                    self.report_namespace_used_as_type(&name, type_ref.name.span);
                 }
                 if let Some(arguments) = &type_ref.type_args {
                     for argument in arguments {
@@ -30586,6 +31475,7 @@ impl TypeChecker {
             TypeNodeKind::IndexedAccess(object, index) => {
                 self.check_type_node_future_lib_globals(object);
                 self.check_type_node_future_lib_globals(index);
+                self.check_global_indexed_access_type(object, index);
             }
             TypeNodeKind::Infer(name, constraint) => {
                 self.check_reserved_type_parameter_name(name, node.span);
@@ -30729,6 +31619,11 @@ impl TypeChecker {
                 }
             }
             TypeNodeKind::Paren(inner) => self.check_type_node_generic_arity(inner),
+            TypeNodeKind::IndexedAccess(object, index) => {
+                self.check_type_node_generic_arity(object);
+                self.check_type_node_generic_arity(index);
+                self.check_global_indexed_access_type(object, index);
+            }
             _ => {}
         }
     }
@@ -30940,7 +31835,11 @@ impl TypeChecker {
     }
 
     fn report_namespace_used_as_type(&mut self, name: &str, span: Span) {
-        if !self.namespace_paths.contains(name)
+        let global_alias = self.import_equals_names.contains(name)
+            && self
+                .lookup_var(name)
+                .is_some_and(|ty| self.is_global_object_type(ty));
+        if (!self.namespace_paths.contains(name) && !global_alias)
             || self.current_file_is_js()
             || self.interface_info.contains_key(name)
             || self.class_info.contains_key(name)
@@ -30953,10 +31852,11 @@ impl TypeChecker {
                 .any(|frame| frame.contains_key(name))
             || self.local_type_only_names.contains(name)
             || self.local_type_alias_names.contains(name)
-            || self.imported_type_sources.contains_key(name)
-            || self.import_equals_names.contains(name)
-            || self.imported_namespace_bindings.contains(name)
-            || self.file_import_binding_names.contains(name)
+            || (!global_alias
+                && (self.imported_type_sources.contains_key(name)
+                    || self.import_equals_names.contains(name)
+                    || self.imported_namespace_bindings.contains(name)
+                    || self.file_import_binding_names.contains(name)))
             || self.user_global_type_names.contains(name)
             || self.nested_scope_declares_type_name(name)
         {
@@ -31040,12 +31940,12 @@ impl TypeChecker {
         candidates.sort();
         candidates.dedup();
         let suggestion = if self.unresolved_name_count < 10 {
+            self.unresolved_name_count += 1;
             spelling_suggestion(name, candidates.iter().map(String::as_str))
         } else {
             None
         };
         if let Some(suggestion) = suggestion {
-            self.unresolved_name_count += 1;
             let related = self.declared_here_note(&suggestion);
             self.diagnostics.push(Diagnostic {
                 code: 2552,
@@ -32054,19 +32954,25 @@ impl TypeChecker {
                 ));
             }
         }
-        // A function source has the `Function` apparent members but no index
-        // signature: against an indexed target whose named members a function
-        // provides (`ArrayLike<T>`), tsc reports the missing index signature.
-        if let Type::Function(_) = source {
+        // Functions have no index signature; arrays and tuples provide only
+        // a numeric one. Report a missing signature when the named target
+        // members are otherwise present.
+        if matches!(source, Type::Function(_) | Type::Array(_) | Type::Tuple(_)) {
             if let Some(target_info) = self.structural_object_info(target) {
                 if let Some((key, _)) = &target_info.index_signature {
-                    let function_members = target_info.properties.iter().all(|(name, _)| {
-                        matches!(
-                            name.trim_start_matches('?'),
-                            "length" | "name" | "prototype" | "arguments" | "caller"
-                        ) || name.starts_with('?')
+                    let provided_members = target_info.properties.iter().all(|(name, _)| {
+                        name.starts_with('?')
+                            || match source {
+                                Type::Function(_) => matches!(
+                                    name.as_str(),
+                                    "length" | "name" | "prototype" | "arguments" | "caller"
+                                ),
+                                _ => self.extract_member_type_opt(source, name).is_some(),
+                            }
                     });
-                    if function_members {
+                    let missing_index = matches!(source, Type::Function(_))
+                        || !matches!(key.as_ref(), Type::Number);
+                    if provided_members && missing_index {
                         return Some((
                             format!(
                                 "Index signature for type '{}' is missing in type '{}'.",
@@ -35803,10 +36709,7 @@ impl TypeChecker {
         self.diagnostics.extend(diags);
     }
 
-    fn check_nolib_globals(&mut self, symbols: &SymbolTable) {
-        if self.compiler_options.no_lib != Some(true) {
-            return;
-        }
+    fn check_nolib_globals(&mut self, file: &SourceFile) {
         const REQUIRED: &[&str] = &[
             "Array",
             "Boolean",
@@ -35819,25 +36722,83 @@ impl TypeChecker {
             "RegExp",
             "String",
         ];
-        for name in REQUIRED {
-            let declared = symbols.symbols.iter().any(|sy| {
-                sy.name == *name
-                    && sy.flags
-                        & (tsc_rs_symbols::SYM_INTERFACE
-                            | tsc_rs_symbols::SYM_TYPE_ALIAS
-                            | tsc_rs_symbols::SYM_CLASS)
-                        != 0
-            });
-            if !declared {
-                self.diagnostics.push(Diagnostic {
-                    code: 2318,
-                    message: format!("Cannot find global type '{}'.", name),
-                    category: DiagnosticCategory::Error,
-                    file_name: None,
-                    span: None,
-                    related: None,
-                });
+        fn collect_global_types(
+            statements: &[Stmt],
+            names: &mut rustc_hash::FxHashSet<String>,
+            global_scope: bool,
+            augmentation_parent: bool,
+        ) {
+            for statement in statements {
+                match &TypeChecker::unwrap_export_stmt(statement).kind {
+                    StmtKind::InterfaceDecl(interface) if global_scope => {
+                        names.insert(interface.name.clone());
+                    }
+                    StmtKind::TypeAlias(alias) if global_scope => {
+                        names.insert(alias.name.clone());
+                    }
+                    StmtKind::ClassDecl(class) if global_scope => {
+                        names.extend(class.name.iter().cloned());
+                    }
+                    StmtKind::ModuleDecl(module) => {
+                        let Some(ModuleBody::Block(body)) = &module.body else {
+                            continue;
+                        };
+                        if augmentation_parent
+                            && module.name_span.is_none()
+                            && matches!(&module.name, ModuleName::Ident(name) if name == "global")
+                        {
+                            collect_global_types(body, names, true, false);
+                        } else if matches!(module.name, ModuleName::String(_)) {
+                            collect_global_types(body, names, false, true);
+                        }
+                    }
+                    _ => {}
+                }
             }
+        }
+        let external = self.augmentation_file_is_external();
+        collect_global_types(
+            &file.statements,
+            &mut self.user_global_type_names,
+            !external,
+            external,
+        );
+        if self.compiler_options.no_lib != Some(true) {
+            return;
+        }
+        for name in REQUIRED {
+            if !self.strict_bind_call_apply
+                && matches!(*name, "CallableFunction" | "NewableFunction")
+            {
+                continue;
+            }
+            // Structural type registries contain module and namespace members
+            // too. Only declarations in the program's global scope satisfy
+            // these requirements, including globals injected from other files.
+            self.require_global_type(name);
+        }
+    }
+
+    fn require_global_type(&mut self, name: &str) {
+        if self.user_global_type_names.contains(name)
+            || self.global_type_names.contains(name)
+            || stdlib::stdlib_member_availability(&self.compiler_options)
+                .is_some_and(|library| library.declares_global_type(name))
+        {
+            return;
+        }
+        let message = format!("Cannot find global type '{name}'.");
+        if !self.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == 2318 && diagnostic.span.is_none() && diagnostic.message == message
+        }) {
+            self.diagnostics.push(Diagnostic {
+                code: 2318,
+                message,
+                category: DiagnosticCategory::Error,
+                file_name: None,
+                span: None,
+                related: None,
+            });
         }
     }
 
@@ -36241,6 +37202,36 @@ impl TypeChecker {
 
     /// Merge every ident-named namespace's value exports across its blocks.
     /// Local names bound by import declarations and import-equals in `stmts`.
+    /// Every identifier a binding pattern binds.
+    fn collect_pattern_binding_names(pattern: &Pat, names: &mut Vec<std::string::String>) {
+        match &pattern.kind {
+            PatKind::Ident(name) => names.push(name.to_string()),
+            PatKind::Array(elements) => {
+                for element in elements.iter().flatten() {
+                    match element {
+                        ArrayPatElem::Pat(pattern) | ArrayPatElem::Rest(pattern) => {
+                            Self::collect_pattern_binding_names(pattern, names)
+                        }
+                    }
+                }
+            }
+            PatKind::Object(properties) => {
+                for property in properties {
+                    match property {
+                        ObjPatProp::KeyValue(_, pattern) | ObjPatProp::Rest(pattern) => {
+                            Self::collect_pattern_binding_names(pattern, names)
+                        }
+                        ObjPatProp::Shorthand(name, _)
+                        | ObjPatProp::ShorthandAssign(name, _, _) => names.push(name.to_string()),
+                    }
+                }
+            }
+            PatKind::Assign(pattern, _) | PatKind::Rest(pattern) => {
+                Self::collect_pattern_binding_names(pattern, names)
+            }
+        }
+    }
+
     fn import_binding_names(stmts: &[Stmt]) -> rustc_hash::FxHashSet<std::string::String> {
         let mut names = rustc_hash::FxHashSet::default();
         for stmt in stmts {
@@ -39216,11 +40207,14 @@ impl TypeChecker {
 
     fn collect_uninstantiated_namespace_names(&mut self, file: &SourceFile) {
         self.uninstantiated_namespace_names.clear();
+        self.javascript_erased_type_imports.clear();
+        if self.current_file_is_js() {
+            self.collect_javascript_erased_imports(file);
+            return;
+        }
         // Script namespaces merge across files; only a module's (or a lone
         // file's) namespaces are known to be complete here.
-        if self.current_file_is_js()
-            || !(Self::file_is_module(file) || self.available_source_files.len() <= 1)
-        {
+        if !(Self::file_is_module(file) || self.available_source_files.len() <= 1) {
             return;
         }
         fn instantiated(module: &ModuleDecl) -> bool {
@@ -39669,7 +40663,7 @@ impl TypeChecker {
         }
     }
 
-    fn surface_binder_diagnostics(&mut self, symbols: &SymbolTable) {
+    fn surface_binder_diagnostics(&mut self, file: &SourceFile, symbols: &SymbolTable) {
         for bind_diag in &symbols.diagnostics {
             if let Some(name) = bind_diag
                 .message
@@ -39713,6 +40707,21 @@ impl TypeChecker {
             } else {
                 2300
             };
+            // JavaScript imports only conflict with local declarations when
+            // their targets have value meaning. The binder cannot resolve
+            // imported symbols, so refine its provisional conflict here.
+            if code == 2440
+                && self.current_file_is_js()
+                && bind_diag
+                    .message
+                    .strip_prefix("Import declaration conflicts with local declaration of '")
+                    .and_then(|rest| rest.split('\'').next())
+                    .is_some_and(|name| {
+                        self.javascript_import_has_no_value_at(file, name, bind_diag.span)
+                    })
+            {
+                continue;
+            }
             self.diagnostics.push(Diagnostic {
                 code,
                 message: bind_diag.message.clone(),
@@ -40738,6 +41747,7 @@ impl TypeChecker {
 
         match ty {
             Type::UniqueSymbol(_) => Type::Symbol,
+            Type::ObjectType(info) if info.is_non_nullish_unknown() => ty.clone(),
             Type::ObjectType(info) => Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: info
                     .properties
@@ -41048,15 +42058,86 @@ impl TypeChecker {
             if solved.contains_key(type_param) {
                 continue;
             }
-            if let Some(Some(default)) = signature.type_param_defaults.get(index) {
-                let resolved_default = Self::substitute(default, solved);
-                solved.insert(type_param.clone(), resolved_default);
+            let fallback = signature
+                .type_param_defaults
+                .get(index)
+                .and_then(Option::as_ref)
+                .or_else(|| {
+                    signature
+                        .type_param_constraints
+                        .get(index)
+                        .and_then(Option::as_ref)
+                });
+            if let Some(fallback) = fallback {
+                solved.insert(type_param.clone(), Self::substitute(fallback, solved));
             }
         }
     }
 
+    /// `{ mode: "manual" as const }`: a property whose initializer is a
+    /// const assertion keeps its literal type through the declaration's
+    /// widening (the asserted literal is not a fresh one).
+    fn keep_const_asserted_properties(init: Option<&Expr>, original: &Type, widened: Type) -> Type {
+        let (
+            Some(Expr {
+                kind: ExprKind::ObjectLit(props),
+                ..
+            }),
+            Type::ObjectType(before),
+            Type::ObjectType(after),
+        ) = (init, original, &widened)
+        else {
+            return widened;
+        };
+        let asserted: Vec<std::string::String> = props
+            .iter()
+            .filter_map(|prop| match prop {
+                ObjLitProp::Property(property)
+                    if Self::is_const_assertion_expr(&property.value) =>
+                {
+                    match &property.key {
+                        PropName::Ident(name, _) | PropName::String(name, _) => {
+                            Some(name.to_string())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        if asserted.is_empty() {
+            return widened;
+        }
+        let properties = after
+            .properties
+            .iter()
+            .map(|(name, ty)| {
+                let kept = asserted.iter().any(|asserted| asserted == name).then(|| {
+                    before
+                        .properties
+                        .iter()
+                        .find(|(original, _)| original == name)
+                        .map(|(_, ty)| Arc::clone(ty))
+                });
+                (
+                    name.clone(),
+                    kept.flatten().unwrap_or_else(|| Arc::clone(ty)),
+                )
+            })
+            .collect();
+        Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+            properties,
+            call_signatures: after.call_signatures.clone(),
+            construct_signatures: after.construct_signatures.clone(),
+            index_signature: after.index_signature.clone(),
+            index_signature_name: after.index_signature_name.clone(),
+            method_names: after.method_names.clone(),
+        }))
+    }
+
     fn widen_nested_literals(ty: &Type) -> Type {
         match ty {
+            Type::ObjectType(info) if info.is_non_nullish_unknown() => ty.clone(),
             Type::NumberLiteral(_) => Type::Number,
             Type::StringLiteral(_) => Type::String,
             Type::BooleanLiteral(_) => Type::Boolean,
@@ -42293,6 +43374,7 @@ impl TypeChecker {
 
     fn substitute_impl(ty: &Type, map: &HashMap<std::string::String, Type>) -> Type {
         match ty {
+            Type::ObjectType(info) if info.is_non_nullish_unknown() => ty.clone(),
             Type::TypeParameter(name) => map.get(name).cloned().unwrap_or_else(|| ty.clone()),
             // Also treat TypeReference("T", []) as a type param when T is in the map
             Type::TypeReference(name, args) if args.is_empty() && map.contains_key(name) => {
@@ -42305,9 +43387,9 @@ impl TypeChecker {
             Type::Union(members) => {
                 Type::flatten_union(members.iter().map(|m| Self::substitute(m, map)).collect())
             }
-            Type::Intersection(members) => {
-                Type::Intersection(members.iter().map(|m| Self::substitute(m, map)).collect())
-            }
+            Type::Intersection(members) => type_ops::simplify_intersection(
+                members.iter().map(|m| Self::substitute(m, map)).collect(),
+            ),
             Type::Function(ft) => Type::Function(Self::substitute_fn(ft, map)),
             Type::Constructor(constructor) => {
                 Type::Constructor(Self::substitute_constructor(constructor, map))
@@ -42381,7 +43463,17 @@ impl TypeChecker {
                 Arc::new(Self::substitute(obj, map)),
                 Arc::new(Self::substitute(idx, map)),
             ),
-            Type::Keyof(inner) => Type::Keyof(Arc::new(Self::substitute(inner, map))),
+            Type::Keyof(inner) => {
+                let inner = Self::substitute(inner, map);
+                if matches!(
+                    inner,
+                    Type::Null | Type::Undefined | Type::Unknown | Type::Never
+                ) {
+                    type_ops::resolve_keyof(&inner)
+                } else {
+                    Type::Keyof(Arc::new(inner))
+                }
+            }
             Type::Optional(inner) => Type::Optional(Arc::new(Self::substitute(inner, map))),
             Type::Readonly(inner) => Type::Readonly(Arc::new(Self::substitute(inner, map))),
             Type::Rest(inner) => Type::Rest(Arc::new(Self::substitute(inner, map))),
@@ -42573,6 +43665,21 @@ impl TypeChecker {
             if let Some(choice) = self.common_supertype_candidate(&candidates) {
                 inferred.insert(name, choice);
             }
+        }
+        let unsolved: Vec<_> = type_params
+            .iter()
+            .filter(|name| !inferred.contains_key(*name))
+            .cloned()
+            .collect();
+        if !unsolved.is_empty() {
+            let mut sources = Vec::new();
+            let mut targets = Vec::new();
+            for (source, (name, target)) in call_arg_types.iter().zip(param_types) {
+                let (source, target) = self.prepare_inference_shapes(source, target, &unsolved, 0);
+                sources.push(source);
+                targets.push((name.clone(), target));
+            }
+            inferred.extend(Self::infer_type_arguments(&sources, &targets, &unsolved));
         }
         inferred
     }

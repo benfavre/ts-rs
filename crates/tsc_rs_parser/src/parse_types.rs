@@ -1202,8 +1202,8 @@ impl<'a> Parser<'a> {
         while !self.at(TokenKind::CloseBrace) && !self.is_eof() {
             let before = self.pos;
             members.push(self.parse_type_member(false));
-            if self.eat(TokenKind::Semicolon).is_none() {
-                self.eat(TokenKind::Comma);
+            if self.eat(TokenKind::Semicolon).is_none() && self.eat(TokenKind::Comma).is_none() {
+                self.report_missing_type_member_separator(before);
             }
             // Error recovery: if we didn't advance, skip the current token to avoid
             // an infinite loop.
@@ -1489,6 +1489,20 @@ impl<'a> Parser<'a> {
             if trailing_comma.is_none() {
                 break;
             }
+        }
+        // In a type, `<` always opens type arguments (no comparison to fall
+        // back to): a list cut off by EOF or an invalid character stays
+        // type arguments, with tsc's parseExpected('>') error (error_code
+        // drops it where the scanner already reported that position).
+        // Without it a cut-off `: Promise<Supe` passed as valid.
+        let cut_off = self.is_eof() || self.at(TokenKind::Unknown);
+        if in_type && cut_off && !self.at_greater_than() && self.speculation_depth == 0 {
+            self.error_code(1005, "'>' expected.".into());
+            self.type_arg_split_rollback_depth -= 1;
+            if self.type_arg_split_rollback_depth == 0 {
+                self.type_arg_split_rollback.truncate(split_mark);
+            }
+            return Some(args);
         }
         let close = self.eat_greater_than();
         if close.is_none() {

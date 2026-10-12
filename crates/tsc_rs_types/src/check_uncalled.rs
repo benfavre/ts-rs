@@ -873,6 +873,10 @@ impl TypeChecker {
         guarded_stmt: Option<&Stmt>,
     ) {
         if self.strict_null_checks {
+            if guarded_stmt.is_some() {
+                self.check_enum_if_operands(expr);
+            }
+            self.check_enum_known_condition(expr, None);
             self.uncalled_check_inner(expr, &[], guarded_expr, guarded_stmt, true);
         }
     }

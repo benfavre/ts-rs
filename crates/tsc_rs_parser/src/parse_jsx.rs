@@ -140,7 +140,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse type arguments (e.g. <MyComponent<string> />)
-        let type_args = if missing_name {
+        let type_args = if missing_name || self.is_js_file {
             None
         } else {
             self.try_parse_type_args()
@@ -167,6 +167,9 @@ impl<'a> Parser<'a> {
         // tag as self-closing.  Do not consume the next `<`: it may be the
         // ancestor's closing tag or a following sibling.
         if self.at(TokenKind::LessThan) {
+            if !missing_name {
+                self.error_code(1003, "Identifier expected.".into());
+            }
             return Expr {
                 kind: ExprKind::JsxSelfClosing(Box::new(JsxSelfClosingElement {
                     name: Box::new(name),
@@ -262,6 +265,21 @@ impl<'a> Parser<'a> {
             if self.is_eof() {
                 self.error_jsx_missing_closing_delimiter();
             }
+            // JSX text includes JavaScript-looking comments and trailing
+            // whitespace. At EOF its range can extend beyond the last token
+            // produced by the ordinary JavaScript scanner.
+            let span = if self.is_eof() {
+                let end = children
+                    .last()
+                    .map_or(opening_span.end, |child| match child {
+                        JsxChild::Text(_, span) | JsxChild::Expression(_, span) => span.end,
+                        JsxChild::Element(element) => element.span.end,
+                        JsxChild::Fragment(_) => self.span_from(start).end,
+                    });
+                Span::new(start, end)
+            } else {
+                self.span_from(start)
+            };
             return Expr {
                 kind: ExprKind::JsxElement(Box::new(JsxElement {
                     name: Box::new(name),
@@ -272,7 +290,7 @@ impl<'a> Parser<'a> {
                     children,
                     closing_tag_missing: true,
                 })),
-                span: self.span_from(start),
+                span,
             };
         }
 
@@ -994,6 +1012,17 @@ impl<'a> Parser<'a> {
                 }
                 text_end += 1;
             }
+            // A conflict marker terminates JSX scanning, including any text
+            // accumulated since the previous JSX token. Indented runs of `<`
+            // are ordinary malformed JSX instead of conflict trivia.
+            if self.source[text_end as usize..].starts_with("<<<<<<<")
+                && (text_end == 0 || matches!(src_bytes[text_end as usize - 1], b'\n' | b'\r'))
+                && src_bytes
+                    .get(text_end as usize + 7)
+                    .is_none_or(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            {
+                break;
+            }
             // Advance the token cursor past tokens that fall before text_end
             // (i.e. the JSX text region we just captured). The original scanner
             // may have produced normal tokens for the text body — we discard
@@ -1120,6 +1149,12 @@ impl<'a> Parser<'a> {
                     && !self.is_eof()
                     && self.cur_could_start_expr()
                 {
+                    // tsc reports the implied comma (parseDelimitedList's
+                    // parseExpected): without it `["a" "b"]` passed as valid
+                    // and its emit is a syntax error in V8.
+                    if self.speculation_depth == 0 {
+                        self.error_code(1005, "',' expected.".into());
+                    }
                     continue;
                 }
                 break;
@@ -1218,6 +1253,7 @@ impl<'a> Parser<'a> {
     pub(crate) fn parse_object_lit_element(&mut self) -> Option<ObjLitProp> {
         // Skip illegal access/class modifiers on object literal members.
         // TypeScript parses these (reports an error) and strips them on emit.
+        let mut has_illegal_modifier = false;
         while matches!(
             self.cur(),
             TokenKind::Public
@@ -1230,6 +1266,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::Export
         ) && self.peek_could_start_prop_name()
         {
+            has_illegal_modifier = true;
             self.bump();
         }
         // Start span AFTER any skipped modifiers so they are excluded.
@@ -1266,6 +1303,7 @@ impl<'a> Parser<'a> {
             let name = self
                 .parse_property_name()
                 .unwrap_or(PropName::Ident("<error>".into(), self.cur_span()));
+            self.check_object_computed_property_name(&name);
             let missing_param_list = self.at(TokenKind::Comma);
             let params = if missing_param_list {
                 Vec::new()
@@ -1317,6 +1355,7 @@ impl<'a> Parser<'a> {
             // Failed to parse property name.
             return None;
         };
+        self.check_object_computed_property_name(&name);
 
         // Definite-assignment markers are invalid in object literals, but the
         // following shorthand or method is still parsed normally.
@@ -1338,7 +1377,14 @@ impl<'a> Parser<'a> {
                 .get(self.pos + 1)
                 .is_some_and(|t| t.kind == TokenKind::OpenParen || t.kind == TokenKind::LessThan)
         {
-            self.bump(); // consume `?`
+            let span = self.bump();
+            if !has_illegal_modifier {
+                self.grammar_error_at_span(
+                    1162,
+                    "An object member cannot be declared optional.".into(),
+                    span,
+                );
+            }
         }
 
         // Method shorthand: { name() {} }
@@ -1404,7 +1450,12 @@ impl<'a> Parser<'a> {
                 .get(self.pos + 1)
                 .is_some_and(|t| t.kind == TokenKind::Colon)
         {
-            self.bump(); // consume `?`
+            let span = self.bump();
+            self.grammar_error_at_span(
+                1162,
+                "An object member cannot be declared optional.".into(),
+                span,
+            );
             true
         } else {
             false
@@ -1417,7 +1468,12 @@ impl<'a> Parser<'a> {
             // Record span before eating `?` so the span doesn't include it.
             let span_before_question = self.span_from(start);
             if !question_token && self.at(TokenKind::Question) {
-                self.bump(); // consume `?`
+                let span = self.bump();
+                self.grammar_error_at_span(
+                    1162,
+                    "An object member cannot be declared optional.".into(),
+                    span,
+                );
             }
             if let PropName::Ident(ref n, _) = name {
                 return Some(ObjLitProp::Shorthand(n.clone(), span_before_question));
@@ -1447,6 +1503,79 @@ impl<'a> Parser<'a> {
             question_token,
             span: self.span_from(start),
         }))
+    }
+
+    fn check_object_computed_property_name(&mut self, name: &PropName) {
+        if let PropName::Computed(expression, _) = name {
+            if matches!(expression.kind, ExprKind::Comma(_)) {
+                self.grammar_error_at_span(
+                    1171,
+                    "A comma expression is not allowed in a computed property name.".into(),
+                    expression.span,
+                );
+            }
+        }
+    }
+
+    // An object literal parsed on the left of `=`/`in`/`of` becomes an
+    // assignment pattern. Its member grammar differs from a value literal;
+    // computed keys and default initializers remain value expressions.
+    pub(crate) fn suppress_object_pattern_grammar(&mut self, expression: &Expr) {
+        if !self
+            .diagnostics
+            .iter()
+            .any(|error| matches!(error.code, 1162 | 1171))
+        {
+            return;
+        }
+        match &expression.kind {
+            ExprKind::ObjectLit(properties) => {
+                for property in properties {
+                    match property {
+                        ObjLitProp::Property(property) => {
+                            if let PropName::Computed(expression, _) = &property.key {
+                                self.diagnostics.retain(|error| {
+                                    error.code != 1171 || error.span != Some(expression.span)
+                                });
+                            }
+                            self.suppress_object_pattern_question(property.key.span().end);
+                            self.suppress_object_pattern_grammar(&property.value);
+                        }
+                        ObjLitProp::Shorthand(_, span) => {
+                            self.suppress_object_pattern_question(span.end);
+                        }
+                        ObjLitProp::Spread(target, _) => {
+                            self.suppress_object_pattern_grammar(target);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ExprKind::ArrayLit(elements) => {
+                for element in elements.iter().flatten() {
+                    self.suppress_object_pattern_grammar(element);
+                }
+            }
+            ExprKind::Assign(assignment) if assignment.op == AssignOp::Assign => {
+                self.suppress_object_pattern_grammar(&assignment.left);
+            }
+            _ => {}
+        }
+    }
+
+    fn suppress_object_pattern_question(&mut self, name_end: u32) {
+        let index = self
+            .tokens
+            .partition_point(|token| token.span.start < name_end);
+        if let Some(token) = self
+            .tokens
+            .get(index)
+            .filter(|token| token.kind == TokenKind::Question)
+        {
+            let span = token.span;
+            self.diagnostics
+                .retain(|error| error.code != 1162 || error.span != Some(span));
+        }
     }
 
     pub(crate) fn parse_function_expr(&mut self, start: u32) -> Expr {
@@ -1717,6 +1846,7 @@ impl<'a> Parser<'a> {
         while !self.at(TokenKind::CloseParen) && !self.is_eof() {
             // Skip omitted arguments: `foo(a,,b)` → skip the empty slot
             if self.at(TokenKind::Comma) {
+                self.error_code(1135, "Argument expression expected.".into());
                 let sp = self.cur_span();
                 args.push(Box::new(Expr {
                     kind: ExprKind::Omitted,
@@ -1736,6 +1866,7 @@ impl<'a> Parser<'a> {
                 self.cur(),
                 TokenKind::Return | TokenKind::Break | TokenKind::Continue | TokenKind::Throw
             ) {
+                self.error_code(1135, "Argument expression expected.".into());
                 break;
             }
             args.push(Box::new(self.parse_assignment_expr()));
@@ -1756,6 +1887,12 @@ impl<'a> Parser<'a> {
             // malformed calls like `foo(public blaz() {})`.
             if !self.can_start_argument_expression() {
                 break;
+            }
+            // tsc reports the missing comma (parseDelimitedList's
+            // parseExpected): without it `f(0 1)` passed as valid and its
+            // emit is a syntax error in V8.
+            if self.speculation_depth == 0 {
+                self.error_code(1005, "',' expected.".into());
             }
         }
         self.expect(TokenKind::CloseParen);

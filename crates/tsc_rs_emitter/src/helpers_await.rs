@@ -55,7 +55,7 @@ impl<'a> Emitter<'a> {
     }
 
     fn collect_async_shadow_param_names(params: &[Param]) -> HashSet<AstString> {
-        let mut names = HashSet::new();
+        let mut names = HashSet::default();
         for param in params {
             let mut bound = Vec::new();
             collect_binding_names(&param.name, &mut bound);
@@ -310,7 +310,7 @@ impl<'a> Emitter<'a> {
     ) -> Vec<AstString> {
         let mut blockers = Vec::new();
         let mut ordered = Vec::new();
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         for stmt in stmts {
             Self::collect_async_var_shadow_hoists_in_stmt(
                 stmt,
@@ -2408,6 +2408,9 @@ impl<'a> Emitter<'a> {
     }
 
     pub(crate) fn is_dynamic_import_call(&self, call: &CallExpr) -> bool {
+        if !self.source_may_have_dynamic_import {
+            return false;
+        }
         if call.optional || call.args.len() > 2 {
             return false;
         }
@@ -3929,6 +3932,9 @@ impl<'a> Emitter<'a> {
     }
 
     pub(crate) fn expr_has_dynamic_import_call(&self, expr: &Expr) -> bool {
+        if !self.source_may_have_dynamic_import {
+            return false;
+        }
         let mut stack = vec![expr];
         while let Some(expr) = stack.pop() {
             match &expr.kind {
@@ -4091,6 +4097,9 @@ impl<'a> Emitter<'a> {
     }
 
     pub(crate) fn stmt_has_dynamic_import_call(&self, stmt: &Stmt) -> bool {
+        if !self.source_may_have_dynamic_import {
+            return false;
+        }
         match &stmt.kind {
             StmtKind::Expr(e) | StmtKind::Throw(e) | StmtKind::ExportAssign(e) => {
                 self.expr_has_dynamic_import_call(e)
@@ -4543,7 +4552,7 @@ impl<'a> Emitter<'a> {
         let mut has_write = false;
         Self::scan_super_in_stmts(stmts, &mut names, &mut has_element, &mut has_write);
         // Deduplicate while preserving order.
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         names.retain(|n| seen.insert(n.clone()));
         (names, has_element, has_write)
     }
@@ -4553,7 +4562,7 @@ impl<'a> Emitter<'a> {
         let mut has_element = false;
         let mut has_write = false;
         Self::scan_super_in_expr(expr, &mut names, &mut has_element, &mut has_write);
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         names.retain(|n| seen.insert(n.clone()));
         (names, has_element, has_write)
     }

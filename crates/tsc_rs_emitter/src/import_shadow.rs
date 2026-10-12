@@ -55,7 +55,7 @@ impl ImportShadows {
     }
 
     pub(crate) fn collect(stmts: &[Stmt]) -> Self {
-        let mut names: HashSet<AstString> = HashSet::new();
+        let mut names: HashSet<AstString> = HashSet::default();
         for stmt in stmts {
             match &stmt.kind {
                 StmtKind::Import(decl) => match &decl.specifiers {

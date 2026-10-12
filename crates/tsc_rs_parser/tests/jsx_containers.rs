@@ -1,6 +1,80 @@
 use tsc_rs_ast::{ExprKind, JsxAttribute, JsxChild, StmtKind};
 
 #[test]
+fn javascript_jsx_rejects_type_arguments_and_recovers_adjacent_elements() {
+    let source = "let x = <Component<Shape> a={10} />; // still JSX text\n";
+    let file = tsc_rs_parser::parse("component.jsx", source);
+    let mut errors: Vec<_> = file
+        .diagnostics
+        .iter()
+        .map(|error| {
+            let span = error.span.unwrap();
+            (span.start, error.code)
+        })
+        .collect();
+    errors.sort_unstable();
+    assert_eq!(
+        errors,
+        [
+            (8, 2657),
+            (18, 1003),
+            (19, 17008),
+            (34, 1382),
+            (source.len() as u32, 1005)
+        ],
+        "{:?}",
+        file.diagnostics
+    );
+    assert_eq!(
+        file.diagnostics
+            .iter()
+            .find(|error| error.code == 2657)
+            .unwrap()
+            .span
+            .unwrap()
+            .end,
+        source.len() as u32
+    );
+
+    let file = tsc_rs_parser::parse("component.tsx", source);
+    assert!(file.diagnostics.is_empty(), "{:?}", file.diagnostics);
+    let StmtKind::Var(variable) = &file.statements[0].kind else {
+        panic!("expected variable declaration")
+    };
+    let ExprKind::JsxSelfClosing(element) = &variable.declarations[0].init.as_ref().unwrap().kind
+    else {
+        panic!("expected JSX element")
+    };
+    assert_eq!(element.type_args.as_ref().unwrap().len(), 1);
+    assert_eq!(element.attributes.len(), 1);
+}
+
+#[test]
+fn adjacent_jsx_roots_report_one_diagnostic_per_sequence() {
+    for (source, spans) in [
+        ("<A/><B/>;", vec![(0, 8)]),
+        ("<A/><B/><C/>;", vec![(0, 12)]),
+        ("(<A/>, <B/>);", vec![]),
+        ("<A/><B/> + <C/>;", vec![(0, 8)]),
+        ("<A/><B/><C/> + <D/><E/>;", vec![(0, 12), (15, 23)]),
+    ] {
+        for name in ["component.jsx", "component.tsx"] {
+            let file = tsc_rs_parser::parse(name, source);
+            let actual: Vec<_> = file
+                .diagnostics
+                .iter()
+                .map(|error| {
+                    assert_eq!(error.code, 2657, "{source}: {error:?}");
+                    let span = error.span.unwrap();
+                    (span.start, span.end)
+                })
+                .collect();
+            assert_eq!(actual, spans, "{source} ({name})");
+        }
+    }
+}
+
+#[test]
 fn jsx_containers_parse_complete_comma_expressions() {
     let source = "<div value={a, b} {...a, b}>{a, b}</div>; after;";
     let file = tsc_rs_parser::parse("containers.tsx", source);

@@ -4,11 +4,11 @@
 //! and verify the output matches expected patterns.
 
 use std::{
-    collections::{HashMap, HashSet},
     io::Write,
     path::PathBuf,
     process::{Command, Output, Stdio},
 };
+use tsc_rs_emitter::{HashMap, HashSet};
 
 use tsc_rs_ast::*;
 use tsc_rs_emitter::{
@@ -713,7 +713,7 @@ fn es5_exported_empty_binding_rejects_external_const_enum_nul_sentinel() {
         "export const {} = {};\n",
         "console.log(JSON.stringify(Enum.Value));",
     );
-    let values = HashMap::from([(
+    let values = HashMap::from_iter([(
         ("Enum".to_string(), "Value".to_string()),
         ConstEnumValue::String("\0__tsrs_deferred_export_name_0__\0".to_string()),
     )]);
@@ -782,7 +782,7 @@ fn es5_exported_empty_binding_rejects_external_file_string_const_nul_sentinel() 
         "export const {} = {};\n",
         "console.log(JSON.stringify(E.Value));",
     );
-    let external_strings = HashMap::from([(
+    let external_strings = HashMap::from_iter([(
         "Imported".to_string(),
         "\0__tsrs_deferred_export_name_0__\0".to_string(),
     )]);
@@ -829,13 +829,13 @@ fn es5_exported_empty_binding_rejects_external_file_string_const_nul_sentinel() 
         let javascript = emit_with_cross_file_consts(
             &file,
             &options,
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashMap::new(),
+            &HashMap::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashMap::default(),
             &external_strings,
-            &HashMap::new(),
-            &HashMap::new(),
+            &HashMap::default(),
+            &HashMap::default(),
         )
         .javascript;
         assert_eq!(javascript, expected, "module={module:?}");
@@ -854,13 +854,13 @@ fn es5_exported_empty_binding_rejects_external_file_string_const_nul_sentinel() 
                 source_map: Some(true),
                 ..options
             },
-            &HashMap::new(),
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashMap::new(),
+            &HashMap::default(),
+            &HashSet::default(),
+            &HashSet::default(),
+            &HashMap::default(),
             &external_strings,
-            &HashMap::new(),
-            &HashMap::new(),
+            &HashMap::default(),
+            &HashMap::default(),
         );
         let mappings =
             decoded_source_map_positions(emitted.source_map.as_deref().expect("source map output"));
@@ -5629,8 +5629,8 @@ fn test_reexport_from_source_ignores_unrelated_global_type_only_name_collision()
             ..Default::default()
         },
         &Default::default(),
-        &HashSet::from([AstString::from("foo")]),
-        &HashSet::new(),
+        &HashSet::from_iter([AstString::from("foo")]),
+        &HashSet::default(),
     )
     .javascript;
     assert_eq!(
@@ -6142,7 +6142,7 @@ fn test_cjs_named_export_of_imported_const_enum_namespace_merge_keeps_predecl_st
             module: Some(ModuleKind::CommonJS),
             ..Default::default()
         },
-        &HashMap::from([(
+        &HashMap::from_iter([(
             ("Enum".to_string(), "One".to_string()),
             ConstEnumValue::Number(1.0),
         )]),
@@ -6195,7 +6195,7 @@ fn test_cjs_imported_const_enum_member_access_still_elides_plain_import() {
             module: Some(ModuleKind::CommonJS),
             ..Default::default()
         },
-        &HashMap::from([(
+        &HashMap::from_iter([(
             ("Enum".to_string(), "One".to_string()),
             ConstEnumValue::Number(1.0),
         )]),
@@ -6238,7 +6238,7 @@ fn test_cjs_imported_const_enum_from_runtime_export_source_keeps_require() {
             )],
             ..Default::default()
         },
-        &HashMap::from([(
+        &HashMap::from_iter([(
             ("Enum".to_string(), "One".to_string()),
             ConstEnumValue::Number(1.0),
         )]),
@@ -7015,6 +7015,34 @@ fn test_js_file_jsx_type_args_recover_as_comma_and_fragment() {
         js.contains("</>;"),
         "JS-file self-closing JSX type-arg recovery should emit trailing fragment close: {js}"
     );
+}
+
+#[test]
+fn test_unclosed_jsx_preserves_literal_children_and_newlines() {
+    for (source, expected) in [
+        ("<div>text\n", "<div>text\n</>;\n"),
+        ("<div>text", "<div>text</>;\n"),
+        ("<div>\n", "<div>\n</>;\n"),
+        ("<A/><B>text\n", "<A />, <B>text\n</>;\n"),
+        ("const x = <div>\n<<<<<<< HEAD\n", "const x = <div></>;\n"),
+        (
+            "let x = <MyComp<Prop> a={10} b=\"hi\" />; // error\n",
+            "let x = <MyComp />, <Prop> a={10} b=\"hi\" />; // error\n</>;\n",
+        ),
+        ("<Foo<number>/>;\n", "<Foo />, <number>/>;\n</>;\n"),
+    ] {
+        let js = emit_ts_file_with(
+            "file.jsx",
+            source,
+            CompilerOptions {
+                jsx: Some(JsxEmit::Preserve),
+                target: Some(ScriptTarget::ES2015),
+                always_strict: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(js, format!("\"use strict\";\n{expected}"), "{source}");
+    }
 }
 
 #[test]
@@ -8231,9 +8259,9 @@ fn test_cjs_reexport_from_type_only_source_skips_predecl() {
             module: Some(ModuleKind::CommonJS),
             ..Default::default()
         },
-        &HashMap::new(),
-        &HashSet::new(),
-        &HashSet::from([AstString::from("B")]),
+        &HashMap::default(),
+        &HashSet::default(),
+        &HashSet::from_iter([AstString::from("B")]),
     );
     assert!(
         !out.javascript.contains("exports.C = void 0;"),
@@ -8255,9 +8283,9 @@ fn test_cjs_import_from_type_only_export_is_elided() {
             target: Some(ScriptTarget::ES2015),
             ..Default::default()
         },
-        &HashMap::new(),
-        &HashSet::new(),
-        &HashSet::from([AstString::from("D")]),
+        &HashMap::default(),
+        &HashSet::default(),
+        &HashSet::from_iter([AstString::from("D")]),
     );
     assert!(
         !out.javascript.contains("require(\"./c\")"),

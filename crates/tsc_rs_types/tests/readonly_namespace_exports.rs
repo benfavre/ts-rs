@@ -483,6 +483,11 @@ Alias[dynamic].Deeper.value = 1;
                 "Cannot assign to 'value' because it is a read-only property.",
                 "\"value\"",
             ),
+            (
+                2339,
+                "Property 'Missing' does not exist on type 'typeof Inner'.",
+                "Missing",
+            ),
         ],
         "diagnostics: {diagnostics:?}"
     );

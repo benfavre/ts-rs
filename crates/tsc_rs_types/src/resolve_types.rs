@@ -109,6 +109,67 @@ impl TypeChecker {
         table.entry(ty.clone()).or_insert(locations);
     }
 
+    /// `keyof operand`. An object type whose member names are all known
+    /// (written properties only: no index signature, no signatures, no
+    /// computed, numeric or spread member) has the union of those names as
+    /// its keys — `keyof typeof CODES` for a declared object const is a
+    /// string-literal union, as tsc resolves it. Anything else
+    /// stays an unevaluated `keyof`.
+    fn keyof_of(operand: Type) -> Type {
+        if matches!(
+            operand,
+            Type::Null | Type::Undefined | Type::Unknown | Type::Never
+        ) {
+            return type_ops::resolve_keyof(&operand);
+        }
+        if let Type::ObjectType(info) = &operand {
+            let known = info.index_signature.is_none()
+                && info.call_signatures.is_empty()
+                && info.construct_signatures.is_empty()
+                && !info.properties.is_empty()
+                && info.properties.iter().all(|(name, _)| {
+                    let name = name.trim_start_matches('?');
+                    !name.is_empty()
+                        && !name.starts_with('[')
+                        && !name.starts_with("...")
+                        && !name.starts_with("__@")
+                        && name.parse::<f64>().is_err()
+                });
+            if known {
+                return Type::flatten_union(
+                    info.properties
+                        .iter()
+                        .map(|(name, _)| {
+                            Type::StringLiteral(name.trim_start_matches('?').to_string())
+                        })
+                        .collect(),
+                );
+            }
+        }
+        Type::Keyof(Arc::new(operand))
+    }
+
+    /// `keyof <operand>` written in a type. A `keyof typeof X` read while a
+    /// file's declarations are injected is evaluated only through the file's
+    /// own annotated `X` (`injection_typeof_bindings`): the scope lookup
+    /// there may find another file's same-named value.
+    fn resolve_keyof_type_node(&self, operand: &TypeNode) -> Type {
+        let resolved = self.resolve_type_node(operand);
+        let untrusted_typeof = match &operand.kind {
+            TypeNodeKind::TypeQuery(expr) => {
+                self.injected_decl_file.is_some()
+                    && !matches!(&expr.kind, ExprKind::Ident(name)
+                        if self.injection_typeof_bindings.contains_key(name.as_str()))
+            }
+            _ => false,
+        };
+        if untrusted_typeof {
+            Type::Keyof(Arc::new(resolved))
+        } else {
+            Self::keyof_of(resolved)
+        }
+    }
+
     pub(crate) fn resolve_type_node(&self, node: &TypeNode) -> Type {
         if !self.enter_recursion() {
             return Type::Any;
@@ -192,6 +253,17 @@ impl TypeChecker {
                 if let Some(t) = self.try_resolve_imported_duplicate_type(&name) {
                     return t;
                 }
+                let root = name.split('.').next().unwrap_or(&name);
+                if !self.local_type_only_names.contains(root)
+                    && !self.local_value_names.contains(root)
+                    && !self.file_import_binding_names.contains(root)
+                    && !self.type_param_name_is_active(root)
+                {
+                    if let Some(target) = self.global_import_type_targets.get(&name) {
+                        let args = self.defaulted_alias_arguments(&name, &args).unwrap_or(args);
+                        return Type::TypeReference(target.clone(), args);
+                    }
+                }
                 Type::TypeReference(name, args)
             }
             TypeNodeKind::Array(inner) => Type::Array(Arc::new(self.resolve_type_node(inner))),
@@ -217,7 +289,7 @@ impl TypeChecker {
             }
             TypeNodeKind::Intersection(types) => {
                 let resolved = types.iter().map(|t| self.resolve_type_node(t)).collect();
-                Type::Intersection(resolved)
+                self.reduce_nullish_intersection(resolved)
             }
             TypeNodeKind::Function(fn_type) => {
                 let _own_type_params =
@@ -402,11 +474,13 @@ impl TypeChecker {
                             // never inferred NewI and returned an
                             // unsubstituted reference.
                             let ft = FunctionType {
-                                type_param_constraints: Vec::new(),
+                                type_param_constraints: self
+                                    .resolve_type_param_constraints(method.type_params.as_deref()),
                                 params: params.clone(),
                                 return_type: Arc::new(ret.clone()),
                                 type_params,
-                                type_param_defaults: Vec::new(),
+                                type_param_defaults: self
+                                    .resolve_type_param_defaults(method.type_params.as_deref()),
                                 type_predicate: None,
                             };
                             self.exit_type_resolution_type_params();
@@ -422,6 +496,8 @@ impl TypeChecker {
                             props.push((name, Arc::new(method_ty)));
                         }
                         TypeMemberKind::CallSig(cs) => {
+                            let _own_type_params =
+                                crate::type_params_in_resolution(cs.type_params.as_deref());
                             let type_params: Vec<_> = cs
                                 .type_params
                                 .as_ref()
@@ -459,11 +535,13 @@ impl TypeChecker {
                                 .map(|t| self.resolve_type_node(t))
                                 .unwrap_or(Type::Any);
                             let function = FunctionType {
-                                type_param_constraints: Vec::new(),
+                                type_param_constraints: self
+                                    .resolve_type_param_constraints(cs.type_params.as_deref()),
                                 params,
                                 return_type: Arc::new(ret),
                                 type_params,
-                                type_param_defaults: Vec::new(),
+                                type_param_defaults: self
+                                    .resolve_type_param_defaults(cs.type_params.as_deref()),
                                 type_predicate: None,
                             };
                             self.exit_type_resolution_type_params();
@@ -559,6 +637,32 @@ impl TypeChecker {
                                         index_sig_name = Some(name.to_string());
                                     }
                                 }
+                            }
+                        }
+                        // `get x(): T` declares a property `x: T`; a lone
+                        // `set x(v: T)` declares it by its parameter type.
+                        TypeMemberKind::GetAccessorSig(accessor) => {
+                            let name = self.prop_name_to_string(&accessor.name);
+                            let ty = accessor
+                                .return_type
+                                .as_ref()
+                                .map(|t| self.resolve_type_node(t))
+                                .unwrap_or(Type::Any);
+                            match props.iter_mut().find(|(existing, _)| *existing == name) {
+                                Some(slot) => slot.1 = Arc::new(ty),
+                                None => props.push((name, Arc::new(ty))),
+                            }
+                        }
+                        TypeMemberKind::SetAccessorSig(accessor) => {
+                            let name = self.prop_name_to_string(&accessor.name);
+                            if !props.iter().any(|(existing, _)| *existing == name) {
+                                let ty = accessor
+                                    .params
+                                    .first()
+                                    .and_then(|parameter| parameter.type_ann.as_ref())
+                                    .map(|t| self.resolve_type_node(t))
+                                    .unwrap_or(Type::Any);
+                                props.push((name, Arc::new(ty)));
                             }
                         }
                         _ => {}
@@ -675,7 +779,7 @@ impl TypeChecker {
                     simplified
                 }
             }
-            TypeNodeKind::Keyof(inner) => Type::Keyof(Arc::new(self.resolve_type_node(inner))),
+            TypeNodeKind::Keyof(inner) => self.resolve_keyof_type_node(inner),
             TypeNodeKind::TypeQuery(expr) => {
                 let mut name = self.expr_to_name(expr);
                 // Mirror the ordinary type-reference rewrite above for
@@ -710,6 +814,11 @@ impl TypeChecker {
                 // `typeof c` for display (their anonymous object types).
                 let function_declaration = self.function_param_spans.contains_key(&name)
                     || self.overloads.contains_key(&name);
+                if matches!(expr.kind, ExprKind::Ident(_)) {
+                    if let Some(declared) = self.injection_typeof_bindings.get(&name) {
+                        return declared.clone();
+                    }
+                }
                 if matches!(expr.kind, ExprKind::Ident(_)) && !self.namespace_paths.contains(&name)
                 {
                     if let Some(resolved) = self.lookup_var(&name).filter(|resolved| {
@@ -774,7 +883,7 @@ impl TypeChecker {
                 }
             }
             TypeNodeKind::TypeOperator(op, inner) => match op {
-                TypeOperatorKind::Keyof => Type::Keyof(Arc::new(self.resolve_type_node(inner))),
+                TypeOperatorKind::Keyof => self.resolve_keyof_type_node(inner),
                 TypeOperatorKind::Unique => self.resolve_type_node(inner),
                 TypeOperatorKind::Readonly => self.resolve_type_node(inner),
             },
@@ -2197,6 +2306,10 @@ impl TypeChecker {
                 .or_else(|| self.lookup_var(name).cloned())
                 .unwrap_or(Type::Any),
             ExprKind::FnExpr(fn_decl) => Type::Function(self.resolve_fn_type(fn_decl)),
+            ExprKind::ClassExpr(_) => Type::TypeReference(
+                format!("typeof __class_expression_{}", expr.span.start),
+                Arc::from([]),
+            ),
             ExprKind::Arrow(arrow) => {
                 let params = arrow
                     .params

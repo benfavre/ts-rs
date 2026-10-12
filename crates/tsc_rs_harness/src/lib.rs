@@ -10,13 +10,15 @@
 //!    internal emit stub), and compares the generated JavaScript against
 //!    stored baselines in `tests/baselines/reference/`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
+// The emitter API takes FxHash maps; the harness feeds it directly.
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
+use tsc_rs_emitter::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use tsc_rs_ast::{
@@ -325,8 +327,8 @@ impl StrictBaselineIndex {
                 baseline_dir.display()
             )
         })?;
-        let mut files_by_name = HashSet::new();
-        let mut parameterized: HashMap<(String, &'static str), Vec<PathBuf>> = HashMap::new();
+        let mut files_by_name = HashSet::default();
+        let mut parameterized: HashMap<(String, &'static str), Vec<PathBuf>> = HashMap::default();
 
         for entry in entries {
             let entry = entry.map_err(|error| {
@@ -1509,7 +1511,7 @@ impl BaselineRunner {
                     .compile();
 
             let mut emitted_files = Vec::new();
-            let mut emitted_seen = HashSet::new();
+            let mut emitted_seen = HashSet::default();
             // tsc names an output written beside its source after the
             // source's own name (a root's spelling).
             let display_name = |full: &str, beside_source: bool| -> Option<String> {
@@ -1930,7 +1932,7 @@ impl BaselineRunner {
             let full = normalize_header_path(&file.full_path);
             !Path::new(&full).is_absolute() || strip_prefix_path(&full, &workspace).is_some()
         });
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         files.retain(|file| seen.insert(file.full_path.clone()));
         Ok(files)
     }
@@ -2031,7 +2033,7 @@ impl BaselineRunner {
             });
         if compile_indices.len() > 1 && !preserve_duplicate_rewrite_units {
             let mut deduped = Vec::with_capacity(compile_indices.len());
-            let mut pos_by_name: HashMap<String, usize> = HashMap::new();
+            let mut pos_by_name: HashMap<String, usize> = HashMap::default();
             for idx in compile_indices {
                 let normalized = normalize_header_path(&test_case.files[idx].name);
                 if let Some(pos) = pos_by_name.get(&normalized).copied() {
@@ -2046,7 +2048,7 @@ impl BaselineRunner {
             }
             compile_indices = deduped;
         }
-        let mut parsed_sources = HashMap::new();
+        let mut parsed_sources = HashMap::default();
         let jsx_option_set = effective_options.jsx.is_some();
         for idx in &compile_indices {
             let file = &test_case.files[*idx];
@@ -2076,7 +2078,7 @@ impl BaselineRunner {
         } else {
             compile_indices
         };
-        let mut path_to_idx = HashMap::new();
+        let mut path_to_idx = HashMap::default();
         for (idx, file) in test_case.files.iter().enumerate() {
             let normalized = normalize_header_path(&file.name);
             path_to_idx.insert(normalized.clone(), idx);
@@ -2096,7 +2098,8 @@ impl BaselineRunner {
                 path_to_idx.entry(alias).or_insert(idx);
             }
         }
-        let mut extra_const_enum_sources: HashMap<usize, tsc_rs_ast::SourceFile> = HashMap::new();
+        let mut extra_const_enum_sources: HashMap<usize, tsc_rs_ast::SourceFile> =
+            HashMap::default();
         let mut const_enum_analysis_indices: Vec<usize> = parsed_sources.keys().copied().collect();
         const_enum_analysis_indices.sort_unstable();
         for (idx, file) in test_case.files.iter().enumerate() {
@@ -2128,7 +2131,7 @@ impl BaselineRunner {
         let mut const_enum_values_by_file: HashMap<
             usize,
             HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
-        > = HashMap::new();
+        > = HashMap::default();
         for idx in &const_enum_analysis_indices {
             let source_file = if let Some(sf) = parsed_sources.get(idx) {
                 sf
@@ -2368,11 +2371,11 @@ impl BaselineRunner {
             }
         }
         // Collect exported const values from all files for cross-file enum eval.
-        let mut exported_consts_by_file: HashMap<usize, ConstValueMaps> = HashMap::new();
+        let mut exported_consts_by_file: HashMap<usize, ConstValueMaps> = HashMap::default();
         // Collect all script-global const-like values (top-level const vars and
         // enum member constants) so non-module files can fold references coming
         // from other script files in the same compilation.
-        let mut script_global_consts_by_file: HashMap<usize, ConstValueMaps> = HashMap::new();
+        let mut script_global_consts_by_file: HashMap<usize, ConstValueMaps> = HashMap::default();
         for idx in &const_enum_analysis_indices {
             let source_file = if let Some(sf) = parsed_sources.get(idx) {
                 sf
@@ -2411,9 +2414,9 @@ impl BaselineRunner {
             || out_file_name.is_some()
             || preserve_duplicate_rewrite_units
         {
-            HashSet::new()
+            HashSet::default()
         } else {
-            let mut counts: HashMap<String, usize> = HashMap::new();
+            let mut counts: HashMap<String, usize> = HashMap::default();
             for idx in &emit_order {
                 let file = &test_case.files[*idx];
                 let name = &file.name;
@@ -2537,9 +2540,9 @@ impl BaselineRunner {
         // globally unique across all define()/System.register() blocks in the
         // concatenated output.  Thread the counter maps between emit calls.
         let is_out_file = out_file_name.is_some();
-        let mut shared_require_var_counters: HashMap<AstString, usize> = HashMap::new();
+        let mut shared_require_var_counters: HashMap<AstString, usize> = HashMap::default();
         let mut shared_system_register_counter: usize = 1;
-        let mut prior_script_value_names: HashSet<String> = HashSet::new();
+        let mut prior_script_value_names: HashSet<String> = HashSet::default();
         let preserve_const_for_runtime_names =
             effective_options.preserve_const_enums.unwrap_or(false);
 
@@ -2554,9 +2557,9 @@ impl BaselineRunner {
         // Collect type-only names from ALL files in the compilation so the
         // emitter can suppress spurious `exports.X = void 0;` for names that
         // are type-only in another file (e.g. a global interface from .d.ts).
-        let global_type_only_names: std::collections::HashSet<AstString> = {
+        let global_type_only_names: HashSet<AstString> = {
             let preserve_const = effective_options.preserve_const_enums.unwrap_or(false);
-            let mut names = std::collections::HashSet::new();
+            let mut names = HashSet::default();
             // Include type-only names from compilable sources.
             for sf in parsed_sources.values() {
                 let file_names = tsc_rs_emitter::collect_type_only_names(sf, preserve_const);
@@ -2642,14 +2645,14 @@ impl BaselineRunner {
         // Per-file maps for precise import elision: when the same name is type-only
         // from one module but value-exported from another, we need per-source info.
         let mut per_idx_type_only_exports: HashMap<usize, HashSet<AstString>> = {
-            let mut map = HashMap::new();
+            let mut map = HashMap::default();
             for (idx, sf) in &parsed_sources {
                 map.insert(*idx, tsc_rs_emitter::collect_type_only_export_names(sf));
             }
             map
         };
         let mut per_idx_value_exports: HashMap<usize, HashSet<AstString>> = {
-            let mut map = HashMap::new();
+            let mut map = HashMap::default();
             for (idx, sf) in &parsed_sources {
                 map.insert(*idx, tsc_rs_emitter::collect_value_export_names(sf));
             }
@@ -2793,7 +2796,7 @@ impl BaselineRunner {
                         })
                         .collect();
                     let mut imported_const_enum_namespace_merges: HashSet<AstString> =
-                        HashSet::new();
+                        HashSet::default();
                     for stmt in &sf.statements {
                         let StmtKind::Import(import_decl) = &stmt.kind else {
                             continue;
@@ -3013,15 +3016,14 @@ impl BaselineRunner {
                 }
             }
         }
-        let global_type_only_export_names: std::collections::HashSet<AstString> =
-            per_idx_type_only_exports
-                .values()
-                .flat_map(|names| names.iter().cloned())
-                .collect();
+        let global_type_only_export_names: HashSet<AstString> = per_idx_type_only_exports
+            .values()
+            .flat_map(|names| names.iter().cloned())
+            .collect();
         let mut script_global_namespace_exports: HashMap<AstString, HashSet<AstString>> =
-            HashMap::new();
+            HashMap::default();
         let mut script_global_namespace_type_exports: HashMap<AstString, HashSet<AstString>> =
-            HashMap::new();
+            HashMap::default();
         for idx in &compile_indices {
             let Some(sf) = parsed_sources.get(idx) else {
                 continue;
@@ -3037,8 +3039,8 @@ impl BaselineRunner {
         }
         let type_only_external_modules: HashSet<String> = {
             let preserve_const = effective_options.preserve_const_enums.unwrap_or(false);
-            let mut type_only = HashSet::new();
-            let mut has_runtime = HashSet::new();
+            let mut type_only = HashSet::default();
+            let mut has_runtime = HashSet::default();
             for sf in parsed_sources.values() {
                 let (to, hr) = collect_external_module_spec_info(sf, preserve_const);
                 type_only.extend(to);
@@ -3137,7 +3139,7 @@ impl BaselineRunner {
                     specs.join("\n"),
                 ));
             }
-            let mut type_only_require_specs: HashSet<String> = HashSet::new();
+            let mut type_only_require_specs: HashSet<String> = HashSet::default();
             for stmt in &source_file.statements {
                 let require_spec = match &stmt.kind {
                     tsc_rs_ast::StmtKind::Import(import_decl) => {
@@ -3334,7 +3336,7 @@ impl BaselineRunner {
             let mut imported_const_enum_values: HashMap<
                 (String, String),
                 tsc_rs_emitter::ConstEnumValue,
-            > = HashMap::new();
+            > = HashMap::default();
             if !isolated_modules {
                 for stmt in &source_file.statements {
                     let import_decl = match &stmt.kind {
@@ -3477,8 +3479,8 @@ impl BaselineRunner {
                 }
             }
             // Resolve cross-file const values from imports for enum evaluation.
-            let mut ext_num_consts: HashMap<String, f64> = HashMap::new();
-            let mut ext_str_consts: HashMap<String, String> = HashMap::new();
+            let mut ext_num_consts: HashMap<String, f64> = HashMap::default();
+            let mut ext_str_consts: HashMap<String, String> = HashMap::default();
             for stmt in &source_file.statements {
                 let import_decl: Option<&tsc_rs_ast::ImportDecl> = match &stmt.kind {
                     tsc_rs_ast::StmtKind::Import(id) => Some(id),
@@ -3554,8 +3556,8 @@ impl BaselineRunner {
                 }
             }
             let has_ext_consts = !ext_num_consts.is_empty() || !ext_str_consts.is_empty();
-            let empty_ns_exports: HashMap<AstString, HashSet<AstString>> = HashMap::new();
-            let empty_ns_type_exports: HashMap<AstString, HashSet<AstString>> = HashMap::new();
+            let empty_ns_exports: HashMap<AstString, HashSet<AstString>> = HashMap::default();
+            let empty_ns_type_exports: HashMap<AstString, HashSet<AstString>> = HashMap::default();
             let (cross_file_ns_exports, cross_file_ns_type_exports) =
                 if source_file_looks_like_module(source_file) {
                     (&empty_ns_exports, &empty_ns_type_exports)
@@ -3669,7 +3671,7 @@ impl BaselineRunner {
                 names
             };
             let resolved_type_only_import_locals: HashSet<String> = {
-                let mut locals = HashSet::new();
+                let mut locals = HashSet::default();
                 for stmt in &source_file.statements {
                     let import_decl: Option<&tsc_rs_ast::ImportDecl> = match &stmt.kind {
                         tsc_rs_ast::StmtKind::Import(id) => Some(id),
@@ -3741,7 +3743,7 @@ impl BaselineRunner {
                 locals
             };
             let resolved_runtime_export_import_locals: HashSet<String> = {
-                let mut locals = HashSet::new();
+                let mut locals = HashSet::default();
                 for stmt in &source_file.statements {
                     let import_decl: Option<&tsc_rs_ast::ImportDecl> = match &stmt.kind {
                         tsc_rs_ast::StmtKind::Import(id) => Some(id),
@@ -3806,7 +3808,7 @@ impl BaselineRunner {
             // type-only export through a namespace merge. The import itself is
             // kept for side effects, but the binding is not qualified.
             let cjs_no_qualify_import_locals: HashSet<String> = {
-                let mut locals = HashSet::new();
+                let mut locals = HashSet::default();
                 for stmt in &source_file.statements {
                     let import_decl: Option<&tsc_rs_ast::ImportDecl> = match &stmt.kind {
                         tsc_rs_ast::StmtKind::Import(id) => Some(id),
@@ -4979,7 +4981,7 @@ impl BaselineRunner {
     // -----------------------------------------------------------------------
 
     fn referenced_ambient_modules(&self, test_case: &TestCase) -> Vec<String> {
-        let mut modules = HashSet::new();
+        let mut modules = HashSet::default();
         for file in &test_case.files {
             // Ambient modules declared by any file in the program are valid
             // bare-specifier targets for every other file, including imports
@@ -5273,7 +5275,7 @@ impl BaselineRunner {
                     .iter()
                     .filter(|param| parameter_name(&param.name).is_none())
                     .count();
-                let mut documented_destructured_roots = HashSet::new();
+                let mut documented_destructured_roots = HashSet::default();
                 for tag in &param_tags {
                     let Some((name, _)) = tag_name(*tag) else {
                         continue;
@@ -5402,7 +5404,7 @@ impl BaselineRunner {
             // specifiers tsc could not resolve either.
             let path_ctx = baseline_path_context(test_case);
             let link_path_mappings = parse_link_path_mappings(source_text);
-            let mut path_to_idx: HashMap<String, usize> = HashMap::new();
+            let mut path_to_idx: HashMap<String, usize> = HashMap::default();
             for (idx, file) in test_case.files.iter().enumerate() {
                 path_to_idx.insert(normalize_header_path(&file.name), idx);
             }
@@ -6240,7 +6242,7 @@ impl BaselineRunner {
         }
 
         // Build a map from (file_name, span_start, code) -> related message for located diagnostics
-        let mut located_related_msgs: HashMap<(String, u32, u32), String> = HashMap::new();
+        let mut located_related_msgs: HashMap<(String, u32, u32), String> = HashMap::default();
         for (file_name, diag, related) in &located_option_diags {
             if let (Some(ref related_msg), Some(ref span)) = (related, &diag.span) {
                 located_related_msgs.insert(
@@ -6392,7 +6394,11 @@ impl BaselineRunner {
                 .then_with(|| a.3.cmp(&b.3))
                 .then_with(|| a.4.cmp(&b.4))
         });
-        global_entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        global_entries.sort();
+        // Every per-file checker can report the same program requirement.
+        // TypeScript's diagnostic collection emits identical file-less
+        // diagnostics once; distinct messages and related information remain.
+        global_entries.dedup();
         for (_, line_str, related) in &global_entries {
             header_lines.push(line_str.clone());
             header_lines.extend(related.iter().cloned());
@@ -6462,14 +6468,13 @@ impl BaselineRunner {
             // Keep every annotation on a source line in diagnostic order,
             // including spans that began on an earlier line.
             let line_starts = compute_line_starts(source);
-            let mut diags_by_line: HashMap<usize, Vec<&Diagnostic>> = HashMap::new();
+            let mut diags_by_line: HashMap<usize, Vec<&Diagnostic>> = HashMap::default();
             for diag in diags {
                 if let Some(span) = &diag.span {
                     let start_line = line_index_from_starts(&line_starts, span.start as usize);
-                    let end_line = line_index_from_starts(
-                        &line_starts,
-                        span.end.saturating_sub(1).max(span.start) as usize,
-                    );
+                    // The exclusive end can be the start of the next line.
+                    // TypeScript keeps that final, empty annotation row.
+                    let end_line = line_index_from_starts(&line_starts, span.end as usize);
                     for line in start_line..=end_line {
                         diags_by_line.entry(line).or_default().push(diag);
                     }
@@ -6513,15 +6518,12 @@ impl BaselineRunner {
                             let col = (span.start as usize).saturating_sub(line_start);
                             let start_line =
                                 line_index_from_starts(&line_starts, span.start as usize);
-                            let end_line = line_index_from_starts(
-                                &line_starts,
-                                span.end.saturating_sub(1).max(span.start) as usize,
-                            );
+                            let end_line = line_index_from_starts(&line_starts, span.end as usize);
                             let is_final_line = line_idx == end_line;
                             let len = if start_line == end_line {
                                 (span.end as usize).saturating_sub(span.start as usize)
                             } else if is_final_line {
-                                (span.end as usize).saturating_sub(line_start).max(1)
+                                (span.end as usize).saturating_sub(line_start)
                             } else if line_idx == start_line {
                                 line.len().saturating_sub(col).max(1)
                             } else {
@@ -7024,7 +7026,7 @@ fn collect_top_level_value_names(
     file: &tsc_rs_ast::SourceFile,
     preserve_const_enums: bool,
 ) -> HashSet<String> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     for stmt in &file.statements {
         match &stmt.kind {
             tsc_rs_ast::StmtKind::Export(ed) => {
@@ -7140,8 +7142,8 @@ fn collect_external_module_spec_info(
     file: &tsc_rs_ast::SourceFile,
     preserve_const_enums: bool,
 ) -> (HashSet<String>, HashSet<String>) {
-    let mut type_only = HashSet::new();
-    let mut has_runtime = HashSet::new();
+    let mut type_only = HashSet::default();
+    let mut has_runtime = HashSet::default();
 
     fn collect_from_stmt(
         stmt: &tsc_rs_ast::Stmt,
@@ -7229,8 +7231,8 @@ fn ambient_module_block_has_runtime_value(
     stmts: &[tsc_rs_ast::Stmt],
     preserve_const_enums: bool,
 ) -> bool {
-    let mut value_names = HashSet::new();
-    let mut type_names = HashSet::new();
+    let mut value_names = HashSet::default();
+    let mut type_names = HashSet::default();
     let mut has_unknown_runtime = false;
 
     fn collect_pat_names(pat: &tsc_rs_ast::Pat, out: &mut HashSet<String>) {
@@ -7473,8 +7475,8 @@ fn eval_enum_numeric_expr(
 fn collect_file_const_values(
     file: &tsc_rs_ast::SourceFile,
 ) -> (HashMap<String, f64>, HashMap<String, String>) {
-    let mut num_consts: HashMap<String, f64> = HashMap::new();
-    let mut str_consts: HashMap<String, String> = HashMap::new();
+    let mut num_consts: HashMap<String, f64> = HashMap::default();
+    let mut str_consts: HashMap<String, String> = HashMap::default();
     for stmt in &file.statements {
         if let tsc_rs_ast::StmtKind::Var(v) = &stmt.kind {
             if v.kind == tsc_rs_ast::VarKind::Const {
@@ -7572,13 +7574,13 @@ fn collect_file_const_values(
 fn collect_exported_const_values(
     file: &tsc_rs_ast::SourceFile,
 ) -> (HashMap<String, f64>, HashMap<String, String>) {
-    let mut num_consts: HashMap<String, f64> = HashMap::new();
-    let mut str_consts: HashMap<String, String> = HashMap::new();
-    let mut all_num: HashMap<String, f64> = HashMap::new();
-    let mut all_str: HashMap<String, String> = HashMap::new();
-    let mut all_enum_num: HashMap<String, HashMap<String, f64>> = HashMap::new();
-    let mut all_enum_str: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut exported_names: HashSet<String> = HashSet::new();
+    let mut num_consts: HashMap<String, f64> = HashMap::default();
+    let mut str_consts: HashMap<String, String> = HashMap::default();
+    let mut all_num: HashMap<String, f64> = HashMap::default();
+    let mut all_str: HashMap<String, String> = HashMap::default();
+    let mut all_enum_num: HashMap<String, HashMap<String, f64>> = HashMap::default();
+    let mut all_enum_str: HashMap<String, HashMap<String, String>> = HashMap::default();
+    let mut exported_names: HashSet<String> = HashSet::default();
     for stmt in &file.statements {
         if let Some(enum_decl) = match &stmt.kind {
             tsc_rs_ast::StmtKind::EnumDecl(e) => Some((e, false)),
@@ -7592,8 +7594,8 @@ fn collect_exported_const_values(
             _ => None,
         } {
             let (enum_decl, is_exported) = enum_decl;
-            let mut enum_num: HashMap<String, f64> = HashMap::new();
-            let mut enum_str: HashMap<String, String> = HashMap::new();
+            let mut enum_num: HashMap<String, f64> = HashMap::default();
+            let mut enum_str: HashMap<String, String> = HashMap::default();
             let mut auto_value = Some(0.0_f64);
             for member in &enum_decl.members {
                 let key = match &member.name {
@@ -7899,7 +7901,7 @@ const LIB_INJECT_ALLOWLIST: &[&str] = &[
 fn lib_injected_donor(options: &tsc_rs_ast::CompilerOptions) -> tsc_rs_types::TypeChecker {
     thread_local! {
         static CACHE: std::cell::RefCell<HashMap<String, tsc_rs_types::TypeChecker>> =
-            std::cell::RefCell::new(HashMap::new());
+            std::cell::RefCell::new(HashMap::default());
     }
     let key = format!(
         "{:?}\0{:?}\0{}",
@@ -8022,9 +8024,9 @@ fn discover_project_input_closure(
         .find_map(|(key, value)| (key == "declarationDir").then(|| normalize_header_path(value)));
     let project_root_normalized = normalize_header_path(&project_root.to_string_lossy());
     let mut ordered = Vec::new();
-    let mut visiting = HashSet::new();
-    let mut visited = HashSet::new();
-    let mut first_names = HashMap::new();
+    let mut visiting = HashSet::default();
+    let mut visited = HashSet::default();
+    let mut first_names = HashMap::default();
 
     for relative in root_files {
         let full_path = normalize_path_segments(&normalize_header_path(
@@ -8304,7 +8306,7 @@ fn path_belongs_to_project(project_root: &str, full_path: &str) -> bool {
 /// mode even inside an ES module, so they are exempt from the ESM
 /// explicit-extension rule.
 fn collect_require_form_specifiers(file: &SourceFile) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+    let mut out = std::collections::HashSet::default();
     let mut visit = |stmt: &tsc_rs_ast::Stmt| match &stmt.kind {
         tsc_rs_ast::StmtKind::Import(import_decl)
             if matches!(import_decl.specifiers, tsc_rs_ast::ImportClause::Require(_)) =>
@@ -8502,7 +8504,7 @@ fn project_baseline_path_context(
         module_suffixes: vec![String::new()],
         suppress_output_path_check: false,
         base_module: options.module,
-        package_type_by_dir: HashMap::new(),
+        package_type_by_dir: HashMap::default(),
     }
 }
 
@@ -8538,7 +8540,7 @@ fn format_project_diagnostics(
     // global otherwise.
     let tsconfig_full = tsconfig.map(|path| normalize_header_path(&path.to_string_lossy()));
     let tsconfig_source = tsconfig.and_then(|path| std::fs::read_to_string(path).ok());
-    let mut related_by_key: HashMap<(String, u32, u32), String> = HashMap::new();
+    let mut related_by_key: HashMap<(String, u32, u32), String> = HashMap::default();
     let mut global: Vec<(Diagnostic, Option<String>)> = Vec::new();
     for option_diag in tsc_rs_types::check_deprecated_options(options) {
         let mut diagnostic = option_diag.diagnostic.clone();
@@ -8725,7 +8727,7 @@ fn format_project_diagnostics(
 
     let mut sections = Vec::new();
     let mut section_inputs: Vec<(String, String, bool)> = Vec::new();
-    let mut display_overrides: HashMap<String, String> = HashMap::new();
+    let mut display_overrides: HashMap<String, String> = HashMap::default();
     if let (Some(full), Some(source)) = (&tsconfig_full, &tsconfig_source) {
         section_inputs.push((full.clone(), source.clone(), false));
     }
@@ -9517,7 +9519,7 @@ fn build_project_summary_json(
         return "{}".to_string();
     };
     let mut resolved_with_libs = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     for lib in [
         "lib.es5.d.ts",
         "lib.decorators.d.ts",
@@ -10522,7 +10524,7 @@ export const x = 1 + 2;
             ctx.paths
         );
 
-        let mut path_to_idx = HashMap::new();
+        let mut path_to_idx = HashMap::default();
         for (idx, file) in tc.files.iter().enumerate() {
             path_to_idx.insert(normalize_header_path(&file.name), idx);
         }
@@ -10566,7 +10568,7 @@ var z2 = foo.y() + 10;
             .enumerate()
             .filter_map(|(idx, file)| should_emit_compilable_source_file(file, &ctx).then_some(idx))
             .collect();
-        let mut parsed_sources = HashMap::new();
+        let mut parsed_sources = HashMap::default();
         for idx in &compile_indices {
             parsed_sources.insert(
                 *idx,
@@ -10612,7 +10614,7 @@ function foo() {
             .enumerate()
             .filter_map(|(idx, file)| should_emit_compilable_source_file(file, &ctx).then_some(idx))
             .collect();
-        let mut parsed_sources = HashMap::new();
+        let mut parsed_sources = HashMap::default();
         for idx in &compile_indices {
             parsed_sources.insert(
                 *idx,
@@ -10659,7 +10661,7 @@ declare module "M" {
             .into_iter()
             .filter(|idx| should_emit_compilable_source_file(&tc.files[*idx], &ctx))
             .collect();
-        let mut parsed_sources = HashMap::new();
+        let mut parsed_sources = HashMap::default();
         for idx in &compile_indices {
             parsed_sources.insert(
                 *idx,
@@ -10730,7 +10732,7 @@ module.exports = Context;
             .enumerate()
             .filter_map(|(idx, file)| should_emit_compilable_source_file(file, &ctx).then_some(idx))
             .collect();
-        let mut parsed_sources = HashMap::new();
+        let mut parsed_sources = HashMap::default();
         for idx in &compile_indices {
             parsed_sources.insert(
                 *idx,
@@ -10796,7 +10798,7 @@ void m1; void m2; void m3;
             .enumerate()
             .filter_map(|(idx, file)| should_emit_compilable_source_file(file, &ctx).then_some(idx))
             .collect();
-        let mut parsed_sources = HashMap::new();
+        let mut parsed_sources = HashMap::default();
         for idx in &compile_indices {
             parsed_sources.insert(
                 *idx,
@@ -10853,7 +10855,7 @@ export function h() { f(); }
             .enumerate()
             .filter_map(|(idx, file)| should_emit_compilable_source_file(file, &ctx).then_some(idx))
             .collect();
-        let mut parsed_sources = HashMap::new();
+        let mut parsed_sources = HashMap::default();
         for idx in &compile_indices {
             parsed_sources.insert(
                 *idx,
@@ -10907,7 +10909,7 @@ type;
             .enumerate()
             .filter_map(|(idx, file)| should_emit_compilable_source_file(file, &ctx).then_some(idx))
             .collect();
-        let mut parsed_sources = HashMap::new();
+        let mut parsed_sources = HashMap::default();
         for idx in &compile_indices {
             parsed_sources.insert(
                 *idx,
@@ -10986,7 +10988,7 @@ void leafJs; void leafMjs; void leafCjs; void index;
             .enumerate()
             .filter_map(|(idx, file)| should_emit_compilable_source_file(file, &ctx).then_some(idx))
             .collect();
-        let mut parsed_sources = HashMap::new();
+        let mut parsed_sources = HashMap::default();
         for idx in &compile_indices {
             parsed_sources.insert(
                 *idx,
@@ -11613,6 +11615,41 @@ mod diagnostic_marker_tests {
     }
 
     #[test]
+    fn multiline_annotations_retain_a_zero_width_final_row() {
+        for newline in ["\n", "\r\n"] {
+            let source = [
+                "// @jsx: preserve",
+                "// @noImplicitAny: false",
+                "<div/><span>text",
+                "",
+            ]
+            .join(newline);
+            let case = parse_test_case("marker.tsx", &source);
+            let actual = BaselineRunner::new(".").generate_errors_baseline(
+                &case,
+                "tests/cases/compiler/marker.tsx",
+                "",
+            );
+            let annotated = actual.split_once("==== ").unwrap().1;
+            assert_eq!(
+                annotated,
+                concat!(
+                    "marker.tsx (3 errors) ====\n",
+                    "    <div/><span>text\n",
+                    "    ~~~~~~~~~~~~~~~~\n",
+                    "           ~~~~\n",
+                    "!!! error TS17008: JSX element 'span' has no corresponding closing tag.\n",
+                    "    \n",
+                    "    \n",
+                    "!!! error TS2657: JSX expressions must have one parent element.\n",
+                    "    \n",
+                    "!!! error TS1005: '</' expected.\n",
+                )
+            );
+        }
+    }
+
+    #[test]
     fn zero_width_parser_diagnostic_has_no_invented_squiggle() {
         let source = "var x = Object. ";
         let case = parse_test_case("marker.ts", source);
@@ -11633,6 +11670,39 @@ mod diagnostic_marker_tests {
             actual.contains("!!! error TS1003: Identifier expected."),
             "diagnostic was lost: {actual}"
         );
+    }
+
+    #[test]
+    fn nolib_program_diagnostics_are_unique_without_merging_file_diagnostics() {
+        let source = "// @noLib: true\n// @filename: globals.ts\ninterface Array<T> {} interface Boolean {} interface Function {} interface IArguments {} interface Number {} interface Object {} interface RegExp {} interface String {}\n// @filename: a.ts\nexport {}; missing;\n// @filename: b.ts\nexport {}; missing;\n";
+        let case = parse_test_case("nolib.ts", source);
+        let actual = BaselineRunner::new(".").generate_errors_baseline(
+            &case,
+            "tests/cases/compiler/nolib.ts",
+            source,
+        );
+        let headers: Vec<_> = actual.lines().take_while(|line| !line.is_empty()).collect();
+        assert_eq!(
+            headers,
+            [
+                "error TS2318: Cannot find global type 'CallableFunction'.",
+                "error TS2318: Cannot find global type 'NewableFunction'.",
+                "a.ts(1,12): error TS2304: Cannot find name 'missing'.",
+                "b.ts(1,12): error TS2304: Cannot find name 'missing'.",
+            ],
+            "{actual}"
+        );
+        for name in ["CallableFunction", "NewableFunction"] {
+            assert_eq!(
+                actual
+                    .matches(&format!(
+                        "!!! error TS2318: Cannot find global type '{name}'."
+                    ))
+                    .count(),
+                1,
+                "{actual}"
+            );
+        }
     }
 
     #[test]

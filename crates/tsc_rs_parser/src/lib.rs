@@ -57,11 +57,20 @@ pub fn is_grammar_diagnostic(code: u32) -> bool {
             | 1096
             | 1098
             | 1099
+            | 1123
+            | 1162
+            | 1171
+            | 1172
+            | 1173
+            | 1174
+            | 1183
+            | 1196
             | 1206
             | 1242
             | 1246
             | 1247
             | 1248
+            | 1254
             | 1275
     )
 }
@@ -81,9 +90,11 @@ pub fn has_syntax_errors(diagnostics: &[Diagnostic]) -> bool {
                 | 1134
                 | 1135
                 | 1136
+                | 1142
                 | 1146
                 | 1160
                 | 1161
+                | 1357
                 | 1434
                 | 1472
         )
@@ -277,6 +288,33 @@ pub fn parse_with_jsx(file_name: &str, source: &str, jsx_enabled: bool) -> Sourc
             diagnostics.push(Diagnostic {
                 code: 1160,
                 message: "Unterminated template literal.".to_string(),
+                category: DiagnosticCategory::Error,
+                file_name: Some(file_name.to_string()),
+                span: Some(Span::new(end, end)),
+                related: None,
+            });
+        }
+    }
+    // TS1010: the scanner ends an unterminated `/*` comment at EOF without
+    // complaint; tsc reports `'*/' expected.` at the end of the file. Such a
+    // comment is the last one and runs to EOF. It counts only after the last
+    // statement: inside one, the `/*` was JSX text or part of a template the
+    // parser rescanned (and a statement a real one cuts off already has its
+    // own parse error).
+    if let Some(comment) = raw_comments
+        .iter()
+        .rev()
+        .find(|comment| comment.is_multiline)
+    {
+        let end = source.len() as u32;
+        let text = &source[comment.pos as usize..comment.end as usize];
+        let covered = statements
+            .iter()
+            .any(|stmt| stmt.span.start <= comment.pos && comment.pos < stmt.span.end);
+        if comment.end == end && (text.len() < 4 || !text.ends_with("*/")) && !covered {
+            diagnostics.push(Diagnostic {
+                code: 1010,
+                message: "'*/' expected.".to_string(),
                 category: DiagnosticCategory::Error,
                 file_name: Some(file_name.to_string()),
                 span: Some(Span::new(end, end)),
@@ -1258,7 +1296,7 @@ impl<'a> Parser<'a> {
         let parse_error = |code: u32| {
             matches!(
                 code,
-                1003 | 1005 | 1109 | 1128 | 1134 | 1135 | 1136 | 1138 | 1144
+                1003 | 1005 | 1109 | 1128 | 1134 | 1135 | 1136 | 1138 | 1142 | 1144 | 1357
             )
         };
         // Scanner errors go through the same check in tsc.
@@ -1298,22 +1336,6 @@ impl<'a> Parser<'a> {
 
     fn is_eof(&self) -> bool {
         self.cur() == TokenKind::EndOfFile
-    }
-
-    /// Skip a `{ ... }` block for error recovery. Consumes matched braces.
-    fn skip_block(&mut self) {
-        if self.eat(TokenKind::OpenBrace).is_none() {
-            return;
-        }
-        let mut depth: u32 = 1;
-        while depth > 0 && !self.is_eof() {
-            match self.cur() {
-                TokenKind::OpenBrace => depth += 1,
-                TokenKind::CloseBrace => depth -= 1,
-                _ => {}
-            }
-            self.bump();
-        }
     }
 
     /// Check if current token is an identifier or a contextual keyword usable as identifier.
@@ -1698,7 +1720,7 @@ impl<'a> Parser<'a> {
             TokenKind::Break => {
                 self.bump();
                 let label = self.parse_optional_label();
-                self.eat_semicolon();
+                self.eat_declaration_semicolon();
                 Stmt {
                     kind: StmtKind::Break(label),
                     span: self.span_from(start),
@@ -1707,7 +1729,7 @@ impl<'a> Parser<'a> {
             TokenKind::Continue => {
                 self.bump();
                 let label = self.parse_optional_label();
-                self.eat_semicolon();
+                self.eat_declaration_semicolon();
                 Stmt {
                     kind: StmtKind::Continue(label),
                     span: self.span_from(start),
@@ -1715,7 +1737,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Debugger => {
                 self.bump();
-                self.eat_semicolon();
+                self.eat_declaration_semicolon();
                 Stmt {
                     kind: StmtKind::Debugger,
                     span: self.span_from(start),
@@ -2404,27 +2426,34 @@ impl<'a> Parser<'a> {
     fn parse_var_stmt(&mut self, modifiers: ModifierFlags, kind: VarKind, start: u32) -> Stmt {
         // skip var/let/const/using keyword
         let keyword_span = self.bump();
-        let declarations = self.parse_var_declarator_list(keyword_span.end);
-        if self.ambient_depth > 0 {
+        // Invalid declaration decorators take precedence over declaration-list
+        // grammar checks, including an empty list or a trailing comma.
+        let invalid_decorator = self.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == 1206 && diagnostic.span.is_some_and(|span| span.start == start)
+        });
+        let declarations = self.parse_var_declarator_list(keyword_span.end, !invalid_decorator);
+        if self.ambient_depth > 0 || modifiers & MOD_DECLARE != 0 {
             for declaration in &declarations {
                 if let Some(initializer) = &declaration.init {
-                    let allowed_const_initializer = kind == VarKind::Const
-                        && Self::ambient_const_initializer_allowed(initializer);
-                    if !allowed_const_initializer {
-                        self.diagnostics.push(Diagnostic {
-                            code: 1039,
-                            message: "Initializers are not allowed in ambient contexts."
-                                .to_string(),
-                            category: DiagnosticCategory::Error,
-                            file_name: None,
-                            span: Some(initializer.span),
-                            related: None,
-                        });
+                    if kind == VarKind::Const && declaration.type_ann.is_none() {
+                        if !Self::ambient_const_initializer_allowed(initializer) {
+                            self.grammar_error_at_span(
+                                1254,
+                                "A 'const' initializer in an ambient context must be a string or numeric literal or literal enum reference.".into(),
+                                initializer.span,
+                            );
+                        }
+                    } else {
+                        self.grammar_error_at_span(
+                            1039,
+                            "Initializers are not allowed in ambient contexts.".into(),
+                            initializer.span,
+                        );
                     }
                 }
             }
         }
-        self.eat_semicolon();
+        self.eat_declaration_semicolon();
         Stmt {
             kind: StmtKind::Var(Box::new(VarStmt {
                 kind,
@@ -2444,19 +2473,42 @@ impl<'a> Parser<'a> {
             | ExprKind::Member(_)
             | ExprKind::ElemAccess(_) => true,
             ExprKind::Template(template) => template.exprs.is_empty(),
-            ExprKind::Unary(unary) => matches!(
-                &unary.argument.kind,
-                ExprKind::NumLit(_) | ExprKind::BigIntLit(_)
-            ),
+            ExprKind::Unary(unary) => {
+                unary.op == UnaryOp::Neg
+                    && matches!(
+                        &unary.argument.kind,
+                        ExprKind::NumLit(_) | ExprKind::BigIntLit(_)
+                    )
+            }
             ExprKind::BigIntLit(_) => true,
             _ => false,
         }
     }
 
-    fn parse_var_declarator_list(&mut self, first_full_start: u32) -> Vec<VarDeclarator> {
+    fn parse_var_declarator_list(
+        &mut self,
+        first_full_start: u32,
+        report_grammar: bool,
+    ) -> Vec<VarDeclarator> {
         let mark = self.scratch_decls.len();
         let mut full_start = first_full_start;
+        let mut trailing_comma = None;
         loop {
+            // Binding names take precedence over automatic semicolon insertion:
+            // `var a,\nb` continues the list, but `var a,\nclass C {}` ends it.
+            let can_start_binding = self.is_identifier()
+                || matches!(
+                    self.cur(),
+                    TokenKind::OpenBrace | TokenKind::OpenBracket | TokenKind::Hash
+                );
+            if !can_start_binding && self.is_var_declarator_list_terminator() {
+                break;
+            }
+            if self.at(TokenKind::Comma) {
+                self.error_code(1134, "Variable declaration expected.".into());
+                full_start = self.bump().end;
+                continue;
+            }
             // Error recovery: when the next token is a statement keyword
             // (class, function), stop the var declarator list. TypeScript
             // treats `var class;` as `var ;` then `class { }`.
@@ -2485,6 +2537,7 @@ impl<'a> Parser<'a> {
                 break;
             }
             let decl = self.parse_var_declarator(full_start);
+            trailing_comma = None;
             let has_initializer = decl.init.is_some();
             self.scratch_decls.push(decl);
             if has_initializer && self.at(TokenKind::Colon) {
@@ -2502,13 +2555,12 @@ impl<'a> Parser<'a> {
                 break;
             }
             if cur == TokenKind::Comma {
-                full_start = self.bump().end;
+                let comma = self.bump();
+                trailing_comma = Some(comma);
+                full_start = comma.end;
                 continue;
             }
-            // Inside a for-loop init (`disallow_in` is set), `of` and `in`
-            // are for-loop separators, not declarator names. Stop the list
-            // so the for-loop parser can handle them.
-            if self.disallow_in && matches!(cur, TokenKind::Of | TokenKind::In) {
+            if self.is_var_declarator_list_terminator() {
                 break;
             }
             // Recovery: invalid identifier escapes like `var arg\u003` are
@@ -2530,13 +2582,9 @@ impl<'a> Parser<'a> {
                 full_start = self.cur_span().start;
                 continue;
             }
-            // A same-line literal cannot start another declarator. Report the
-            // missing separator, then leave it for expression-statement recovery.
-            if !self.is_on_new_line()
-                && matches!(cur, TokenKind::NumericLiteral | TokenKind::StringLiteral)
-            {
-                self.error_code(1005, "',' expected.".into());
-            }
+            // Any other token needs a comma before recovery leaves the list.
+            // This includes unary operators and a following declaration keyword.
+            self.error_code(1005, "',' expected.".into());
             // Recovery: `.identifier` after type annotation → treat as `, identifier`
             // (e.g. `var v: void.x;` → `var v, x;` — the `.x` from type leaks)
             if matches!(cur, TokenKind::Dot)
@@ -2549,7 +2597,31 @@ impl<'a> Parser<'a> {
             }
             break;
         }
+        if report_grammar {
+            if let Some(comma) = trailing_comma {
+                self.grammar_error_at_span(1009, "Trailing comma not allowed.".into(), comma);
+            } else if self.scratch_decls.len() == mark {
+                self.grammar_error_at_span(
+                    1123,
+                    "Variable declaration list cannot be empty.".into(),
+                    Span::new(first_full_start, first_full_start),
+                );
+            }
+        }
         take_exact(&mut self.scratch_decls, mark)
+    }
+
+    fn is_var_declarator_list_terminator(&self) -> bool {
+        self.is_on_new_line()
+            || matches!(
+                self.cur(),
+                TokenKind::Semicolon
+                    | TokenKind::CloseBrace
+                    | TokenKind::EndOfFile
+                    | TokenKind::In
+                    | TokenKind::Of
+                    | TokenKind::FatArrow
+            )
     }
 
     fn try_skip_invalid_identifier_escape_separator_in_var_decl_list(&mut self) -> bool {
@@ -2675,7 +2747,7 @@ impl<'a> Parser<'a> {
         } else {
             Some(Box::new(self.parse_expression()))
         };
-        self.eat_semicolon();
+        self.eat_declaration_semicolon();
         Stmt {
             kind: StmtKind::Return(arg),
             span: self.span_from(start),
@@ -2806,7 +2878,7 @@ impl<'a> Parser<'a> {
             };
             let keyword_span = self.bump();
             // `for (var of X)` / `for (var in X)`: `of`/`in` directly after `var`
-            // is the loop keyword, not a binding name. Create an error binding.
+            // is the loop keyword, not a binding name. Preserve the empty list.
             // `const` has the same recovery; `let` is ambiguous with an identifier
             // in `for (let of ...)`.
             // Only when the token AFTER `of`/`in` is NOT one of `of`, `in`, `;`,
@@ -2827,22 +2899,14 @@ impl<'a> Parser<'a> {
                 && (!self.peek_is(TokenKind::Of) || self.peek2_is(TokenKind::CloseParen))
                 && (!self.peek_is(TokenKind::In) || self.peek2_is(TokenKind::CloseParen))
             {
-                let span = self.cur_span();
-                let decls = vec![VarDeclarator {
-                    name: Pat {
-                        kind: PatKind::Ident("<error>".into()),
-                        span,
-                    },
-                    type_ann: None,
-                    init: None,
-                    full_start: keyword_span.end,
-                    binding_name_full_starts: Vec::new(),
-                    span,
-                    definite: false,
-                }];
+                self.grammar_error_at_span(
+                    1123,
+                    "Variable declaration list cannot be empty.".into(),
+                    Span::new(keyword_span.end, keyword_span.end),
+                );
                 let var_stmt = VarStmt {
                     kind,
-                    declarations: decls,
+                    declarations: Vec::new(),
                     modifiers: MOD_NONE,
                 };
                 if self.eat(TokenKind::In).is_some() {
@@ -2877,7 +2941,7 @@ impl<'a> Parser<'a> {
             }
             let saved_disallow_in = self.disallow_in;
             self.disallow_in = true;
-            let decls = self.parse_var_declarator_list(keyword_span.end);
+            let decls = self.parse_var_declarator_list(keyword_span.end, true);
             self.disallow_in = saved_disallow_in;
             let var_stmt = VarStmt {
                 kind,
@@ -2921,12 +2985,15 @@ impl<'a> Parser<'a> {
         let expr = self.parse_expression();
         self.disallow_in = saved_disallow_in;
         if self.eat(TokenKind::In).is_some() {
+            self.suppress_object_pattern_grammar(&expr);
             let right = Box::new(self.parse_expression());
             self.expect(TokenKind::CloseParen);
             let body = Box::new(self.parse_statement(true));
             return Stmt {
                 kind: StmtKind::ForIn(Box::new(ForInStmt {
-                    left: expr_to_for_in_of_left(expr),
+                    // For-in does not permit assignment patterns. Preserve
+                    // the expression for reference/type checks and recovery.
+                    left: ForInOfLeft::Expr(Box::new(expr)),
                     right,
                     body,
                 })),
@@ -2934,6 +3001,7 @@ impl<'a> Parser<'a> {
             };
         }
         if self.eat(TokenKind::Of).is_some() {
+            self.suppress_object_pattern_grammar(&expr);
             let right = Box::new(self.parse_assignment_expr());
             self.expect(TokenKind::CloseParen);
             let body = Box::new(self.parse_statement(true));
@@ -3069,7 +3137,10 @@ impl<'a> Parser<'a> {
             Some(self.parse_block_body())
         } else if handler.is_none() {
             // Error recovery: `try { }` without catch or finally →
-            // synthesize empty `finally { }`
+            // synthesize empty `finally { }`, and report it as tsc does.
+            if self.speculation_depth == 0 {
+                self.error_code(1472, "'catch' or 'finally' expected.".into());
+            }
             Some(Vec::new())
         } else {
             None
@@ -3085,23 +3156,26 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_throw_stmt(&mut self, start: u32) -> Stmt {
-        self.bump(); // throw
-                     // `throw` has [no LineTerminator here] before the expression.
-                     // If there's a newline (or EOF/semicolon), treat as `throw;` (error recovery).
-        let expr = if self.at(TokenKind::Semicolon) || self.is_eof() || self.is_on_new_line() {
-            // Missing throw expression - create a synthetic empty ident
-            let pos = self.cur_span().start;
+        let keyword = self.bump(); // throw
+        let expr = if self.is_on_new_line()
+            || matches!(
+                self.cur(),
+                TokenKind::Semicolon | TokenKind::CloseBrace | TokenKind::EndOfFile
+            ) {
+            // A line break is diagnosed by the grammar checker; a missing
+            // expression on the same line is a parse error. Leave delimiters
+            // in place so they can end this statement or its enclosing block.
+            if !self.is_on_new_line() {
+                self.error_code(1109, "Expression expected.".into());
+            }
             Box::new(Expr {
                 kind: ExprKind::Ident("".into()),
-                span: Span {
-                    start: pos,
-                    end: pos,
-                },
+                span: Span::new(keyword.end, keyword.end),
             })
         } else {
             Box::new(self.parse_expression())
         };
-        self.eat_semicolon();
+        self.eat_declaration_semicolon();
         Stmt {
             kind: StmtKind::Throw(expr),
             span: self.span_from(start),
@@ -3356,13 +3430,22 @@ impl<'a> Parser<'a> {
             Vec::new()
         };
         // Error recovery: `class D implements C extends C { }` — implements before extends
-        if extends.is_none() && self.eat(TokenKind::Extends).is_some() {
-            let expr = self.parse_left_hand_side_expr();
-            let ta = self.try_parse_js_checked_type_args();
-            extends = Some(Box::new(expr));
-            extends_type_args = ta;
+        let mut heritage_error_reported = false;
+        if extends.is_none() {
+            if let Some(token) = self.eat(TokenKind::Extends) {
+                self.grammar_error_at_span(
+                    1173,
+                    "'extends' clause must precede 'implements' clause.".into(),
+                    token,
+                );
+                heritage_error_reported = true;
+                let expr = self.parse_left_hand_side_expr();
+                let ta = self.try_parse_js_checked_type_args();
+                extends = Some(Box::new(expr));
+                extends_type_args = ta;
+            }
         }
-        self.skip_extra_class_heritage_clauses();
+        self.skip_extra_class_heritage_clauses(extends.is_some(), heritage_error_reported);
         let establish_ambient_class = modifiers & MOD_DECLARE != 0 && self.ambient_depth == 0;
         if establish_ambient_class {
             self.ambient_depth += 1;
@@ -3388,12 +3471,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn skip_extra_class_heritage_clauses(&mut self) {
+    fn skip_extra_class_heritage_clauses(
+        &mut self,
+        has_extends: bool,
+        mut heritage_error_reported: bool,
+    ) {
         while !self.at(TokenKind::OpenBrace) && !self.is_eof() {
-            let consumed_sep =
-                self.eat(TokenKind::Extends).is_some() || self.eat(TokenKind::Comma).is_some();
-            if !consumed_sep {
+            let repeated_extends = self.at(TokenKind::Extends);
+            if !repeated_extends && !self.at(TokenKind::Comma) {
                 break;
+            }
+            let separator = self.bump();
+            if has_extends && !heritage_error_reported {
+                let (code, message, span) = if repeated_extends {
+                    (1172, "'extends' clause already seen.", separator)
+                } else {
+                    (
+                        1174,
+                        "Classes can only extend a single class.",
+                        self.cur_span(),
+                    )
+                };
+                self.grammar_error_at_span(code, message.into(), span);
+                heritage_error_reported = true;
             }
             let before = self.pos;
             let _expr = self.parse_left_hand_side_expr();
@@ -4082,8 +4182,11 @@ impl<'a> Parser<'a> {
                 break;
             }
             // eat ; or ,
-            if !self.at(TokenKind::CloseBrace) && self.eat(TokenKind::Semicolon).is_none() {
-                self.eat(TokenKind::Comma);
+            if !self.at(TokenKind::CloseBrace)
+                && self.eat(TokenKind::Semicolon).is_none()
+                && self.eat(TokenKind::Comma).is_none()
+            {
+                self.report_missing_type_member_separator(before);
             }
             // Error recovery: if we didn't advance, skip the current token to avoid
             // an infinite loop.
@@ -4172,11 +4275,16 @@ impl<'a> Parser<'a> {
             } else {
                 None
             };
-            // Error recovery: if there's a body `{ ... }` after the accessor
-            // signature in a type context, skip it. Accessor bodies are invalid
-            // in type/interface positions but TypeScript still parses them.
+            // Accessor bodies are invalid in type/interface positions, but
+            // still parse them so syntax errors take precedence over TS1183.
             if self.at(TokenKind::OpenBrace) {
-                self.skip_block();
+                let body_start = self.cur_span().start;
+                self.parse_block_body();
+                self.grammar_error_at_span(
+                    1183,
+                    "An implementation cannot be declared in ambient contexts.".into(),
+                    self.span_from(body_start),
+                );
             } else {
                 self.check_signature_parameter_defaults(&params);
             }
@@ -4271,7 +4379,17 @@ impl<'a> Parser<'a> {
 
     fn parse_type_alias_decl(&mut self, modifiers: ModifierFlags, start: u32) -> Stmt {
         self.bump(); // type
-        let (name, name_span) = self.parse_identifier();
+        if self.is_on_new_line() {
+            self.error_code(1142, "Line break not permitted here.".into());
+        }
+        let (name, name_span) = if self.at(TokenKind::Equals) {
+            // A missing name must not consume the initializer's separator.
+            self.error_code(1003, "Identifier expected.".into());
+            let position = self.cur_span().start;
+            ("<error>".into(), Span::new(position, position))
+        } else {
+            self.parse_identifier()
+        };
         if self.is_js_file {
             self.error_at_span(
                 8008,
@@ -4305,7 +4423,7 @@ impl<'a> Parser<'a> {
         }
         self.expect(TokenKind::Equals);
         let type_ann = self.parse_type();
-        self.eat_semicolon();
+        self.eat_declaration_semicolon();
         Stmt {
             kind: StmtKind::TypeAlias(Box::new(TypeAliasDecl {
                 name: name.into(),
@@ -4361,6 +4479,15 @@ impl<'a> Parser<'a> {
                 initializer: init,
                 span: self.span_from(mem_start),
             });
+            if !matches!(
+                self.cur(),
+                TokenKind::Comma | TokenKind::CloseBrace | TokenKind::EndOfFile
+            ) {
+                self.error_code(
+                    1357,
+                    "An enum member name must be followed by a ',', '=', or '}'.".into(),
+                );
+            }
             if self.eat(TokenKind::Comma).is_none()
                 && self.eat(TokenKind::Colon).is_none()
                 && self.eat(TokenKind::Semicolon).is_none()
@@ -4497,10 +4624,20 @@ impl<'a> Parser<'a> {
     // -----------------------------------------------------------------------
 
     fn parse_import_or_import_equals(&mut self, modifiers: ModifierFlags, start: u32) -> Stmt {
-        self.bump(); // import
-                     // Note: `import.meta` and `import(...)` are handled as expression
-                     // statements by `parse_statement` (the Import arm has a guard that
-                     // excludes `.` and `(` following `import`).
+        let import_span = self.bump(); // import
+                                       // `import;` / `import` at EOF (a cut-off file) is no declaration:
+                                       // tsc reports TS1128 at `import`. Without it the empty import passed
+                                       // as valid.
+        if (self.at(TokenKind::Semicolon) || self.is_eof()) && self.speculation_depth == 0 {
+            self.error_at_span(
+                1128,
+                "Declaration or statement expected.".into(),
+                import_span,
+            );
+        }
+        // Note: `import.meta` and `import(...)` are handled as expression
+        // statements by `parse_statement` (the Import arm has a guard that
+        // excludes `.` and `(` following `import`).
 
         // import type ...
         // `import type` is a type-only import when the token after `type` is:
@@ -4652,7 +4789,7 @@ impl<'a> Parser<'a> {
         if self.at(TokenKind::StringLiteral) {
             let (src, src_span) = self.parse_string_literal_with_span();
             let has_resolution_mode = self.skip_import_attributes();
-            self.eat_semicolon();
+            self.eat_declaration_semicolon();
             return Stmt {
                 kind: StmtKind::Import(Box::new(ImportDecl {
                     specifiers: ImportClause::Named {
@@ -4698,7 +4835,7 @@ impl<'a> Parser<'a> {
                 self.expect(TokenKind::From);
                 let (source, source_span) = self.parse_string_literal_with_span();
                 let has_resolution_mode = self.skip_import_attributes();
-                self.eat_semicolon();
+                self.eat_declaration_semicolon();
                 return Stmt {
                     kind: StmtKind::Import(Box::new(ImportDecl {
                         specifiers: ImportClause::Named {
@@ -4836,11 +4973,21 @@ impl<'a> Parser<'a> {
             self.bump();
             (String::new(), Span::new(0, 0))
         } else {
+            // A clause with no `from` (a cut-off `import Commerc`): tsc reads
+            // a lone default name as an unfinished `import X = …`. Without
+            // this the import of "" passed as valid.
+            if self.speculation_depth == 0 {
+                if default_import.is_some() && named.is_empty() && namespace.is_none() {
+                    self.error_code(1005, "'=' expected.".into());
+                } else if namespace.is_some() || !named.is_empty() {
+                    self.error_code(1005, "'from' expected.".into());
+                }
+            }
             (String::new(), self.cur_span())
         };
 
         let has_resolution_mode = self.skip_import_attributes();
-        self.eat_semicolon();
+        self.eat_declaration_semicolon();
         let statement_span = self.span_from(start);
         if self.is_js_file && type_only {
             self.error_at_span(
@@ -4960,7 +5107,7 @@ impl<'a> Parser<'a> {
         mut decorators: Vec<Expr>,
         start: u32,
     ) -> Stmt {
-        self.bump(); // export
+        let export_span = self.bump(); // export
 
         // export default ...
         if self.eat(TokenKind::Default).is_some() {
@@ -5056,7 +5203,7 @@ impl<'a> Parser<'a> {
                 self.parse_string_literal()
             };
             let _ = self.skip_import_attributes();
-            self.eat_semicolon();
+            self.eat_declaration_semicolon();
             let statement_span = self.span_from(start);
             if self.is_js_file && type_only {
                 self.error_at_span(
@@ -5088,7 +5235,7 @@ impl<'a> Parser<'a> {
                 None
             };
             let _ = self.skip_import_attributes();
-            self.eat_semicolon();
+            self.eat_declaration_semicolon();
             let statement_span = self.span_from(start);
             if self.is_js_file && type_only {
                 self.error_at_span(
@@ -5131,6 +5278,35 @@ impl<'a> Parser<'a> {
                 _ => self.parse_statement(true),
             }
         } else {
+            // Ordinary statements and incomplete declarations cannot follow
+            // `export`. Report TS1128 on the export keyword while preserving
+            // the following statement for recovery.
+            let starts_no_declaration = match self.cur() {
+                TokenKind::Identifier
+                | TokenKind::As
+                | TokenKind::Throw
+                | TokenKind::Return
+                | TokenKind::Break
+                | TokenKind::Continue
+                | TokenKind::Debugger
+                | TokenKind::If
+                | TokenKind::While
+                | TokenKind::Do
+                | TokenKind::For
+                | TokenKind::Switch
+                | TokenKind::Try
+                | TokenKind::With
+                | TokenKind::Semicolon => true,
+                TokenKind::Async => !self.peek_is(TokenKind::Function),
+                _ => false,
+            };
+            if starts_no_declaration && self.speculation_depth == 0 {
+                self.error_at_span(
+                    1128,
+                    "Declaration or statement expected.".into(),
+                    export_span,
+                );
+            }
             self.parse_statement(true)
         };
         Stmt {
@@ -5614,6 +5790,9 @@ impl<'a> Parser<'a> {
             && !matches!(expr.kind, ExprKind::Await(_))
         {
             let op = self.parse_assign_op();
+            if op == AssignOp::Assign {
+                self.suppress_object_pattern_grammar(&expr);
+            }
             self.bump();
             let right = Box::new(self.parse_assignment_expr());
             return Expr {
@@ -5712,6 +5891,7 @@ impl<'a> Parser<'a> {
     fn parse_binary_expr(&mut self, min_prec: u8) -> Expr {
         let start = self.cur_span().start;
         let mut left = self.parse_unary_expr();
+        let mut adjacent_jsx_diagnostic: Option<usize> = None;
 
         loop {
             // Adjacent JSX elements are not valid operands of `<`, because the
@@ -5734,7 +5914,20 @@ impl<'a> Parser<'a> {
                 };
             if self.at(TokenKind::LessThan) && self.is_jsx_start() && left_ends_in_jsx {
                 let right = Box::new(self.parse_unary_expr());
-                let span = self.span_from(start);
+                let span = Span::new(start, right.span.end);
+                if let Some(index) = adjacent_jsx_diagnostic {
+                    self.diagnostics[index].span = Some(span);
+                } else {
+                    adjacent_jsx_diagnostic = Some(self.diagnostics.len());
+                    self.diagnostics.push(Diagnostic {
+                        code: 2657,
+                        message: "JSX expressions must have one parent element.".into(),
+                        category: DiagnosticCategory::Error,
+                        file_name: None,
+                        span: Some(span),
+                        related: None,
+                    });
+                }
                 left = match left.kind {
                     ExprKind::Comma(mut exprs) => {
                         exprs.push(right);
@@ -8626,6 +8819,45 @@ impl<'a> Parser<'a> {
             self.bump();
         }
         // ASI: allow missing semicolons at end of line, before }, or at EOF
+    }
+
+    /// tsc's parseTypeMemberSemicolon: a type member ends with `;`, `,`, a
+    /// line break, `}` or EOF. Anything else on the same line is TS1005
+    /// (`{ a: A b: B }`). `member_start` is the token index the member began
+    /// at: a member that consumed nothing is the caller's recovery.
+    fn report_missing_type_member_separator(&mut self, member_start: usize) {
+        // Some member parses consume their own trailing separator.
+        let separated = self.pos > 0
+            && matches!(
+                self.tokens[self.pos - 1].kind,
+                TokenKind::Semicolon | TokenKind::Comma
+            );
+        if self.pos != member_start
+            && !separated
+            && !self.is_on_new_line()
+            && !matches!(self.cur(), TokenKind::CloseBrace | TokenKind::EndOfFile)
+            && self.speculation_depth == 0
+        {
+            self.error_code(1005, "';' expected.".into());
+        }
+    }
+
+    /// `eat_semicolon` for the end of an import or export declaration, with
+    /// tsc's parseSemicolon error: anything but `;`, `}`, EOF or a line break
+    /// is TS1005. Without it a cut-off `export { a } fr` passed as valid.
+    /// (Not in `eat_semicolon` itself: statement recovery paths that share it
+    /// would then report errors tsc does not.)
+    fn eat_declaration_semicolon(&mut self) {
+        if self.at(TokenKind::Semicolon) {
+            self.bump();
+            return;
+        }
+        if !self.is_on_new_line()
+            && !matches!(self.cur(), TokenKind::CloseBrace | TokenKind::EndOfFile)
+            && self.speculation_depth == 0
+        {
+            self.error_code(1005, "';' expected.".into());
+        }
     }
 
     /// Skip `with { ... }` or `assert { ... }` import attributes/assertions.

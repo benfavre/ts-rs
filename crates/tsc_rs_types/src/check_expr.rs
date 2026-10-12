@@ -127,6 +127,7 @@ impl TypeChecker {
                 .iter()
                 .all(|member| self.binary_operator_type_has_unknown(member)),
             Type::Optional(inner) => self.binary_operator_type_has_unknown(inner),
+            Type::TypeReference(..) => self.is_unknown_receiver(ty),
             _ => false,
         }
     }
@@ -408,6 +409,12 @@ impl TypeChecker {
             && (self.binary_operator_type_has_unknown(left)
                 || self.binary_operator_type_has_unknown(right))
         {
+            if !self.binary_operator_type_is_string_like(left)
+                && !self.binary_operator_type_is_string_like(right)
+            {
+                self.report_unknown_receiver(left_expr, left, false);
+                self.report_unknown_receiver(right_expr, right, false);
+            }
             return false;
         }
         let apparent_left =
@@ -718,22 +725,6 @@ impl TypeChecker {
         }
     }
 
-    fn update_operand_has_unknown(&self, ty: &Type) -> bool {
-        match ty {
-            Type::Unknown => true,
-            Type::Union(members) => members
-                .iter()
-                .any(|member| self.update_operand_has_unknown(member)),
-            // `unknown & T` reduces to T, so an unknown constituent does not
-            // make the intersection itself unknown.
-            Type::Intersection(members) => members
-                .iter()
-                .all(|member| self.update_operand_has_unknown(member)),
-            Type::Optional(inner) => self.update_operand_has_unknown(inner),
-            _ => false,
-        }
-    }
-
     /// Resolve the two enum element-access signatures without making every
     /// dynamic key precise: known member names keep the enum type, while a
     /// numeric (or any) index selects a numeric enum's string reverse map.
@@ -853,6 +844,56 @@ impl TypeChecker {
         }))
     }
 
+    pub(super) fn skip_reference_wrappers(mut expression: &Expr) -> &Expr {
+        loop {
+            expression = match &expression.kind {
+                ExprKind::Paren(inner) | ExprKind::NonNull(inner) => inner,
+                ExprKind::As(assertion) => &assertion.expr,
+                ExprKind::Satisfies(assertion) => &assertion.expr,
+                ExprKind::TypeAssertion(assertion) => &assertion.expr,
+                _ => return expression,
+            };
+        }
+    }
+
+    fn report_invalid_reference(&mut self, target: &Expr, update: bool) -> bool {
+        let reference = Self::skip_reference_wrappers(target);
+        let valid = matches!(&reference.kind, ExprKind::Ident(name) if !name.starts_with('#'))
+            || matches!(
+                reference.kind,
+                ExprKind::Member(_) | ExprKind::ElemAccess(_)
+            );
+        let optional = valid && Self::reference_is_optional_chain(reference);
+        if valid && !optional {
+            return false;
+        }
+        let subject = if update {
+            "The operand of an increment or decrement operator"
+        } else {
+            "The left-hand side of an assignment expression"
+        };
+        let (code, message) = if optional {
+            (
+                if update { 2777 } else { 2779 },
+                format!("{subject} may not be an optional property access."),
+            )
+        } else {
+            (
+                if update { 2357 } else { 2364 },
+                format!("{subject} must be a variable or a property access."),
+            )
+        };
+        self.diagnostics.push(Diagnostic {
+            code,
+            message,
+            category: DiagnosticCategory::Error,
+            file_name: None,
+            span: Some(target.span),
+            related: None,
+        });
+        true
+    }
+
     fn report_invalid_assignment_target(&mut self, target: &Expr) -> bool {
         // tsc's getAssignmentTarget walks through parentheses and non-null
         // assertions only: `(Foo as any) = null` is not an assignment to the
@@ -864,20 +905,6 @@ impl TypeChecker {
                 _ => break,
             };
         }
-        // `import.meta = x` / `new.target = x`: a meta-property is not a
-        // reference (tsc checkReferenceExpression, TS2364); the value is not
-        // checked against it.
-        if matches!(inner.kind, ExprKind::MetaProp(_)) {
-            self.diagnostics.push(Diagnostic {
-                code: 2364,
-                message: "The left-hand side of an assignment expression must be a variable or a property access.".to_string(),
-                category: DiagnosticCategory::Error,
-                file_name: None,
-                span: Some(target.span),
-                related: None,
-            });
-            return true;
-        }
         let ExprKind::Ident(name) = &inner.kind else {
             return false;
         };
@@ -887,9 +914,24 @@ impl TypeChecker {
         let binding = self.lookup_var(name).cloned();
         let self_ref = matches!(&binding, Some(Type::TypeReference(n, a))
             if a.is_empty() && (n == name.as_str() || n.strip_prefix("typeof ") == Some(name.as_str())));
-        let is_function_decl =
-            self.nearer_binding_is(&Self::function_marker_name(name), name) == Some(true);
-        let diagnostic = if self_ref && self.enum_info.contains_key(name.as_str()) {
+        let lexical_shadow = self.non_global_scope_declares_name(name)
+            || self.function_parameter_name_is_active(name);
+        let unshadowed_global = !lexical_shadow
+            && !self.local_value_names.contains(name.as_str())
+            && !self.user_global_value_names.contains(name.as_str());
+        // A script's top-level declaration shares the library's global symbol
+        // table, so a conflicting variable does not shadow the function. A
+        // module-local binding or a nested lexical binding does shadow it.
+        let library_function = !lexical_shadow
+            && !(self.file_is_module_flag && self.local_value_names.contains(name.as_str()))
+            && stdlib::stdlib_member_availability(&self.compiler_options)
+                .is_some_and(|library| library.declares_global_function(name));
+        let is_function_decl = self.nearer_binding_is(&Self::function_marker_name(name), name)
+            == Some(true)
+            || library_function;
+        let diagnostic = if name == "undefined" && unshadowed_global {
+            crate::diagnostics::error_cannot_assign_binding(2539, name, inner.span)
+        } else if self_ref && self.enum_info.contains_key(name.as_str()) {
             error_cannot_assign_enum(name, inner.span)
         } else if self_ref && self.class_info.contains_key(name.as_str()) {
             error_cannot_assign_class(name, inner.span)
@@ -1073,6 +1115,9 @@ impl TypeChecker {
     /// types never carry `undefined`). Returns whether it reported; the
     /// caller then continues with the non-nullable remainder.
     fn report_nullish_operand(&mut self, operand: &Expr, ty: &Type) -> bool {
+        if self.report_unknown_receiver(operand, ty, false) {
+            return true;
+        }
         if self.report_nullish_literal_operand(operand) {
             return true;
         }
@@ -1085,6 +1130,58 @@ impl TypeChecker {
         let before = self.diagnostics.len();
         self.check_nullable_access(ty, operand);
         self.diagnostics.len() > before
+    }
+
+    fn check_in_operand(&mut self, operand: &Expr, ty: &Type, right: bool) {
+        let reported = self.report_nullish_operand(operand, ty);
+        if reported && self.is_unknown_receiver(ty) {
+            return;
+        }
+        let checked = if reported {
+            self.remove_null_undefined(ty)
+        } else {
+            ty.clone()
+        };
+        let target = if right {
+            Type::Object
+        } else {
+            Type::flatten_union(vec![Type::String, Type::Number, Type::Symbol])
+        };
+        if !self.in_operand_assignable(&checked, &target) {
+            let source = self.widen_type(&checked);
+            self.push_not_assignable(&source, &target, operand.span);
+        } else if right && Self::has_non_nullish_unknown(ty) {
+            self.diagnostics.push(Diagnostic {
+                code: 2638,
+                message: format!("Type '{}' may represent a primitive value, which is not permitted as the right operand of the 'in' operator.", ty.display_string()),
+                category: DiagnosticCategory::Error,
+                file_name: None,
+                span: Some(operand.span),
+                related: None,
+            });
+        }
+    }
+
+    fn in_operand_assignable(&self, source: &Type, target: &Type) -> bool {
+        // Every possible union member must be valid at this use. Generic
+        // union members cannot be ignored as an approximation of narrowing.
+        match source {
+            Type::Union(members) => members
+                .iter()
+                .all(|member| self.in_operand_assignable(member, target)),
+            Type::Intersection(members) => members
+                .iter()
+                .any(|member| self.in_operand_assignable(member, target)),
+            _ => self.is_assignable_to(source, target),
+        }
+    }
+
+    fn has_non_nullish_unknown(ty: &Type) -> bool {
+        match ty {
+            Type::ObjectType(info) => info.is_non_nullish_unknown(),
+            Type::Union(members) => members.iter().any(Self::has_non_nullish_unknown),
+            _ => false,
+        }
     }
 
     /// tsc `checkDeleteExpression`: the operand (parentheses skipped) must be
@@ -1699,6 +1796,9 @@ impl TypeChecker {
         let diagnostics_start = self.diagnostics.len();
         let receiver_type = self.check_expr(receiver);
         self.diagnostics.truncate(diagnostics_start);
+        let readonly_global = property == "globalThis"
+            && (self.is_global_object_expression(receiver)
+                || self.is_global_object_type(&receiver_type));
         let imported_module_export = matches!(
             &receiver_type,
             Type::Module(module)
@@ -1746,6 +1846,7 @@ impl TypeChecker {
             && !readonly_namespace_alias_export
             && !readonly_local_property
             && !enum_member
+            && !readonly_global
         {
             return false;
         }
@@ -2565,7 +2666,7 @@ impl TypeChecker {
 
     /// TS6210 for a named parameter, TS6211 for a binding pattern (recorded
     /// with an empty name).
-    fn missing_argument_note(
+    pub(super) fn missing_argument_note(
         &self,
         param_name: &str,
         param_span: Span,
@@ -2882,14 +2983,18 @@ impl TypeChecker {
 
     pub(crate) fn check_decorator_expressions(&mut self, decorators: &[Expr]) {
         for decorator in decorators {
-            let mut expression = decorator.clone();
-            if self.current_source.as_ref().is_some_and(|source| {
-                source.as_bytes().get(expression.span.start as usize) == Some(&b'@')
-            }) {
-                expression.span.start = expression.span.start.saturating_add(1);
-            }
-            self.check_expr(&expression);
+            self.check_decorator_expression(decorator);
         }
+    }
+
+    pub(super) fn check_decorator_expression(&mut self, decorator: &Expr) -> Type {
+        let mut expression = decorator.clone();
+        if self.current_source.as_ref().is_some_and(|source| {
+            source.as_bytes().get(expression.span.start as usize) == Some(&b'@')
+        }) {
+            expression.span.start = expression.span.start.saturating_add(1);
+        }
+        self.check_expr(&expression)
     }
 
     pub(crate) fn current_file_is_javascript(&self) -> bool {
@@ -3006,14 +3111,17 @@ impl TypeChecker {
             return;
         }
         let invalid = match &statement.kind {
-            StmtKind::Var(variable) => variable.declarations.iter().any(|declaration| {
-                !matches!(&declaration.name.kind, PatKind::Ident(name) if name == "<error>")
-                    || self.current_source.as_ref().is_some_and(|source| {
-                        declaration.name.span.start as usize >= source.len()
-                            || source.as_bytes().get(declaration.name.span.start as usize)
-                                == Some(&b';')
+            StmtKind::Var(variable) => {
+                variable.declarations.is_empty()
+                    || variable.declarations.iter().any(|declaration| {
+                        !matches!(&declaration.name.kind, PatKind::Ident(name) if name == "<error>")
+                            || self.current_source.as_ref().is_some_and(|source| {
+                                declaration.name.span.start as usize >= source.len()
+                                    || source.as_bytes().get(declaration.name.span.start as usize)
+                                        == Some(&b';')
+                            })
                     })
-            }),
+            }
             StmtKind::Expr(expression) if matches!(&expression.kind, ExprKind::Ident(name) if name == "let" || name == "using") => {
                 self.current_source.as_ref().is_some_and(|source| {
                     source
@@ -3138,7 +3246,11 @@ impl TypeChecker {
                     self.report_js_syntactic_invalid_decorator(&parameter.decorators);
                 }
             } else {
-                self.check_decorators_with_validity(&parameter.decorators, valid);
+                self.check_decorators_at_site(
+                    &parameter.decorators,
+                    valid,
+                    decorator_types::DecoratorSite::Parameter,
+                );
             }
         }
     }
@@ -3680,11 +3792,9 @@ impl TypeChecker {
             let Some(info) = self.class_info.get(class.as_str()) else {
                 break;
             };
-            let declared = if is_static {
-                info.own_private_static_members.contains(property)
-            } else {
-                info.own_private_members.contains(property)
-            };
+            let declared = info
+                .private_identifiers
+                .contains(&(property.to_string(), is_static));
             if declared {
                 class_name = Some(class);
                 break;
@@ -3700,8 +3810,9 @@ impl TypeChecker {
         };
         let declares = |checker: &Self, class: &str| {
             checker.class_info.get(class).is_some_and(|info| {
-                info.own_private_members.contains(property)
-                    || info.own_private_static_members.contains(property)
+                info.private_identifiers
+                    .iter()
+                    .any(|(name, _)| name == property)
             })
         };
         // The name resolves lexically to the innermost enclosing class that
@@ -4619,8 +4730,16 @@ impl TypeChecker {
                 Some((t.clone(), t.clone()))
             } else if type_param_name(t).is_some() {
                 self.typeparam_constraint_apparent(t)
-                    .filter(|c| self.equality_comparable_shape(c))
-                    .map(|c| (c, t.clone()))
+                    .filter(|c| {
+                        !matches!(c, Type::Any | Type::Unknown) && !self.is_unknown_receiver(c)
+                    })
+                    .map(|c| {
+                        if self.equality_comparable_shape(&c) {
+                            (c, t.clone())
+                        } else {
+                            (t.clone(), t.clone())
+                        }
+                    })
             } else if let Type::TypeReference(name, args) = t {
                 if args.is_empty() && self.type_aliases.contains_key(name.as_str()) {
                     self.resolve_type_for_assignability(t)
@@ -5087,8 +5206,11 @@ impl TypeChecker {
                             let ty = self.lookup_var(name).cloned().unwrap_or(Type::Any);
                             properties.push((name.to_string(), Arc::new(ty)));
                         }
-                        tsc_rs_ast::ObjLitProp::Spread(e, _) => {
+                        tsc_rs_ast::ObjLitProp::Spread(e, span) => {
                             let spread_ty = self.check_expr(e);
+                            if self.report_unknown_object_spread(&spread_ty, *span) {
+                                any_spread = true;
+                            }
                             let before = properties.len();
                             any_spread |= self
                                 .merge_spread_into_object_properties(&spread_ty, &mut properties);
@@ -5980,6 +6102,13 @@ impl TypeChecker {
                 // "no function-like between the reference and the initializer"
                 // (arrows bind nothing; functions/methods declare `arguments`,
                 // which wins the race and legalizes the reference).
+                let cooked_name;
+                let name = if name.contains('\\') && self.lookup_var(name).is_none() {
+                    cooked_name = self.cooked_identifier_name(name, expr.span).into();
+                    &cooked_name
+                } else {
+                    name
+                };
                 if name == "arguments"
                     && matches!(
                         self.nearer_binding_is(ARGS_BLOCKED_MARKER, "arguments"),
@@ -5991,6 +6120,20 @@ impl TypeChecker {
                     return Type::Error;
                 }
                 self.check_type_only_value_use(name, expr.span);
+                if self.javascript_erased_type_imports.contains(name.as_str())
+                    && self.type_only_use_allowed == 0
+                    && self.type_only_allowed_span != Some(expr.span)
+                    && self.binding_scope_is_root(name).unwrap_or(true)
+                {
+                    if self
+                        .reported_duplicate_spans
+                        .insert((2693, expr.span.start, expr.span.end))
+                    {
+                        self.diagnostics
+                            .push(error_type_used_as_value(name, expr.span));
+                    }
+                    return Type::Error;
+                }
                 // TS2708: a namespace with no value meaning in value position.
                 if self.uninstantiated_namespace_names.contains(name.as_str())
                     && self.binding_scope_is_root(name).unwrap_or(true)
@@ -6052,14 +6195,25 @@ impl TypeChecker {
                     // Special built-in identifiers
                     match name.as_str() {
                         "undefined" => Type::Undefined,
-                        "NaN" | "Infinity" => Type::Number,
+                        "NaN" | "Infinity" => {
+                            if !self.user_global_value_names.contains(name.as_str())
+                                && stdlib::stdlib_member_availability(&self.compiler_options)
+                                    .is_some_and(|library| !library.declares_global_value(name))
+                            {
+                                self.diagnostics.push(crate::diagnostics::error_cannot_find_name_in_expression(name, expr.span));
+                                Type::Error
+                            } else {
+                                Type::Number
+                            }
+                        },
+                        "globalThis" => Type::Typeof(name.to_string()),
                         // JS/TS built-in globals
                         "console" | "Math" | "JSON" | "Object" | "Array" | "String" | "Number"
                         | "Boolean" | "Symbol" | "Promise" | "Map" | "Set" | "WeakMap"
                         | "WeakSet" | "Error" | "TypeError" | "RangeError"
                         | "EvalError" | "ReferenceError" | "SyntaxError" | "URIError"
                         | "Date" | "RegExp"
-                        | "globalThis" | "window" | "document" | "process" | "require"
+                        | "window" | "document" | "process" | "require"
                         | "module" | "exports" | "setTimeout" | "setInterval" | "clearTimeout"
                         | "clearInterval" | "parseInt" | "parseFloat" | "isNaN" | "isFinite"
                         // Web API globals
@@ -6141,12 +6295,6 @@ impl TypeChecker {
                         | "caches" | "addEventListener" | "removeEventListener"
                         // AMD/module loaders
                         | "define"
-                        // TS keywords that can appear as identifiers in expression context
-                        | "public" | "private" | "protected" | "static"
-                        | "readonly" | "override" | "accessor"
-                        | "declare" | "module"
-                        | "is" | "asserts" | "infer" | "out" | "satisfies"
-                        | "async" | "of" | "from" | "as" | "get" | "set"
                         // Other well-known globals
                         | "eval" | "importScripts" | "postMessage"
                         | "WScript" | "ActiveXObject" | "Enumerator"
@@ -6284,6 +6432,9 @@ impl TypeChecker {
                 } else {
                     self.check_expr(&bin.left)
                 };
+                if bin.op == BinaryOp::LogAnd {
+                    self.check_enum_known_condition(&bin.left, Some(&left_ty));
+                }
                 // `&&` evaluates its right operand only when the left is truthy,
                 // so the right operand is checked with the left's truthy
                 // control-flow facts in scope. Without this, the pervasive
@@ -6344,6 +6495,8 @@ impl TypeChecker {
                             // on both; a nullish literal is the whole error
                             // (under strictNullChecks only — otherwise null is
                             // string-assignable and the pair check runs).
+                            self.report_unknown_receiver(&bin.left, &left_ty, false);
+                            self.report_unknown_receiver(&bin.right, &right_ty, false);
                             Type::Any
                         } else if {
                             // A nullish-TYPED operand reports and then takes
@@ -6501,6 +6654,7 @@ impl TypeChecker {
                         }
                     }
                     BinaryOp::Eq | BinaryOp::Ne | BinaryOp::StrictEq | BinaryOp::StrictNe => {
+                        self.check_constant_equality_condition(bin, expr.span);
                         // TS2367: equality between types with NO overlap
                         // (neither side assignable to the other) is flagged as
                         // an unintentional comparison — the classic shape is a
@@ -6568,6 +6722,8 @@ impl TypeChecker {
                         // comparability check.
                         let nullish_literal = self.report_nullish_literal_operand(&bin.left)
                             | self.report_nullish_literal_operand(&bin.right);
+                        self.report_unknown_receiver(&bin.left, &left_ty, false);
+                        self.report_unknown_receiver(&bin.right, &right_ty, false);
                         if !nullish_literal {
                             self.report_nullish_operand(&bin.left, &left_ty);
                             self.report_nullish_operand(&bin.right, &right_ty);
@@ -6589,8 +6745,8 @@ impl TypeChecker {
                         Type::Boolean
                     }
                     BinaryOp::In => {
-                        self.report_nullish_operand(&bin.left, &left_ty);
-                        self.report_nullish_operand(&bin.right, &right_ty);
+                        self.check_in_operand(&bin.left, &left_ty, false);
+                        self.check_in_operand(&bin.right, &right_ty, true);
                         Type::Boolean
                     }
                     BinaryOp::InstanceOf => {
@@ -6616,8 +6772,11 @@ impl TypeChecker {
                     }
                     BinaryOp::LogAnd => {
                         self.check_syntactic_truthiness(&bin.left);
-                        // Return right operand type (simplified)
-                        right_ty
+                        if Self::enum_literal_truthiness(&left_ty) == Some(false) {
+                            left_ty
+                        } else {
+                            right_ty
+                        }
                     }
                     BinaryOp::LogOr => {
                         self.check_syntactic_truthiness(&bin.left);
@@ -6627,23 +6786,31 @@ impl TypeChecker {
                         // `const e = map.get(k) || fallback` (and `x || "def"`)
                         // yields a non-nullable `e` instead of keeping
                         // `undefined` and mis-firing TS2532 on later use.
-                        let truthy_left = match &left_ty {
-                            Type::Union(members) => {
-                                let filtered: Vec<Type> = members
-                                    .iter()
-                                    .filter(|m| !Self::is_always_falsy(m))
-                                    .cloned()
-                                    .collect();
-                                if filtered.is_empty() {
-                                    right_ty.clone()
-                                } else {
-                                    Type::flatten_union(filtered)
-                                }
+                        if let Some(truthy) = Self::enum_literal_truthiness(&left_ty) {
+                            if truthy {
+                                left_ty
+                            } else {
+                                right_ty
                             }
-                            t if Self::is_always_falsy(t) => right_ty.clone(),
-                            _ => left_ty,
-                        };
-                        Type::flatten_union(vec![truthy_left, right_ty])
+                        } else {
+                            let truthy_left = match &left_ty {
+                                Type::Union(members) => {
+                                    let filtered: Vec<Type> = members
+                                        .iter()
+                                        .filter(|m| !Self::is_always_falsy(m))
+                                        .cloned()
+                                        .collect();
+                                    if filtered.is_empty() {
+                                        right_ty.clone()
+                                    } else {
+                                        Type::flatten_union(filtered)
+                                    }
+                                }
+                                t if Self::is_always_falsy(t) => right_ty.clone(),
+                                _ => left_ty,
+                            };
+                            Type::flatten_union(vec![truthy_left, right_ty])
+                        }
                     }
                     BinaryOp::NullCoal => {
                         // x ?? y: strip null/undefined from left, then union with right.
@@ -6731,11 +6898,10 @@ impl TypeChecker {
                 }
                 let operand = self.check_expr(&up.argument);
                 self.assignment_target_span = saved_target;
-                if self.update_operand_has_unknown(&operand) {
-                    if let Some(path) = Self::simple_expression_path(&up.argument) {
-                        self.diagnostics
-                            .push(error_value_unknown(&path, up.argument.span));
-                    }
+                if matches!(up.argument.kind, ExprKind::NullLit) {
+                    self.report_nullish_literal_operand(&up.argument);
+                }
+                if self.report_unknown_receiver(&up.argument, &operand, false) {
                 } else if !matches!(operand, Type::Error)
                     && !readonly_write
                     && !self.update_target_has_specific_assignment_error(&up.argument)
@@ -6743,6 +6909,8 @@ impl TypeChecker {
                 {
                     self.diagnostics
                         .push(error_arithmetic_operand(up.argument.span));
+                } else {
+                    self.report_invalid_reference(&up.argument, true);
                 }
                 if matches!(operand, Type::BigInt | Type::BigIntLiteral(_)) {
                     Type::BigInt
@@ -6795,6 +6963,43 @@ impl TypeChecker {
                     } else {
                         callee_ty_raw
                     };
+                    let callee_ty = if self.is_unknown_receiver(&callee_ty) {
+                        if !self.report_unknown_receiver(&call.callee, &callee_ty, call.optional) {
+                            self.diagnostics
+                                .push(error_not_callable("{}", call.callee.span));
+                        }
+                        Type::Error
+                    } else {
+                        callee_ty
+                    };
+                    if self.strict_null_checks
+                        && !call.optional
+                        && !Self::expr_in_optional_chain(&call.callee)
+                        && self.single_call_signature(&callee_ty).is_some()
+                    {
+                        if let Type::Union(members) = &callee_ty {
+                            let null = members.contains(&Type::Null);
+                            let undefined = members.contains(&Type::Undefined);
+                            let diagnostic = match (null, undefined) {
+                                (true, true) => Some((2723, "null' or 'undefined")),
+                                (true, false) => Some((2721, "null")),
+                                (false, true) => Some((2722, "undefined")),
+                                _ => None,
+                            };
+                            if let Some((code, nullish)) = diagnostic {
+                                self.diagnostics.push(Diagnostic {
+                                    code,
+                                    message: format!(
+                                        "Cannot invoke an object which is possibly '{nullish}'."
+                                    ),
+                                    category: DiagnosticCategory::Error,
+                                    file_name: None,
+                                    span: Some(call.callee.span),
+                                    related: None,
+                                });
+                            }
+                        }
+                    }
 
                     // TS2349/TS2348: calling a definitely-non-callable value
                     // (`foo()(...)` where foo returns string, `(a | b)()`,
@@ -7187,7 +7392,20 @@ impl TypeChecker {
                         Type::TypeReference(value_name, args) if args.is_empty() => value_name
                             .strip_prefix("typeof ")
                             .map(str::to_owned)
+                            // A class binding carried as its instance name
+                            // (`import { TRPCError as Raw }` through a
+                            // re-export chain) still names that class.
+                            .or_else(|| {
+                                (value_name != name
+                                    && self.class_info.contains_key(value_name.as_str())
+                                    && !self.duplicate_type_names.contains(value_name.as_str()))
+                                .then(|| value_name.to_string())
+                            })
                             .or_else(|| Some(name.to_string())),
+                        // A binding asserted `any`
+                        // (`const { Svc } = (await import(p)) as any`) is not
+                        // the program's same-named class.
+                        Type::Any if self.explicit_any_bindings.contains(name.as_str()) => None,
                         _ => Some(name.to_string()),
                     },
                     ExprKind::Member(member) => {
@@ -7375,20 +7593,13 @@ impl TypeChecker {
                     return Type::Error;
                 }
                 if matches!(constructability, Constructability::None)
-                    && match &effective_callee_ty {
-                        Type::Unknown => true,
-                        Type::Union(members) => {
-                            members.iter().any(|member| matches!(member, Type::Unknown))
-                        }
-                        _ => false,
-                    }
+                    && self.is_unknown_receiver(&effective_callee_ty)
                 {
-                    let name = match &new_expr.callee.kind {
-                        ExprKind::Ident(name) => name.as_str(),
-                        _ => "value",
-                    };
-                    self.diagnostics
-                        .push(error_value_unknown(name, new_expr.callee.span));
+                    if !self.report_unknown_receiver(&new_expr.callee, &effective_callee_ty, false)
+                    {
+                        self.diagnostics
+                            .push(error_not_constructable("{}", new_expr.callee.span));
+                    }
                     return Type::Error;
                 }
 
@@ -7781,17 +7992,19 @@ impl TypeChecker {
                     expr.span.end,
                 );
                 let property_name = self.cooked_identifier_name(&mem.property, property_span);
+                let cooked_member;
+                let mem = if property_name != mem.property {
+                    cooked_member = MemberExpr {
+                        property: property_name.clone().into(),
+                        ..mem.as_ref().clone()
+                    };
+                    &cooked_member
+                } else {
+                    mem.as_ref()
+                };
                 // `globalThis.x`: only script-level `var`/`function`/enum/
                 // namespace declarations and lib values are its properties.
-                let global_this_receiver = match &mem.object.kind {
-                    ExprKind::Ident(object_name) => {
-                        object_name == "globalThis" && self.lookup_var("globalThis").is_none()
-                    }
-                    // (A script's top-level `this` is `typeof globalThis` too,
-                    // but object-literal members are checked on a path that
-                    // does not track function nesting; left out for now.)
-                    _ => false,
-                };
+                let global_this_receiver = self.is_global_object_expression(&mem.object);
                 if global_this_receiver && !self.current_file_is_js() {
                     if let Some(ty) = self.global_this_member_type(&property_name, property_span) {
                         return ty;
@@ -7827,6 +8040,51 @@ impl TypeChecker {
                         ty
                     }
                 };
+                if self.is_global_object_type(&obj_ty) && !self.current_file_is_js() {
+                    if let Some(ty) = self.global_this_member_type(&property_name, property_span) {
+                        return ty;
+                    }
+                }
+                if matches!(obj_ty, Type::This) {
+                    if let Some(receiver) = self.this_receiver_origin(&mem.object) {
+                        // Preserve the class of a captured `this` alias when
+                        // the access occurs inside another class's body.
+                        if !matches!(mem.object.kind, ExprKind::This) {
+                            obj_ty = receiver;
+                        }
+                    }
+                }
+                if self.is_unknown_receiver(&obj_ty) {
+                    if self.report_unknown_receiver(&mem.object, &obj_ty, mem.optional) {
+                        self.report_unbound_private_member_on_any(&property_name, property_span);
+                        return Type::Error;
+                    }
+                    if let Some(member) = self.unknown_apparent_member(&property_name) {
+                        if mem.optional && self.strict_null_checks {
+                            self.short_circuit_undefined_exprs.clear();
+                            self.short_circuit_undefined_exprs
+                                .push(std::ptr::from_ref(expr) as usize);
+                            return Type::flatten_union(vec![member, Type::Undefined]);
+                        }
+                        return member;
+                    }
+                    let display = if self.strict_null_checks && mem.optional {
+                        "{}"
+                    } else {
+                        "unknown"
+                    };
+                    self.diagnostics.push(error_property_not_exist(
+                        &property_name,
+                        display,
+                        property_span,
+                    ));
+                    return Type::Error;
+                }
+                if matches!(obj_ty, Type::Any)
+                    && self.report_unbound_private_member_on_any(&property_name, property_span)
+                {
+                    return Type::Error;
+                }
                 // Member access on a bare constrained type parameter sees
                 // the constraint's apparent type (`t.x` with `T extends I`).
                 if let Some(apparent) = self.typeparam_constraint_apparent(&obj_ty) {
@@ -7842,8 +8100,19 @@ impl TypeChecker {
                 if continues_short_circuit {
                     obj_ty = self.remove_undefined_only(&obj_ty);
                 }
-                if !mem.optional {
-                    self.check_nullable_access(&obj_ty, &mem.object);
+                // Once "possibly null/undefined" is reported, tsc reads the
+                // member from the non-nullable type (a missing property is
+                // still TS2339 on `T`). A member that does exist keeps the
+                // `any` read of the nullable union: the possibly-nullish
+                // report itself can stem from a guard whose narrowing is not
+                // modeled, and a typed read would cascade it.
+                let mut nullish_receiver_reported = false;
+                if !mem.optional && self.check_nullable_access(&obj_ty, &mem.object) {
+                    let non_nullable = self.remove_null_undefined(&obj_ty);
+                    if !matches!(non_nullable, Type::Never) {
+                        obj_ty = non_nullable;
+                        nullish_receiver_reported = true;
+                    }
                 }
                 self.check_private_member_access(&obj_ty, &mem.property, property_span);
                 self.check_protected_member_access(
@@ -7958,6 +8227,10 @@ impl TypeChecker {
                 } else {
                     (obj_ty.clone(), false)
                 };
+                if self.report_missing_private_member(&effective_obj, &property_name, property_span)
+                {
+                    return Type::Error;
+                }
                 // Type aliases keep their display identity in diagnostics,
                 // but member availability must be checked against the
                 // aliased structure. In particular, `type U = A | B` has the
@@ -7985,7 +8258,8 @@ impl TypeChecker {
                         .map(|member| match member {
                             LazyAliasProperty::Present(value) => value,
                             LazyAliasProperty::Missing => {
-                                self.diagnostics.push(error_property_not_exist(
+                                self.diagnostics.push(self.missing_property_diagnostic(
+                                    &member_obj,
                                     &mem.property,
                                     &obj_ty.display_string_single_line(),
                                     property_span,
@@ -7996,6 +8270,12 @@ impl TypeChecker {
                         }),
                     _ => None,
                 };
+                let alias_receiver = match &lazy_alias_member {
+                    None => self.alias_member_receiver(&member_obj),
+                    Some(_) => None,
+                };
+                let alias_source = alias_receiver.is_some().then(|| member_obj.clone());
+                let member_obj = alias_receiver.unwrap_or(member_obj);
                 let member_ty = lazy_alias_member.unwrap_or_else(|| match &member_obj {
                     Type::ObjectType(info) => {
                         if let Some((_, prop_ty)) =
@@ -8047,6 +8327,14 @@ impl TypeChecker {
                         }) {
                             // A string index signature admits every name.
                             value
+                        } else if let Some(member) = self.standard_object_member_fallback(
+                            &mem.object,
+                            &member_obj,
+                            &mem.property,
+                            property_span,
+                            reported_future_lib_member,
+                        ) {
+                            member
                         } else if info.properties.is_empty()
                             && info.index_signature.is_none()
                         {
@@ -8070,7 +8358,7 @@ impl TypeChecker {
                         } else if reported_future_lib_member {
                             Type::Any
                         } else {
-                            self.diagnostics.push(error_property_not_exist(
+                            self.diagnostics.push(self.missing_property_diagnostic(&member_obj,
                                 &mem.property,
                                 &obj_ty.display_string_single_line(),
                                 property_span,
@@ -8091,7 +8379,7 @@ impl TypeChecker {
                             expr.span.end.saturating_sub(mem.property.len() as u32),
                             expr.span.end,
                         );
-                        self.diagnostics.push(error_property_not_exist(
+                        self.diagnostics.push(self.missing_property_diagnostic(&member_obj,
                             &mem.property,
                             "never",
                             property_span,
@@ -8121,9 +8409,15 @@ impl TypeChecker {
                                     expr.span.end.saturating_sub(mem.property.len() as u32),
                                     expr.span.end,
                                 );
-                                self.diagnostics.push(error_property_not_exist(
+                                self.diagnostics.push(self.missing_property_diagnostic(&member_obj,
                                     &mem.property,
                                     &format!("typeof import(\"{shown}\")"),
+                                    property_span,
+                                ));
+                            } else if self.ambient_module_paths.contains_key(&info.name) {
+                                self.diagnostics.push(diagnostics::error_property_not_exist(
+                                    &mem.property,
+                                    &format!("typeof import(\"{}\")", info.name),
                                     property_span,
                                 ));
                             }
@@ -8157,7 +8451,7 @@ impl TypeChecker {
                                     expr.span.end.saturating_sub(mem.property.len() as u32),
                                     expr.span.end,
                                 );
-                                self.diagnostics.push(error_property_not_exist(
+                                self.diagnostics.push(self.missing_property_diagnostic(&member_obj,
                                     &mem.property,
                                     &format!("typeof {}", info.name),
                                     property_span,
@@ -8205,6 +8499,15 @@ impl TypeChecker {
                                     ci.static_methods.iter().find(|(n, _)| n == &mem.property)
                                 {
                                     return Type::Function(ft.clone());
+                                }
+                                // Declared static index signatures supply
+                                // otherwise unnamed constructor properties.
+                                if !mem.property.starts_with('#') {
+                                    if let Some((_, value, _)) = ci.index_signatures.iter().find(|(key, _, is_static)| {
+                                        *is_static && self.is_assignable_to(&Type::StringLiteral(mem.property.to_string()), key)
+                                    }) {
+                                        return value.clone();
+                                    }
                                 }
                                 // Inherited statics, `prototype`, and Function's
                                 // own members (`call`, `bind`, `name`, …) exist;
@@ -8261,7 +8564,10 @@ impl TypeChecker {
                                 if inherited
                                     || augmented
                                     || function_member
-                                    || ci.extends.is_some()
+                                    // Private static names belong only to the
+                                    // declaring constructor, even when the
+                                    // base class cannot be fully resolved.
+                                    || (ci.extends.is_some() && !mem.property.starts_with('#'))
                                     || self.in_js_expando_assignment
                                     || reported_future_lib_member
                                     || narrowed_receiver
@@ -8269,7 +8575,7 @@ impl TypeChecker {
                                 {
                                     return Type::Any;
                                 }
-                                self.diagnostics.push(error_property_not_exist(
+                                self.diagnostics.push(self.missing_property_diagnostic(&member_obj,
                                     &mem.property,
                                     &format!("typeof {cls}"),
                                     property_span,
@@ -8335,11 +8641,17 @@ impl TypeChecker {
                             {
                                 Type::Any
                             } else {
-                                // An enum value has no such member (the enum's
-                                // own members are not properties of a value).
-                                self.diagnostics.push(error_property_not_exist(
+                                let enum_object = Self::simple_expression_path(&mem.object)
+                                    .is_some_and(|path| path == enum_key || path == *name);
+                                let receiver = if enum_object {
+                                    Type::TypeReference(format!("typeof {name}"), Arc::from([]))
+                                } else {
+                                    member_obj.clone()
+                                };
+                                self.diagnostics.push(self.missing_property_diagnostic(
+                                    &receiver,
                                     &mem.property,
-                                    &obj_ty.display_string_single_line(),
+                                    &receiver.display_string_single_line(),
                                     property_span,
                                 ));
                                 Type::Error
@@ -8549,7 +8861,7 @@ impl TypeChecker {
                                                             expr.span.end.saturating_sub(mem.property.len() as u32),
                                                             expr.span.end,
                                                         );
-                                                        self.diagnostics.push(error_property_not_exist(
+                                                        self.diagnostics.push(self.missing_property_diagnostic(&member_obj,
                                                             &mem.property,
                                                             &obj_ty.display_string_single_line(),
                                                             property_span,
@@ -8585,7 +8897,7 @@ impl TypeChecker {
                                                             expr.span.end,
                                                         );
                                                         self.diagnostics.push(
-                                                            error_property_not_exist(
+                                                            self.missing_property_diagnostic(&member_obj,
                                                                 &mem.property,
                                                                 &obj_ty.display_string_single_line(),
                                                                 property_span,
@@ -8691,7 +9003,7 @@ impl TypeChecker {
                                     expr.span.end.saturating_sub(mem.property.len() as u32),
                                     expr.span.end,
                                 );
-                                self.diagnostics.push(error_property_not_exist(
+                                self.diagnostics.push(self.missing_property_diagnostic(&member_obj,
                                     &mem.property,
                                     &obj_ty.display_string(),
                                     property_span,
@@ -8719,7 +9031,7 @@ impl TypeChecker {
                                 expr.span.end.saturating_sub(mem.property.len() as u32),
                                 expr.span.end,
                             );
-                            let mut diagnostic = error_property_not_exist(
+                            let mut diagnostic = self.missing_property_diagnostic(&member_obj,
                                 &mem.property,
                                 &obj_ty.display_string(),
                                 property_span,
@@ -8758,6 +9070,10 @@ impl TypeChecker {
                             if !matches!(resolved, Type::Any) && !found.contains(&resolved) {
                                 found.push(resolved);
                             }
+                        }
+                        if self.intersection_property_presence(&obj_ty, &mem.property, 0) == Some(false) {
+                            self.diagnostics.push(self.missing_property_diagnostic(&member_obj, &mem.property, &obj_ty.display_string_single_line(), property_span));
+                            return Type::Error;
                         }
                         match found.len() {
                             0 => Type::Any,
@@ -8825,7 +9141,7 @@ impl TypeChecker {
                                         return Type::Function(method.clone());
                                     }
                                 }
-                                self.diagnostics.push(error_property_not_exist(
+                                self.diagnostics.push(self.missing_property_diagnostic(&member_obj,
                                     &property_name,
                                     &format!("typeof {class_name}"),
                                     property_span,
@@ -8875,7 +9191,7 @@ impl TypeChecker {
                                             clean == property_name.as_str()
                                         });
                                     if prop_missing {
-                                        self.diagnostics.push(error_property_not_exist(
+                                        self.diagnostics.push(self.missing_property_diagnostic(&member_obj,
                                             &property_name,
                                             &class_name,
                                             property_span,
@@ -8910,7 +9226,7 @@ impl TypeChecker {
                             expr.span.end.saturating_sub(mem.property.len() as u32),
                             expr.span.end,
                         );
-                        self.diagnostics.push(error_property_not_exist(
+                        self.diagnostics.push(self.missing_property_diagnostic(&member_obj,
                             &mem.property,
                             "never",
                             property_span,
@@ -8919,6 +9235,15 @@ impl TypeChecker {
                     }
                     _ => Type::Any,
                 });
+                let member_ty = match &alias_source {
+                    Some(source) => self.alias_receiver_read(source, member_ty),
+                    None => member_ty,
+                };
+                let member_ty = if nullish_receiver_reported && !matches!(member_ty, Type::Error) {
+                    Type::Any
+                } else {
+                    member_ty
+                };
                 // For optional chaining, the result is T | undefined
                 if (is_optional_chain || continues_short_circuit)
                     && !matches!(member_ty, Type::Any | Type::Error | Type::Never)
@@ -8943,27 +9268,89 @@ impl TypeChecker {
                 }
             }
             ExprKind::ElemAccess(ea) => {
+                if let Some(narrowed) = self
+                    .known_element_path(expr)
+                    .and_then(|key| self.lookup_narrowed(&key))
+                {
+                    return narrowed;
+                }
                 if let Some(narrowed) =
                     Self::element_path(expr).and_then(|key| self.lookup_narrowed(&key))
                 {
                     return narrowed;
                 }
-                if let (ExprKind::Ident(object_name), ExprKind::StrLit(key)) =
-                    (&ea.object.kind, &ea.index.kind)
+                let obj_ty = self.check_expr(&ea.object);
+                let idx_ty = self.check_expr(&ea.index);
+                if (self.is_global_object_expression(&ea.object)
+                    || self.is_global_object_type(&obj_ty))
+                    && !self.current_file_is_js()
                 {
-                    if object_name == "globalThis"
-                        && self.lookup_var("globalThis").is_none()
-                        && !self.current_file_is_js()
-                    {
-                        if let Some(ty) = self.global_this_member_type(key, expr.span) {
-                            return ty;
+                    if let Some(ty) = self.global_this_element_access(&idx_ty, expr.span) {
+                        return ty;
+                    }
+                }
+                if self.no_implicit_any && matches!(obj_ty, Type::Intersection(_)) {
+                    if let Type::StringLiteral(key) | Type::NumberLiteral(key) = &idx_ty {
+                        if self.intersection_property_presence(&obj_ty, key, 0) == Some(false) {
+                            let numeric_only = self
+                                .intersection_index_kinds(&obj_ty, 0)
+                                .is_some_and(|kinds| kinds & 1 != 0 && kinds & 2 == 0);
+                            let shown = obj_ty.display_string_single_line();
+                            self.diagnostics.push(Diagnostic {
+                                code: if numeric_only { 7015 } else { 7053 },
+                                message: if numeric_only { "Element implicitly has an 'any' type because index expression is not of type 'number'.".to_string() }
+                                    else { format!("Element implicitly has an 'any' type because expression of type '{}' can't be used to index type '{shown}'.\n  Property '{key}' does not exist on type '{shown}'.", idx_ty.display_string_single_line()) },
+                                category: DiagnosticCategory::Error, file_name: None,
+                                span: Some(if numeric_only { ea.index.span } else { expr.span }), related: None,
+                            });
+                            return Type::Any;
                         }
                     }
                 }
-                let obj_ty = self.check_expr(&ea.object);
-                let idx_ty = self.check_expr(&ea.index);
+                if self.is_unknown_receiver(&obj_ty) {
+                    if self.report_unknown_receiver(&ea.object, &obj_ty, ea.optional) {
+                        return Type::Error;
+                    }
+                    let member = self.unknown_element_access(&idx_ty, ea.index.span, expr.span);
+                    if ea.optional
+                        && self.strict_null_checks
+                        && !matches!(member, Type::Any | Type::Error)
+                    {
+                        self.short_circuit_undefined_exprs.clear();
+                        self.short_circuit_undefined_exprs
+                            .push(std::ptr::from_ref(expr) as usize);
+                        return Type::flatten_union(vec![member, Type::Undefined]);
+                    }
+                    return member;
+                }
                 if let Some(operand) = self.enum_element_access_type(expr, &idx_ty) {
                     return operand;
+                }
+                if self.active_type_parameter_name(&obj_ty).is_some() {
+                    let key_constraint = self.declared_type_param_constraint(&idx_ty);
+                    if let Type::Keyof(owner) = key_constraint.as_ref().unwrap_or(&idx_ty) {
+                        let valid_owner = match owner.as_ref() {
+                            Type::Intersection(members) => members
+                                .iter()
+                                .all(|member| self.is_assignable_to(&obj_ty, member)),
+                            owner => self.is_assignable_to(&obj_ty, owner),
+                        };
+                        if !valid_owner {
+                            self.diagnostics.push(Diagnostic {
+                                code: 2536,
+                                message: format!(
+                                    "Type '{}' cannot be used to index type '{}'.",
+                                    idx_ty.display_string(),
+                                    obj_ty.display_string()
+                                ),
+                                category: DiagnosticCategory::Error,
+                                file_name: None,
+                                span: Some(expr.span),
+                                related: None,
+                            });
+                            return Type::Error;
+                        }
+                    }
                 }
                 let is_symbol_iterator = matches!(
                     &ea.index.kind,
@@ -9027,6 +9414,26 @@ impl TypeChecker {
                         ty
                     }
                 };
+                if let Some(member) = self.known_literal_index_read(&obj_ty, &idx_ty, 0) {
+                    self.record_expr_type(expr.span.start, &member);
+                    return member;
+                }
+                // A program alias of an object type (and `Record<string, V>`)
+                // indexes like the object type it names. Its index-signature
+                // reads stay without the noUncheckedIndexedAccess `undefined`:
+                // flow narrowing of such element paths (`if (!m[k]) m[k] = …`)
+                // is not modeled, and these reads used to be `any`.
+                if let Some(Type::ObjectType(info)) = self.alias_member_receiver(&obj_ty) {
+                    if let ExprKind::StrLit(ref key) = ea.index.kind {
+                        if let Some((_, prop_ty)) = info.properties.iter().find(|(n, _)| n == key) {
+                            return self.alias_receiver_read(&obj_ty, Type::clone(prop_ty));
+                        }
+                    }
+                    return match &info.index_signature {
+                        Some((_, value)) => self.alias_receiver_read(&obj_ty, Type::clone(value)),
+                        None => Type::Any,
+                    };
+                }
                 match &obj_ty {
                     Type::Array(elem) if is_symbol_iterator => Type::Function(FunctionType {
                         type_param_constraints: Vec::new(),
@@ -9282,10 +9689,27 @@ impl TypeChecker {
                 // right-hand side still is (`x = x.concat([])`), so the
                 // binding leaves the unassigned set only after the RHS check.
                 let saved_assignment_target = self.assignment_target_span;
-                if (assign.op == AssignOp::Assign && matches!(assign.left.kind, ExprKind::Ident(_)))
-                    || matches!(assign.left.kind, ExprKind::Member(_))
+                let mut written_target = assign.left.as_ref();
+                while let ExprKind::Paren(inner) | ExprKind::NonNull(inner) = &written_target.kind {
+                    written_target = inner;
+                }
+                let pending_assignment = if assign.op == AssignOp::Assign {
+                    if let ExprKind::Ident(name) = &written_target.kind {
+                        self.uninitialized_vars
+                            .get(name.as_str())
+                            .copied()
+                            .map(|entry| (name.to_string(), entry))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if (assign.op == AssignOp::Assign
+                    && matches!(written_target.kind, ExprKind::Ident(_)))
+                    || matches!(written_target.kind, ExprKind::Member(_))
                 {
-                    self.assignment_target_span = Some(assign.left.span);
+                    self.assignment_target_span = Some(written_target.span);
                 }
                 // For an Ident LHS, use the DECLARED type (vars), not the
                 // narrowed view. TS-correct semantics: `let x: A = ...;
@@ -9367,7 +9791,11 @@ impl TypeChecker {
                                 _ => ty,
                             }
                         }
-                        ExprKind::ObjectLit(_) | ExprKind::ArrayLit(_) => {
+                        _ if matches!(
+                            written_target.kind,
+                            ExprKind::ObjectLit(_) | ExprKind::ArrayLit(_)
+                        ) =>
+                        {
                             // Destructuring assignment pattern.
                             self.assignment_pattern_depth += 1;
                             let ty = self.check_expr(&assign.left);
@@ -9379,6 +9807,12 @@ impl TypeChecker {
                 } else {
                     self.check_expr(&assign.left)
                 };
+                // Reading through parentheses visits the identifier checker,
+                // which marks a write assigned. The RHS still precedes that
+                // write, so restore its pending state until the RHS is checked.
+                if let Some((name, entry)) = pending_assignment {
+                    self.uninitialized_vars.insert(name, entry);
+                }
                 // Contextual-type the RHS by the LHS so literal-narrowing
                 // survives across `x = [{ createdAt: "asc" }]` (Prisma
                 // `orderBy` shape — `{createdAt?: "asc"|"desc"; ...}[]`).
@@ -9396,7 +9830,7 @@ impl TypeChecker {
                     self.check_expr(&assign.right)
                 };
                 if assign.op == AssignOp::Assign {
-                    if let ExprKind::Ident(ref name) = assign.left.kind {
+                    if let ExprKind::Ident(ref name) = written_target.kind {
                         self.uninitialized_vars.remove(name.as_str());
                     }
                 }
@@ -9405,6 +9839,7 @@ impl TypeChecker {
                 // diagnostics within it), but suppresses secondary target
                 // compatibility, operator, and excess-property diagnostics.
                 if readonly_write {
+                    self.report_invalid_reference(&assign.left, false);
                     return right_ty;
                 }
                 // Property assignments can declare expando members on a
@@ -9476,6 +9911,7 @@ impl TypeChecker {
                         }
                     }
                 }
+                let operator_diagnostics_start = self.diagnostics.len();
                 if matches!(
                     assign.op,
                     AssignOp::AddAssign
@@ -9505,6 +9941,12 @@ impl TypeChecker {
                         self.diagnostics
                             .push(error_boolean_operator(op, sug, expr.span));
                     } else if assign.op == AssignOp::AddAssign {
+                        if !self.binary_operator_type_is_string_like(&left_ty)
+                            && !self.binary_operator_type_is_string_like(&right_ty)
+                        {
+                            self.report_unknown_receiver(&assign.left, &left_ty, false);
+                            self.report_unknown_receiver(&assign.right, &right_ty, false);
+                        }
                         if !(self.strict_null_checks
                             && !self.binary_operator_type_is_string_like(&left_ty)
                             && self.report_nullish_literal_operand(&assign.right))
@@ -9559,6 +10001,16 @@ impl TypeChecker {
                 // An object destructuring target is checked property by
                 // property (tsc's checkObjectLiteralAssignment), not as a whole.
                 let object_target = matches!(assign.left.kind, ExprKind::ObjectLit(_));
+                let destructuring = assign.op == AssignOp::Assign
+                    && matches!(
+                        assign.left.kind,
+                        ExprKind::ObjectLit(_) | ExprKind::ArrayLit(_)
+                    );
+                // Invalid compound operands take precedence over reference
+                // checks. Simple assignment patterns are checked separately.
+                let invalid_reference = !destructuring
+                    && self.diagnostics.len() == operator_diagnostics_start
+                    && self.report_invalid_reference(&assign.left, false);
                 if assign.op == AssignOp::Assign && object_target {
                     if let ExprKind::ObjectLit(properties) = &assign.left.kind {
                         self.check_object_destructuring_properties(properties, &right_ty);
@@ -9566,6 +10018,7 @@ impl TypeChecker {
                 }
                 if assign.op == AssignOp::Assign
                     && !object_target
+                    && !invalid_reference
                     && !matches!(left_ty, Type::Any | Type::Error)
                 {
                     let assignable = self.is_assignable_to(&right_ty, &left_ty);
@@ -9857,7 +10310,7 @@ impl TypeChecker {
                                 properties.push((name.to_string(), Arc::new(ty)));
                             }
                         }
-                        ObjLitProp::Spread(e, _) => {
+                        ObjLitProp::Spread(e, span) => {
                             // `({ ...rest } = value)`: the spread target is
                             // assigned, not read.
                             let spread_ty = if self.assignment_pattern_depth > 0
@@ -9877,7 +10330,10 @@ impl TypeChecker {
                             // Spreading `any` makes the whole literal `any`
                             // (tsc's getSpreadType) — flag it and collapse
                             // after the loop.
-                            if matches!(spread_ty, Type::Any) {
+                            if matches!(spread_ty, Type::Any)
+                                || (self.assignment_pattern_depth == 0
+                                    && self.report_unknown_object_spread(&spread_ty, *span))
+                            {
                                 any_spread_plain = true;
                             }
                             let before = properties.len();
@@ -9968,7 +10424,14 @@ impl TypeChecker {
                             self.return_type_stack.push(expected_ret);
                             self.return_is_async_stack.push(m.is_async);
                             self.generator_stack.push(m.is_generator);
-                            let ret = declared_ret.unwrap_or(Type::Void);
+                            let ret = declared_ret.unwrap_or_else(|| {
+                                let inferred = self.infer_return_type_from_block(&m.body);
+                                if m.is_async {
+                                    self.wrap_async_inferred(inferred)
+                                } else {
+                                    inferred
+                                }
+                            });
                             let tp = m
                                 .type_params
                                 .as_ref()
@@ -10422,7 +10885,11 @@ impl TypeChecker {
                     self.check_base_constructor_expression(extends);
                 }
                 let legacy_decorators = self.compiler_options.experimental_decorators == Some(true);
-                self.check_decorators_with_validity(&class_decl.decorators, !legacy_decorators);
+                self.check_decorators_at_site(
+                    &class_decl.decorators,
+                    !legacy_decorators,
+                    decorator_types::DecoratorSite::Class,
+                );
                 // Give every class expression a stable internal class identity,
                 // including anonymous expressions. This preserves private
                 // instance/static nominal origins across construction and
@@ -10449,6 +10916,7 @@ impl TypeChecker {
                 self.enclosing_class_names.push(identity.clone());
                 self.enclosing_class_derived
                     .push(class_decl.extends.is_some());
+                self.register_class_initializer_shapes(class_decl);
                 let info = self.build_class_info(class_decl);
                 self.insert_class_info(identity.clone(), info);
                 let class_type_param_frame = pushed_type_params
@@ -10456,6 +10924,10 @@ impl TypeChecker {
                 for member in &class_decl.members {
                     let pushed_static_context =
                         self.push_static_member_context(member, class_type_param_frame);
+                    let saved_static_this = self.static_this_class.take();
+                    if Self::class_member_is_static(member) {
+                        self.static_this_class = Some(identity.clone());
+                    }
                     let member_type_params = match &member.kind {
                         ClassMemberKind::Method(method) => method.type_params.as_deref(),
                         _ => None,
@@ -10464,6 +10936,7 @@ impl TypeChecker {
                         self.push_active_type_param_names(member_type_params);
                     self.check_active_type_param_declarations(member_type_params);
                     self.check_class_member_with_siblings(member, &class_decl.members, true);
+                    self.static_this_class = saved_static_this;
                     self.check_class_member_future_lib_globals(member);
                     self.pop_active_type_param_names(pushed_member_type_params);
                     if pushed_static_context {
@@ -11375,7 +11848,26 @@ impl TypeChecker {
                         // Widen literals: TypeScript infers `number` from arg `1`, not literal `1`.
                         let widened: Vec<Type> = arg_types
                             .iter()
-                            .map(|t| self.widen_argument_for_inference(t))
+                            .enumerate()
+                            .map(|(index, ty)| {
+                                let intersection_target =
+                                    ft.params.get(index).is_some_and(|(_, target)| {
+                                        matches!(target, Type::Intersection(_))
+                                            || matches!(
+                                                self.resolve_type_for_assignability(target),
+                                                Some(Type::Intersection(_))
+                                            )
+                                    });
+                                // An intersection fixes the inference context:
+                                // null must remain a candidate for T & {}, so
+                                // substitution can reduce that parameter to never.
+                                if intersection_target && matches!(ty, Type::Null | Type::Undefined)
+                                {
+                                    ty.clone()
+                                } else {
+                                    self.widen_argument_for_inference(ty)
+                                }
+                            })
                             .collect();
                         let mut map = self.infer_type_arguments_for_call(
                             &widened,
@@ -11491,7 +11983,12 @@ impl TypeChecker {
                             if n.starts_with("...") && bare_tp {
                                 (n.clone(), Type::Any)
                             } else {
-                                (n.clone(), Self::substitute(t, &type_param_map))
+                                let substituted = Self::substitute(t, &type_param_map);
+                                let substituted = match substituted {
+                                    Type::Intersection(members) => self.reduce_nullish_intersection(members.to_vec()),
+                                    other => other,
+                                };
+                                (n.clone(), substituted)
                             }
                         })
                         .collect();
@@ -11697,7 +12194,8 @@ impl TypeChecker {
                             let param_is_literal_typed = {
                                 fn has_literal(ty: &Type) -> bool {
                                     match ty {
-                                        Type::StringLiteral(_)
+                                        Type::Never
+                                        | Type::StringLiteral(_)
                                         | Type::NumberLiteral(_)
                                         | Type::BooleanLiteral(_)
                                         | Type::BigIntLiteral(_) => true,
@@ -11929,6 +12427,9 @@ impl TypeChecker {
     /// values). A block-scoped, class or type-only global is TS2339; an
     /// unknown name is TS7017 under noImplicitAny.
     fn global_this_member_type(&mut self, name: &str, span: Span) -> Option<Type> {
+        if let Some(ty) = self.global_this_known_property(name) {
+            return Some(ty);
+        }
         match self.script_global_kinds.get(name).copied() {
             Some(0) => Some(self.lookup_var(name).cloned().unwrap_or(Type::Any)),
             // A type-only name is no property at all (TS7017 below).
@@ -12357,6 +12858,64 @@ impl TypeChecker {
         false
     }
 
+    /// Builtin constructor values have a compact structural type, sometimes
+    /// containing `any` properties such as `Object.prototype`. Consult the
+    /// library declarations before treating that structure as incomplete.
+    fn standard_object_member_fallback(
+        &mut self,
+        expression: &Expr,
+        receiver: &Type,
+        property: &str,
+        span: Span,
+        reported_future_lib_member: bool,
+    ) -> Option<Type> {
+        let availability = stdlib::stdlib_member_availability(&self.compiler_options)?;
+        let standard = self.future_lib_receiver_from_type(expression, receiver, &availability)?;
+        // Parser recovery can leave a placeholder after an incomplete dot.
+        // The syntax diagnostic already explains the missing identifier.
+        if property.is_empty() || property.starts_with('<') {
+            return Some(Type::Any);
+        }
+        let constructor = availability.owner_is_constructor(&standard.owner);
+        let owners = [
+            Some(standard.owner.as_str()),
+            Some("Object"),
+            constructor.then_some("Function"),
+        ];
+        let declared = owners.iter().flatten().any(|owner| {
+            availability.member_is_active(owner, property)
+                || self.interface_info.keys().any(|key| {
+                    (key == *owner || key.rsplit_once('.').is_some_and(|(_, tail)| tail == *owner))
+                        && self
+                            .resolve_type_reference_to_object(key, &[])
+                            .is_some_and(|ty| {
+                                let Type::ObjectType(info) = ty else {
+                                    return false;
+                                };
+                                info.properties.iter().any(|(name, _)| {
+                                    name.strip_prefix('?').unwrap_or(name) == property
+                                }) || info
+                                    .index_signature
+                                    .as_ref()
+                                    .is_some_and(|(key, _)| matches!(key.as_ref(), Type::String))
+                            })
+                })
+        });
+        if declared
+            || reported_future_lib_member
+            || (self.in_js_expando_assignment && self.current_file_is_js())
+        {
+            return Some(Type::Any);
+        }
+        self.diagnostics.push(self.missing_property_diagnostic(
+            &Type::TypeReference(standard.owner, Arc::from([])),
+            property,
+            &standard.display,
+            span,
+        ));
+        Some(Type::Error)
+    }
+
     /// A member missing from the builtin model of a primitive: TS2339 when
     /// the configured lib files do not declare it on the primitive's
     /// interface (or `Object`) either; otherwise the member exists and is
@@ -12412,12 +12971,152 @@ impl TypeChecker {
         if augmented {
             return Type::Any;
         }
-        self.diagnostics.push(error_property_not_exist(
+        self.diagnostics.push(self.missing_property_diagnostic(
+            receiver,
             property,
             &receiver.display_string_single_line(),
             property_span,
         ));
         Type::Error
+    }
+
+    /// The structure a program-declared type alias receiver names, for
+    /// member access: `type T = { a: number }` reads members like the written
+    /// object type. Lib aliases (`Omit`, `Partial`, …) are left as
+    /// references: their structural expansion is approximate and keeps its
+    /// own lenient lookup.
+    fn alias_member_receiver(&self, ty: &Type) -> Option<Type> {
+        // The alias registry is keyed by bare name across the whole program,
+        // and a failed inference leaves a type parameter behind as a bare
+        // reference (`T`). Only a name this file itself declares or imports
+        // from the declaring module is known to mean the registered alias.
+        if let Type::TypeReference(name, _) = ty {
+            if name != "Record" && !self.alias_name_means_registered_alias(name) {
+                return None;
+            }
+        }
+        let mut current = ty.clone();
+        for _ in 0..8 {
+            let Type::TypeReference(name, _) = &current else {
+                break;
+            };
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            // `Record<string, V>` is `{ [key: string]: V }`; other key sets
+            // name properties the lenient lookup keeps.
+            if bare == "Record" {
+                if let Type::TypeReference(_, args) = &current {
+                    // `Record<string, unknown>` stays lenient: its reads
+                    // are refined by guards (`typeof r.k === "string"`,
+                    // predicates) whose narrowing is not fully modeled.
+                    if args.len() == 2
+                        && matches!(args[0], Type::String)
+                        && !matches!(args[1], Type::Unknown)
+                    {
+                        current = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                            properties: Vec::new(),
+                            call_signatures: Vec::new(),
+                            construct_signatures: Vec::new(),
+                            index_signature: Some((
+                                Arc::new(Type::String),
+                                Arc::new(args[1].clone()),
+                            )),
+                            index_signature_name: None,
+                            method_names: Vec::new(),
+                        }));
+                    }
+                }
+                break;
+            }
+            // Each hop is a bare-name lookup too: a namespace-qualified or
+            // multiply-declared name may land on another module's alias.
+            let scoped = name.starts_with(FILE_INTERFACE_KEY_PREFIX);
+            if self.class_info.contains_key(name.as_str())
+                || self.interface_info.contains_key(name.as_str())
+                || self.enum_info.contains_key(name.as_str())
+                || stdlib::any_lib_declares_global(bare)
+                || (!scoped
+                    && (name.contains('.') || self.duplicate_type_names.contains(name.as_str())))
+            {
+                break;
+            }
+            let Some(resolved) = self.resolve_type_for_assignability(&current) else {
+                break;
+            };
+            if resolved == current {
+                break;
+            }
+            current = resolved;
+        }
+        if current == *ty {
+            return None;
+        }
+        // Unions and intersections keep their lenient lookup: their member
+        // types (an intersection's `(A | null) & A` property, a union's
+        // generic methods) are not normalized like tsc's.
+        match &current {
+            Type::ObjectType(_) => Some(current),
+            Type::TypeReference(name, _)
+                if self.class_info.contains_key(name.as_str())
+                    || self.interface_info.contains_key(name.as_str()) =>
+            {
+                Some(current)
+            }
+            _ => None,
+        }
+    }
+
+    /// A member read through `alias_member_receiver`. Reads through a
+    /// non-generic alias (or `Record`) used to be `any`; they keep that
+    /// unless the member is itself a plain data object (no methods), whose
+    /// members are then checked too (`n.v.nope`, `rec["k"].nope`). Typing
+    /// every such read exposes inference and narrowing paths (`??` operands,
+    /// `Array.isArray(a?.b)`, generic candidates from method results) that
+    /// are not yet as precise as tsc's.
+    fn alias_receiver_read(&self, source: &Type, read: Type) -> Type {
+        let was_lenient = match source {
+            Type::TypeReference(name, args) => {
+                args.is_empty() || name.rsplit('.').next() == Some("Record")
+            }
+            _ => false,
+        };
+        if !was_lenient || matches!(read, Type::Error) || self.is_plain_data_object(&read) {
+            read
+        } else {
+            Type::Any
+        }
+    }
+
+    /// An object type with properties only (no call/construct signatures,
+    /// no methods or function-valued members): a program interface without
+    /// type arguments, or an object type (written or behind a program alias).
+    fn is_plain_data_object(&self, ty: &Type) -> bool {
+        let plain = |info: &ObjectTypeInfo| {
+            info.call_signatures.is_empty()
+                && info.construct_signatures.is_empty()
+                && info.method_names.is_empty()
+                && !info.properties.is_empty()
+                && info.properties.iter().all(|(_, member)| {
+                    let member = match member.as_ref() {
+                        Type::Optional(inner) => inner.as_ref(),
+                        other => other,
+                    };
+                    !matches!(member, Type::Function(_) | Type::Constructor(_) | Type::Any)
+                })
+        };
+        match ty {
+            Type::ObjectType(info) => plain(info),
+            Type::TypeReference(name, args) if args.is_empty() => {
+                if self.interface_info.contains_key(name.as_str())
+                    && !self.class_info.contains_key(name.as_str())
+                    && !stdlib::any_lib_declares_global(name)
+                {
+                    matches!(self.get_class_instance_type(name), Type::ObjectType(ref info) if plain(info))
+                } else {
+                    matches!(self.alias_member_receiver(ty), Some(Type::ObjectType(ref info)) if plain(info))
+                }
+            }
+            _ => false,
+        }
     }
 
     /// The structural shape we hold for interface `name` is complete: every
@@ -12530,7 +13229,8 @@ impl TypeChecker {
         if !availability.owner_is_active(owner) {
             return Type::Any;
         }
-        self.diagnostics.push(error_property_not_exist(
+        self.diagnostics.push(self.missing_property_diagnostic(
+            receiver,
             property,
             &receiver.display_string_single_line(),
             property_span,
@@ -13385,7 +14085,12 @@ impl TypeChecker {
                 } else {
                     prop.modifiers & (MOD_ABSTRACT | MOD_DECLARE) == 0
                 };
-                self.check_decorators_with_validity(&prop.decorators, valid_decorators);
+                let site = if prop.modifiers & tsc_rs_ast::MOD_ACCESSOR != 0 {
+                    decorator_types::DecoratorSite::AutoAccessor
+                } else {
+                    decorator_types::DecoratorSite::Property
+                };
+                self.check_decorators_at_site(&prop.decorators, valid_decorators, site);
                 // A class member's computed name has its own control-flow
                 // container (tsc), so outer variables are assumed assigned.
                 self.fn_nesting_depth += 1;
@@ -13430,6 +14135,8 @@ impl TypeChecker {
                     self.declare_class_member_super_marker();
                     if (prop.modifiers & MOD_STATIC) != 0 {
                         self.declare_var(STATIC_THIS_MARKER, Type::Never);
+                    } else {
+                        self.declare_instance_member_marker();
                     }
                     // TS2715: an instance property initializer runs during
                     // class initialization — abstract `this.prop` access here
@@ -13568,10 +14275,11 @@ impl TypeChecker {
                 let legacy_decorators = self.compiler_options.experimental_decorators == Some(true);
                 let has_private_name = matches!(method.name, PropName::Private(_, _));
                 if method.body.is_some() {
-                    self.check_decorators_with_validity(
+                    self.check_decorators_at_site(
                         &method.decorators,
                         (!legacy_decorators || !class_is_expression)
                             && (!legacy_decorators || !has_private_name),
+                        decorator_types::DecoratorSite::Method,
                     );
                 } else {
                     self.report_decorator_on_method_overload(&method.decorators);
@@ -13810,11 +14518,12 @@ impl TypeChecker {
             ClassMemberKind::GetAccessor(acc) | ClassMemberKind::SetAccessor(acc) => {
                 let legacy_decorators = self.compiler_options.experimental_decorators == Some(true);
                 let has_private_name = matches!(acc.name, PropName::Private(_, _));
-                self.check_decorators_with_validity(
+                self.check_decorators_at_site(
                     &acc.decorators,
                     acc.body.is_some()
                         && (!legacy_decorators || !class_is_expression)
                         && (!legacy_decorators || !has_private_name),
+                    decorator_types::DecoratorSite::Method,
                 );
                 // A class member's computed name has its own control-flow
                 // container (tsc), so outer variables are assumed assigned.

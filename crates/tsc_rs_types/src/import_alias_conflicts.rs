@@ -158,6 +158,9 @@ impl TypeChecker {
     /// Whether an import-equals target has a value meaning, resolved through
     /// the file's own namespaces (`None` when it cannot be resolved here).
     fn alias_target_has_value(root: &[Stmt], module_ref: &Expr) -> Option<bool> {
+        if Self::file_global_object_alias(root, module_ref) {
+            return Some(true);
+        }
         if let ExprKind::Call(call) = &module_ref.kind {
             return matches!(&call.callee.kind, ExprKind::Ident(n) if n == "require")
                 .then_some(true);
@@ -292,10 +295,12 @@ impl TypeChecker {
                 _ => {}
             }
         }
-        if !local_value || std::ptr::eq(statements, root) {
+        if !local_value || (first != "globalThis" && std::ptr::eq(statements, root)) {
             return;
         }
-        if Self::alias_target_has_value(root, &import.module_ref) != Some(true) {
+        if first != "globalThis"
+            && Self::alias_target_has_value(root, &import.module_ref) != Some(true)
+        {
             return;
         }
         // The first identifier's span: the start of the entity expression.

@@ -462,7 +462,7 @@ impl TsProject {
                         javascript: String::new(),
                         source_map: None,
                         declaration_file: None,
-                        require_var_counters: HashMap::new(),
+                        require_var_counters: Default::default(),
                         system_register_counter: 0,
                     }
                 } else {

@@ -406,10 +406,7 @@ pub(crate) fn expr_is_error_placeholder(expr: &Expr) -> bool {
 }
 
 /// Returns true if an expression contains a reference to a CJS import binding.
-pub(crate) fn expr_has_cjs_import_ref(
-    expr: &Expr,
-    map: &HashMap<AstString, (AstString, AstString)>,
-) -> bool {
+pub(crate) fn expr_has_cjs_import_ref(expr: &Expr, map: &CjsImportMap) -> bool {
     match &expr.kind {
         ExprKind::Ident(name) => map.contains_key(name.as_str()),
         ExprKind::Member(mem) => expr_has_cjs_import_ref(&mem.object, map),
@@ -510,10 +507,7 @@ pub(crate) fn expr_has_cjs_import_ref(
     }
 }
 
-pub(crate) fn jsx_attrs_have_cjs_ref(
-    attrs: &[JsxAttribute],
-    map: &HashMap<AstString, (AstString, AstString)>,
-) -> bool {
+pub(crate) fn jsx_attrs_have_cjs_ref(attrs: &[JsxAttribute], map: &CjsImportMap) -> bool {
     attrs.iter().any(|a| match a {
         JsxAttribute::Normal { value: Some(v), .. } => expr_has_cjs_import_ref(v, map),
         JsxAttribute::Spread(e, _) => expr_has_cjs_import_ref(e, map),
@@ -521,10 +515,7 @@ pub(crate) fn jsx_attrs_have_cjs_ref(
     })
 }
 
-pub(crate) fn jsx_children_have_cjs_ref(
-    children: &[JsxChild],
-    map: &HashMap<AstString, (AstString, AstString)>,
-) -> bool {
+pub(crate) fn jsx_children_have_cjs_ref(children: &[JsxChild], map: &CjsImportMap) -> bool {
     children.iter().any(|c| match c {
         JsxChild::Element(e) => expr_has_cjs_import_ref(e, map),
         JsxChild::Expression(Some(e), _) => expr_has_cjs_import_ref(e, map),
@@ -622,10 +613,7 @@ pub(crate) fn expr_has_cjs_export_ref(expr: &Expr, names: &HashSet<AstString>) -
 }
 
 /// Returns true if a statement contains a reference to a CJS import binding.
-pub(crate) fn stmt_has_cjs_import_ref(
-    stmt: &Stmt,
-    map: &HashMap<AstString, (AstString, AstString)>,
-) -> bool {
+pub(crate) fn stmt_has_cjs_import_ref(stmt: &Stmt, map: &CjsImportMap) -> bool {
     match &stmt.kind {
         StmtKind::Expr(e) | StmtKind::Throw(e) | StmtKind::ExportAssign(e) => {
             expr_has_cjs_import_ref(e, map)
@@ -854,7 +842,7 @@ pub(crate) fn stmt_has_cjs_import_meta_rewrite(stmt: &Stmt) -> bool {
 pub(crate) fn stmt_has_ns_export_ref(stmt: &Stmt, exports: &HashSet<AstString>) -> bool {
     /// Collect parameter names that shadow export names.
     fn param_names_set(params: &[Param], exports: &HashSet<AstString>) -> HashSet<AstString> {
-        let mut result = HashSet::new();
+        let mut result = HashSet::default();
         for p in params {
             collect_pat_idents(&p.name, exports, &mut result);
         }
@@ -2536,6 +2524,10 @@ pub(crate) fn find_line_comment(s: &str) -> Option<usize> {
 
 /// Find the first trailing comment start (`//` or `/*`) in a line fragment.
 pub(crate) fn find_trailing_comment_start(s: &str) -> Option<usize> {
+    // Most line tails hold no `/` at all: one memchr instead of two scans.
+    if !s.as_bytes().contains(&b'/') {
+        return None;
+    }
     let line = find_line_comment(s);
     let block = s.find("/*");
     match (line, block) {
@@ -2582,20 +2574,17 @@ pub(crate) fn find_separator_outside_comments(s: &str) -> usize {
 }
 
 pub(crate) fn is_string_literal(expr: &Expr) -> bool {
-    is_string_valued(expr, &std::collections::HashSet::new())
+    is_string_valued(expr, &HashSet::default())
 }
 
 /// Check whether an enum member initializer is string-valued, taking into
 /// account a set of previously-emitted members known to have string values.
-pub(crate) fn is_string_valued(
-    expr: &Expr,
-    string_members: &std::collections::HashSet<String>,
-) -> bool {
+pub(crate) fn is_string_valued(expr: &Expr, string_members: &HashSet<String>) -> bool {
     is_string_valued_ext(
         expr,
         string_members,
-        &std::collections::HashMap::new(),
-        &std::collections::HashMap::new(),
+        &HashMap::default(),
+        &HashMap::default(),
     )
 }
 
@@ -2603,12 +2592,9 @@ pub(crate) fn is_string_valued(
 /// string member references via `merged_string_enum_values`.
 pub(crate) fn is_string_valued_ext(
     expr: &Expr,
-    string_members: &std::collections::HashSet<String>,
-    merged_string_enum_values: &std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, String>,
-    >,
-    file_string_consts: &std::collections::HashMap<String, String>,
+    string_members: &HashSet<String>,
+    merged_string_enum_values: &HashMap<String, HashMap<String, String>>,
+    file_string_consts: &HashMap<String, String>,
 ) -> bool {
     match &expr.kind {
         ExprKind::StrLit(_) | ExprKind::NoSubstTemplate(_) | ExprKind::Template(_) => true,

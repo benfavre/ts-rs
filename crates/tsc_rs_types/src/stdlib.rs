@@ -26,9 +26,12 @@ type MemberKey = (String, String);
 #[derive(Debug, Clone, Default)]
 struct LibraryDeclarations {
     members: HashSet<MemberKey>,
+    bases: HashMap<String, HashSet<String>>,
+    index_kinds: HashMap<String, u8>,
     owners: HashSet<String>,
     types: HashSet<String>,
     values: HashSet<String>,
+    functions: HashSet<String>,
     value_owners: HashMap<String, String>,
     constructor_returns: HashMap<String, String>,
 }
@@ -36,9 +39,19 @@ struct LibraryDeclarations {
 impl LibraryDeclarations {
     fn extend(&mut self, other: &Self) {
         self.members.extend(other.members.iter().cloned());
+        for (owner, bases) in &other.bases {
+            self.bases
+                .entry(owner.clone())
+                .or_default()
+                .extend(bases.iter().cloned());
+        }
+        for (owner, kinds) in &other.index_kinds {
+            *self.index_kinds.entry(owner.clone()).or_default() |= kinds;
+        }
         self.owners.extend(other.owners.iter().cloned());
         self.types.extend(other.types.iter().cloned());
         self.values.extend(other.values.iter().cloned());
+        self.functions.extend(other.functions.iter().cloned());
         self.value_owners.extend(other.value_owners.clone());
         self.constructor_returns
             .extend(other.constructor_returns.clone());
@@ -64,16 +77,59 @@ struct LibMemberMetadata {
 #[derive(Debug)]
 pub(crate) struct StdLibMemberAvailability {
     active: HashSet<MemberKey>,
+    bases: HashMap<String, HashSet<String>>,
+    index_kinds: HashMap<String, u8>,
     active_owners: HashSet<String>,
     active_types: HashSet<String>,
     active_values: HashSet<String>,
+    active_functions: HashSet<String>,
+    active_files: Vec<String>,
     metadata: Arc<LibMemberMetadata>,
 }
 
 impl StdLibMemberAvailability {
+    fn inherited_owners<'a>(&'a self, owner: &'a str) -> Vec<&'a str> {
+        let mut pending = vec![owner];
+        let mut seen = HashSet::new();
+        let mut owners = Vec::new();
+        while let Some(owner) = pending.pop() {
+            if !seen.insert(owner) {
+                continue;
+            }
+            owners.push(owner);
+            if let Some(bases) = self.bases.get(owner) {
+                pending.extend(bases.iter().map(String::as_str));
+            }
+        }
+        owners
+    }
+
+    pub(crate) fn declares_inherited_member(&self, owner: &str, property: &str) -> Option<bool> {
+        self.active_owners.contains(owner).then(|| {
+            self.inherited_owners(owner).iter().any(|owner| {
+                self.active
+                    .contains(&(owner.to_string(), property.to_string()))
+            })
+        })
+    }
+
+    /// Number (1), string (2), symbol (4), and computed (8) index domains,
+    /// including inherited ones.
+    pub(crate) fn inherited_index_kinds(&self, owner: &str) -> Option<u8> {
+        self.active_owners.contains(owner).then(|| {
+            self.inherited_owners(owner).iter().fold(0, |kinds, owner| {
+                kinds | self.index_kinds.get(*owner).copied().unwrap_or(0)
+            })
+        })
+    }
+
     /// The configured libs declare `name` as a global type or value.
     pub(crate) fn declares_global(&self, name: &str) -> bool {
         self.active_types.contains(name) || self.active_values.contains(name)
+    }
+
+    pub(crate) fn declares_global_type(&self, name: &str) -> bool {
+        self.active_types.contains(name)
     }
 
     /// Global type names the configured libs declare.
@@ -135,6 +191,12 @@ impl StdLibMemberAvailability {
         self.active_values.contains(name)
     }
 
+    /// Function declarations are not writable variable bindings, even though
+    /// both kinds of declarations can have callable types.
+    pub(crate) fn declares_global_function(&self, name: &str) -> bool {
+        self.active_functions.contains(name)
+    }
+
     /// Library to suggest when `name` is a standard global whose TYPE the
     /// configured libs declare but whose VALUE they do not (TS2585:
     /// `Symbol()` / `Promise.resolve` with only es5).
@@ -178,11 +240,45 @@ impl StdLibMemberAvailability {
             .contains(&(owner.to_string(), property.to_string()))
     }
 
+    pub(crate) fn member_names(&self, owner: &str) -> Vec<String> {
+        let mut names: Vec<_> = self
+            .active
+            .iter()
+            .filter(|(candidate, _)| candidate == owner)
+            .map(|(_, name)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    pub(crate) fn member_declaring_lib(&self, owner: &str, property: &str) -> Option<String> {
+        let key = (owner.to_string(), property.to_string());
+        if !self.active.contains(&key) {
+            return None;
+        }
+        self.active_files
+            .iter()
+            .find(|file| {
+                self.metadata
+                    .declarations_by_file
+                    .get(file.as_str())
+                    .is_some_and(|declarations| declarations.members.contains(&key))
+            })
+            .and_then(|file| std::path::Path::new(file).file_name())
+            .map(|file| file.to_string_lossy().into_owned())
+    }
+
     pub(crate) fn constructor_instance(&self, path: &str) -> Option<&str> {
         self.metadata
             .constructor_instances
             .get(path)
             .map(String::as_str)
+    }
+
+    pub(crate) fn owner_is_constructor(&self, owner: &str) -> bool {
+        self.metadata.value_owners.iter().any(|(value, candidate)| {
+            candidate == owner && self.metadata.constructor_instances.contains_key(value)
+        })
     }
 }
 
@@ -328,10 +424,15 @@ pub(crate) fn stdlib_member_availability(
     }
 
     let mut active = HashSet::new();
+    let mut bases: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut index_kinds: HashMap<String, u8> = HashMap::new();
     let mut active_owners = HashSet::new();
     let mut active_types = HashSet::new();
     let mut active_values = HashSet::new();
+    let mut active_functions = HashSet::new();
+    let mut active_files = Vec::new();
     for source in load_stdlib_sources(options) {
+        active_files.push(source.file_name.clone());
         let declarations =
             if let Some(declarations) = metadata.declarations_by_file.get(&source.file_name) {
                 declarations.clone()
@@ -339,15 +440,26 @@ pub(crate) fn stdlib_member_availability(
                 extract_library_declarations(&source)
             };
         active.extend(declarations.members);
+        for (owner, inherited) in declarations.bases {
+            bases.entry(owner).or_default().extend(inherited);
+        }
+        for (owner, kinds) in declarations.index_kinds {
+            *index_kinds.entry(owner).or_default() |= kinds;
+        }
         active_owners.extend(declarations.owners);
         active_types.extend(declarations.types);
         active_values.extend(declarations.values);
+        active_functions.extend(declarations.functions);
     }
     let availability = Arc::new(StdLibMemberAvailability {
         active,
+        bases,
+        index_kinds,
         active_owners,
         active_types,
         active_values,
+        active_functions,
+        active_files,
         metadata,
     });
     cache.lock().ok()?.insert(key, availability.clone());
@@ -468,6 +580,15 @@ fn collect_library_statements(
         match &statement.kind {
             StmtKind::InterfaceDecl(interface) => {
                 declarations.owners.insert(interface.name.clone());
+                for base in &interface.extends {
+                    if let Some(base) = simple_type_name(file, base) {
+                        declarations
+                            .bases
+                            .entry(interface.name.clone())
+                            .or_default()
+                            .insert(base);
+                    }
+                }
                 declarations
                     .types
                     .insert(qualify(namespace, &interface.name));
@@ -507,7 +628,24 @@ fn collect_library_statements(
                                     .or_insert(display);
                             }
                         }
-                        TypeMemberKind::CallSig(_) | TypeMemberKind::IndexSig(_) => {}
+                        TypeMemberKind::IndexSig(signature) => {
+                            let kind = signature
+                                .params
+                                .first()
+                                .and_then(|param| param.type_ann.as_ref())
+                                .map(|node| match node.kind {
+                                    TypeNodeKind::Keyword(tsc_rs_ast::KeywordTypeKind::Number) => 1,
+                                    TypeNodeKind::Keyword(tsc_rs_ast::KeywordTypeKind::String) => 2,
+                                    TypeNodeKind::Keyword(tsc_rs_ast::KeywordTypeKind::Symbol) => 4,
+                                    _ => 8,
+                                })
+                                .unwrap_or(0);
+                            *declarations
+                                .index_kinds
+                                .entry(interface.name.clone())
+                                .or_default() |= kind;
+                        }
+                        TypeMemberKind::CallSig(_) => {}
                     }
                 }
             }
@@ -535,6 +673,7 @@ fn collect_library_statements(
             StmtKind::FnDecl(function) => {
                 if let Some(name) = &function.name {
                     declarations.values.insert(qualify(namespace, name));
+                    declarations.functions.insert(qualify(namespace, name));
                     if !namespace.is_empty() {
                         declarations
                             .members

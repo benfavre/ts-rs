@@ -625,13 +625,10 @@ fn for_in_of_wrapped_property_targets_preserve_expressions() {
 }
 
 #[test]
-fn for_in_of_bindings_and_destructuring_remain_patterns() {
+fn for_in_bindings_remain_expressions_and_for_of_bindings_remain_patterns() {
     assert!(matches!(
-        non_variable_for_left("for (key in source) {}"),
-        ForInOfLeft::Pat(Pat {
-            kind: PatKind::Ident(name),
-            ..
-        }) if name == "key"
+        non_variable_for_left_expr("for (key in source) {}", "key").kind,
+        ExprKind::Ident(name) if name == "key"
     ));
     assert!(matches!(
         non_variable_for_left("for ((key) of source) {}"),

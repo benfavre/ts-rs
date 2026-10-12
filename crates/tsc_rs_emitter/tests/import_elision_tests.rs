@@ -4,10 +4,10 @@
 //! they should be elided from the JavaScript output. This matches TypeScript's
 //! default `importsNotUsedAsValues: "remove"` behaviour.
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use tsc_rs_ast::*;
+use tsc_rs_emitter::HashMap;
 use tsc_rs_emitter::{emit, emit_with_const_enum_values, ConstEnumValue};
 
 /// Helper: parse and emit with CommonJS options.
@@ -674,7 +674,7 @@ fn test_const_enum_member_only_import_elided_by_default() {
         module: Some(ModuleKind::CommonJS),
         ..Default::default()
     };
-    let mut ext = HashMap::new();
+    let mut ext = HashMap::default();
     ext.insert(
         ("Enum".to_string(), "One".to_string()),
         ConstEnumValue::Number(1.0),
@@ -698,7 +698,7 @@ fn test_const_enum_member_only_import_elided_with_preserve_const_enums() {
         preserve_const_enums: Some(true),
         ..Default::default()
     };
-    let mut ext = HashMap::new();
+    let mut ext = HashMap::default();
     ext.insert(
         ("Enum".to_string(), "One".to_string()),
         ConstEnumValue::Number(1.0),

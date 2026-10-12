@@ -51,6 +51,8 @@ struct ReservedWordCheck<'a> {
     es2015_or_later: bool,
     current_function_is_generator: bool,
     ambient_depth: u32,
+    class_depth: u32,
+    external_module: bool,
     source: &'a str,
 }
 
@@ -64,6 +66,8 @@ impl<'a> ReservedWordCheck<'a> {
                     .is_some_and(|target| target >= ScriptTarget::ES2015),
             current_function_is_generator: false,
             ambient_depth: 0,
+            class_depth: 0,
+            external_module: false,
             source,
         }
     }
@@ -111,16 +115,23 @@ impl<'a> ReservedWordCheck<'a> {
         if !Self::is_reserved(name) || (!strict && !reserved_for_target) {
             return;
         }
+        let (code, context) = if self.class_depth > 0 {
+            (1213, " Class definitions are automatically in strict mode.")
+        } else if self.external_module {
+            (1214, " Modules are automatically in strict mode.")
+        } else {
+            (1212, "")
+        };
         if self.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == 1212 && diagnostic.span.is_some_and(|existing| existing == span)
+            diagnostic.code == code && diagnostic.span.is_some_and(|existing| existing == span)
         }) {
             return;
         }
         self.diagnostics.push(Diagnostic {
-            code: 1212,
+            code,
             message: format!(
-                "Identifier expected. '{}' is a reserved word in strict mode.",
-                name
+                "Identifier expected. '{}' is a reserved word in strict mode.{}",
+                name, context
             ),
             category: DiagnosticCategory::Error,
             file_name: None,
@@ -233,22 +244,48 @@ impl<'a> ReservedWordCheck<'a> {
         }
     }
 
-    /// TS1100: a strict-mode parameter may not be named `eval` or
-    /// `arguments` (tsc's bindParameter; ambient signatures are exempt).
+    fn eval_or_arguments_name(&mut self, name: &str, span: Span) {
+        if !matches!(name, "eval" | "arguments") {
+            return;
+        }
+        let diagnostic = if self.class_depth > 0 {
+            crate::diagnostics::error_invalid_strict_name(name, span)
+        } else {
+            let mut diagnostic = crate::diagnostics::error_invalid_strict_mode_name(name, span);
+            if self.external_module {
+                diagnostic.code = 1215;
+                diagnostic.message = format!(
+                    "Invalid use of '{}'. Modules are automatically in strict mode.",
+                    name
+                );
+            }
+            diagnostic
+        };
+        if !self
+            .diagnostics
+            .iter()
+            .any(|existing| existing.code == diagnostic.code && existing.span == diagnostic.span)
+        {
+            self.diagnostics.push(diagnostic);
+        }
+    }
+
+    /// TS1100 checks the direct write target. Parentheses and assertions are
+    /// not unwrapped by tsc's strict-mode binding checks.
+    fn eval_or_arguments_write(&mut self, target: &Expr, strict: bool) {
+        if strict {
+            if let ExprKind::Ident(name) = &target.kind {
+                self.eval_or_arguments_name(name, target.span);
+            }
+        }
+    }
+
+    /// Strict-mode bindings may not be named `eval` or `arguments`.
+    /// Callers apply the ambient exemption for functions and parameters;
+    /// variable declarations are checked even in ambient contexts.
     fn eval_or_arguments_binding(&mut self, pattern: &Pat) {
         match &pattern.kind {
-            PatKind::Ident(name) if matches!(name.as_str(), "eval" | "arguments") => {
-                if !self.diagnostics.iter().any(|diagnostic| {
-                    diagnostic.code == 1100 && diagnostic.span == Some(pattern.span)
-                }) {
-                    self.diagnostics
-                        .push(crate::diagnostics::error_invalid_strict_mode_name(
-                            name,
-                            pattern.span,
-                        ));
-                }
-            }
-            PatKind::Ident(_) => {}
+            PatKind::Ident(name) => self.eval_or_arguments_name(name, pattern.span),
             PatKind::Array(elements) => {
                 for element in elements.iter().flatten() {
                     match element {
@@ -266,11 +303,7 @@ impl<'a> ReservedWordCheck<'a> {
                         }
                         ObjPatProp::Shorthand(name, span)
                         | ObjPatProp::ShorthandAssign(name, _, span) => {
-                            if matches!(name.as_str(), "eval" | "arguments") {
-                                self.diagnostics.push(
-                                    crate::diagnostics::error_invalid_strict_mode_name(name, *span),
-                                );
-                            }
+                            self.eval_or_arguments_name(name, *span);
                         }
                     }
                 }
@@ -302,6 +335,11 @@ impl<'a> ReservedWordCheck<'a> {
     fn function(&mut self, function: &FnDecl, inherited_strict: bool) {
         if let (Some(name), Some(span)) = (&function.name, function.name_span) {
             self.name(name, span, inherited_strict);
+            // A directive in this function's body does not make its name
+            // strict: tsc binds the name in the enclosing context.
+            if inherited_strict && self.ambient_depth == 0 {
+                self.eval_or_arguments_name(name, span);
+            }
         }
         for decorator in &function.decorators {
             self.expr(decorator, inherited_strict);
@@ -522,6 +560,103 @@ impl<'a> ReservedWordCheck<'a> {
         self.current_function_is_generator = saved_generator;
     }
 
+    fn class(&mut self, class: &ClassDecl) {
+        let ambient = class.modifiers & MOD_DECLARE != 0;
+        self.ambient_depth += u32::from(ambient);
+        self.class_depth += 1;
+        if let (Some(name), Some(span)) = (&class.name, class.name_span) {
+            self.name(name, span, true);
+        }
+        for decorator in &class.decorators {
+            self.expr(decorator, true);
+        }
+        self.type_params(class.type_params.as_deref(), true);
+        if let Some(base) = &class.extends {
+            self.expr(base, true);
+        }
+        for argument in class.extends_type_args.as_deref().unwrap_or_default() {
+            self.ty(argument, true);
+        }
+        for interface in &class.implements {
+            self.ty(interface, true);
+        }
+        for member in &class.members {
+            match &member.kind {
+                ClassMemberKind::Property(property) => {
+                    let ambient = property.modifiers & MOD_DECLARE != 0;
+                    self.ambient_depth += u32::from(ambient);
+                    self.prop_expression(&property.name, true);
+                    for decorator in &property.decorators {
+                        self.expr(decorator, true);
+                    }
+                    if let Some(annotation) = &property.type_ann {
+                        self.ty(annotation, true);
+                    }
+                    if let Some(initializer) = &property.initializer {
+                        self.expr(initializer, true);
+                    }
+                    self.ambient_depth -= u32::from(ambient);
+                }
+                ClassMemberKind::Method(method) => {
+                    self.prop_expression(&method.name, true);
+                    for decorator in &method.decorators {
+                        self.expr(decorator, true);
+                    }
+                    self.object_function(
+                        method.type_params.as_deref(),
+                        &method.params,
+                        method.return_type.as_ref(),
+                        method.body.as_deref().unwrap_or_default(),
+                        true,
+                        method.is_generator,
+                    );
+                }
+                ClassMemberKind::Constructor(constructor) => {
+                    for decorator in &constructor.decorators {
+                        self.expr(decorator, true);
+                    }
+                    self.object_function(
+                        None,
+                        &constructor.params,
+                        None,
+                        constructor.body.as_deref().unwrap_or_default(),
+                        true,
+                        false,
+                    );
+                }
+                ClassMemberKind::GetAccessor(accessor) | ClassMemberKind::SetAccessor(accessor) => {
+                    self.prop_expression(&accessor.name, true);
+                    for decorator in &accessor.decorators {
+                        self.expr(decorator, true);
+                    }
+                    self.object_function(
+                        accessor.type_params.as_deref(),
+                        &accessor.params,
+                        accessor.return_type.as_ref(),
+                        accessor.body.as_deref().unwrap_or_default(),
+                        true,
+                        false,
+                    );
+                }
+                ClassMemberKind::IndexSignature(signature) => {
+                    self.params(&signature.params, true);
+                    if let Some(annotation) = &signature.type_ann {
+                        self.ty(annotation, true);
+                    }
+                }
+                ClassMemberKind::StaticBlock(statements) => {
+                    let saved_generator = self.current_function_is_generator;
+                    self.current_function_is_generator = false;
+                    self.statements(statements, true);
+                    self.current_function_is_generator = saved_generator;
+                }
+                ClassMemberKind::SemicolonClassElement => {}
+            }
+        }
+        self.class_depth -= 1;
+        self.ambient_depth -= u32::from(ambient);
+    }
+
     fn expr(&mut self, expression: &Expr, strict: bool) {
         match &expression.kind {
             ExprKind::Ident(name) => {
@@ -588,8 +723,7 @@ impl<'a> ReservedWordCheck<'a> {
             }
             ExprKind::FnExpr(function) => self.function(function, strict),
             ExprKind::Arrow(arrow) => self.arrow(arrow, strict),
-            // Class definitions have the more specific TS1213 diagnostic.
-            ExprKind::ClassExpr(_) => {}
+            ExprKind::ClassExpr(class) => self.class(class),
             ExprKind::Call(call) => {
                 self.expr(&call.callee, strict);
                 for argument in call.type_args.as_deref().unwrap_or_default() {
@@ -623,7 +757,10 @@ impl<'a> ReservedWordCheck<'a> {
                 self.expr(&binary.right, strict);
             }
             ExprKind::Unary(unary) => self.expr(&unary.argument, strict),
-            ExprKind::Update(update) => self.expr(&update.argument, strict),
+            ExprKind::Update(update) => {
+                self.eval_or_arguments_write(&update.argument, strict);
+                self.expr(&update.argument, strict);
+            }
             ExprKind::Paren(inner)
             | ExprKind::NonNull(inner)
             | ExprKind::Spread(inner)
@@ -662,6 +799,7 @@ impl<'a> ReservedWordCheck<'a> {
                 }
             }
             ExprKind::Assign(assignment) => {
+                self.eval_or_arguments_write(&assignment.left, strict);
                 self.expr(&assignment.left, strict);
                 self.expr(&assignment.right, strict);
             }
@@ -731,6 +869,9 @@ impl<'a> ReservedWordCheck<'a> {
             VarKind::Let | VarKind::Const | VarKind::Using | VarKind::AwaitUsing
         );
         for declaration in &variable.declarations {
+            if strict {
+                self.eval_or_arguments_binding(&declaration.name);
+            }
             self.pattern(&declaration.name, strict);
             if block_scoped {
                 self.let_as_binding_name(&declaration.name);
@@ -840,6 +981,9 @@ impl<'a> ReservedWordCheck<'a> {
                 self.statements(&statement.block, strict);
                 if let Some(handler) = &statement.handler {
                     if let Some(pattern) = &handler.param {
+                        if strict {
+                            self.eval_or_arguments_binding(pattern);
+                        }
                         self.pattern(pattern, strict);
                     }
                     if let Some(annotation) = &handler.param_type {
@@ -853,8 +997,7 @@ impl<'a> ReservedWordCheck<'a> {
             }
             StmtKind::Block(statements) => self.statements(statements, strict),
             StmtKind::FnDecl(function) => self.function(function, strict),
-            // Class definitions are validated by TS1213, not TS1212.
-            StmtKind::ClassDecl(_) => {}
+            StmtKind::ClassDecl(class) => self.class(class),
             StmtKind::InterfaceDecl(interface) => {
                 if let Some(span) = interface.name_span {
                     // `interface public {}` is rejected under the ES2015
@@ -922,20 +1065,19 @@ impl<'a> ReservedWordCheck<'a> {
 
 impl TypeChecker {
     pub(crate) fn check_strict_reserved_words(&mut self, file: &SourceFile) {
-        // External modules use TS1214's more specific "modules are
-        // automatically strict" wording. Do not duplicate it with TS1212.
-        if self.file_is_module_flag || (!file.diagnostics.is_empty() && !self.current_file_is_js())
-        {
+        if !file.diagnostics.is_empty() && !self.current_file_is_js() {
             return;
         }
         let mut check = ReservedWordCheck::new(&self.compiler_options, &file.text);
         check.ambient_depth = u32::from(self.current_file_is_declaration());
+        check.external_module = self.file_is_module_flag;
         let strict = !self.current_file_is_declaration()
             && self
                 .compiler_options
                 .always_strict
                 .unwrap_or(self.compiler_options.strict != Some(false))
-            || check.has_use_strict(&file.statements);
+            || check.has_use_strict(&file.statements)
+            || check.external_module;
         check.statements(&file.statements, strict);
         self.diagnostics.extend(check.diagnostics);
     }

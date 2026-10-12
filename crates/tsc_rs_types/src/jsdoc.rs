@@ -207,6 +207,30 @@ fn collect(file: &SourceFile) -> Vec<JsDoc> {
     docs
 }
 
+/// The original JSDoc tag that supplies an automatically exported type.
+pub(crate) fn type_alias_tag_span(source: &str, name: &str) -> Option<Span> {
+    let file = tsc_rs_parser::parse("source.js", source);
+    for doc in collect(&file) {
+        for (index, tag) in doc.tags.iter().enumerate() {
+            if !matches!(tag.name.as_str(), "typedef" | "callback")
+                || tag.target.as_deref() != Some(name)
+            {
+                continue;
+            }
+            let start = tag.name_span.start.saturating_sub(1) as usize;
+            let end = doc
+                .tags
+                .get(index + 1)
+                .map_or(doc.end.saturating_sub(2), |next| {
+                    next.name_span.start.saturating_sub(1)
+                }) as usize;
+            let text = source.get(start..end)?.trim_end();
+            return Some(Span::new(start as u32, (start + text.len()) as u32));
+        }
+    }
+    None
+}
+
 fn parse_tags(text: &str, base: usize) -> Vec<Tag> {
     let bytes = text.as_bytes();
     let mut tags = Vec::new();

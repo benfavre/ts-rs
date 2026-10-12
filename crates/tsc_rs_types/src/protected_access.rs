@@ -20,7 +20,19 @@ impl TypeChecker {
                                 self.check_binding_pattern_access(nested, &member);
                             }
                         }
-                        ObjPatProp::Rest(_) => {}
+                        ObjPatProp::Rest(binding) => {
+                            if self.is_unknown_receiver(ty) {
+                                self.diagnostics.push(Diagnostic {
+                                    code: 2700,
+                                    message: "Rest types may only be created from object types."
+                                        .to_string(),
+                                    category: DiagnosticCategory::Error,
+                                    file_name: None,
+                                    span: Some(binding.span),
+                                    related: None,
+                                });
+                            }
+                        }
                     }
                 }
             }

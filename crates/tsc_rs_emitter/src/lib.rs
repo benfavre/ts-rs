@@ -44,7 +44,16 @@ use normalize::*;
 use source_map::{offset_to_line_col, Mapping, SourceMapGenerator};
 use source_transform::*;
 use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet};
+// FxHash for the emitter's internal maps and sets: they are keyed by
+// identifiers and spans and looked up per AST node; std's SipHash was 2.5-3%
+// of fast emit. Public: callers of the emitter API use them too.
+pub type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
+pub type HashSet<T> = rustc_hash::FxHashSet<T>;
+
+/// Local name -> (require variable, member) of the CommonJS imports. Looked
+/// up for every identifier of a CommonJS file, so it hashes with FxHash
+/// (std's SipHash was 1.2% of fast emit on the bext sites).
+pub(crate) type CjsImportMap = HashMap<AstString, (AstString, AstString)>;
 use tsc_rs_ast::*;
 use tsc_rs_scanner::{Scanner, TokenKind};
 
@@ -83,9 +92,9 @@ pub fn emit(file: &SourceFile, options: &CompilerOptions) -> EmitOutput {
     emit_full(
         file,
         options,
-        &HashMap::new(),
-        &HashSet::new(),
-        &HashSet::new(),
+        &HashMap::default(),
+        &HashSet::default(),
+        &HashSet::default(),
     )
 }
 
@@ -206,10 +215,10 @@ fn emit_full(
         external_const_enum_values,
         global_type_only_names,
         global_type_only_export_names,
-        &HashMap::new(),
-        &HashMap::new(),
-        &HashMap::new(),
-        &HashMap::new(),
+        &HashMap::default(),
+        &HashMap::default(),
+        &HashMap::default(),
+        &HashMap::default(),
     )
 }
 
@@ -551,7 +560,7 @@ fn relative_path_from_dir(base_dir: &str, target: &str) -> String {
 /// Output keys are `(enum_object_name, member_name)`.
 pub fn collect_const_enum_values(file: &SourceFile) -> HashMap<(String, String), ConstEnumValue> {
     let opts = CompilerOptions::default();
-    let mut e = Emitter::new(&file.text, &opts, &file.comments, HashMap::new());
+    let mut e = Emitter::new(&file.text, &opts, &file.comments, HashMap::default());
     e.scan_const_enums(&file.statements);
     e.const_enum_values
 }
@@ -659,7 +668,7 @@ pub fn collect_type_only_names(
     file: &SourceFile,
     preserve_const_enums: bool,
 ) -> HashSet<AstString> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     // Helper: check a statement for type-only declarations
     let check_stmt = |s: &Stmt, names: &mut HashSet<AstString>| match &s.kind {
         StmtKind::InterfaceDecl(i) => {
@@ -855,7 +864,7 @@ pub fn collect_type_only_names(
 /// - `export { Foo }` where `Foo` is a type alias or interface in the same file
 pub fn collect_type_only_export_names(file: &SourceFile) -> HashSet<AstString> {
     let type_only_bindings = collect_local_type_only_bindings(file);
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     let collect_direct_export = |stmt: &Stmt, names: &mut HashSet<AstString>| match &stmt.kind {
         StmtKind::TypeAlias(t)
             if t.modifiers & MOD_EXPORT != 0 && type_only_bindings.contains(t.name.as_str()) =>
@@ -959,7 +968,7 @@ pub fn collect_type_only_export_names(file: &SourceFile) -> HashSet<AstString> {
 pub fn collect_value_export_names(file: &SourceFile) -> HashSet<AstString> {
     use crate::analysis::collect_binding_names;
     let type_only_bindings = collect_local_type_only_bindings(file);
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
     for stmt in &file.statements {
         match &stmt.kind {
             // `export function f()`, `export class C`, `export const x`, `export enum E`
@@ -1479,7 +1488,7 @@ struct Emitter<'a> {
     ns_collision_counters: HashMap<AstString, usize>,
     /// CJS import binding map: local name → (require_var, imported_name).
     /// Used to rewrite references like `Calculator` → `file1_1.Calculator`.
-    cjs_import_map: HashMap<AstString, (AstString, AstString)>,
+    cjs_import_map: CjsImportMap,
     /// Scopes where a local binding shadows a top-level import; references
     /// inside them must not be rewritten through `cjs_import_map`.
     import_shadows: import_shadow::ImportShadows,
@@ -1819,6 +1828,11 @@ struct Emitter<'a> {
     /// whitespace but JS engines do not, so verbatim fast-emit copies must fall
     /// back to the normalizing slow path when this is set (see `normalize_nel`).
     source_has_nel: bool,
+    /// Whether the source can hold a dynamic `import(...)` call: an
+    /// `import` followed by `(` after whitespace and comments. Conservative
+    /// (a string or comment can set it); false lets every dynamic-import
+    /// subtree walk return at once (they ran for every statement).
+    source_may_have_dynamic_import: bool,
     /// `true` iff the source contains the `// => Error` marker anywhere.
     /// span_has_error_marker_comment scans a statement's whole span for this
     /// literal on every statement; when the file has no such marker at all
@@ -1863,7 +1877,7 @@ struct Emitter<'a> {
     recovery_static_class_assignments: Vec<(String, String, Expr, Span)>,
     /// During class emission: map from "ClassName.prop" to temp name (_a, _b)
     /// for computed property names that reference the class before construction.
-    class_computed_name_temps: Option<std::collections::HashMap<String, String>>,
+    class_computed_name_temps: Option<HashMap<String, String>>,
     /// During class emission (legacy mode): map from computed property expression
     /// span start to temp var name. Used for pre-evaluating ALL computed property
     /// keys in class declarations when useDefineForClassFields = false.
@@ -1871,13 +1885,13 @@ struct Emitter<'a> {
     /// Pre-computed auto-accessor storage names, mapping accessor property name
     /// to its storage field name (e.g. "a0" → "a0_accessor_storage" or
     /// "a1" → "a1_1_accessor_storage" when there's a name collision).
-    accessor_storage_names: std::collections::HashMap<String, String>,
+    accessor_storage_names: HashMap<String, String>,
     /// Stack of private field names from enclosing classes, for collision
     /// avoidance in nested auto-accessor storage names.
-    enclosing_private_names: Vec<std::collections::HashSet<String>>,
+    enclosing_private_names: Vec<HashSet<String>>,
     /// Parallel stack of private member kinds from enclosing classes.
     /// Used to resolve nested accesses to outer private members.
-    enclosing_private_members: Vec<std::collections::HashMap<String, EnclosingPrivateMemberKind>>,
+    enclosing_private_members: Vec<HashMap<String, EnclosingPrivateMemberKind>>,
     /// Parallel stack of class names for each entry in `enclosing_private_names`.
     /// Used to construct WeakMap variable names when nested classes access outer
     /// classes' private fields.
@@ -1957,22 +1971,23 @@ impl<'a> Emitter<'a> {
             source,
             source_identifiers: OnceCell::new(),
             lexical_downlevel_plan: lexical_downlevel::LexicalDownlevelPlan::default(),
-            generator_catch_names: HashMap::new(),
+            generator_catch_names: HashMap::default(),
             generator_catch_scope: false,
-            emitted_lexical_binding_ids: HashSet::new(),
+            emitted_lexical_binding_ids: HashSet::default(),
             active_lexical_loop_helpers: Vec::new(),
             active_lexical_for_of_plan: None,
             lexical_arrow_this_alias: None,
             options,
             fast_emit: options.fast_emit == Some(true),
             source_has_nel: source.contains('\u{0085}'),
+            source_may_have_dynamic_import: source_may_have_dynamic_import(source),
             source_has_error_marker: source.contains("// => Error"),
             adjacent_spread_comments: OnceCell::new(),
             output: String::with_capacity(source.len()),
             indent: 0,
             module_wrapper_indent: 0,
             at_line_start: true,
-            require_var_counters: HashMap::new(),
+            require_var_counters: HashMap::default(),
             temp_var_counter: 0,
             pre_allocated_assignment_rest_temps: Vec::new(),
             class_scope_temp_reserved: 0,
@@ -1991,7 +2006,7 @@ impl<'a> Emitter<'a> {
             has_export_assign: false,
             emitted_esm_export: false,
             bare_export_empty_trailing_comment: None,
-            verbatim_empty_reexport_sources: HashSet::new(),
+            verbatim_empty_reexport_sources: HashSet::default(),
             export_target: None,
             source_map_gen: None,
             line_index: None,
@@ -2001,13 +2016,13 @@ impl<'a> Emitter<'a> {
             needs_import_default: false,
             needs_import_star: false,
             needs_export_star: false,
-            merged_namespace_names: HashSet::new(),
+            merged_namespace_names: HashSet::default(),
             first_import_default_helper_use: None,
             first_import_star_helper_use: None,
             first_export_star_helper_use: None,
             needs_decorate_helper: false,
             needs_extends_helper: false,
-            legacy_es5_member_lowerable_class_starts: HashSet::new(),
+            legacy_es5_member_lowerable_class_starts: HashSet::default(),
             legacy_es5_cjs_default_class_start: None,
             needs_es_decorate_helper: false,
             has_es_decorated_methods: false,
@@ -2040,17 +2055,17 @@ impl<'a> Emitter<'a> {
             in_parameter_initializer: false,
             in_async_function: false,
             current_class_name: None,
-            current_class_private_fields: HashSet::new(),
-            current_class_static_private_fields: HashSet::new(),
+            current_class_private_fields: HashSet::default(),
+            current_class_static_private_fields: HashSet::default(),
             current_class_static_alias: None,
             class_name_locally_shadowed: false,
             decorated_class_self_ref_alias: None,
             hoisted_decorated_aliases: Vec::new(),
-            decorated_alias_emit_counter: HashMap::new(),
-            current_class_private_methods: HashMap::new(),
-            current_class_private_accessors: HashMap::new(),
-            current_class_static_private_accessors: HashSet::new(),
-            current_class_static_private_methods: HashMap::new(),
+            decorated_alias_emit_counter: HashMap::default(),
+            current_class_private_methods: HashMap::default(),
+            current_class_private_accessors: HashMap::default(),
+            current_class_static_private_accessors: HashSet::default(),
+            current_class_static_private_methods: HashMap::default(),
             static_this_alias: None,
             legacy_constructor_super: None,
             legacy_this_alias: None,
@@ -2059,8 +2074,8 @@ impl<'a> Emitter<'a> {
             static_super_receiver_alias: None,
             super_reflect_destructure_target: false,
             super_reflect_in_field_init: false,
-            current_class_private_var_map: HashMap::new(),
-            all_allocated_private_var_names: HashMap::new(),
+            current_class_private_var_map: HashMap::default(),
+            all_allocated_private_var_names: HashMap::default(),
             needs_private_field_get: false,
             needs_private_field_set: false,
             needs_private_field_in: false,
@@ -2074,71 +2089,71 @@ impl<'a> Emitter<'a> {
             anonymous_class_counter: 0,
             inject_decorator_alias_block: None,
             standard_decorator_instance_field_slots: Vec::new(),
-            value_used_imports: HashSet::new(),
-            jsx_factory_import_retained: HashSet::new(),
-            jsx_element_import_retained: HashSet::new(),
-            import_sources_with_value_bindings: HashSet::new(),
+            value_used_imports: HashSet::default(),
+            jsx_factory_import_retained: HashSet::default(),
+            jsx_element_import_retained: HashSet::default(),
+            import_sources_with_value_bindings: HashSet::default(),
             import_elision_active: false,
-            runtime_export_import_names: HashSet::new(),
-            const_enum_values: HashMap::new(),
+            runtime_export_import_names: HashSet::default(),
+            const_enum_values: HashMap::default(),
             external_const_enum_values,
-            const_enum_object_names: HashSet::new(),
+            const_enum_object_names: HashSet::default(),
             comments,
             next_comment_idx: 0,
             comment_emit_pos: 0,
             deferred_recovery_comment: None,
             in_export_context: false,
-            emitted_var_names: HashSet::new(),
-            namespace_exports: HashSet::new(),
+            emitted_var_names: HashSet::default(),
+            namespace_exports: HashSet::default(),
             ns_export_stack: Vec::new(),
-            ns_local_bindings: HashSet::new(),
-            ns_local_value_vars: HashSet::new(),
-            ns_seen_import_equals: HashSet::new(),
-            cumulative_ns_exports: HashMap::new(),
-            cumulative_ns_type_exports: HashMap::new(),
+            ns_local_bindings: HashSet::default(),
+            ns_local_value_vars: HashSet::default(),
+            ns_seen_import_equals: HashSet::default(),
+            cumulative_ns_exports: HashMap::default(),
+            cumulative_ns_type_exports: HashMap::default(),
             ns_original_name: None,
-            ns_collision_counters: HashMap::new(),
-            cjs_import_map: HashMap::new(),
-            cjs_string_import_locals: HashSet::new(),
-            cjs_string_export_names: HashSet::new(),
-            cjs_default_import_bindings: HashSet::new(),
+            ns_collision_counters: HashMap::default(),
+            cjs_import_map: CjsImportMap::default(),
+            cjs_string_import_locals: HashSet::default(),
+            cjs_string_export_names: HashSet::default(),
+            cjs_default_import_bindings: HashSet::default(),
             import_shadows: Default::default(),
             value_ref_pos: None,
-            cjs_exported_names: HashSet::new(),
-            cjs_default_fn_local_names: HashSet::new(),
-            cjs_export_alias_map: HashMap::new(),
-            cjs_var_export_names: HashSet::new(),
-            cjs_param_shadows: HashSet::new(),
-            cjs_live_export_chain: HashMap::new(),
-            cjs_live_export_keys: HashSet::new(),
-            cjs_inline_exported_var_names: HashSet::new(),
+            cjs_exported_names: HashSet::default(),
+            cjs_default_fn_local_names: HashSet::default(),
+            cjs_export_alias_map: HashMap::default(),
+            cjs_var_export_names: HashSet::default(),
+            cjs_param_shadows: HashSet::default(),
+            cjs_live_export_chain: HashMap::default(),
+            cjs_live_export_keys: HashSet::default(),
+            cjs_inline_exported_var_names: HashSet::default(),
             cjs_inline_export_depth: 0,
             suppress_cjs_live_export_wrap: false,
             cjs_export_in_expr_stmt: false,
             update_value_discarded: false,
             cjs_file_level_temp_names: Vec::new(),
             cjs_file_level_temp_counter: 0,
-            type_only_decl_names: HashSet::new(),
-            global_type_only_names: HashSet::new(),
-            global_type_only_export_names: HashSet::new(),
-            type_only_import_names: HashSet::new(),
-            cjs_no_qualify_import_locals: HashSet::new(),
-            cjs_keep_side_effect_sources: HashSet::new(),
-            enum_decl_names: HashSet::new(),
-            file_value_bound_names: HashSet::new(),
-            declare_ns_with_values: HashSet::new(),
-            import_equals_type_only_ns: HashSet::new(),
-            type_only_external_modules: HashSet::new(),
-            type_only_require_specs: HashSet::new(),
-            prior_script_value_names: HashSet::new(),
-            seen_script_value_names: HashSet::new(),
-            merged_enum_values: HashMap::new(),
-            merged_string_enum_values: HashMap::new(),
-            file_consts: HashMap::new(),
-            file_string_consts: HashMap::new(),
-            external_file_consts: HashMap::new(),
-            external_file_string_consts: HashMap::new(),
-            amd_dep_map: HashMap::new(),
+            type_only_decl_names: HashSet::default(),
+            global_type_only_names: HashSet::default(),
+            global_type_only_export_names: HashSet::default(),
+            type_only_import_names: HashSet::default(),
+            cjs_no_qualify_import_locals: HashSet::default(),
+            cjs_keep_side_effect_sources: HashSet::default(),
+            enum_decl_names: HashSet::default(),
+            file_value_bound_names: HashSet::default(),
+            declare_ns_with_values: HashSet::default(),
+            import_equals_type_only_ns: HashSet::default(),
+            type_only_external_modules: HashSet::default(),
+            type_only_require_specs: HashSet::default(),
+            prior_script_value_names: HashSet::default(),
+            seen_script_value_names: HashSet::default(),
+            merged_enum_values: HashMap::default(),
+            merged_string_enum_values: HashMap::default(),
+            file_consts: HashMap::default(),
+            file_string_consts: HashMap::default(),
+            external_file_consts: HashMap::default(),
+            external_file_string_consts: HashMap::default(),
+            amd_dep_map: HashMap::default(),
             suppress_oc_parens: false,
             suppress_bare_super_fixup: false,
             suppress_continuation_paren_depth: false,
@@ -2164,7 +2179,7 @@ impl<'a> Emitter<'a> {
             emit_static_prefix: false,
             emit_accessor_prefix: false,
             skip_recovery_until: 0,
-            omitted_array_destructure_plans: HashMap::new(),
+            omitted_array_destructure_plans: HashMap::default(),
             omitted_array_destructure_counter: 0,
             module_kind_override: None,
             force_external_module: false,
@@ -2191,8 +2206,8 @@ impl<'a> Emitter<'a> {
             preserve_module_uses_require: false,
             dotted_namespace_depth: 0,
             rewrite_ident_with_import_map: false,
-            system_inline_export_aliases: HashMap::new(),
-            system_live_export_names: HashSet::new(),
+            system_inline_export_aliases: HashMap::default(),
+            system_live_export_names: HashSet::default(),
             suppress_system_live_export_wrap: false,
             system_hoist_var_in_execute: false,
             system_register_counter: 1,
@@ -2201,7 +2216,7 @@ impl<'a> Emitter<'a> {
             class_expr_temp_emitted: false,
             file_has_recovery_errors: false,
             class_spans: Vec::new(),
-            es5_param_temp_names: HashMap::new(),
+            es5_param_temp_names: HashMap::default(),
             environment_spans: Vec::new(),
             this_arrow_spans: Vec::new(),
             this_boundary_spans: Vec::new(),
@@ -2226,7 +2241,7 @@ impl<'a> Emitter<'a> {
             recovery_static_class_assignments: Vec::new(),
             class_computed_name_temps: None,
             class_general_computed_temps: Vec::new(),
-            accessor_storage_names: std::collections::HashMap::new(),
+            accessor_storage_names: HashMap::default(),
             enclosing_private_names: Vec::new(),
             enclosing_private_members: Vec::new(),
             enclosing_private_class_names: Vec::new(),
@@ -2484,21 +2499,55 @@ impl<'a> Emitter<'a> {
         sorted_reps.sort_by_key(|(s, e, _)| (*s, *e));
         let source = &self.source[elem_start..elem_end];
         let mut result = String::with_capacity(source.len());
+        let mut text_ranges = Vec::new();
+        let append_source =
+            |result: &mut String, ranges: &mut Vec<(usize, usize)>, start: usize, end: usize| {
+                let output_start = result.len();
+                result.push_str(&self.source[start..end]);
+                for span in &self.jsx_text_spans {
+                    let text_start = (span.start as usize).max(start);
+                    let text_end = (span.end as usize).min(end);
+                    if text_start < text_end {
+                        ranges.push((
+                            output_start + text_start - start,
+                            output_start + text_end - start,
+                        ));
+                    }
+                }
+            };
         let mut pos = 0;
         for (start, end, replacement) in sorted_reps {
             let s = start.saturating_sub(elem_start);
             let e = end.saturating_sub(elem_start);
             if s > pos && s <= source.len() {
-                result.push_str(&source[pos..s]);
+                append_source(
+                    &mut result,
+                    &mut text_ranges,
+                    elem_start + pos,
+                    elem_start + s,
+                );
             }
             result.push_str(replacement);
             pos = e;
         }
         if pos < source.len() {
-            result.push_str(&source[pos..]);
+            append_source(&mut result, &mut text_ranges, elem_start + pos, elem_end);
         }
-        // Apply the same normalizations as copy_expr_span single-line path
-        let result = normalize_close_paren(&result);
+        // JSX text is literal, including JavaScript-looking strings and `/>`.
+        // Normalize only the syntax between text children, after accounting
+        // for replacements that changed the copied source offsets.
+        text_ranges.sort_unstable();
+        let mut normalized = String::with_capacity(result.len());
+        let mut pos = 0;
+        for (start, end) in text_ranges {
+            if start >= pos {
+                normalized.push_str(&normalize_close_paren(&result[pos..start]));
+                normalized.push_str(&result[start..end]);
+                pos = end;
+            }
+        }
+        normalized.push_str(&normalize_close_paren(&result[pos..]));
+        let result = normalized;
         // Expand empty function bodies `=> {}` → `=> { }`, `) {}` → `) { }`.
         // Use normalize_empty_blocks (not normalize_brace_spacing which is too
         // aggressive for JSX context — it adds spaces inside JSX `{expr}` wrappers).
@@ -2552,13 +2601,6 @@ impl<'a> Emitter<'a> {
                     // First line: write normally (it continues the current output line).
                     self.write(line);
                 } else {
-                    // Skip blank lines that follow a `;` — these are between
-                    // expression statements and should not be preserved.
-                    // But blank lines INSIDE JSX elements (between open/close
-                    // tags) are semantically significant whitespace.
-                    if line.is_empty() && self.output.ends_with(';') {
-                        continue;
-                    }
                     self.output.push('\n');
                     self.out_line += 1;
                     self.out_col = 0;
@@ -4352,6 +4394,15 @@ impl<'a> Emitter<'a> {
     }
 
     fn collect_malformed_export_class_modifier_imports_from_source(&self) -> Vec<(String, String)> {
+        // Only a line starting `export public|private|static import` can
+        // match: skip splitting every source line when none can. (Our parser
+        // reports no diagnostic for this shape, so recovery is no gate.)
+        if !["public import ", "private import ", "static import "]
+            .iter()
+            .any(|needle| self.source.contains(needle))
+        {
+            return Vec::new();
+        }
         self.source
             .lines()
             .filter_map(Self::parse_malformed_export_class_modifier_import_text)
@@ -4981,118 +5032,7 @@ impl<'a> Emitter<'a> {
         // is `--gray - 500`. We mark those lines and skip normalization
         // for them. Inside `${…}` expressions, normalize again — they're
         // first-class JS.
-        let inside_template_text: Vec<bool> = {
-            let bytes = text.as_bytes();
-            let mut flags: Vec<bool> = Vec::with_capacity(lines.len());
-            let mut in_template: bool = false;
-            // Stack: each entry is the template-nesting count of `${` we
-            // entered. Plain `{` braces inside a template expression match
-            // through `}` like normal JS. We track template-expression
-            // braces specifically with a separate counter.
-            let mut template_expr_depth: u32 = 0;
-            // String-state for non-template strings (so backticks inside
-            // a `'...'` don't toggle template mode).
-            let mut in_string: u8 = 0;
-            let mut in_line_comment = false;
-            let mut in_block_comment = false;
-            let mut line_idx: usize = 0;
-            // The line is "inside template text" if at the START of the
-            // line we're inside the backtick-quoted region AND not inside
-            // a `${...}` expression on this line.
-            flags.push(in_template && template_expr_depth == 0);
-            let mut i = 0usize;
-            while i < bytes.len() {
-                let ch = bytes[i];
-                if ch == b'\n' {
-                    line_idx += 1;
-                    if line_idx < lines.len() {
-                        flags.push(in_template && template_expr_depth == 0);
-                    }
-                    in_line_comment = false;
-                    i += 1;
-                    continue;
-                }
-                if in_line_comment {
-                    i += 1;
-                    continue;
-                }
-                if in_block_comment {
-                    if ch == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                        in_block_comment = false;
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    continue;
-                }
-                if in_string != 0 {
-                    if ch == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if ch == in_string {
-                        in_string = 0;
-                    }
-                    i += 1;
-                    continue;
-                }
-                // Not inside any nested context. Now check template-state.
-                if in_template && template_expr_depth == 0 {
-                    // We're in raw template text. Only `${` (enter expr)
-                    // and a closing `\`` (exit template) matter here.
-                    if ch == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if ch == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
-                        template_expr_depth = template_expr_depth.saturating_add(1);
-                        i += 2;
-                        continue;
-                    }
-                    if ch == b'`' {
-                        in_template = false;
-                        i += 1;
-                        continue;
-                    }
-                    i += 1;
-                    continue;
-                }
-                // Either not in a template OR inside a `${...}` (JS code).
-                if ch == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                    in_line_comment = true;
-                    i += 2;
-                    continue;
-                }
-                if ch == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-                    in_block_comment = true;
-                    i += 2;
-                    continue;
-                }
-                if ch == b'\'' || ch == b'"' {
-                    in_string = ch;
-                    i += 1;
-                    continue;
-                }
-                if ch == b'`' {
-                    in_template = true;
-                    i += 1;
-                    continue;
-                }
-                if template_expr_depth > 0 {
-                    if ch == b'{' {
-                        template_expr_depth = template_expr_depth.saturating_add(1);
-                    } else if ch == b'}' {
-                        template_expr_depth = template_expr_depth.saturating_sub(1);
-                    }
-                }
-                i += 1;
-            }
-            // Pad to lines.len() in case of trailing-newline mismatch.
-            while flags.len() < lines.len() {
-                flags.push(in_template && template_expr_depth == 0);
-            }
-            flags
-        };
+        let inside_template_text = template_text_lines(&text, lines.len());
 
         // Remove blank lines inside block bodies ({ ... }) and array literals ([ ... ]).
         // TypeScript's structured emit never preserves blank lines inside
@@ -5607,6 +5547,11 @@ impl<'a> Emitter<'a> {
         let tail = &rest[..eol];
         // Check for a trailing // or /* ... */ comment in the trailing text
         if let Some(comment_pos) = find_trailing_comment_start(tail) {
+            if self.jsx_text_spans.iter().any(|span| {
+                span.start as usize <= end + comment_pos && end + comment_pos < span.end as usize
+            }) {
+                return;
+            }
             // If there is a semicolon or closing brace between span.end and the
             // comment, the comment belongs to a subsequent statement or outer scope.
             // (e.g. `enum E {}; // x` has `;` as a separate empty statement,
@@ -6170,11 +6115,17 @@ impl<'a> Emitter<'a> {
                     }));
             }
         }
-        if self.jsx_is_react_jsx() {
-            // Pre-scan all JSX to determine which runtime functions are needed.
+        if self.jsx_is_react_jsx() || self.jsx_is_preserve() {
+            // Collect JSX text ranges for preserve-mode normalization and
+            // determine which runtime functions automatic JSX needs.
             jsx::scan_jsx_runtime_needs(&file.statements, self);
-            self.jsx_dev_file_name_ident =
-                jsx::jsx_dev_filename_ident(self.source, &self.jsx_text_spans);
+            // Only the dev runtime writes `_jsxFileName`; the name search
+            // re-tokenizes the whole file (7.7% of fast emit on the bext
+            // sites, which use react-jsx).
+            if self.jsx_is_dev() {
+                self.jsx_dev_file_name_ident =
+                    jsx::jsx_dev_filename_ident(self.source, &self.jsx_text_spans);
+            }
         }
 
         // Collect type-only declaration names for export default elision.
@@ -6732,7 +6683,7 @@ impl<'a> Emitter<'a> {
             // and `exports.name = name;` for hoisted function declarations.
             let mut pre_decl_names: Vec<String> = Vec::new();
             let mut var_export_names: Vec<String> = Vec::new(); // var/let/const only
-            let mut import_equals_export_names: HashSet<String> = HashSet::new();
+            let mut import_equals_export_names: HashSet<String> = HashSet::default();
             let mut fn_export_names: Vec<(String, String)> = Vec::new(); // (exported, local)
             let mut local_named_exports: Vec<(String, String)> = Vec::new(); // (exported, local)
             let mut modifier_export_names: Vec<String> = Vec::new();
@@ -6833,7 +6784,7 @@ impl<'a> Emitter<'a> {
                 .collect();
             // Collect names that map exported→local for named exports where the
             // local name is a function (these should not get void 0 pre-declaration).
-            let mut aliased_fn_exports: HashSet<String> = HashSet::new();
+            let mut aliased_fn_exports: HashSet<String> = HashSet::default();
             let using_scope_start_idx = if self.needs_downlevel("using") {
                 crate::emit_stmt::first_using_index(&file.statements)
             } else {
@@ -7072,11 +7023,11 @@ impl<'a> Emitter<'a> {
 
             // Deduplicate pre-declaration names (e.g. merged namespaces)
             {
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 pre_decl_names.retain(|n| seen.insert(n.clone()));
             }
             {
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 local_named_exports.retain(|pair| seen.insert(pair.clone()));
             }
             // Remove (name, name) entries for directly-exported enums/namespaces
@@ -7103,14 +7054,14 @@ impl<'a> Emitter<'a> {
                 });
             }
             {
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 modifier_export_names.retain(|n| seen.insert(n.clone()));
             }
             // Build set of names that are re-exported (with source) — these need
             // void 0 pre-declarations even if a same-name function export exists,
             // because there are multiple assignments to the same exports slot.
             let reexported_names: HashSet<String> = {
-                let mut set = HashSet::new();
+                let mut set = HashSet::default();
                 for stmt in &file.statements {
                     if let StmtKind::Export(ref ed) = stmt.kind {
                         if let ExportDeclKind::Named {
@@ -7221,7 +7172,7 @@ impl<'a> Emitter<'a> {
                 // Build a map: exported_name → local_name from re-export specifiers
                 // (export { local as exported } from "..."). These need cross-file
                 // type-only filtering too.
-                let mut reexport_local_map: HashMap<String, String> = HashMap::new();
+                let mut reexport_local_map: HashMap<String, String> = HashMap::default();
                 for stmt in &file.statements {
                     if let StmtKind::Export(ref ed) = stmt.kind {
                         if let ExportDeclKind::Named {
@@ -7248,7 +7199,7 @@ impl<'a> Emitter<'a> {
                 // imports that will definitely produce CJS require() calls.
                 // These names always have runtime value in the emitted JS.
                 let cjs_import_names: HashSet<String> = {
-                    let mut names = HashSet::new();
+                    let mut names = HashSet::default();
                     for stmt in &file.statements {
                         let imp = match &stmt.kind {
                             StmtKind::Import(imp) if !imp.type_only => Some(imp),
@@ -7535,7 +7486,7 @@ impl<'a> Emitter<'a> {
             }
 
             let mut emitted_prologue = false;
-            let mut emitted_import_local_export_idxs: HashSet<usize> = HashSet::new();
+            let mut emitted_import_local_export_idxs: HashSet<usize> = HashSet::default();
             let mut using_scope_emitted = false;
             for (stmt_idx, stmt) in file.statements.iter().enumerate() {
                 // When we reach the using scope, emit the try/catch/finally
@@ -8567,9 +8518,13 @@ impl<'a> Emitter<'a> {
         self.normalize_unterminated_template_recovery_output();
         self.normalize_invalid_jsx_preserve_recovery_output();
         self.normalize_invalid_js_modifier_recovery_output();
-        self.normalize_multiline_if_condition_recovery_output();
-        self.normalize_multiline_return_binary_indent();
-        self.normalize_recovery_layout_edges();
+        // Layout passes that reproduce tsc's line breaks: fast emit keeps
+        // the source layout, so it skips them (each splits the whole output).
+        if !self.fast_emit {
+            self.normalize_multiline_if_condition_recovery_output();
+            self.normalize_multiline_return_binary_indent();
+            self.normalize_recovery_layout_edges();
+        }
         self.normalize_jsx_type_assertion_recovery_output();
     }
 
@@ -8742,6 +8697,14 @@ impl<'a> Emitter<'a> {
     fn normalize_multiline_return_binary_indent(&mut self) {
         let had_final_newline = self.output.ends_with('\n');
         let mut lines: Vec<String> = self.output.lines().map(str::to_string).collect();
+        // A line inside a template literal's text keeps its whitespace: it
+        // is part of the string (`return a &&` followed by a multi-line SQL
+        // or CSS template re-indented it).
+        let in_template = if self.file_has_recovery_errors {
+            vec![false; lines.len()]
+        } else {
+            template_text_lines(&self.output, lines.len())
+        };
         let mut i = 0;
         while i < lines.len() {
             let trimmed = lines[i].trim_start();
@@ -8764,7 +8727,9 @@ impl<'a> Emitter<'a> {
                 } else {
                     base_indent + 4
                 };
-                lines[i] = format!("{}{item}", " ".repeat(indent));
+                if !in_template[i] {
+                    lines[i] = format!("{}{item}", " ".repeat(indent));
+                }
                 let done = item.ends_with(';');
                 i += 1;
                 if done {
@@ -8789,6 +8754,14 @@ impl<'a> Emitter<'a> {
         }
         let had_final_newline = self.output.ends_with('\n');
         let lines: Vec<String> = self.output.lines().map(str::to_string).collect();
+        // The rebuild below re-indents whole runs of lines; a multi-line
+        // template literal's text must keep its whitespace, so leave such
+        // files as emitted (the layout is cosmetic, the string is not).
+        if !self.file_has_recovery_errors
+            && template_text_lines(&self.output, lines.len()).contains(&true)
+        {
+            return;
+        }
         let mut rebuilt = Vec::with_capacity(lines.len());
         let mut i = 0;
 
@@ -8824,7 +8797,7 @@ impl<'a> Emitter<'a> {
                 let after_if = trimmed_header.strip_prefix("if (").unwrap_or("");
                 after_if.matches('(').count() as isize - after_if.matches(')').count() as isize
             };
-            let mut condition_comments = std::collections::HashSet::new();
+            let mut condition_comments = HashSet::default();
             let mut last_condition_index = None;
 
             for line in &lines[i + 1..condition_end] {
@@ -9769,8 +9742,8 @@ fn prop_name_computed_str(name: &PropName, source: &str, options: &CompilerOptio
             source,
             options,
             expr,
-            &HashMap::new(),
-            &HashSet::new(),
+            &CjsImportMap::default(),
+            &HashSet::default(),
             &Default::default(),
         )
     } else {
@@ -9796,7 +9769,7 @@ fn emit_expr_to_string(
     source: &str,
     options: &CompilerOptions,
     expr: &Expr,
-    cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
+    cjs_import_map: &CjsImportMap,
     cjs_string_import_locals: &HashSet<AstString>,
     import_shadows: &import_shadow::ImportShadows,
 ) -> String {
@@ -9818,7 +9791,7 @@ fn emit_expr_to_string_await_to_yield(
     source: &str,
     options: &CompilerOptions,
     expr: &Expr,
-    cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
+    cjs_import_map: &CjsImportMap,
     cjs_string_import_locals: &HashSet<AstString>,
     import_shadows: &import_shadow::ImportShadows,
 ) -> String {
@@ -9837,7 +9810,7 @@ fn emit_expr_to_string_inner(
     source: &str,
     options: &CompilerOptions,
     expr: &Expr,
-    cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
+    cjs_import_map: &CjsImportMap,
     cjs_string_import_locals: &HashSet<AstString>,
     import_shadows: &import_shadow::ImportShadows,
     await_to_yield: bool,
@@ -9853,7 +9826,7 @@ fn emit_expr_to_string_inner(
     } else {
         expr.clone()
     };
-    let mut e = Emitter::new(source, options, &[], HashMap::new());
+    let mut e = Emitter::new(source, options, &[], HashMap::default());
     e.cjs_import_map = cjs_import_map.clone();
     e.cjs_string_import_locals = cjs_string_import_locals.clone();
     e.import_shadows = import_shadows.clone();
@@ -9866,7 +9839,7 @@ fn emit_expr_to_string_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_brace_spacing, ConstEnumValue, Emitter};
+    use super::{normalize_brace_spacing, ConstEnumValue, Emitter, HashMap};
 
     #[test]
     fn es5_exported_empty_binding_checks_all_semantic_string_stores() {
@@ -9877,7 +9850,7 @@ mod tests {
             jsx_fragment_factory: Some(marker(7)),
             ..Default::default()
         };
-        let mut emitter = Emitter::new("", &options, &[], std::collections::HashMap::new());
+        let mut emitter = Emitter::new("", &options, &[], HashMap::default());
 
         emitter.const_enum_values.insert(
             ("Local".to_string(), "Value".to_string()),
@@ -9895,7 +9868,7 @@ mod tests {
             .insert("externalValue".to_string(), marker(3));
         emitter.merged_string_enum_values.insert(
             "Merged".to_string(),
-            std::collections::HashMap::from([("Value".to_string(), marker(4))]),
+            HashMap::from_iter([("Value".to_string(), marker(4))]),
         );
 
         for index in 0..=7 {
@@ -9910,7 +9883,7 @@ mod tests {
     #[test]
     fn es5_exported_empty_binding_system_resolution_is_token_provenanced() {
         let options = tsc_rs_ast::CompilerOptions::default();
-        let mut emitter = Emitter::new("", &options, &[], std::collections::HashMap::new());
+        let mut emitter = Emitter::new("", &options, &[], HashMap::default());
         let marker = "\0__tsrs_deferred_export_name_0__\0";
         emitter.output = format!(
             "exports_1(\"{marker}\", {marker} = _a = {{}});\nvar semantic = `\"{marker}\", {marker}`;\n// \"{marker}\", {marker}\n"
@@ -10281,4 +10254,155 @@ export { x, y };
 
         eprintln!("=== emit_strip_types output ===\n{}", js);
     }
+}
+
+/// Per output line of `text` (`line_count` lines), whether the line starts
+/// inside a template literal's text, outside any `${...}`. Line-based layout
+/// passes must leave such lines alone: their leading whitespace is part of
+/// the string.
+pub(crate) fn template_text_lines(text: &str, line_count: usize) -> Vec<bool> {
+    let bytes = text.as_bytes();
+    let mut flags: Vec<bool> = Vec::with_capacity(line_count);
+    let mut in_template: bool = false;
+    // Stack: each entry is the template-nesting count of `${` we
+    // entered. Plain `{` braces inside a template expression match
+    // through `}` like normal JS. We track template-expression
+    // braces specifically with a separate counter.
+    let mut template_expr_depth: u32 = 0;
+    // String-state for non-template strings (so backticks inside
+    // a `'...'` don't toggle template mode).
+    let mut in_string: u8 = 0;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut line_idx: usize = 0;
+    // The line is "inside template text" if at the START of the
+    // line we're inside the backtick-quoted region AND not inside
+    // a `${...}` expression on this line.
+    flags.push(in_template && template_expr_depth == 0);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = bytes[i];
+        if ch == b'\n' {
+            line_idx += 1;
+            if line_idx < line_count {
+                flags.push(in_template && template_expr_depth == 0);
+            }
+            in_line_comment = false;
+            i += 1;
+            continue;
+        }
+        if in_line_comment {
+            i += 1;
+            continue;
+        }
+        if in_block_comment {
+            if ch == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                in_block_comment = false;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if in_string != 0 {
+            if ch == b'\\' {
+                i += 2;
+                continue;
+            }
+            if ch == in_string {
+                in_string = 0;
+            }
+            i += 1;
+            continue;
+        }
+        // Not inside any nested context. Now check template-state.
+        if in_template && template_expr_depth == 0 {
+            // We're in raw template text. Only `${` (enter expr)
+            // and a closing `\`` (exit template) matter here.
+            if ch == b'\\' {
+                i += 2;
+                continue;
+            }
+            if ch == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+                template_expr_depth = template_expr_depth.saturating_add(1);
+                i += 2;
+                continue;
+            }
+            if ch == b'`' {
+                in_template = false;
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        // Either not in a template OR inside a `${...}` (JS code).
+        if ch == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            in_line_comment = true;
+            i += 2;
+            continue;
+        }
+        if ch == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if ch == b'\'' || ch == b'"' {
+            in_string = ch;
+            i += 1;
+            continue;
+        }
+        if ch == b'`' {
+            in_template = true;
+            i += 1;
+            continue;
+        }
+        if template_expr_depth > 0 {
+            if ch == b'{' {
+                template_expr_depth = template_expr_depth.saturating_add(1);
+            } else if ch == b'}' {
+                template_expr_depth = template_expr_depth.saturating_sub(1);
+            }
+        }
+        i += 1;
+    }
+    // Pad to line_count in case of trailing-newline mismatch.
+    while flags.len() < line_count {
+        flags.push(in_template && template_expr_depth == 0);
+    }
+    flags
+}
+
+/// `import` followed, after whitespace and comments, by `(` or `<`: the only
+/// source text a dynamic import call (`is_dynamic_import_call`) can come from.
+pub(crate) fn source_may_have_dynamic_import(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = source[from..].find("import") {
+        let mut i = from + rel + "import".len();
+        loop {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if bytes[i..].starts_with(b"/*") {
+                match source[i + 2..].find("*/") {
+                    Some(end) => i += 2 + end + 2,
+                    None => return true,
+                }
+            } else if bytes[i..].starts_with(b"//") {
+                match source[i..].find('\n') {
+                    Some(end) => i += end,
+                    None => return false,
+                }
+            } else {
+                break;
+            }
+        }
+        // `import<T>(...)` (type arguments, an error tsc still emits as a call).
+        if matches!(bytes.get(i), Some(b'(' | b'<')) || i >= bytes.len() {
+            return true;
+        }
+        from = from + rel + "import".len();
+    }
+    false
 }

@@ -1355,9 +1355,21 @@ impl<'a> Emitter<'a> {
             } else {
                 false
             };
-            if is_jsx_string && s.contains('&') {
+            // A JSX string attribute has no escape sequences: a backslash in
+            // it is a backslash (`onclick="confirm('l\'a')"` keeps it, as
+            // tsc and Babel do). The parser reads the literal as a JS string,
+            // so take the text between the quotes from the source instead.
+            let raw = if is_jsx_string {
+                let end = val.span.end as usize;
+                self.source
+                    .get(start + 1..end.saturating_sub(1))
+                    .filter(|raw| end > start + 1 && raw.contains('\\'))
+            } else {
+                None
+            };
+            if is_jsx_string && (raw.is_some() || s.contains('&')) {
                 // JSX string attribute with potential HTML entities — decode them
-                let decoded = jsx_decode_entities(s);
+                let decoded = jsx_decode_entities(raw.unwrap_or(s));
                 let quote = source_byte as char;
                 self.write(&String::from(quote));
                 if quote == '\'' {

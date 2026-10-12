@@ -1178,12 +1178,19 @@ impl<'a> Emitter<'a> {
         });
         // Disqualify source-copy when the raw text starts with a Unicode
         // escape that resolves to a keyword (e.g. `\u0076ar` → `var`).
-        // Var declarations with <error> binding names need structured emit
-        // so the error declarator (and trailing comma) can be dropped.
+        // Recovered empty lists, trailing commas, and <error> binding names
+        // need structured emit so invalid source tokens are not copied back.
         // e.g. `var a,;` → `var a;`, `var a,` → `var a;`
         let has_error_binding_var_decl = matches!(&stmt.kind, StmtKind::Var(var_stmt) if {
-            var_stmt.declarations.iter().any(|d| {
+            var_stmt.declarations.is_empty()
+            || var_stmt.declarations.iter().any(|d| {
                 matches!(&d.name.kind, PatKind::Ident(name) if name == "<error>")
+            })
+            || var_stmt.declarations.last().is_some_and(|last| {
+                self.source.get(last.span.end as usize..stmt.span.end as usize)
+                    .is_some_and(|tail| {
+                        tsc_rs_scanner::TsScanner::new(tail).scan() == tsc_rs_scanner::TokenKind::Comma
+                    })
             })
         });
         // TypeScript's structured emit writes keyword tokens literally.
@@ -1207,14 +1214,16 @@ impl<'a> Emitter<'a> {
         let has_reserved_word_binding_target = matches!(&stmt.kind, StmtKind::Var(var_stmt) if {
             var_stmt.declarations.iter().any(|d| binding_has_reserved_word_keyvalue_target(&d.name, self.source))
         });
-        // For-in/of with <error> binding needs structured emit so the gap is preserved
+        // For-in/of with an empty list or <error> binding needs structured emit
+        // so the gap is preserved
         // (e.g. `for (var of X)` → `for (var  of X)` with double space).
         let has_for_in_of_error_binding = {
             let check_left = |left: &ForInOfLeft| -> bool {
                 if let ForInOfLeft::Var(vs) = left {
-                    vs.declarations
-                        .iter()
-                        .any(|d| matches!(&d.name.kind, PatKind::Ident(name) if name == "<error>"))
+                    vs.declarations.is_empty()
+                        || vs.declarations.iter().any(
+                            |d| matches!(&d.name.kind, PatKind::Ident(name) if name == "<error>"),
+                        )
                 } else {
                     false
                 }
@@ -4071,25 +4080,37 @@ impl<'a> Emitter<'a> {
         // TypeScript's structured emit doesn't preserve blank lines inside
         // function/block bodies.
         let mut lines: Vec<&str> = text_ref.lines().collect();
+        // Lines inside a template literal's text are part of the string:
+        // they are never dropped or re-indented below. A file with parse
+        // recovery keeps the old layout: its recovered tree and a text scan
+        // can disagree on where a template ends.
+        let mut in_template_text = if self.file_has_recovery_errors {
+            vec![false; lines.len()]
+        } else {
+            crate::template_text_lines(text_ref, lines.len())
+        };
         {
             let mut i = 0;
             while i + 1 < lines.len() {
-                if lines[i].trim().is_empty() {
+                if lines[i].trim().is_empty() && !in_template_text[i] {
                     let next_trimmed = lines.get(i + 1).map(|l| l.trim()).unwrap_or("");
                     // Remove blank lines before lines starting with `}`
                     if next_trimmed.starts_with('}') {
                         lines.remove(i);
+                        in_template_text.remove(i);
                         continue;
                     }
                     // Remove blank lines after lines ending with `{` (possibly followed by a comment)
                     if i > 0 && line_ends_with_open_brace(lines[i - 1]) {
                         lines.remove(i);
+                        in_template_text.remove(i);
                         continue;
                     }
                     // Remove blank lines between statements inside blocks
                     let in_block = lines[..i].iter().any(|l| line_ends_with_open_brace(l));
                     if in_block {
                         lines.remove(i);
+                        in_template_text.remove(i);
                         continue;
                     }
                 }
@@ -5309,6 +5330,17 @@ impl<'a> Emitter<'a> {
             if skip_line[i] {
                 continue;
             }
+            // Template literal text: the exact bytes, no emitter indentation.
+            if in_template_text[i] {
+                self.output.push_str(line);
+                if i == last_idx && needs_semi && !line.trim_end().ends_with(';') {
+                    self.output.push(';');
+                }
+                self.output.push('\n');
+                self.at_line_start = true;
+                self.out_col = 0;
+                continue;
+            }
             // Join call-argument continuation lines onto the previous line
             if join_with_prev[i] {
                 let content = line.trim();
@@ -6139,6 +6171,12 @@ impl<'a> Emitter<'a> {
     }
 
     pub(super) fn expr_stmt_is_garbage_recovery(&self, expr: &Expr, span: Span) -> bool {
+        // Garbage only comes out of parse recovery. On a clean parse a NUL or
+        // U+FFFD in a nested string literal is data: dropping the statement
+        // for it removed a whole `describe(...)` block from a test file.
+        if !self.file_has_recovery_errors {
+            return false;
+        }
         let text = self.copy_span_trimmed(span).trim();
         if text.is_empty() {
             return false;
@@ -6215,6 +6253,11 @@ impl<'a> Emitter<'a> {
         &self,
         span: Span,
     ) -> Option<MalformedImportTypeOptionRecovery> {
+        // Only an `import(` type can have malformed options. (Our parser
+        // reports no diagnostic for some of them, so recovery is no gate.)
+        if !self.source.contains("import(") {
+            return None;
+        }
         let start = span.start as usize;
         let end = span.end as usize;
         if start >= end || end > self.source.len() {
@@ -6404,6 +6447,9 @@ impl<'a> Emitter<'a> {
         var_stmt: &VarStmt,
     ) -> Vec<String> {
         let mut tails = Vec::new();
+        if !self.source.contains("import(") {
+            return tails;
+        }
         for init in var_stmt
             .declarations
             .iter()
@@ -8156,7 +8202,7 @@ impl<'a> Emitter<'a> {
             return false;
         }
         let body = &source[open + 1..close];
-        let mut seen_names: HashSet<String> = HashSet::new();
+        let mut seen_names: HashSet<String> = HashSet::default();
         let mut emitted = false;
         for raw_line in body.lines() {
             let trimmed = raw_line.trim_start();

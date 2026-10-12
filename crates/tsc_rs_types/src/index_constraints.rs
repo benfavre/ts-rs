@@ -16,6 +16,62 @@ pub(super) struct ComputedIndexMember {
 }
 
 impl TypeChecker {
+    pub(super) fn known_literal_index_read(
+        &self,
+        receiver: &Type,
+        index: &Type,
+        depth: usize,
+    ) -> Option<Type> {
+        if depth >= 16 {
+            return None;
+        }
+        if let Some(constraint) = self.declared_type_param_constraint(index) {
+            if constraint != *index {
+                return self.known_literal_index_read(receiver, &constraint, depth + 1);
+            }
+        }
+        if let Type::Union(keys) = index {
+            return keys
+                .iter()
+                .map(|key| self.known_literal_index_read(receiver, key, depth + 1))
+                .collect::<Option<Vec<_>>>()
+                .map(Type::flatten_union);
+        }
+        let key = match index {
+            Type::StringLiteral(key) => key.clone(),
+            Type::NumberLiteral(key) => Self::canonical_numeric_property_name(key),
+            _ => return None,
+        };
+        match receiver {
+            Type::ObjectType(info) => {
+                info.properties
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, ty)| match ty.as_ref() {
+                        Type::Optional(inner) => {
+                            Type::flatten_union(vec![Type::clone(inner), Type::Undefined])
+                        }
+                        ty => ty.clone(),
+                    })
+            }
+            Type::TypeReference(name, args) => {
+                let shape = self
+                    .resolve_type_reference_to_object(name, args)
+                    .or_else(|| self.resolve_type_for_assignability(receiver))?;
+                (shape != *receiver)
+                    .then(|| self.known_literal_index_read(&shape, index, depth + 1))
+                    .flatten()
+            }
+            Type::Mapped { .. } => {
+                let shape = self.simplify_type(receiver);
+                (shape != *receiver)
+                    .then(|| self.known_literal_index_read(&shape, index, depth + 1))
+                    .flatten()
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn class_computed_index_members(
         &self,
         declaration: &ClassDecl,
@@ -816,7 +872,7 @@ impl TypeChecker {
         }
     }
 
-    fn index_applies_to_property(&self, key: &Type, index: &Type) -> bool {
+    pub(super) fn index_applies_to_property(&self, key: &Type, index: &Type) -> bool {
         match (key, index) {
             (
                 Type::String | Type::StringLiteral(_) | Type::Number | Type::NumberLiteral(_),

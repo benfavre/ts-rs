@@ -86,7 +86,7 @@ fn substitute_inner(ty: &Type, name: &str, replacement: &Type) -> Type {
                 .collect(),
         ),
 
-        Type::Intersection(members) => Type::Intersection(
+        Type::Intersection(members) => simplify_intersection(
             members
                 .iter()
                 .map(|m| substitute(m, name, replacement))
@@ -282,6 +282,9 @@ fn substitute_inner(ty: &Type, name: &str, replacement: &Type) -> Type {
 }
 
 fn substitute_object(obj: &ObjectTypeInfo, name: &str, replacement: &Type) -> ObjectTypeInfo {
+    if obj.is_non_nullish_unknown() {
+        return obj.clone();
+    }
     ObjectTypeInfo::new(ObjectTypeData {
         properties: obj
             .properties
@@ -786,7 +789,9 @@ pub fn resolve_keyof(ty: &Type) -> Type {
 
         Type::Any => Type::Union(vec![Type::String, Type::Number, Type::Symbol].into()),
 
-        Type::Never => Type::Never,
+        Type::Never => Type::flatten_union(vec![Type::String, Type::Number, Type::Symbol]),
+
+        Type::Null | Type::Undefined | Type::Unknown => Type::Never,
 
         _ => Type::Keyof(Arc::new(ty.clone())),
     }
@@ -935,6 +940,9 @@ pub fn simplify_union(types: Vec<Type>) -> Type {
     if flattened.iter().any(|t| matches!(t, Type::Any)) {
         return Type::Any;
     }
+    if flattened.iter().any(|t| matches!(t, Type::Unknown)) {
+        return Type::Unknown;
+    }
 
     match flattened.len() {
         0 => Type::Never,
@@ -980,10 +988,89 @@ pub fn simplify_intersection(types: Vec<Type>) -> Type {
     // Remove duplicates while preserving order
     dedup_types(&mut flattened);
 
+    // A nullish value cannot also be a concrete primitive or object.
+    // Keep unresolved type parameters: `T & undefined` may still be inhabited.
+    if let Some(nullish) = flattened
+        .iter()
+        .find(|ty| matches!(ty, Type::Null | Type::Undefined))
+        .cloned()
+    {
+        if flattened
+            .iter()
+            .any(|ty| nullish_intersection_member(ty, &nullish) == Some(false))
+        {
+            return Type::Never;
+        }
+        flattened
+            .retain(|ty| ty == &nullish || nullish_intersection_member(ty, &nullish).is_none());
+    }
+
     match flattened.len() {
         0 => Type::Unknown,
         1 => flattened.into_iter().next().unwrap(),
         _ => Type::Intersection(flattened.into()),
+    }
+}
+
+/// Whether a type admits this exact nullish intersection constituent.
+/// `None` leaves generic, alias, and deferred types for checker resolution.
+pub(crate) fn nullish_intersection_member(ty: &Type, nullish: &Type) -> Option<bool> {
+    match ty {
+        Type::Any | Type::Unknown | Type::Error => Some(true),
+        Type::Null | Type::Undefined => Some(ty == nullish),
+        Type::Void => Some(matches!(nullish, Type::Undefined)),
+        Type::Never
+        | Type::String
+        | Type::StringLiteral(_)
+        | Type::Number
+        | Type::NumberLiteral(_)
+        | Type::Boolean
+        | Type::BooleanLiteral(_)
+        | Type::BigInt
+        | Type::BigIntLiteral(_)
+        | Type::Symbol
+        | Type::UniqueSymbol(_)
+        | Type::Object
+        | Type::EnumType(_)
+        | Type::EnumVariant { .. }
+        | Type::TemplateLiteral { .. } => Some(false),
+        Type::ObjectType(info)
+            if info.properties.is_empty()
+                && info.call_signatures.is_empty()
+                && info.construct_signatures.is_empty()
+                && info.index_signature.is_none() =>
+        {
+            Some(false)
+        }
+        Type::Optional(_) if matches!(nullish, Type::Undefined) => Some(true),
+        Type::Optional(inner) => nullish_intersection_member(inner, nullish),
+        Type::Union(members) => {
+            let facts: Vec<_> = members
+                .iter()
+                .map(|ty| nullish_intersection_member(ty, nullish))
+                .collect();
+            if facts.contains(&Some(true)) {
+                Some(true)
+            } else if facts.iter().all(|fact| *fact == Some(false)) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Type::Intersection(members) => {
+            let facts: Vec<_> = members
+                .iter()
+                .map(|ty| nullish_intersection_member(ty, nullish))
+                .collect();
+            if facts.contains(&Some(false)) {
+                Some(false)
+            } else if facts.iter().all(|fact| *fact == Some(true)) {
+                Some(true)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1304,7 +1391,10 @@ mod tests {
 
     #[test]
     fn keyof_never() {
-        assert_eq!(resolve_keyof(&Type::Never), Type::Never);
+        assert_eq!(
+            resolve_keyof(&Type::Never),
+            Type::flatten_union(vec![Type::String, Type::Number, Type::Symbol])
+        );
     }
 
     // -- resolve_indexed_access tests --

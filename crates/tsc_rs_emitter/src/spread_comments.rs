@@ -69,7 +69,7 @@ mod tests {
 
     fn check_all_spans(source: &str) {
         let options = CompilerOptions::default();
-        let emitter = Emitter::new(source, &options, &[], HashMap::new());
+        let emitter = Emitter::new(source, &options, &[], Default::default());
         let boundaries: Vec<_> = source
             .char_indices()
             .map(|(i, _)| i)
@@ -127,7 +127,7 @@ mod tests {
             fast_emit: Some(true),
             ..Default::default()
         };
-        let emitter = Emitter::new("... /*x*/\n", &options, &[], HashMap::new());
+        let emitter = Emitter::new("... /*x*/\n", &options, &[], Default::default());
         assert!(!emitter.span_has_adjacent_spread_comment(Span::new(0, 10)));
         assert!(!emitter.span_has_adjacent_spread_comment_linebreak(Span::new(0, 10)));
         assert!(emitter.adjacent_spread_comments.get().is_none());

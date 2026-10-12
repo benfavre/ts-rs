@@ -301,7 +301,7 @@ impl<'a> Emitter<'a> {
         use_stage3_member_names: bool,
     ) -> Vec<DecoratedMethodInfo> {
         let mut result = Vec::new();
-        let mut var_name_counts: HashMap<String, usize> = HashMap::new();
+        let mut var_name_counts: HashMap<String, usize> = HashMap::default();
         for member in &class_decl.members {
             let (decorators, name, is_static, kind) = match &member.kind {
                 ClassMemberKind::Method(method) if !method.decorators.is_empty() => (
@@ -424,7 +424,7 @@ impl<'a> Emitter<'a> {
             Setter,
         }
 
-        let mut groups: HashMap<String, Vec<(PrivateMemberKind, bool)>> = HashMap::new();
+        let mut groups: HashMap<String, Vec<(PrivateMemberKind, bool)>> = HashMap::default();
         for member in &class_decl.members {
             match &member.kind {
                 ClassMemberKind::Property(prop) => {
@@ -466,7 +466,7 @@ impl<'a> Emitter<'a> {
             }
         }
 
-        let mut invalid = HashMap::new();
+        let mut invalid = HashMap::default();
         for (name, entries) in groups {
             if entries.len() <= 1 {
                 continue;
@@ -1656,7 +1656,7 @@ impl<'a> Emitter<'a> {
             .iter()
             .any(|m| matches!(&m.kind, ClassMemberKind::Constructor(_)));
 
-        let mut allocated_bindings = HashSet::new();
+        let mut allocated_bindings = HashSet::default();
         for member in &mut decorated_methods {
             member.var_name = self.allocate_inline_binding_name(
                 &format!("_{}", member.var_name),
@@ -1672,7 +1672,7 @@ impl<'a> Emitter<'a> {
         let metadata_name = self.allocate_inline_binding_name("_metadata", &mut allocated_bindings);
 
         let mut pending_assignments = Vec::new();
-        let mut member_name_overrides: HashMap<u32, String> = HashMap::new();
+        let mut member_name_overrides: HashMap<u32, String> = HashMap::default();
         for (idx, member) in decorated_methods.iter().enumerate() {
             pending_assignments.push(idx);
             let DecoratedPublicMemberKey::Dynamic { expr, temp_name } = &member.key else {
@@ -3630,8 +3630,8 @@ impl<'a> Emitter<'a> {
         // Duplicate getter/setter declarations have recovery-specific emit
         // semantics. Keep the structural path to one descriptor slot of each
         // kind per public name and staticness.
-        let mut getters = HashSet::new();
-        let mut setters = HashSet::new();
+        let mut getters = HashSet::default();
+        let mut setters = HashSet::default();
         for member in &class_decl.members {
             let (accessor, slots) = match &member.kind {
                 ClassMemberKind::GetAccessor(accessor) => (accessor, &mut getters),
@@ -3949,7 +3949,7 @@ impl<'a> Emitter<'a> {
         }
 
         let declarations: Vec<&ClassDecl> = stmts.iter().filter_map(direct_class_decl).collect();
-        let mut name_counts: HashMap<AstString, usize> = HashMap::new();
+        let mut name_counts: HashMap<AstString, usize> = HashMap::default();
         for class_decl in &declarations {
             if let Some(name) = &class_decl.name {
                 *name_counts.entry(name.as_str().into()).or_default() += 1;
@@ -3966,7 +3966,7 @@ impl<'a> Emitter<'a> {
             })
             .collect();
 
-        let mut safe_names: HashSet<AstString> = HashSet::new();
+        let mut safe_names: HashSet<AstString> = HashSet::default();
         loop {
             let mut changed = false;
             for (name, class_decl) in &candidates {
@@ -5034,7 +5034,7 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        let mut emitted_accessors = HashSet::new();
+        let mut emitted_accessors = HashSet::default();
         for member in &class_decl.members {
             match &member.kind {
                 ClassMemberKind::Method(method) => {
@@ -5287,8 +5287,7 @@ impl<'a> Emitter<'a> {
         } else {
             Vec::new()
         };
-        let mut computed_temps: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
+        let mut computed_temps: HashMap<String, String> = HashMap::default();
         let mut instance_prop_temps: Vec<String> = Vec::new();
         for key in &prop_keys {
             let temp = self.next_temp_var();
@@ -5600,8 +5599,7 @@ impl<'a> Emitter<'a> {
         // Emit declarations for private helper vars (WeakMap/WeakSet/method helpers).
         // TypeScript hoists these to the top of user code as a single declaration.
         let mut helper_var_names: Vec<String> = Vec::new();
-        let mut helper_var_seen: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut helper_var_seen: HashSet<String> = HashSet::default();
         // TypeScript ordering for private helper vars:
         // 1. _instances brand (when instance methods/accessors present) — FIRST
         // 2. Class alias _a (when class needs static wrapper)
@@ -6059,7 +6057,7 @@ impl<'a> Emitter<'a> {
         // computed key once for __setFunctionName.
         self.class_general_computed_temps.clear();
         let general_class_name = class_decl.name.as_deref().unwrap_or("");
-        let mut seen_starts = std::collections::HashSet::new();
+        let mut seen_starts = HashSet::default();
         if !use_define {
             for member in &class_decl.members {
                 let computed = match &member.kind {
@@ -6175,13 +6173,12 @@ impl<'a> Emitter<'a> {
             }
         }
 
-        let general_temp_by_start: std::collections::HashMap<u32, String> = self
+        let general_temp_by_start: HashMap<u32, String> = self
             .class_general_computed_temps
             .iter()
             .map(|(temp, start)| (*start, temp.clone()))
             .collect();
-        let mut legacy_method_name_overrides: std::collections::HashMap<u32, String> =
-            std::collections::HashMap::new();
+        let mut legacy_method_name_overrides: HashMap<u32, String> = HashMap::default();
         let mut legacy_post_class_computed_actions: Vec<(Option<String>, Expr)> = Vec::new();
         if !use_define {
             let computed_method_anchors: Vec<usize> = class_decl
@@ -6200,10 +6197,8 @@ impl<'a> Emitter<'a> {
                     _ => None,
                 })
                 .collect();
-            let mut legacy_actions_by_method_idx: std::collections::HashMap<
-                usize,
-                Vec<(Option<String>, Expr)>,
-            > = std::collections::HashMap::new();
+            let mut legacy_actions_by_method_idx: HashMap<usize, Vec<(Option<String>, Expr)>> =
+                HashMap::default();
             let mut next_anchor_idx = 0usize;
             for (idx, member) in class_decl.members.iter().enumerate() {
                 let ClassMemberKind::Property(prop) = &member.kind else {
@@ -6347,12 +6342,9 @@ impl<'a> Emitter<'a> {
         // existing private fields AND private names from enclosing classes.
         self.accessor_storage_names.clear();
         {
-            let mut this_class_private_names: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let mut this_class_private_members: std::collections::HashMap<
-                String,
-                EnclosingPrivateMemberKind,
-            > = std::collections::HashMap::new();
+            let mut this_class_private_names: HashSet<String> = HashSet::default();
+            let mut this_class_private_members: HashMap<String, EnclosingPrivateMemberKind> =
+                HashMap::default();
             for member in &class_decl.members {
                 match &member.kind {
                     ClassMemberKind::Property(prop) => {
@@ -6397,7 +6389,7 @@ impl<'a> Emitter<'a> {
             if (use_define && downlevel_accessors) || needs_legacy_instance_init_transform {
                 // Check collisions against this class's private fields and
                 // enclosing classes' private names (from the stack).
-                let enclosing_names: std::collections::HashSet<&String> = self
+                let enclosing_names: HashSet<&String> = self
                     .enclosing_private_names
                     .iter()
                     .flat_map(|s| s.iter())
@@ -6611,14 +6603,14 @@ impl<'a> Emitter<'a> {
             // Emit private field WeakMap.set() and regular field inits
             // interleaved in source order by walking class members.
             // Build a map from member position → private_fields index for matching.
-            let pf_by_pos: std::collections::HashMap<u32, usize> = if downlevel_private {
+            let pf_by_pos: HashMap<u32, usize> = if downlevel_private {
                 private_fields
                     .iter()
                     .enumerate()
                     .map(|(i, (_, _, _, pf_span, _))| (pf_span.start, i))
                     .collect()
             } else {
-                std::collections::HashMap::new()
+                HashMap::default()
             };
             let saved_comment_pos = self.comment_emit_pos;
             let saved_next_idx = self.next_comment_idx;
@@ -7173,19 +7165,15 @@ impl<'a> Emitter<'a> {
                 || has_private_accessors
                 || has_static_private_methods
             {
-                let private_method_helper_by_pos: std::collections::HashMap<u32, &str> =
-                    private_instance_methods
-                        .iter()
-                        .chain(private_static_methods.iter())
-                        .map(|(_, span, helper_decl_name, _)| {
-                            (span.start, helper_decl_name.as_str())
-                        })
-                        .collect();
-                let private_accessor_helper_by_pos: std::collections::HashMap<u32, &str> =
-                    private_accessors
-                        .iter()
-                        .map(|info| (info.span.start, info.helper_decl_name.as_str()))
-                        .collect();
+                let private_method_helper_by_pos: HashMap<u32, &str> = private_instance_methods
+                    .iter()
+                    .chain(private_static_methods.iter())
+                    .map(|(_, span, helper_decl_name, _)| (span.start, helper_decl_name.as_str()))
+                    .collect();
+                let private_accessor_helper_by_pos: HashMap<u32, &str> = private_accessors
+                    .iter()
+                    .map(|info| (info.span.start, info.helper_decl_name.as_str()))
+                    .collect();
                 let saved_class_alias = if let (Some(ref class_name), Some(ref tn)) =
                     (&class_decl.name, &class_temp_name)
                 {
@@ -7422,7 +7410,7 @@ impl<'a> Emitter<'a> {
             .as_ref()
             .map(|v| v.clone())
             .unwrap_or_default();
-        let computed_temps_snapshot: std::collections::HashMap<String, String> = self
+        let computed_temps_snapshot: HashMap<String, String> = self
             .class_computed_name_temps
             .as_ref()
             .map(|m| m.clone())
@@ -7659,7 +7647,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             // Second pass: allocate temps in source order
-            let mut seen_starts = std::collections::HashSet::new();
+            let mut seen_starts = HashSet::default();
             for member in &class_decl.members {
                 match &member.kind {
                     ClassMemberKind::Property(prop) => {
@@ -7788,7 +7776,7 @@ impl<'a> Emitter<'a> {
             instance_starts.sort_unstable();
 
             if allocated_names.len() == static_starts.len() + instance_starts.len() + 1 {
-                let mut replacement_by_start: HashMap<u32, String> = HashMap::new();
+                let mut replacement_by_start: HashMap<u32, String> = HashMap::default();
                 for (idx, start) in static_starts.iter().enumerate() {
                     replacement_by_start.insert(*start, allocated_names[idx].clone());
                 }
@@ -8084,8 +8072,7 @@ impl<'a> Emitter<'a> {
 
         let downlevel_auto_accessors = !use_define && downlevel_accessors;
         let mut helper_var_names: Vec<String> = Vec::new();
-        let mut helper_var_seen: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut helper_var_seen: HashSet<String> = HashSet::default();
 
         // Helper closure: allocate a unique name, suffixing with _1, _2, etc. on collision.
         let allocate_unique = |base: &str, all: &mut HashMap<AstString, u32>| -> String {
@@ -8383,13 +8370,11 @@ impl<'a> Emitter<'a> {
             }
         }
 
-        let class_expr_temp_by_start: std::collections::HashMap<u32, String> =
-            class_expr_computed_temps
-                .iter()
-                .map(|(temp, start)| (*start, temp.clone()))
-                .collect();
-        let mut class_expr_method_name_overrides: std::collections::HashMap<u32, String> =
-            std::collections::HashMap::new();
+        let class_expr_temp_by_start: HashMap<u32, String> = class_expr_computed_temps
+            .iter()
+            .map(|(temp, start)| (*start, temp.clone()))
+            .collect();
+        let mut class_expr_method_name_overrides: HashMap<u32, String> = HashMap::default();
         let mut class_expr_post_actions: Vec<(u32, Option<String>, Expr)> = Vec::new();
         if !use_define {
             let computed_method_anchors: Vec<usize> = class_decl
@@ -8409,10 +8394,8 @@ impl<'a> Emitter<'a> {
                     _ => None,
                 })
                 .collect();
-            let mut actions_by_method_idx: std::collections::HashMap<
-                usize,
-                Vec<(u32, Option<String>, Expr)>,
-            > = std::collections::HashMap::new();
+            let mut actions_by_method_idx: HashMap<usize, Vec<(u32, Option<String>, Expr)>> =
+                HashMap::default();
             let mut next_anchor_idx = 0usize;
             for (idx, member) in class_decl.members.iter().enumerate() {
                 let ClassMemberKind::Property(prop) = &member.kind else {
@@ -8629,12 +8612,9 @@ impl<'a> Emitter<'a> {
         // Pre-compute auto-accessor storage names for class expressions too.
         self.accessor_storage_names.clear();
         {
-            let mut this_class_private_names_expr: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let mut this_class_private_members_expr: std::collections::HashMap<
-                String,
-                EnclosingPrivateMemberKind,
-            > = std::collections::HashMap::new();
+            let mut this_class_private_names_expr: HashSet<String> = HashSet::default();
+            let mut this_class_private_members_expr: HashMap<String, EnclosingPrivateMemberKind> =
+                HashMap::default();
             for member in &class_decl.members {
                 match &member.kind {
                     ClassMemberKind::Property(prop) => {
@@ -8677,7 +8657,7 @@ impl<'a> Emitter<'a> {
                 }
             }
             if (use_define && downlevel_accessors) || needs_legacy_instance_init_transform {
-                let enclosing_names: std::collections::HashSet<&String> = self
+                let enclosing_names: HashSet<&String> = self
                     .enclosing_private_names
                     .iter()
                     .flat_map(|s| s.iter())
@@ -9056,17 +9036,15 @@ impl<'a> Emitter<'a> {
             self.write(" = new WeakSet()");
             self.writeln(",");
         }
-        let private_method_helper_by_pos: std::collections::HashMap<u32, &str> =
-            private_instance_methods
-                .iter()
-                .chain(private_static_methods.iter())
-                .map(|(_, span, helper_decl_name, _)| (span.start, helper_decl_name.as_str()))
-                .collect();
-        let private_accessor_helper_by_pos: std::collections::HashMap<u32, &str> =
-            private_accessors
-                .iter()
-                .map(|info| (info.span.start, info.helper_decl_name.as_str()))
-                .collect();
+        let private_method_helper_by_pos: HashMap<u32, &str> = private_instance_methods
+            .iter()
+            .chain(private_static_methods.iter())
+            .map(|(_, span, helper_decl_name, _)| (span.start, helper_decl_name.as_str()))
+            .collect();
+        let private_accessor_helper_by_pos: HashMap<u32, &str> = private_accessors
+            .iter()
+            .map(|info| (info.span.start, info.helper_decl_name.as_str()))
+            .collect();
         for member in &class_decl.members {
             match &member.kind {
                 ClassMemberKind::Method(method) => {
@@ -9789,7 +9767,7 @@ impl<'a> Emitter<'a> {
                     .as_ref()
                     .map(|v| v.clone())
                     .unwrap_or_default();
-                let temps: std::collections::HashMap<String, String> = self
+                let temps: HashMap<String, String> = self
                     .class_computed_name_temps
                     .as_ref()
                     .map(|m| m.clone())

@@ -144,7 +144,7 @@ impl TypeChecker {
         };
         let ExportDeclKind::Named {
             specifiers,
-            source: None,
+            source,
             type_only: false,
         } = &export.kind
         else {
@@ -154,7 +154,30 @@ impl TypeChecker {
             let name = specifier.local.as_str();
             let names_type =
                 self.interface_info.contains_key(name) || self.type_aliases.contains_key(name);
-            if names_type && self.lookup_var(name).is_none() && !specifier.is_type {
+            let erased_alias = self.current_file_name.as_deref().is_some_and(|file| {
+                if let Some(source) = source {
+                    self.javascript_import_is_erased(source, name)
+                } else {
+                    self.javascript_alias_is_erased(file, false, name)
+                        || (names_type
+                            && !self.local_value_names.contains(name)
+                            && self.lookup_var(name).is_none())
+                }
+            });
+            if erased_alias && !specifier.is_type {
+                let related = source
+                    .is_none()
+                    .then(|| {
+                        let text = self.current_source.as_deref()?;
+                        let span = crate::jsdoc::type_alias_tag_span(text, name)?;
+                        Some(vec![RelatedDiagnostic {
+                            code: 18044,
+                            message: format!("'{name}' is automatically exported here."),
+                            file_name: self.current_file_name.clone(),
+                            span: Some(span),
+                        }])
+                    })
+                    .flatten();
                 self.diagnostics.push(Diagnostic {
                     code: 18043,
                     message: "Types cannot appear in export declarations in JavaScript files."
@@ -162,11 +185,8 @@ impl TypeChecker {
                     category: DiagnosticCategory::Error,
                     file_name: None,
                     // tsc marks the local name, not `local as exported`.
-                    span: Some(Span::new(
-                        specifier.span.start,
-                        specifier.span.start + name.len() as u32,
-                    )),
-                    related: None,
+                    span: Some(self.javascript_alias_token_span(specifier.span, 0)),
+                    related,
                 });
             }
         }

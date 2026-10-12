@@ -1002,8 +1002,7 @@ fn patience(
         return;
     }
     // Tokens occurring exactly once on each side.
-    let mut counts: std::collections::HashMap<&str, (u32, u32, usize, usize)> =
-        std::collections::HashMap::new();
+    let mut counts: crate::HashMap<&str, (u32, u32, usize, usize)> = crate::HashMap::default();
     for (i, token) in a.iter().enumerate().take(a_hi).skip(a_lo) {
         let entry = counts.entry(token).or_insert((0, 0, 0, 0));
         entry.0 += 1;

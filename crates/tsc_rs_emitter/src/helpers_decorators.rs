@@ -699,7 +699,7 @@ impl<'a> Emitter<'a> {
         &mut self,
         type_ann: &TypeNode,
         serialized: String,
-        cjs_map: &HashMap<AstString, (AstString, AstString)>,
+        cjs_map: &CjsImportMap,
     ) -> String {
         fn unwrap_paren_type<'t>(ty: &'t TypeNode) -> &'t TypeNode {
             match &ty.kind {
@@ -798,7 +798,7 @@ impl<'a> Emitter<'a> {
         &mut self,
         type_ann: &TypeNode,
         metadata_type_only: &HashSet<AstString>,
-        cjs_map: &HashMap<AstString, (AstString, AstString)>,
+        cjs_map: &CjsImportMap,
     ) -> String {
         let serialized = serialize_type_for_metadata_cjs(
             type_ann,
@@ -821,7 +821,7 @@ impl<'a> Emitter<'a> {
         &mut self,
         param: &Param,
         metadata_type_only: &HashSet<AstString>,
-        cjs_map: &HashMap<AstString, (AstString, AstString)>,
+        cjs_map: &CjsImportMap,
     ) -> String {
         let serialized = serialize_param_type_for_metadata_cjs(
             param,
@@ -884,7 +884,7 @@ impl<'a> Emitter<'a> {
         let cjs_map = if self.is_commonjs() {
             self.cjs_import_map.clone()
         } else {
-            HashMap::new()
+            crate::CjsImportMap::default()
         };
         // Collect class type parameter names -- these should serialize as Object
         // in metadata because they have no runtime value.

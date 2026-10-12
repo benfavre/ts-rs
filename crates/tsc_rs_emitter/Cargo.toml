@@ -10,6 +10,7 @@ description = "TypeScript-to-JavaScript emitter for tsc-rs"
 [dependencies]
 tsc_rs_ast = { path = "../tsc_rs_ast" }
 tsc_rs_scanner = { path = "../tsc_rs_scanner" }
+rustc-hash = "2"
 
 [dev-dependencies]
 tsc_rs_parser = { path = "../tsc_rs_parser" }

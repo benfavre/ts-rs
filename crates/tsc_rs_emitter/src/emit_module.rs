@@ -469,25 +469,25 @@ impl<'a> Emitter<'a> {
 
         let preserve_const_enums = self.preserve_const_enums_effective();
         let mut system_deps: Vec<SystemDep> = Vec::new();
-        let mut dep_index_by_source: HashMap<String, usize> = HashMap::new();
+        let mut dep_index_by_source: HashMap<String, usize> = HashMap::default();
         let mut var_names: Vec<String> = Vec::new();
-        let mut seen_var_names: HashSet<String> = HashSet::new();
+        let mut seen_var_names: HashSet<String> = HashSet::default();
         let mut system_transform_temp_names: Vec<String> = Vec::new();
         let mut deferred_system_export_names: Vec<String> = Vec::new();
         let mut local_export_names: Vec<String> = Vec::new();
-        let mut seen_local_export_names: HashSet<String> = HashSet::new();
+        let mut seen_local_export_names: HashSet<String> = HashSet::default();
         let mut execute_actions: Vec<ExecuteAction> = Vec::new();
         let mut prelude_fn_decls: Vec<FnDecl> = Vec::new();
         let mut prelude_fn_decl_spans: Vec<Span> = Vec::new();
-        let mut prelude_fn_names: HashSet<String> = HashSet::new();
+        let mut prelude_fn_names: HashSet<String> = HashSet::default();
         let mut prelude_export_calls: Vec<(String, String)> = Vec::new();
-        let mut seen_prelude_export_calls: HashSet<(String, String)> = HashSet::new();
-        let mut seen_execute_named_exports: HashSet<(String, String)> = HashSet::new();
+        let mut seen_prelude_export_calls: HashSet<(String, String)> = HashSet::default();
+        let mut seen_execute_named_exports: HashSet<(String, String)> = HashSet::default();
         let mut default_export_counter = 1usize;
-        let mut local_symbol_order: HashMap<String, usize> = HashMap::new();
+        let mut local_symbol_order: HashMap<String, usize> = HashMap::default();
         let mut next_local_symbol_order = 0usize;
-        let mut decl_inline_export_names: HashSet<String> = HashSet::new();
-        let mut inline_export_aliases: HashMap<String, Vec<String>> = HashMap::new();
+        let mut decl_inline_export_names: HashSet<String> = HashSet::default();
+        let mut inline_export_aliases: HashMap<String, Vec<String>> = HashMap::default();
 
         let ensure_dep = |source: &str,
                           suggested_param: Option<String>,
@@ -600,7 +600,7 @@ impl<'a> Emitter<'a> {
         // affecting the ordering or deduplication of the main `var_names` / `seen_var_names`.
         let all_hoisted_var_names: HashSet<String> = {
             let mut prescan_names: Vec<String> = Vec::new();
-            let mut prescan_seen: HashSet<String> = HashSet::new();
+            let mut prescan_seen: HashSet<String> = HashSet::default();
             for stmt in &file.statements {
                 collect_function_scope_var_names(stmt, &mut prescan_names, &mut prescan_seen);
             }
@@ -611,7 +611,7 @@ impl<'a> Emitter<'a> {
         // (without source) so that inside a disposal scope we know which
         // assignments need `exports_fn(...)` wrapping.
         let named_export_locals: HashSet<String> = {
-            let mut set = HashSet::new();
+            let mut set = HashSet::default();
             for stmt in &file.statements {
                 if let StmtKind::Export(ed) = &stmt.kind {
                     if let ExportDeclKind::Named {
@@ -2237,7 +2237,7 @@ impl<'a> Emitter<'a> {
             .map(|s| AstString::from(s.as_str()))
             .collect();
 
-        let mut emitted_prelude_export_calls: HashSet<(String, String)> = HashSet::new();
+        let mut emitted_prelude_export_calls: HashSet<(String, String)> = HashSet::default();
         for (idx, fn_decl) in prelude_fn_decls.iter().enumerate() {
             if let Some(span) = prelude_fn_decl_spans.get(idx) {
                 self.emit_leading_comments(span.start);
@@ -3634,7 +3634,7 @@ impl<'a> Emitter<'a> {
             Some(&mut self.cumulative_ns_type_exports),
         );
 
-        let mut aliased_fn_exports: HashSet<String> = HashSet::new();
+        let mut aliased_fn_exports: HashSet<String> = HashSet::default();
         for stmt in &file.statements {
             if let StmtKind::Export(ref export_decl) = stmt.kind {
                 collect_export_names(
@@ -3746,7 +3746,7 @@ impl<'a> Emitter<'a> {
             // Dedup with HashSet<&str> instead of HashSet<String> — borrowing
             // each name from the Vec avoids cloning every entry just to insert.
             // Compute keep flags first, then drop the borrow before mutating.
-            let mut seen: HashSet<&str> = HashSet::new();
+            let mut seen: HashSet<&str> = HashSet::default();
             let keeps: Vec<bool> = pre_decl_names
                 .iter()
                 .map(|n| seen.insert(n.as_str()))
@@ -3756,7 +3756,7 @@ impl<'a> Emitter<'a> {
             pre_decl_names.retain(|_| iter.next().unwrap_or(false));
         }
         {
-            let mut seen: HashSet<(&str, &str)> = HashSet::new();
+            let mut seen: HashSet<(&str, &str)> = HashSet::default();
             let keeps: Vec<bool> = local_named_exports
                 .iter()
                 .map(|(a, b)| seen.insert((a.as_str(), b.as_str())))
@@ -3766,7 +3766,7 @@ impl<'a> Emitter<'a> {
             local_named_exports.retain(|_| iter.next().unwrap_or(false));
         }
         {
-            let mut seen: HashSet<&str> = HashSet::new();
+            let mut seen: HashSet<&str> = HashSet::default();
             let keeps: Vec<bool> = modifier_export_names
                 .iter()
                 .map(|n| seen.insert(n.as_str()))
@@ -3849,7 +3849,7 @@ impl<'a> Emitter<'a> {
                 .map(|(e, l)| (e.clone(), l.clone()))
                 .collect();
             // Build re-export map: exported → local for `export { X } from "..."`
-            let mut reexport_local_map: HashMap<String, String> = HashMap::new();
+            let mut reexport_local_map: HashMap<String, String> = HashMap::default();
             for stmt in &file.statements {
                 if let StmtKind::Export(ref ed) = stmt.kind {
                     if let ExportDeclKind::Named {
@@ -4071,7 +4071,7 @@ impl<'a> Emitter<'a> {
                 .collect()
         };
         let mut emitted_prologue = emitted_file_prologue;
-        let mut emitted_import_local_export_idxs: HashSet<usize> = HashSet::new();
+        let mut emitted_import_local_export_idxs: HashSet<usize> = HashSet::default();
         for stmt in &file.statements {
             if stmt_is_export_assign(stmt) {
                 continue;

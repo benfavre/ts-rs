@@ -80,8 +80,12 @@ impl DeclarationEmitter<'_> {
                     kind: ExprKind::Unary(resolved),
                     span: expr.span,
                 };
-                try_eval_enum_expr(&resolved, &HashMap::new(), &HashMap::new())
-                    .map(EnumValue::Number)
+                try_eval_enum_expr(
+                    &resolved,
+                    &crate::HashMap::default(),
+                    &crate::HashMap::default(),
+                )
+                .map(EnumValue::Number)
             }
             ExprKind::Binary(binary) => {
                 let left = self.enum_initializer_value(&binary.left, current)?;
@@ -95,8 +99,12 @@ impl DeclarationEmitter<'_> {
                             kind: ExprKind::Binary(resolved),
                             span: expr.span,
                         };
-                        try_eval_enum_expr(&resolved, &HashMap::new(), &HashMap::new())
-                            .map(EnumValue::Number)
+                        try_eval_enum_expr(
+                            &resolved,
+                            &crate::HashMap::default(),
+                            &crate::HashMap::default(),
+                        )
+                        .map(EnumValue::Number)
                     }
                     (left, right) if binary.op == BinaryOp::Add => Some(EnumValue::String(
                         format!("{}{}", left.text(), right.text()),

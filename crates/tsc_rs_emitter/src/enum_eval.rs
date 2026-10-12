@@ -103,24 +103,19 @@ pub(crate) fn format_enum_value(v: f64) -> String {
 #[allow(dead_code)] // enum constant evaluation
 pub(crate) fn try_eval_enum_expr(
     expr: &Expr,
-    members: &std::collections::HashMap<String, f64>,
-    merged_enum_values: &std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+    members: &HashMap<String, f64>,
+    merged_enum_values: &HashMap<String, HashMap<String, f64>>,
 ) -> Option<f64> {
-    try_eval_enum_expr_with_consts(
-        expr,
-        members,
-        merged_enum_values,
-        &std::collections::HashMap::new(),
-    )
+    try_eval_enum_expr_with_consts(expr, members, merged_enum_values, &HashMap::default())
 }
 
 /// Like `try_eval_enum_expr` but also resolves file-level `const` declarations
 /// with known numeric values (e.g. `const EV = 1`).
 pub(crate) fn try_eval_enum_expr_with_consts(
     expr: &Expr,
-    members: &std::collections::HashMap<String, f64>,
-    merged_enum_values: &std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
-    file_consts: &std::collections::HashMap<String, f64>,
+    members: &HashMap<String, f64>,
+    merged_enum_values: &HashMap<String, HashMap<String, f64>>,
+    file_consts: &HashMap<String, f64>,
 ) -> Option<f64> {
     match &expr.kind {
         ExprKind::NumLit(s) => parse_js_number(s),
@@ -286,17 +281,14 @@ pub(crate) fn js_to_uint32(v: f64) -> u32 {
 #[allow(dead_code)] // string enum constant evaluation
 pub(crate) fn try_eval_string_enum_expr(
     expr: &Expr,
-    string_member_values: &std::collections::HashMap<String, String>,
-    merged_string_enum_values: &std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, String>,
-    >,
+    string_member_values: &HashMap<String, String>,
+    merged_string_enum_values: &HashMap<String, HashMap<String, String>>,
 ) -> Option<String> {
     try_eval_string_enum_expr_with_consts(
         expr,
         string_member_values,
         merged_string_enum_values,
-        &std::collections::HashMap::new(),
+        &HashMap::default(),
     )
 }
 
@@ -304,19 +296,16 @@ pub(crate) fn try_eval_string_enum_expr(
 /// declarations with known string values (e.g. `const d = 'd'`).
 pub(crate) fn try_eval_string_enum_expr_with_consts(
     expr: &Expr,
-    string_member_values: &std::collections::HashMap<String, String>,
-    merged_string_enum_values: &std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, String>,
-    >,
-    file_string_consts: &std::collections::HashMap<String, String>,
+    string_member_values: &HashMap<String, String>,
+    merged_string_enum_values: &HashMap<String, HashMap<String, String>>,
+    file_string_consts: &HashMap<String, String>,
 ) -> Option<String> {
     try_eval_string_enum_expr_full(
         expr,
         string_member_values,
         merged_string_enum_values,
         file_string_consts,
-        &std::collections::HashMap::new(),
+        &HashMap::default(),
     )
 }
 
@@ -324,13 +313,10 @@ pub(crate) fn try_eval_string_enum_expr_with_consts(
 /// coercion (e.g. `\`${foo}\`` where `const foo = 2` → `"2"`).
 pub(crate) fn try_eval_string_enum_expr_full(
     expr: &Expr,
-    string_member_values: &std::collections::HashMap<String, String>,
-    merged_string_enum_values: &std::collections::HashMap<
-        String,
-        std::collections::HashMap<String, String>,
-    >,
-    file_string_consts: &std::collections::HashMap<String, String>,
-    file_num_consts: &std::collections::HashMap<String, f64>,
+    string_member_values: &HashMap<String, String>,
+    merged_string_enum_values: &HashMap<String, HashMap<String, String>>,
+    file_string_consts: &HashMap<String, String>,
+    file_num_consts: &HashMap<String, f64>,
 ) -> Option<String> {
     match &expr.kind {
         ExprKind::StrLit(s) => Some(s.to_string()),

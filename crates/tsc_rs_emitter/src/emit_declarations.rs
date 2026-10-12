@@ -337,7 +337,7 @@ impl<'a> Emitter<'a> {
         }
         let mut auto_value: Option<f64> = Some(0.0);
         // Seed from persistent map to support merged enum declarations.
-        let mut member_values: std::collections::HashMap<String, f64> = self
+        let mut member_values: HashMap<String, f64> = self
             .merged_enum_values
             .get(name)
             .cloned()
@@ -345,10 +345,9 @@ impl<'a> Emitter<'a> {
         // Track which enum members have been determined to have string values,
         // so that references like `H = A` (where A is string-valued) are
         // correctly treated as string-valued too.
-        let mut string_members: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut string_members: HashSet<String> = HashSet::default();
         // Track string enum member constant values for folding.
-        let mut string_member_values: std::collections::HashMap<String, String> = self
+        let mut string_member_values: HashMap<String, String> = self
             .merged_string_enum_values
             .get(name)
             .cloned()
@@ -356,8 +355,7 @@ impl<'a> Emitter<'a> {
         // Track which enum members have been processed (emitted) so far.
         // Used to distinguish forward references (emit 0) from backward
         // references to computed members (emit as-is).
-        let mut processed_members: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut processed_members: HashSet<String> = HashSet::default();
         for member in &enum_decl.members {
             // Emit leading comments (JSDoc) for this enum member
             self.emit_leading_comments(member.span.start);
@@ -3972,8 +3970,8 @@ impl<'a> Emitter<'a> {
 fn has_member_access_on_value(
     expr: &Expr,
     enum_name: &str,
-    member_values: &std::collections::HashMap<String, f64>,
-    merged_enum_values: &std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+    member_values: &HashMap<String, f64>,
+    merged_enum_values: &HashMap<String, HashMap<String, f64>>,
 ) -> bool {
     match &expr.kind {
         ExprKind::Member(member) => {
@@ -4030,8 +4028,8 @@ fn is_unresolved_enum_self_ref(
     expr: &Expr,
     enum_name: &str,
     current_member: &str,
-    processed_members: &std::collections::HashSet<String>,
-    all_member_names: &std::collections::HashSet<AstString>,
+    processed_members: &HashSet<String>,
+    all_member_names: &HashSet<AstString>,
 ) -> bool {
     match &expr.kind {
         // Bare identifier: `Y` (will be qualified as `E1.Y` during emit)
@@ -4081,8 +4079,8 @@ fn is_unresolved_enum_self_ref(
 /// - Non-exported `var`/`let`/`const` declarations
 /// - Function, class, enum, and namespace declarations (even when exported,
 ///   these always retain a local binding: `function f(){} M.f = f;`)
-fn collect_local_non_exported_vars(stmts: &[Stmt]) -> std::collections::HashSet<String> {
-    let mut locals = std::collections::HashSet::new();
+fn collect_local_non_exported_vars(stmts: &[Stmt]) -> HashSet<String> {
+    let mut locals = HashSet::default();
     for stmt in stmts {
         match &stmt.kind {
             // Non-exported variable declarations create local bindings
@@ -4152,8 +4150,8 @@ fn collect_local_non_exported_vars(stmts: &[Stmt]) -> std::collections::HashSet<
 /// These represent local value rebindings that shadow outer module names.
 /// When `import X = Y` has an RHS matching one of these names, the import
 /// should be elided because Y refers to a local value, not a module.
-fn collect_ns_local_value_vars(stmts: &[Stmt]) -> std::collections::HashSet<String> {
-    let mut vars = std::collections::HashSet::new();
+fn collect_ns_local_value_vars(stmts: &[Stmt]) -> HashSet<String> {
+    let mut vars = HashSet::default();
     for stmt in stmts {
         if let StmtKind::Var(v) = &stmt.kind {
             if v.modifiers & MOD_EXPORT == 0 && v.modifiers & MOD_DECLARE == 0 {
@@ -4167,7 +4165,7 @@ fn collect_ns_local_value_vars(stmts: &[Stmt]) -> std::collections::HashSet<Stri
 }
 
 /// Extract all binding names from a pattern into the given set.
-fn collect_pat_names(pat: &Pat, names: &mut std::collections::HashSet<String>) {
+fn collect_pat_names(pat: &Pat, names: &mut HashSet<String>) {
     match &pat.kind {
         PatKind::Ident(name) => {
             names.insert(name.to_string());

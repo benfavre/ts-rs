@@ -196,7 +196,7 @@ pub(crate) fn collect_file_value_bound_names(
     stmts: &[Stmt],
     preserve_const_enums: bool,
 ) -> HashSet<AstString> {
-    let mut names: HashSet<AstString> = HashSet::new();
+    let mut names: HashSet<AstString> = HashSet::default();
     for stmt in stmts {
         let mut tmp: Vec<String> = Vec::new();
         match &stmt.kind {
@@ -1355,7 +1355,7 @@ pub(crate) fn single_destructure_access(pat: &Pat) -> DestructureAccess {
 /// declarations retain their local binding in the IIFE (e.g. `class A {} NS.A = A;`),
 /// while `export var x = init;` becomes `NS.x = init;` with no local `x`.
 pub(crate) fn collect_namespace_exports(stmts: &[Stmt]) -> HashSet<String> {
-    let mut exports = HashSet::new();
+    let mut exports = HashSet::default();
     let type_only_import_equals = collect_ns_type_only_import_equals(stmts);
     for stmt in stmts {
         match &stmt.kind {
@@ -1400,7 +1400,7 @@ pub(crate) fn collect_namespace_exports(stmts: &[Stmt]) -> HashSet<String> {
 /// reopened, exports from previous openings need qualification because they have
 /// no local binding in the new IIFE scope.
 pub(crate) fn collect_all_namespace_exports(stmts: &[Stmt]) -> HashSet<String> {
-    let mut exports = HashSet::new();
+    let mut exports = HashSet::default();
     let type_only_import_equals = collect_ns_type_only_import_equals(stmts);
     for stmt in stmts {
         match &stmt.kind {
@@ -1479,7 +1479,7 @@ pub(crate) fn collect_all_namespace_exports(stmts: &[Stmt]) -> HashSet<String> {
 /// namespaces. Used to distinguish "member is a declared type-only export" from
 /// "member is an undeclared property" in import-equals elision.
 pub(crate) fn collect_namespace_type_only_exports(stmts: &[Stmt]) -> HashSet<String> {
-    let mut type_exports = HashSet::new();
+    let mut type_exports = HashSet::default();
     let type_only_import_equals = collect_ns_type_only_import_equals(stmts);
     for stmt in stmts {
         match &stmt.kind {
@@ -1683,7 +1683,7 @@ pub(crate) fn prescan_declare_namespace_value_exports(
         }
     }
 
-    let mut namespaces: HashMap<String, NamespaceInfo> = HashMap::new();
+    let mut namespaces: HashMap<String, NamespaceInfo> = HashMap::default();
     for stmt in stmts {
         let module_decl = match &stmt.kind {
             StmtKind::ModuleDecl(module_decl) => Some(module_decl.as_ref()),
@@ -1718,7 +1718,7 @@ pub(crate) fn prescan_declare_namespace_value_exports(
         .iter()
         .map(|(name, info)| (name.clone(), info.direct_values.clone()))
         .collect();
-    let mut runtime_exports: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut runtime_exports: HashMap<String, HashSet<String>> = HashMap::default();
     loop {
         let mut changed = false;
         for (namespace, info) in &namespaces {
@@ -2000,7 +2000,7 @@ pub(crate) fn collect_member_decorator_strings(
     decorators: &[Expr],
     params: &[Param],
     helper_prefix: &str,
-    cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
+    cjs_import_map: &CjsImportMap,
     cjs_string_import_locals: &HashSet<AstString>,
     import_shadows: &crate::import_shadow::ImportShadows,
 ) -> Vec<String> {
@@ -2023,7 +2023,7 @@ pub(crate) fn collect_member_decorator_strings_await_to_yield(
     decorators: &[Expr],
     params: &[Param],
     helper_prefix: &str,
-    cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
+    cjs_import_map: &CjsImportMap,
     cjs_string_import_locals: &HashSet<AstString>,
     import_shadows: &crate::import_shadow::ImportShadows,
 ) -> Vec<String> {
@@ -2046,7 +2046,7 @@ fn collect_member_decorator_strings_inner(
     decorators: &[Expr],
     params: &[Param],
     helper_prefix: &str,
-    cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
+    cjs_import_map: &CjsImportMap,
     cjs_string_import_locals: &HashSet<AstString>,
     import_shadows: &crate::import_shadow::ImportShadows,
     await_to_yield: bool,
@@ -2535,7 +2535,7 @@ pub(crate) fn class_can_emit_narrow_standard_decorator_member_decl(class: &Class
         return false;
     }
 
-    let mut seen_supported_names = std::collections::HashSet::new();
+    let mut seen_supported_names = HashSet::default();
     let mut saw_supported_member = false;
 
     for member in &class.members {
@@ -2803,8 +2803,8 @@ pub(crate) fn serialize_type_for_metadata(
         type_only_names,
         type_only_import_names,
         global_type_only_names,
-        &HashMap::new(),
-        &HashSet::new(),
+        &crate::CjsImportMap::default(),
+        &HashSet::default(),
         enum_names,
         strict_null_checks,
     )
@@ -2867,7 +2867,7 @@ pub(crate) fn serialize_type_for_metadata_cjs(
     type_only_names: &HashSet<AstString>,
     type_only_import_names: &HashSet<AstString>,
     global_type_only_names: &HashSet<AstString>,
-    cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
+    cjs_import_map: &CjsImportMap,
     cjs_string_import_locals: &HashSet<AstString>,
     enum_names: &HashSet<AstString>,
     strict_null_checks: bool,
@@ -3110,8 +3110,8 @@ pub(crate) fn serialize_param_type_for_metadata(
         type_only_names,
         type_only_import_names,
         global_type_only_names,
-        &HashMap::new(),
-        &HashSet::new(),
+        &crate::CjsImportMap::default(),
+        &HashSet::default(),
         enum_names,
         strict_null_checks,
     )
@@ -3124,7 +3124,7 @@ pub(crate) fn serialize_param_type_for_metadata_cjs(
     type_only_names: &HashSet<AstString>,
     type_only_import_names: &HashSet<AstString>,
     global_type_only_names: &HashSet<AstString>,
-    cjs_import_map: &HashMap<AstString, (AstString, AstString)>,
+    cjs_import_map: &CjsImportMap,
     cjs_string_import_locals: &HashSet<AstString>,
     enum_names: &HashSet<AstString>,
     strict_null_checks: bool,
@@ -3189,7 +3189,7 @@ pub(crate) fn collect_metadata_type_refs(
             }
         }
         TypeNodeKind::Union(types) => {
-            let cjs_import_map = HashMap::new();
+            let cjs_import_map = crate::CjsImportMap::default();
             let decision = metadata_union_decision(types, strict_null_checks, |type_ann| {
                 serialize_type_for_metadata_cjs(
                     type_ann,
@@ -3198,7 +3198,7 @@ pub(crate) fn collect_metadata_type_refs(
                     type_only_import_names,
                     global_type_only_names,
                     &cjs_import_map,
-                    &HashSet::new(),
+                    &HashSet::default(),
                     enum_names,
                     strict_null_checks,
                 )
@@ -5804,7 +5804,7 @@ fn class_needs_private_field_helpers(class: &ClassDecl) -> (bool, bool) {
     if !has_declared_private {
         return (false, false);
     }
-    let declared_private_names: std::collections::HashSet<String> = class
+    let declared_private_names: HashSet<String> = class
         .members
         .iter()
         .filter_map(|m| match &m.kind {
@@ -5885,7 +5885,7 @@ fn class_needs_private_field_helpers(class: &ClassDecl) -> (bool, bool) {
 
 fn member_matches_declared_private(
     mem: &MemberExpr,
-    declared_private_names: &std::collections::HashSet<String>,
+    declared_private_names: &HashSet<String>,
 ) -> bool {
     mem.property
         .strip_prefix('#')
@@ -5894,7 +5894,7 @@ fn member_matches_declared_private(
 
 fn lhs_pattern_has_declared_private_write_target(
     expr: &Expr,
-    declared_private_names: &std::collections::HashSet<String>,
+    declared_private_names: &HashSet<String>,
 ) -> bool {
     match &expr.kind {
         ExprKind::Member(m) => member_matches_declared_private(m, declared_private_names),
@@ -6381,7 +6381,7 @@ pub(crate) fn class_computed_name_prop_keys(
     if use_define || class_name.is_empty() {
         return Vec::new();
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::default();
     let mut result = Vec::new();
 
     for member in &class.members {
@@ -7238,7 +7238,7 @@ fn expr_has_private_member_access(expr: &Expr) -> bool {
 /// Returns (needs_get, needs_set).
 fn stmts_private_member_access_kind_declared(
     stmts: &[Stmt],
-    declared_private_names: &std::collections::HashSet<String>,
+    declared_private_names: &HashSet<String>,
 ) -> (bool, bool) {
     let mut needs_get = false;
     let mut needs_set = false;
@@ -7255,7 +7255,7 @@ fn stmts_private_member_access_kind_declared(
 
 fn stmt_private_member_access_kind_declared(
     stmt: &Stmt,
-    declared_private_names: &std::collections::HashSet<String>,
+    declared_private_names: &HashSet<String>,
 ) -> (bool, bool) {
     match &stmt.kind {
         StmtKind::Expr(e) => expr_private_member_access_kind_declared(e, declared_private_names),
@@ -7443,7 +7443,7 @@ fn stmt_private_member_access_kind_declared(
 
 fn expr_private_member_access_kind_declared(
     expr: &Expr,
-    declared_private_names: &std::collections::HashSet<String>,
+    declared_private_names: &HashSet<String>,
 ) -> (bool, bool) {
     match &expr.kind {
         ExprKind::Member(m) => {
@@ -7878,7 +7878,7 @@ pub(crate) fn pat_to_simple_name(pat: &Pat) -> Option<String> {
 /// positions (not referenced in value expressions by sibling statements).
 /// These should be elided from the emitted namespace body.
 pub fn collect_ns_type_only_import_equals(stmts: &[Stmt]) -> HashSet<String> {
-    let mut import_equals_names: HashSet<AstString> = HashSet::new();
+    let mut import_equals_names: HashSet<AstString> = HashSet::default();
     for stmt in stmts {
         if let StmtKind::ImportEquals(ie) = &stmt.kind {
             import_equals_names.insert(AstString::from(ie.name.as_str()));
@@ -7892,11 +7892,11 @@ pub fn collect_ns_type_only_import_equals(stmts: &[Stmt]) -> HashSet<String> {
         }
     }
     if import_equals_names.is_empty() {
-        return HashSet::new();
+        return HashSet::default();
     }
     let ie_nf = FilteredNames::new(&import_equals_names);
-    let mut value_used: HashSet<AstString> = HashSet::new();
-    let mut value_used_non_member: HashSet<AstString> = HashSet::new();
+    let mut value_used: HashSet<AstString> = HashSet::default();
+    let mut value_used_non_member: HashSet<AstString> = HashSet::default();
     for stmt in stmts {
         match &stmt.kind {
             // For import-equals, scan the RHS for value refs to other import-equals
@@ -8894,7 +8894,7 @@ pub(crate) fn stmt_contains_jsx(stmt: &Stmt) -> bool {
 /// Collect uppercase JSX component identifiers from expressions.
 /// In JSX preserve mode, uppercase tag names like `<MyComponent />`
 /// reference a value that must not be import-elided.
-fn collect_jsx_component_names_expr(expr: &Expr, names: &mut std::collections::HashSet<String>) {
+fn collect_jsx_component_names_expr(expr: &Expr, names: &mut HashSet<String>) {
     match &expr.kind {
         ExprKind::JsxElement(el) => {
             collect_jsx_tag_name_root(&el.name, names);
@@ -9025,7 +9025,7 @@ fn collect_jsx_component_names_expr(expr: &Expr, names: &mut std::collections::H
     }
 }
 
-fn collect_jsx_tag_name_root(name: &Expr, names: &mut std::collections::HashSet<String>) {
+fn collect_jsx_tag_name_root(name: &Expr, names: &mut HashSet<String>) {
     match &name.kind {
         ExprKind::Ident(n) => {
             // Only uppercase (component) names are value references
@@ -9041,7 +9041,7 @@ fn collect_jsx_tag_name_root(name: &Expr, names: &mut std::collections::HashSet<
     }
 }
 
-fn collect_jsx_component_names_stmt(stmt: &Stmt, names: &mut std::collections::HashSet<String>) {
+fn collect_jsx_component_names_stmt(stmt: &Stmt, names: &mut HashSet<String>) {
     match &stmt.kind {
         StmtKind::Expr(e) | StmtKind::Throw(e) | StmtKind::Return(Some(e)) => {
             collect_jsx_component_names_expr(e, names);
@@ -9113,10 +9113,7 @@ fn collect_jsx_component_names_stmt(stmt: &Stmt, names: &mut std::collections::H
     }
 }
 
-fn collect_jsx_component_names_member(
-    m: &ClassMember,
-    names: &mut std::collections::HashSet<String>,
-) {
+fn collect_jsx_component_names_member(m: &ClassMember, names: &mut HashSet<String>) {
     match &m.kind {
         ClassMemberKind::Method(method) => {
             if let Some(body) = &method.body {
@@ -9154,8 +9151,8 @@ fn collect_jsx_component_names_member(
 }
 
 /// Collect all JSX component names used in statements.
-pub(crate) fn collect_jsx_component_names(stmts: &[Stmt]) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
+pub(crate) fn collect_jsx_component_names(stmts: &[Stmt]) -> HashSet<String> {
+    let mut names = HashSet::default();
     for s in stmts {
         collect_jsx_component_names_stmt(s, &mut names);
     }

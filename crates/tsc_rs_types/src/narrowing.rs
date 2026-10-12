@@ -268,7 +268,8 @@ fn is_definitely_truthy(ty: &Type) -> bool {
         Type::BigIntLiteral(n) => n != "0",
         Type::Symbol | Type::UniqueSymbol(_) => true,
         Type::Function(_) | Type::Constructor(_) => true,
-        Type::ObjectType(_) | Type::Array(_) | Type::Tuple(_) => true,
+        Type::ObjectType(info) => !info.is_non_nullish_unknown(),
+        Type::Array(_) | Type::Tuple(_) => true,
         _ => false,
     }
 }

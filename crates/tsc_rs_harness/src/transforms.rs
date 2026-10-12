@@ -447,7 +447,7 @@ pub(crate) fn effective_compiler_options(test_case: &TestCase) -> CompilerOption
 }
 
 pub(crate) fn package_json_module_type_by_dir(test_case: &TestCase) -> HashMap<String, bool> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     for file in &test_case.files {
         if !basename(&file.name).eq_ignore_ascii_case("package.json") {
             continue;
@@ -822,10 +822,10 @@ pub(crate) fn remove_exact_line(text: &str, target_trimmed: &str) -> String {
 }
 
 pub(crate) fn merge_const_enum_object_values(
-    out: &mut HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
+    out: &mut tsc_rs_emitter::HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
     target_obj: &str,
     source_obj: &str,
-    source_vals: &HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
+    source_vals: &tsc_rs_emitter::HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
 ) -> bool {
     let mut changed = false;
     for ((obj_name, member_name), value) in source_vals {
@@ -842,10 +842,10 @@ pub(crate) fn merge_const_enum_object_values(
 }
 
 pub(crate) fn merge_const_enum_object_values_with_prefix(
-    out: &mut HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
+    out: &mut tsc_rs_emitter::HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
     target_prefix: &str,
     source_prefix: &str,
-    source_vals: &HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
+    source_vals: &tsc_rs_emitter::HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
 ) -> bool {
     let mut changed = false;
     for ((obj_name, member_name), value) in source_vals {
@@ -872,9 +872,9 @@ pub(crate) fn merge_const_enum_object_values_with_prefix(
 }
 
 pub(crate) fn merge_const_enum_namespace_values(
-    out: &mut HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
+    out: &mut tsc_rs_emitter::HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
     namespace_obj: &str,
-    source_vals: &HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
+    source_vals: &tsc_rs_emitter::HashMap<(String, String), tsc_rs_emitter::ConstEnumValue>,
 ) -> bool {
     let mut changed = false;
     for ((obj_name, member_name), value) in source_vals {
@@ -1366,11 +1366,11 @@ fn maybe_reorder_prologue_directives(emitted: &str, directives: &[String]) -> St
         return emitted.to_string();
     }
 
-    let mut expected_counts: HashMap<&str, usize> = HashMap::new();
+    let mut expected_counts: HashMap<&str, usize> = HashMap::default();
     for line in &expected_trimmed {
         *expected_counts.entry(line.as_str()).or_insert(0) += 1;
     }
-    let mut actual_counts: HashMap<&str, usize> = HashMap::new();
+    let mut actual_counts: HashMap<&str, usize> = HashMap::default();
     for line in &actual_trimmed {
         *actual_counts.entry(line.as_str()).or_insert(0) += 1;
     }
@@ -1638,7 +1638,7 @@ pub(crate) fn parse_triple_slash_reference(line: &str) -> Option<String> {
 }
 
 pub(crate) fn parse_symlink_aliases(source: &str) -> HashMap<String, Vec<String>> {
-    let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+    let mut aliases: HashMap<String, Vec<String>> = HashMap::default();
     let mut current_file: Option<String> = None;
 
     for line in source.lines() {
@@ -2145,7 +2145,7 @@ pub(crate) fn bundle_out_file_js(js_sections: &[(String, String, String)]) -> St
     // prologues hoisted to right after the first section's prologue.
     let mut cleaned_sections: Vec<String> = Vec::new();
     let mut hoisted_prologues: Vec<String> = Vec::new();
-    let mut seen_helpers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_helpers: std::collections::HashSet<String> = std::collections::HashSet::default();
     let mut is_first = true;
 
     for (_, _, section) in js_sections {
