@@ -2141,3 +2141,50 @@ The first optimized conformance-type report exited with SIGSEGV. The same
 binary then completed under the debugger, in three standalone reruns and
 eight reruns under parallel report load, all with identical case results.
 The initial crash did not reproduce; its cause remains unresolved.
+
+## 2026-10-12: tuple destructuring types and diagnostics
+
+Tuple destructuring projects fixed, optional and rest elements through aliases
+and generic constraints. Nested patterns retain tuple labels in bounds errors.
+Defaults respect explicit annotations, and signature inference includes
+destructured parameters and local bindings. Array assignment checks evaluate
+the source before writing individual targets, preserve assertion reads, and
+record empty and spread target expressions for type inspection.
+The batch adds 62 regression tests checked against TypeScript 6.0.3, including
+diagnostic messages, source spans and expression types. Upstream cases and
+reference baselines are unchanged.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,961 | 4,968 |
+| Conformance | 4,035 | 4,040 |
+
+| Type baseline | Passes before | After |
+|---|---:|---:|
+| Compiler | 640 | 641 |
+| Conformance | 614 | 614 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 86.91% | 88.21% | 64.45% | 64.58% |
+| Conformance | 90.02% | 90.07% | 72.59% | 72.71% |
+
+False-positive diagnostics change from 1,448 to 1,287 in compiler
+and from 2,313 to 2,303 in conformance. The accuracy report includes all option variants.
+
+QuickInfo retains 306 passes. Comparing every supported
+LSP failure set finds no newly failing cases or additional skips.
+
+Whole-case baselines gain 12 diagnostic matches and 1 type match.
+All twelve measured baseline lanes have zero passed-to-failed cases and no
+new skips. The public JavaScript, diagnostic and type results match the six
+private verification manifests exactly.
+
+Cache-free reports cover JavaScript, diagnostics, symbols, types, expanded
+JavaScript/declarations, diagnostic accuracy and all supported LSP operations.
+Skips are excluded from pass rates. Remaining failures remain visible in the
+published snapshot; this batch does not establish full TypeScript compatibility.
+
+All 4,539 public Rust tests pass, with 37 ignored, and `make ci` passes.
+The measured compiler commit is `c0d733123`. The preceding
+snapshot is retained at `docs/compatibility-metrics-2026-10-12-eb41dbc28.json`.
