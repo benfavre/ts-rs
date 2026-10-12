@@ -857,7 +857,7 @@ impl TypeChecker {
         }
     }
 
-    fn report_invalid_reference(&mut self, target: &Expr, update: bool) -> bool {
+    pub(super) fn report_invalid_reference(&mut self, target: &Expr, update: bool) -> bool {
         let reference = Self::skip_reference_wrappers(target);
         let valid = matches!(&reference.kind, ExprKind::Ident(name) if !name.starts_with('#'))
             || matches!(
@@ -5540,6 +5540,10 @@ impl TypeChecker {
                                     checked_types.push(Type::clone(&item));
                                 }
                             }
+                            Type::Any | Type::Error if tuple_ctx.is_some() => {
+                                checked_types
+                                    .push(Type::Rest(Arc::new(Type::Array(Arc::new(Type::Any)))));
+                            }
                             other => checked_types.push(other),
                         }
                         continue;
@@ -9887,6 +9891,17 @@ impl TypeChecker {
             }
             ExprKind::Cond(cond) => self.check_conditional_expression(cond, None),
             ExprKind::Assign(assign) => {
+                if assign.op == AssignOp::Assign {
+                    let target = assign.left.as_ref();
+                    if let Some(context) = self.array_assignment_context(target) {
+                        // The RHS is evaluated before any target is written.
+                        let value = self.check_expr_contextual(&assign.right, Some(&context));
+                        let display = self.binding_tuple_metadata(None, Some(&assign.right));
+                        self.check_array_destructuring_assignment(target, &value, display.as_ref());
+                        self.record_expr_type(target.span.start, &context);
+                        return value;
+                    }
+                }
                 let readonly_write = self.report_readonly_property_write(&assign.left);
                 if assign.op == AssignOp::Assign && matches!(&assign.right.kind, ExprKind::This) {
                     self.check_abstract_this_assignment_pattern(&assign.left);
@@ -10411,7 +10426,9 @@ impl TypeChecker {
                                 &self.remove_null_undefined(&declared),
                                 &right_ty,
                             );
-                            if narrowed != declared && !matches!(declared, Type::Any | Type::Error)
+                            if narrowed != declared
+                                && !matches!(declared, Type::Any | Type::Error)
+                                && self.is_assignable_to(&right_ty, &declared)
                             {
                                 self.narrow_var(&path, narrowed);
                             }
@@ -14229,6 +14246,196 @@ impl TypeChecker {
                 related: None,
             });
         }
+    }
+
+    fn array_assignment_context(&self, target: &Expr) -> Option<Type> {
+        let ExprKind::ArrayLit(elements) = &target.kind else {
+            return None;
+        };
+        let mut types = Vec::new();
+        for element in elements {
+            let Some(element) = element else {
+                types.push(Type::Any);
+                continue;
+            };
+            match &element.kind {
+                ExprKind::Spread(inner) => {
+                    let ty = self
+                        .array_assignment_context(inner)
+                        .unwrap_or_else(|| self.destructuring_target_type(inner));
+                    let ty = self.tuple_index_receiver(&ty, 0).unwrap_or(ty);
+                    if let Type::Tuple(items) = ty {
+                        types.extend(items.iter().cloned());
+                    } else {
+                        let element = self.for_of_element_type(&ty).unwrap_or(Type::Any);
+                        types.push(Type::Rest(Arc::new(Type::Array(Arc::new(element)))));
+                    }
+                }
+                ExprKind::Assign(assign) if assign.op == AssignOp::Assign => {
+                    types.push(self.destructuring_target_type(&assign.left));
+                }
+                _ => types.push(
+                    self.array_assignment_context(element)
+                        .unwrap_or_else(|| self.destructuring_target_type(element)),
+                ),
+            }
+        }
+        if let [Type::Rest(rest)] = types.as_slice() {
+            if matches!(rest.as_ref(), Type::Array(_)) {
+                return Some(Type::clone(rest));
+            }
+        }
+        Some(Type::Tuple(types.into()))
+    }
+
+    fn destructuring_target_type(&self, target: &Expr) -> Type {
+        match &target.kind {
+            ExprKind::Ident(name) => self
+                .lookup_declared_var(name)
+                .unwrap_or_else(|| self.infer_expr_type(target)),
+            _ => self.infer_expr_type(target),
+        }
+    }
+
+    /// Each destructuring assignment reads a source slot and writes its own
+    /// target. Checking the entire pattern as an array loses both positions
+    /// and the individual target spans.
+    fn check_array_destructuring_assignment(
+        &mut self,
+        target: &Expr,
+        source: &Type,
+        tuple_metadata: Option<&tuple_access::TupleBindingMetadata>,
+    ) {
+        if let ExprKind::ArrayLit(elements) = &target.kind {
+            self.check_array_pattern_iterable(
+                &Pat {
+                    kind: PatKind::Array(Vec::new()),
+                    span: target.span,
+                },
+                source,
+            );
+            for (index, element) in elements.iter().enumerate() {
+                let Some(element) = element else {
+                    continue;
+                };
+                if let ExprKind::Spread(rest) = &element.kind {
+                    let value = self.array_rest_binding_type(source, index);
+                    self.check_array_destructuring_assignment(rest, &value, None);
+                    let shown = self.destructuring_target_type(rest);
+                    self.record_expr_type(element.span.start, &shown);
+                    self.record_checked_expression_type(element, &shown);
+                    continue;
+                }
+                if !matches!(&element.kind, ExprKind::Assign(assign) if assign.op == AssignOp::Assign)
+                {
+                    self.tuple_element_access(
+                        source,
+                        &Type::NumberLiteral(index.to_string()),
+                        element.span,
+                        false,
+                        false,
+                        tuple_metadata.map(|metadata| metadata.display.as_str()),
+                    );
+                }
+                let value = self.extract_element_type(source, index);
+                let child = tuple_metadata
+                    .and_then(|metadata| metadata.children.get(index))
+                    .and_then(Option::as_ref);
+                self.check_array_destructuring_assignment(element, &value, child);
+            }
+            if let Some(shown) = self.array_assignment_context(target) {
+                self.record_expr_type(target.span.start, &shown);
+                self.record_checked_expression_type(target, &shown);
+            }
+            return;
+        }
+        if let ExprKind::Assign(assign) = &target.kind {
+            if assign.op == AssignOp::Assign {
+                let expected = self.destructuring_target_type(&assign.left);
+                let default = self.check_expr_contextual(&assign.right, Some(&expected));
+                let incoming = match source {
+                    Type::Undefined => Type::Never,
+                    Type::Optional(inner) => Type::clone(inner),
+                    other => self.remove_undefined_only(other),
+                };
+                let value = Type::flatten_union(vec![default.clone(), incoming.clone()]);
+                if matches!(
+                    assign.left.kind,
+                    ExprKind::ArrayLit(_) | ExprKind::ObjectLit(_)
+                ) {
+                    self.check_array_destructuring_assignment(&assign.left, &value, None);
+                } else {
+                    self.check_assignment_expression_types(
+                        &assign.left,
+                        &value,
+                        &[default, incoming],
+                        &mut Vec::new(),
+                        false,
+                    );
+                }
+                return;
+            }
+        }
+        if let ExprKind::ObjectLit(properties) = &target.kind {
+            self.check_object_destructuring_properties(properties, source);
+            let consumed: HashSet<String> = properties
+                .iter()
+                .filter_map(|property| match property {
+                    ObjLitProp::Property(property) => self.pattern_property_name(&property.key),
+                    ObjLitProp::Shorthand(name, _) | ObjLitProp::ShorthandDefault(name, _, _) => {
+                        Some(name.to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            for property in properties {
+                match property {
+                    ObjLitProp::Property(property) => {
+                        self.check_property_name_expression(&property.key);
+                        let value = self
+                            .pattern_property_name(&property.key)
+                            .and_then(|name| self.extract_member_type_opt(source, &name))
+                            .unwrap_or(Type::Any);
+                        self.check_array_destructuring_assignment(&property.value, &value, None);
+                    }
+                    ObjLitProp::Shorthand(name, span)
+                    | ObjLitProp::ShorthandDefault(name, _, span) => {
+                        let name_span = Span::new(span.start, span.start + name.len() as u32);
+                        let mut target = Expr {
+                            kind: ExprKind::Ident(name.clone()),
+                            span: name_span,
+                        };
+                        if let ObjLitProp::ShorthandDefault(_, default, _) = property {
+                            target = Expr {
+                                kind: ExprKind::Assign(AssignExpr {
+                                    op: AssignOp::Assign,
+                                    left: Box::new(target),
+                                    right: default.clone(),
+                                }),
+                                span: *span,
+                            };
+                        }
+                        let value = self
+                            .extract_member_type_opt(source, name)
+                            .unwrap_or(Type::Any);
+                        self.check_array_destructuring_assignment(&target, &value, None);
+                    }
+                    ObjLitProp::Spread(target, _) => {
+                        let value = self.object_rest_binding_type(source, &consumed);
+                        self.check_array_destructuring_assignment(target, &value, None);
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        self.check_assignment_expression_types(
+            target,
+            source,
+            std::slice::from_ref(source),
+            &mut Vec::new(),
+            false,
+        );
     }
 
     /// TS2339 for an object destructuring assignment target property that

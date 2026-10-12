@@ -1276,6 +1276,18 @@ impl TypeChecker {
     }
 
     pub(crate) fn qualified_property_type(&self, owner: Type, property_name: &str) -> Option<Type> {
+        if let Some(value) = self.tuple_index_receiver(&owner, 0).and_then(|shape| {
+            crate::tuple_access::indexed_type(
+                &shape,
+                &Type::StringLiteral(property_name.to_string()),
+                self.strict_null_checks,
+                self.strict_null_checks
+                    && self.compiler_options.no_unchecked_indexed_access == Some(true),
+                false,
+            )
+        }) {
+            return Some(value);
+        }
         match owner {
             Type::Namespace(info) => info
                 .exports
@@ -1684,6 +1696,7 @@ impl TypeChecker {
 
     pub(crate) fn resolve_fn_type(&self, fn_decl: &FnDecl) -> FunctionType {
         let _own_type_params = crate::type_params_in_resolution(fn_decl.type_params.as_deref());
+        let _constraints = self.inferred_constraint_scope(fn_decl.type_params.as_deref());
         let params: Vec<(String, Type)> = fn_decl
             .params
             .iter()
@@ -1729,15 +1742,16 @@ impl TypeChecker {
             // Hoisting can resolve a signature outside its parameter scope.
             // Formal parameters, including default initializers, supply the
             // body bindings even before the function has been checked.
-            let bindings = fn_decl
-                .params
-                .iter()
-                .zip(&params)
-                .filter_map(|(parameter, (_, ty))| match &parameter.name.kind {
-                    PatKind::Ident(name) => Some((name.to_string(), ty.clone())),
-                    _ => None,
-                })
-                .collect();
+            let mut bindings = Vec::new();
+            for (parameter, (_, ty)) in fn_decl.params.iter().zip(&params) {
+                self.collect_inferred_pattern_bindings(
+                    &parameter.name,
+                    ty.clone(),
+                    false,
+                    parameter.type_ann.is_some(),
+                    &mut bindings,
+                );
+            }
             let inferred =
                 crate::with_infer_param_scope(bindings, || self.infer_return_type_from_stmts(body));
             // An async function ALWAYS returns a Promise. When the return type
@@ -1930,9 +1944,6 @@ impl TypeChecker {
                 if locals.len() >= MAX_LOCALS {
                     break;
                 }
-                let PatKind::Ident(name) = &declarator.name.kind else {
-                    continue;
-                };
                 let ty = if let Some(annotation) = &declarator.type_ann {
                     self.resolve_type_node(annotation)
                 } else if let Some(init) = &declarator.init {
@@ -1956,7 +1967,13 @@ impl TypeChecker {
                     || matches!(ty, Type::Array(_) | Type::Unknown)
                     || matches!(&ty, Type::ObjectType(info) if info.properties.is_empty());
                 let ty = if flow_dependent { Type::Any } else { ty };
-                locals.push((name.to_string(), ty));
+                self.collect_inferred_pattern_bindings(
+                    &declarator.name,
+                    ty,
+                    var_stmt.kind == VarKind::Const,
+                    declarator.type_ann.is_some(),
+                    &mut locals,
+                );
             }
         }
         if !locals.is_empty() {
@@ -3072,6 +3089,18 @@ impl TypeChecker {
                 let obj_ty = self.widen_fresh_array_type(&ea.object, obj_ty);
                 let obj_ty = self.fresh_index_receiver_type(&ea.object, obj_ty);
                 let index = self.infer_expr_type(&ea.index);
+                if let Some(value) = self.tuple_index_receiver(&obj_ty, 0).and_then(|shape| {
+                    crate::tuple_access::indexed_type(
+                        &shape,
+                        &index,
+                        self.strict_null_checks,
+                        self.strict_null_checks
+                            && self.compiler_options.no_unchecked_indexed_access == Some(true),
+                        false,
+                    )
+                }) {
+                    return value;
+                }
                 if let Some(value) = self
                     .known_literal_index_read(&obj_ty, &index, 0)
                     .or_else(|| self.inherited_element_index_type(&obj_ty, &index))

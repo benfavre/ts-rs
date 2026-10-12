@@ -47,10 +47,10 @@ impl TypeChecker {
                             );
                         }
                         Some(ArrayPatElem::Rest(nested)) => {
-                            let ty = Self::array_rest_binding_type(element, index);
+                            let ty = self.array_rest_binding_type(element, index);
                             let projected: Vec<_> = sources
                                 .iter()
-                                .map(|source| Self::array_rest_binding_type(source, index))
+                                .map(|source| self.array_rest_binding_type(source, index))
                                 .collect();
                             self.check_for_of_assignment_pattern_types(
                                 nested, &ty, &projected, flows,
@@ -197,7 +197,28 @@ impl TypeChecker {
         sources: &[Type],
         flows: &mut Vec<(String, Type)>,
     ) {
-        let reference = Self::skip_reference_wrappers(expression);
+        self.check_assignment_expression_types(expression, element, sources, flows, true);
+    }
+
+    pub(super) fn check_assignment_expression_types(
+        &mut self,
+        expression: &Expr,
+        element: &Type,
+        sources: &[Type],
+        flows: &mut Vec<(String, Type)>,
+        for_of: bool,
+    ) {
+        let reference = if for_of {
+            Self::skip_reference_wrappers(expression)
+        } else {
+            // Assertions and satisfies expressions read their operand. Only
+            // parentheses and non-null assertions preserve an assignment target.
+            let mut reference = expression;
+            while let ExprKind::Paren(inner) | ExprKind::NonNull(inner) = &reference.kind {
+                reference = inner;
+            }
+            reference
+        };
         let readonly = self.report_readonly_property_write(expression);
         let invalid_binding = self.report_invalid_assignment_target(expression);
         let saved_target = self.assignment_target_span;
@@ -237,7 +258,10 @@ impl TypeChecker {
         if readonly || invalid_binding {
             return;
         }
-        if Self::reference_is_optional_chain(reference) {
+        if !for_of && self.report_invalid_reference(expression, false) {
+            return;
+        }
+        if for_of && Self::reference_is_optional_chain(reference) {
             self.diagnostics.push(Diagnostic {
                 code: 2781,
                 message: "The left-hand side of a 'for...of' statement may not be an optional property access.".into(),

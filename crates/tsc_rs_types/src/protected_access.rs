@@ -4,6 +4,15 @@ impl TypeChecker {
     /// Destructuring reads named properties even when the local binding has a
     /// different name. Object rest copies only public properties.
     pub(crate) fn check_binding_pattern_access(&mut self, pattern: &Pat, ty: &Type) {
+        self.check_binding_pattern_access_with_tuple_metadata(pattern, ty, None);
+    }
+
+    pub(crate) fn check_binding_pattern_access_with_tuple_metadata(
+        &mut self,
+        pattern: &Pat,
+        ty: &Type,
+        tuple_metadata: Option<&tuple_access::TupleBindingMetadata>,
+    ) {
         use tsc_rs_ast::{ArrayPatElem, ObjPatProp};
         match &pattern.kind {
             PatKind::Object(properties) => {
@@ -39,13 +48,38 @@ impl TypeChecker {
             PatKind::Array(elements) => {
                 for (index, element) in elements.iter().enumerate() {
                     if let Some(ArrayPatElem::Pat(nested)) = element {
+                        // A default supplies a missing tuple slot. Without a
+                        // default, the binding itself owns the index error.
+                        if !matches!(nested.kind, PatKind::Assign(..)) {
+                            self.tuple_element_access(
+                                ty,
+                                &Type::NumberLiteral(index.to_string()),
+                                nested.span,
+                                false,
+                                false,
+                                tuple_metadata.map(|metadata| metadata.display.as_str()),
+                            );
+                        }
                         let member = self.extract_element_type(ty, index);
-                        self.check_binding_pattern_access(nested, &member);
+                        let child = tuple_metadata
+                            .and_then(|metadata| metadata.children.get(index))
+                            .and_then(Option::as_ref);
+                        self.check_binding_pattern_access_with_tuple_metadata(
+                            nested, &member, child,
+                        );
                     }
                 }
             }
-            PatKind::Assign(nested, _) | PatKind::Rest(nested) => {
-                self.check_binding_pattern_access(nested, ty);
+            PatKind::Assign(nested, default) => {
+                let value = self.binding_default_type(Some(ty.clone()), default, false);
+                self.check_binding_pattern_access_with_tuple_metadata(
+                    nested,
+                    &value,
+                    tuple_metadata,
+                );
+            }
+            PatKind::Rest(nested) => {
+                self.check_binding_pattern_access_with_tuple_metadata(nested, ty, tuple_metadata);
             }
             PatKind::Ident(_) => {}
         }

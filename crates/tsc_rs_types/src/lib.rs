@@ -53,6 +53,7 @@ mod static_overrides;
 mod stdlib;
 mod strict_reserved;
 mod tuple_access;
+mod tuple_bindings;
 mod type_computations;
 pub mod type_facts;
 mod type_only_aliases;
@@ -1862,7 +1863,14 @@ impl Type {
                 inner.display_into(buf);
             }
             Type::Optional(inner) => {
+                let parentheses = matches!(inner.as_ref(), Type::Union(_) | Type::Intersection(_));
+                if parentheses {
+                    buf.push('(');
+                }
                 inner.display_into(buf);
+                if parentheses {
+                    buf.push(')');
+                }
                 buf.push('?');
             }
             Type::Readonly(inner) => {
@@ -7308,7 +7316,7 @@ impl TypeChecker {
                             );
                         }
                         tsc_rs_ast::ArrayPatElem::Rest(nested) => {
-                            let rest_ty = Self::array_rest_binding_type(&ty, index);
+                            let rest_ty = self.array_rest_binding_type(&ty, index);
                             self.collect_pattern_binding_types(
                                 file,
                                 nested,
@@ -7709,19 +7717,6 @@ impl TypeChecker {
             .lookup_instance_property("Object", property)
             .map(LazyAliasProperty::Present)
             .or(Some(LazyAliasProperty::Missing))
-    }
-
-    fn array_rest_binding_type(ty: &Type, start: usize) -> Type {
-        match ty {
-            Type::Tuple(elements) => Type::Tuple(elements.iter().skip(start).cloned().collect()),
-            Type::Array(element) => Type::Array(Arc::clone(element)),
-            Type::TypeReference(name, args)
-                if matches!(name.as_str(), "Array" | "ReadonlyArray") && args.len() == 1 =>
-            {
-                Type::TypeReference(name.clone(), args.clone())
-            }
-            _ => ty.clone(),
-        }
     }
 
     fn binding_default_type(
@@ -12758,6 +12753,16 @@ impl TypeChecker {
         ty: Type,
         preserve_default_literals: bool,
     ) {
+        self.declare_pattern_vars_with_context(pat, ty, preserve_default_literals, false);
+    }
+
+    fn declare_pattern_vars_with_context(
+        &mut self,
+        pat: &Pat,
+        ty: Type,
+        preserve_default_literals: bool,
+        annotated: bool,
+    ) {
         use tsc_rs_ast::{ArrayPatElem, ObjPatProp, PatKind};
         match &pat.kind {
             PatKind::Ident(name) => {
@@ -12804,10 +12809,11 @@ impl TypeChecker {
                             self.declare_var(name, member_ty);
                         }
                         ObjPatProp::ShorthandAssign(name, default_value, _) => {
-                            let member_ty = self.binding_default_type(
+                            let member_ty = self.binding_initializer_type(
                                 self.extract_member_type_opt(&ty, name),
                                 default_value,
                                 preserve_default_literals,
+                                annotated,
                             );
                             self.declare_var(name, member_ty);
                         }
@@ -12832,18 +12838,20 @@ impl TypeChecker {
                                         Type::Undefined
                                     }
                                 });
-                            self.declare_pattern_vars_with_defaults(
+                            self.declare_pattern_vars_with_context(
                                 p,
                                 member_ty,
                                 preserve_default_literals,
+                                annotated,
                             );
                         }
                         ObjPatProp::Rest(p) => {
                             let rest_ty = self.object_rest_binding_type(&ty, &consumed);
-                            self.declare_pattern_vars_with_defaults(
+                            self.declare_pattern_vars_with_context(
                                 p,
                                 rest_ty,
                                 preserve_default_literals,
+                                annotated,
                             );
                         }
                     }
@@ -12854,17 +12862,19 @@ impl TypeChecker {
                     if let Some(elem) = elem {
                         let elem_ty = self.extract_element_type(&ty, i);
                         match elem {
-                            ArrayPatElem::Pat(p) => self.declare_pattern_vars_with_defaults(
+                            ArrayPatElem::Pat(p) => self.declare_pattern_vars_with_context(
                                 p,
                                 elem_ty,
                                 preserve_default_literals,
+                                annotated,
                             ),
                             ArrayPatElem::Rest(p) => {
-                                let rest_ty = Self::array_rest_binding_type(&ty, i);
-                                self.declare_pattern_vars_with_defaults(
+                                let rest_ty = self.array_rest_binding_type(&ty, i);
+                                self.declare_pattern_vars_with_context(
                                     p,
                                     rest_ty,
                                     preserve_default_literals,
+                                    annotated,
                                 );
                             }
                         }
@@ -12872,12 +12882,27 @@ impl TypeChecker {
                 }
             }
             PatKind::Assign(p, default_expr) => {
-                let actual_ty =
-                    self.binding_default_type(Some(ty), default_expr, preserve_default_literals);
-                self.declare_pattern_vars_with_defaults(p, actual_ty, preserve_default_literals);
+                let actual_ty = self.binding_initializer_type(
+                    Some(ty),
+                    default_expr,
+                    preserve_default_literals,
+                    annotated,
+                );
+                if annotated {
+                    let initial = self.infer_expr_type(default_expr);
+                    if !self.is_assignable_to(&initial, &actual_ty) {
+                        self.push_not_assignable(&initial, &actual_ty, p.span);
+                    }
+                }
+                self.declare_pattern_vars_with_context(
+                    p,
+                    actual_ty,
+                    preserve_default_literals,
+                    annotated,
+                );
             }
             PatKind::Rest(p) => {
-                self.declare_pattern_vars_with_defaults(p, ty, preserve_default_literals)
+                self.declare_pattern_vars_with_context(p, ty, preserve_default_literals, annotated)
             }
         }
     }
@@ -12980,7 +13005,10 @@ impl TypeChecker {
                         let elem_ty = self.extract_element_type(ty, i);
                         match elem {
                             ArrayPatElem::Pat(p) => self.record_pattern_types(p, &elem_ty),
-                            ArrayPatElem::Rest(p) => self.record_pattern_types(p, ty),
+                            ArrayPatElem::Rest(p) => {
+                                let rest = self.array_rest_binding_type(ty, i);
+                                self.record_pattern_types(p, &rest);
+                            }
                         }
                     }
                 }
@@ -13198,8 +13226,19 @@ impl TypeChecker {
                     Type::Any
                 };
                 self.record_pattern_types(&p.name, &pty);
-                self.check_binding_pattern_access(&p.name, &pty);
-                self.declare_pattern_vars(&p.name, pty.clone());
+                let tuple_display =
+                    self.binding_tuple_metadata(p.type_ann.as_ref(), p.initializer.as_deref());
+                self.check_binding_pattern_access_with_tuple_metadata(
+                    &p.name,
+                    &pty,
+                    tuple_display.as_ref(),
+                );
+                self.declare_pattern_vars_with_context(
+                    &p.name,
+                    pty.clone(),
+                    false,
+                    p.type_ann.is_some(),
+                );
                 self.completion_mark_parameter(p);
                 self.mark_optional_parameter(p);
                 (pname, pty)
@@ -13783,6 +13822,9 @@ impl TypeChecker {
 
     /// Extract the type of an element at an index from an array/tuple.
     fn extract_element_type(&self, ty: &Type, index: usize) -> Type {
+        if let Some(value) = self.binding_element_type(ty, index) {
+            return value;
+        }
         match ty {
             Type::Array(elem) => Type::clone(&elem),
             Type::Tuple(elems) => elems.get(index).cloned().unwrap_or(Type::Any),
@@ -27574,7 +27616,13 @@ impl TypeChecker {
                     if decl.init.is_some() || decl.type_ann.is_some() {
                         self.check_array_pattern_iterable(&decl.name, &ty);
                     }
-                    self.check_binding_pattern_access(&decl.name, &ty);
+                    let tuple_display =
+                        self.binding_tuple_metadata(decl.type_ann.as_ref(), decl.init.as_deref());
+                    self.check_binding_pattern_access_with_tuple_metadata(
+                        &decl.name,
+                        &ty,
+                        tuple_display.as_ref(),
+                    );
                     let this_receiver = if matches!(ty, Type::This) {
                         decl.init
                             .as_deref()
@@ -27585,10 +27633,11 @@ impl TypeChecker {
                     let boolean_flow = matches!(ty, Type::Boolean)
                         .then_some(initial_boolean_literal)
                         .flatten();
-                    self.declare_pattern_vars_with_defaults(
+                    self.declare_pattern_vars_with_context(
                         &decl.name,
                         ty,
                         var_stmt.kind == VarKind::Const,
+                        has_annotation,
                     );
                     // Boolean is a union of two literals. Its declaration
                     // widens, but a checked initializer still establishes the
@@ -28366,8 +28415,21 @@ impl TypeChecker {
                         pty.clone()
                     };
                     self.record_pattern_types(&param.name, &hover_ty);
-                    self.check_binding_pattern_access(&param.name, &pty);
-                    self.declare_pattern_vars(&param.name, pty);
+                    let tuple_display = self.binding_tuple_metadata(
+                        param.type_ann.as_ref(),
+                        param.initializer.as_deref(),
+                    );
+                    self.check_binding_pattern_access_with_tuple_metadata(
+                        &param.name,
+                        &pty,
+                        tuple_display.as_ref(),
+                    );
+                    self.declare_pattern_vars_with_context(
+                        &param.name,
+                        pty,
+                        false,
+                        param.type_ann.is_some(),
+                    );
                     self.completion_mark_parameter(param);
                     self.mark_optional_parameter(param);
                 }
@@ -33043,6 +33105,18 @@ impl TypeChecker {
                         }
                     }
                 }
+            }
+        }
+        if let (Type::Tuple(_), Type::Array(target_element)) = (source, target) {
+            let source_element = tuple_access::indexed_type(
+                source,
+                &Type::Number,
+                self.strict_null_checks,
+                false,
+                false,
+            )?;
+            if !self.is_assignable_to(&source_element, target_element) {
+                return Some((self.leaf_reason_text(&source_element, target_element), None));
             }
         }
         // Element types of two arrays elaborate directly (`C3[]` vs `I1[]`
@@ -41822,6 +41896,9 @@ impl TypeChecker {
     pub(crate) fn declared_type_param_constraint(&self, ty: &Type) -> Option<Type> {
         if let Some(name) = Self::opaque_type_param_name(ty) {
             return Self::opaque_type_param_constraint(name);
+        }
+        if let Some(constraint) = tuple_bindings::inferred_constraint(ty) {
+            return constraint;
         }
         let name = self.active_type_parameter_name(ty)?;
         self.type_param_constraint_stack

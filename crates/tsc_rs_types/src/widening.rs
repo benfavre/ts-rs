@@ -557,7 +557,7 @@ impl TypeChecker {
             Type::Readonly(inner) => inner.as_ref(),
             ty => ty,
         };
-        let ty = Self::array_rest_binding_type(ty, start);
+        let ty = self.array_rest_binding_type(ty, start);
         if let WideningShape::Tuple(entries) = &info.shape {
             let entries: Vec<_> = entries.iter().skip(start).cloned().collect();
             Arc::new(WideningInfo {

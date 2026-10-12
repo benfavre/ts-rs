@@ -2,8 +2,9 @@ use super::*;
 
 #[derive(Clone)]
 pub(super) struct TupleBindingMetadata {
-    display: String,
+    pub(super) display: String,
     readonly: bool,
+    pub(super) children: Vec<Option<TupleBindingMetadata>>,
 }
 
 /// A numeric property name uses JavaScript's canonical number spelling.
@@ -169,6 +170,18 @@ pub(crate) fn indexed_type(
 }
 
 impl TypeChecker {
+    pub(super) fn binding_tuple_metadata(
+        &self,
+        annotation: Option<&TypeNode>,
+        initializer: Option<&Expr>,
+    ) -> Option<TupleBindingMetadata> {
+        annotation
+            .and_then(|annotation| self.tuple_annotation_metadata(annotation))
+            .or_else(|| {
+                initializer.and_then(|initializer| self.tuple_expression_metadata(initializer))
+            })
+    }
+
     fn tuple_annotation_display(&self, annotation: &TypeNode) -> Option<String> {
         match &annotation.kind {
             TypeNodeKind::Paren(inner) => self.tuple_annotation_display(inner),
@@ -220,9 +233,24 @@ impl TypeChecker {
                 _ => false,
             }
         }
+        fn tuple_items(node: &TypeNode) -> &[TupleElement] {
+            match &node.kind {
+                TypeNodeKind::Tuple(items) => items,
+                TypeNodeKind::Paren(inner)
+                | TypeNodeKind::Readonly(inner)
+                | TypeNodeKind::TypeOperator(TypeOperatorKind::Readonly, inner) => {
+                    tuple_items(inner)
+                }
+                _ => &[],
+            }
+        }
         Some(TupleBindingMetadata {
             display,
             readonly: readonly(annotation),
+            children: tuple_items(annotation)
+                .iter()
+                .map(|item| self.tuple_annotation_metadata(&item.type_node))
+                .collect(),
         })
     }
 
@@ -251,6 +279,7 @@ impl TypeChecker {
                 .map(|ty| TupleBindingMetadata {
                     display: format!("readonly {}", self.tuple_diagnostic_name(ty)),
                     readonly: true,
+                    children: Vec::new(),
                 })
         } else {
             self.tuple_expression_metadata(initializer)
