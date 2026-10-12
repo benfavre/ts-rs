@@ -2003,3 +2003,43 @@ All 3,786 public Rust tests pass, with 37 ignored, and `make ci` passes.
 The measured compiler commit is `1eb8300a4`. The preceding
 snapshot, measured on 2026-10-12, is retained at
 `docs/compatibility-metrics-2026-10-12-17d96efab.json`.
+
+## 2026-10-12: array inference, destructuring and implicit-any diagnostics
+
+Constructor inference now respects variance. For-of bindings and assignments
+infer and narrow from iterable element types, and index-access checks validate
+key types. Arrays preserve literal and tuple element shapes, including empty
+arrays and omitted elements. Implicit-any diagnostics follow inferred nullable
+values through properties, function returns and nested destructuring.
+Upstream test cases and reference baselines are unchanged.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,939 | 4,951 |
+| Conformance | 4,004 | 4,022 |
+
+| Type baseline | Passes before | After |
+|---|---:|---:|
+| Compiler | 619 | 638 |
+| Conformance | 560 | 613 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 87.03% | 86.91% | 63.58% | 64.12% |
+| Conformance | 90.06% | 89.98% | 71.48% | 71.77% |
+
+Whole-case baselines gain 30 diagnostic matches and 72 type matches, with
+no passed-to-failed cases or new skips across all twelve measured lanes.
+Diagnostic recall improves; precision decreases slightly as false positives
+rise from 1,413 to 1,440 in compiler and 2,266 to 2,297 in conformance.
+The full LSP inventory gains two passes (QuickInfo and completions).
+
+Cache-free reports cover JavaScript, diagnostics, symbols, types, expanded
+JavaScript/declarations, diagnostic accuracy and all LSP operations. JavaScript
+emit still matches every available default baseline in both suites. Skips are
+excluded from pass rates. LSP totals are refreshed in the same snapshot.
+
+All 4,247 public Rust tests pass, with 37 ignored, and `make ci` passes.
+The measured compiler commit is `7750e4c1d`. The preceding
+snapshot, measured on 2026-10-12, is retained at
+`docs/compatibility-metrics-2026-10-12-1eb8300a4.json`.
