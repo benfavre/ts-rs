@@ -24,17 +24,58 @@ impl TypeChecker {
     }
 
     pub(super) fn inherited_element_index_type(&self, receiver: &Type, key: &Type) -> Option<Type> {
+        self.element_index_type_at_depth(receiver, key, 0)
+    }
+
+    fn element_index_type_at_depth(
+        &self,
+        receiver: &Type,
+        key: &Type,
+        depth: usize,
+    ) -> Option<Type> {
+        if depth >= 32 {
+            return None;
+        }
         if let Type::Union(keys) = key {
             return keys
                 .iter()
-                .map(|key| self.inherited_element_index_type(receiver, key))
+                .map(|key| self.element_index_type_at_depth(receiver, key, depth + 1))
                 .collect::<Option<Vec<_>>>()
                 .map(Type::flatten_union);
+        }
+        if let Type::TypeReference(name, args) = receiver {
+            if let Some(expanded) = self.expand_type_alias_once(name, args) {
+                if expanded != *receiver {
+                    return self.element_index_type_at_depth(&expanded, key, depth + 1);
+                }
+            }
+        }
+        if let Type::Intersection(members) = receiver {
+            let values = members
+                .iter()
+                .filter_map(|member| self.element_index_type_at_depth(member, key, depth + 1))
+                .collect::<Vec<_>>();
+            return (!values.is_empty()).then(|| {
+                let result = simplify_intersection(values);
+                if Self::is_disjoint_primitive_intersection(&result) {
+                    Type::Never
+                } else {
+                    result
+                }
+            });
         }
         let indices = self.inherited_index_constraints(receiver, &mut HashSet::new());
         let mut specific = Vec::new();
         let mut string_index = None;
+        let mut seen_keys = Vec::new();
         for index in indices {
+            // A structured type uses its first signature for a given key
+            // domain: own declarations precede bases, in heritage order.
+            // Receiver intersections combine values separately above.
+            if seen_keys.contains(&index.key) {
+                continue;
+            }
+            seen_keys.push(index.key.clone());
             if self.index_applies_to_property(key, &index.key)
                 || matches!(key, Type::Any) && matches!(index.key, Type::Number | Type::String)
             {
@@ -387,6 +428,7 @@ impl TypeChecker {
             return;
         }
         let mut indices = self.own_interface_index_constraints(declaration);
+        self.report_duplicate_index_signatures(&indices);
         let name = self.namespace_owned_type_name(&declaration.name);
         let own_type = Type::TypeReference(
             name.clone(),
@@ -721,6 +763,7 @@ impl TypeChecker {
     /// TS2411 applies to both sides of a class, including inherited indexers.
     pub(crate) fn check_index_signature_members(&mut self, declaration: &ClassDecl) {
         let mut indices = self.own_class_index_constraints(declaration);
+        self.report_duplicate_index_signatures(&indices);
         let check_inherited = !indices.is_empty();
         let mut base = declaration.extends.as_ref().map(|base| {
             (
@@ -926,6 +969,39 @@ impl TypeChecker {
             Type::flatten_union(vec![ty, Type::Undefined])
         } else {
             ty
+        }
+    }
+
+    fn report_duplicate_index_signatures(&mut self, indices: &[IndexConstraint]) {
+        for index in indices {
+            let Some(span) = index.local_span else {
+                continue;
+            };
+            if !indices.iter().any(|other| {
+                other.key == index.key
+                    && other.is_static == index.is_static
+                    && other.local_span != Some(span)
+            }) {
+                continue;
+            }
+            let message = format!(
+                "Duplicate index signature for type '{}'.",
+                index.key.display_string_single_line()
+            );
+            if !self.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == 2374
+                    && diagnostic.span == Some(span)
+                    && diagnostic.message == message
+            }) {
+                self.diagnostics.push(Diagnostic {
+                    code: 2374,
+                    message,
+                    category: DiagnosticCategory::Error,
+                    file_name: None,
+                    span: Some(span),
+                    related: None,
+                });
+            }
         }
     }
 

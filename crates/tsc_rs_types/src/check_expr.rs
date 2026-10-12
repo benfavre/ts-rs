@@ -9736,7 +9736,7 @@ impl TypeChecker {
                 if let Some(result) = self.report_missing_element_index(expr, &obj_ty, &idx_ty) {
                     return result;
                 }
-                if matches!(obj_ty, Type::TypeReference(..)) {
+                if matches!(obj_ty, Type::TypeReference(..) | Type::Intersection(_)) {
                     if let Some(value) = self.inherited_element_index_type(&obj_ty, &idx_ty) {
                         return if self.assignment_target_span == Some(expr.span) {
                             value

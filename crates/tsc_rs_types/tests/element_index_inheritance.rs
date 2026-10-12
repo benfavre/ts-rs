@@ -1161,3 +1161,44 @@ fn boolean_flow_contextual() {
         &[],
     );
 }
+
+#[test]
+fn duplicate_interface() {
+    verify("interface I{[x:number]:string;[x:number]:number;}declare const value:I;const result=value[1]; result;", false, "string", &[
+        (2374, "Duplicate index signature for type 'number'.", 12, 18),
+        (2374, "Duplicate index signature for type 'number'.", 30, 18),
+    ]);
+}
+
+#[test]
+fn duplicate_alias() {
+    verify("interface I{[x:number]:string;[x:number]:number;}type Alias=I;declare const value:Alias;const result=value[1]; result;", false, "string", &[
+        (2374, "Duplicate index signature for type 'number'.", 12, 18),
+        (2374, "Duplicate index signature for type 'number'.", 30, 18),
+    ]);
+}
+
+#[test]
+fn inherited_same_index() {
+    verify("interface A{[x:number]:string;}interface B{[x:number]:number;}interface I extends A,B{}declare const value:I;const result=value[1]; result;", false, "string", &[
+        (2430, "Interface 'I' incorrectly extends interface 'B'.\n  'number' index signatures are incompatible.\n    Type 'string' is not assignable to type 'number'.", 72, 1),
+    ]);
+}
+
+#[test]
+fn intersection_indices() {
+    verify("interface A{[x:number]:string;}interface B{[x:number]:number;}declare const value:A&B;const result=value[1]; result;", false, "never", &[
+    ]);
+}
+
+#[test]
+fn intersection_index_alias() {
+    verify("interface A{[x:number]:string;}interface B{[x:number]:number;}type Both=A&B;declare const value:Both;const result=value[1]; result;", false, "never", &[
+    ]);
+}
+
+#[test]
+fn overriding_index() {
+    verify("interface A{[x:number]:number;}interface I extends A{[x:number]:1;}declare const value:I;const result=value[1]; result;", false, "1", &[
+    ]);
+}
