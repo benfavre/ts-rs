@@ -105,7 +105,7 @@ impl TypeChecker {
         name: &PropName,
         annotation: Option<&TypeNode>,
         properties: &[(String, Arc<Type>)],
-        setter: bool,
+        accessor: bool,
     ) -> PropertyDeclaration {
         let key = self.prop_name_to_string(name);
         let ty = properties
@@ -134,8 +134,8 @@ impl TypeChecker {
         PropertyDeclaration {
             annotation: annotation.and_then(|node| {
                 ty.and_then(|ty| {
-                    if setter {
-                        // The write annotation can differ from the read type.
+                    if accessor {
+                        // Getter and setter annotations can describe different types.
                         self.source_annotation(node, &self.resolve_type_node(node))
                     } else {
                         // This annotation already produced the member type.
@@ -182,7 +182,15 @@ impl TypeChecker {
                 _ => continue,
             };
             let key = self.prop_name_to_string(name);
-            let mut declaration = self.property_declaration(name, annotation, properties, setter);
+            let mut declaration = self.property_declaration(
+                name,
+                annotation,
+                properties,
+                matches!(
+                    member.kind,
+                    TypeMemberKind::GetAccessorSig(_) | TypeMemberKind::SetAccessorSig(_)
+                ),
+            );
             declaration.method = method;
             if let Some(existing) = source.property(&key) {
                 if setter && existing.annotation.is_some() || annotation.is_none() && !method {
@@ -246,7 +254,7 @@ impl TypeChecker {
                 }
             };
             let key = self.prop_name_to_string(name);
-            let mut declaration = self.property_declaration(name, annotation, properties, setter);
+            let mut declaration = self.property_declaration(name, annotation, properties, accessor);
             if method {
                 direct_methods.insert(key.clone());
             }

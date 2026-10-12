@@ -739,6 +739,7 @@ impl TypeChecker {
                 }
                 let ty = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     node_source: self.object_declaration_source(members, &props),
+                    setter_only_names: self.declaration_setter_only_names(members),
                     properties: props,
                     call_signatures: call_sigs,
                     construct_signatures: construct_sigs,
@@ -2402,6 +2403,14 @@ impl TypeChecker {
                                 })),
                             ));
                         }
+                        ObjLitProp::Set(accessor) => {
+                            let name = self.prop_name_to_string(&accessor.name);
+                            if !props.iter().any(|property| matches!(property, ObjLitProp::Get(getter) if self.prop_name_to_string(&getter.name) == name)) {
+                                let ty = accessor.params.first().and_then(|parameter| parameter.type_ann.as_ref())
+                                    .map(|node| self.resolve_type_node(node)).unwrap_or(Type::Any);
+                                properties.push((name, Arc::new(ty)));
+                            }
+                        }
                         ObjLitProp::Get(acc) => {
                             let name = self.prop_name_to_string(&acc.name);
                             let ty = acc
@@ -2421,6 +2430,7 @@ impl TypeChecker {
                 }
                 Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     node_source: self.object_literal_source(props, &properties),
+                    setter_only_names: self.object_literal_setter_only_names(props),
                     properties,
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
@@ -3450,6 +3460,7 @@ pub(crate) fn implied_binding_pattern_type(pattern: &Pat) -> Option<Type> {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    setter_only_names: Vec::new(),
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
                     node_source: Default::default(),

@@ -811,6 +811,7 @@ impl TypeChecker {
                             Arc::new(Type::Union(vec![Type::String, Type::Undefined].into())),
                         )),
                         index_signature_name: None,
+                        setter_only_names: Vec::new(),
                         readonly_names: Vec::new(),
                         method_names: Vec::new(),
                         node_source: Default::default(),
@@ -845,6 +846,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            setter_only_names: Vec::new(),
             readonly_names: Vec::new(),
             method_names: Vec::new(),
             node_source: Default::default(),
@@ -5529,6 +5531,7 @@ impl TypeChecker {
                 }
                 return Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     node_source: self.object_literal_source(props, &properties),
+                    setter_only_names: self.object_literal_setter_only_names(props),
                     properties: Self::dedup_object_props_last_wins(properties),
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
@@ -10316,6 +10319,7 @@ impl TypeChecker {
                                                 construct_signatures: Vec::new(),
                                                 index_signature: None,
                                                 index_signature_name: None,
+                                                setter_only_names: Vec::new(),
                                                 readonly_names: Vec::new(),
                                                 method_names: Vec::new(),
                                                 node_source: Default::default(),
@@ -11100,6 +11104,7 @@ impl TypeChecker {
                 }
                 Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                     node_source: self.object_literal_source(props, &properties),
+                    setter_only_names: self.object_literal_setter_only_names(props),
                     properties: Self::dedup_object_props_last_wins(properties),
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
@@ -13589,6 +13594,7 @@ impl TypeChecker {
                                 Arc::new(args[1].clone()),
                             )),
                             index_signature_name: None,
+                            setter_only_names: Vec::new(),
                             readonly_names: Vec::new(),
                             method_names: Vec::new(),
                             node_source: Default::default(),

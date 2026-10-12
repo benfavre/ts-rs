@@ -187,6 +187,7 @@ impl TypeChecker {
                         construct_signatures: Vec::new(),
                         index_signature: None,
                         index_signature_name: None,
+                        setter_only_names: Vec::new(),
                         readonly_names: Vec::new(),
                         method_names: if method {
                             vec![name.clone()]

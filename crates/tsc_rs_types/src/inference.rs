@@ -700,6 +700,7 @@ pub fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
                 )
             }),
             index_signature_name: obj.index_signature_name.clone(),
+            setter_only_names: obj.setter_only_names.clone(),
             readonly_names: obj.readonly_names.clone(),
             method_names: obj.method_names.clone(),
             node_source: obj.node_source.clone(),
@@ -1032,6 +1033,7 @@ mod tests {
                 construct_signatures: vec![],
                 index_signature: None,
                 index_signature_name: None,
+                setter_only_names: Vec::new(),
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
                 node_source: Default::default(),
@@ -1042,6 +1044,7 @@ mod tests {
                 construct_signatures: vec![],
                 index_signature: None,
                 index_signature_name: None,
+                setter_only_names: Vec::new(),
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
                 node_source: Default::default(),

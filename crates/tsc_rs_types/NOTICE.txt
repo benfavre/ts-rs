@@ -47,3 +47,8 @@ indexInfoToIndexSignatureDeclarationHelper (nodebuilder_impl_p3.rs and
 nodebuilder_impl_p2.rs). Native object metadata retains the original member
 annotations across spreads and substitutions, independently of hover output
 and structural identity. Index signatures are synthesized, including readonly.
+
+Setter-only object spread reads adapt getSpreadSymbol from checker_p15.rs in
+that same ts-rust revision. The native object representation retains setter
+kind through substitutions and inheritance, then copies undefined as the
+spread value without changing the original annotated accessor type.

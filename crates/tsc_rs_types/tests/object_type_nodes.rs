@@ -26,8 +26,8 @@ fn assert_node_with_options(
         .expression_type_spans
         .get(&(start, start + name.len() as u32))
         .unwrap();
-    assert_eq!(entry.node_text, text, "{source}");
-    assert_eq!(entry.underline, underline, "{source}\n{text}");
+    assert_eq!(entry.node_text, text, "{anchor}: {source}");
+    assert_eq!(entry.underline, underline, "{anchor}: {source}\n{text}");
     assert_eq!(text.encode_utf16().count(), underline.len());
 }
 
@@ -334,4 +334,127 @@ fn inferred_accessor_discards_spread_accessor_annotation() {
         "{ value: number; }",
         "^^^^^^^^^^^^^^^^^^",
     );
+}
+
+#[test]
+fn setter_only_spreads_do_not_report_incompatible_read_types() {
+    // TypeScript 6.0.3 accepts this: spreading a setter-only property copies
+    // undefined, independently of its annotated write type.
+    let source =
+        "const o: { foo: number, bar: undefined } = { foo: 1, ... { set bar(value: number) {} } };";
+    let file = tsc_rs_parser::parse("case.ts", source);
+    let symbols = tsc_rs_symbols::bind(&file);
+    let options = tsc_rs_ast::CompilerOptions {
+        strict: Some(true),
+        ..Default::default()
+    };
+    let result = TypeChecker::new().check_with_options(&file, &symbols, &options);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn setter_only_spread_keeps_the_original_declared_type() {
+    let source = "const source = { set value(v: number) {} }; const x = {...source}; const y = source.value;";
+    assert_node_with_options(
+        source,
+        "source =",
+        "source",
+        "{ value: number; }",
+        "^^^^^^^^^      ^^^",
+        true,
+    );
+    assert_node_with_options(
+        source,
+        "x =",
+        "x",
+        "{ value: undefined; }",
+        "^^^^^^^^^^^^^^^^^^^^^",
+        true,
+    );
+    assert_node_with_options(source, "y =", "y", "number", "^^^^^^", true);
+}
+
+#[test]
+fn paired_accessors_spread_the_getter_type() {
+    let source = "const source = { get value(): number { return 1; }, set value(v: number) {} }; const x = {...source};";
+    assert_node_with_options(
+        source,
+        "x =",
+        "x",
+        "{ value: number; }",
+        "^^^^^^^^^      ^^^",
+        true,
+    );
+}
+
+#[test]
+fn declared_setter_only_properties_spread_undefined() {
+    let source = "declare const source: { set value(v: number); }; const x = {...source};";
+    assert_node_with_options(
+        source,
+        "x =",
+        "x",
+        "{ value: undefined; }",
+        "^^^^^^^^^^^^^^^^^^^^^",
+        true,
+    );
+}
+
+#[test]
+fn inherited_generic_setter_only_properties_spread_undefined() {
+    let source = "interface Base<T> { set value(v:T); } interface Child<T> extends Base<T> {} declare const source: Child<number>; const x = {...source};";
+    assert_node_with_options(
+        source,
+        "x =",
+        "x",
+        "{ value: undefined; }",
+        "^^^^^^^^^^^^^^^^^^^^^",
+        true,
+    );
+}
+
+#[test]
+fn data_property_overrides_clear_setter_only_origin() {
+    let source = "const source = { set value(v: number) {} }; const x = {...source, value:1}; const y = {value:1, ...source}; const z = {...x};";
+    assert_node_with_options(
+        source,
+        "x =",
+        "x",
+        "{ value: number; }",
+        "^^^^^^^^^^^^^^^^^^",
+        true,
+    );
+    assert_node_with_options(
+        source,
+        "y =",
+        "y",
+        "{ value: undefined; }",
+        "^^^^^^^^^^^^^^^^^^^^^",
+        true,
+    );
+    assert_node_with_options(
+        source,
+        "z =",
+        "z",
+        "{ value: number; }",
+        "^^^^^^^^^^^^^^^^^^",
+        true,
+    );
+}
+
+#[test]
+fn merged_interface_accessors_spread_the_getter_type() {
+    for source in [
+        "interface I { set value(v:number); } interface I { get value(): number; } declare const source: I; const x = {...source};",
+        "interface I { get value(): number; } interface I { set value(v:number); } declare const source: I; const x = {...source};",
+    ] {
+        assert_node_with_options(
+            source,
+            "x =",
+            "x",
+            "{ value: number; }",
+            "^^^^^^^^^      ^^^",
+            true,
+        );
+    }
 }

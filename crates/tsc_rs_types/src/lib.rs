@@ -44,6 +44,7 @@ mod layered_map;
 mod module_augmentations;
 mod module_resolution_diagnostics;
 pub mod narrowing;
+mod object_accessors;
 mod overload_compatibility;
 mod private_names;
 mod property_suggestions;
@@ -642,6 +643,10 @@ pub struct ObjectTypeData {
     /// Readonly property declarations, retained for display and write checks.
     /// Like method spelling, ignored by structural equality and hashing.
     pub readonly_names: Vec<std::string::String>,
+    /// Setter-only declaration flags. Ordinary access uses the annotated type,
+    /// while an object spread copies `undefined`. Include them in arena
+    /// identity so interning cannot replace an accessor with a data property.
+    pub setter_only_names: Vec<std::string::String>,
 }
 
 impl PartialEq for ObjectTypeData {
@@ -651,6 +656,7 @@ impl PartialEq for ObjectTypeData {
             && self.construct_signatures == other.construct_signatures
             && self.index_signature == other.index_signature
             && self.index_signature_name == other.index_signature_name
+            && self.setter_only_names == other.setter_only_names
     }
 }
 
@@ -663,6 +669,7 @@ impl std::hash::Hash for ObjectTypeData {
         self.construct_signatures.hash(state);
         self.index_signature.hash(state);
         self.index_signature_name.hash(state);
+        self.setter_only_names.hash(state);
     }
 }
 
@@ -4061,6 +4068,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    setter_only_names: Vec::new(),
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
                     node_source: Default::default(),
@@ -7179,6 +7187,7 @@ impl TypeChecker {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                setter_only_names: Vec::new(),
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
                 node_source: Default::default(),
@@ -7622,6 +7631,7 @@ impl TypeChecker {
                 construct_signatures: object.construct_signatures.clone(),
                 index_signature: object.index_signature.clone(),
                 index_signature_name: object.index_signature_name.clone(),
+                setter_only_names: object.setter_only_names.clone(),
                 readonly_names: object.readonly_names.clone(),
                 method_names: object.method_names.clone(),
                 node_source: object.node_source.clone(),
@@ -9144,6 +9154,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            setter_only_names: Vec::new(),
             readonly_names: Vec::new(),
             method_names: Vec::new(),
             node_source: Default::default(),
@@ -9180,6 +9191,7 @@ impl TypeChecker {
                                 construct_signatures: Vec::new(),
                                 index_signature: None,
                                 index_signature_name: None,
+                                setter_only_names: Vec::new(),
                                 readonly_names: Vec::new(),
                                 method_names: Vec::new(),
                                 node_source: Default::default(),
@@ -9489,6 +9501,7 @@ impl TypeChecker {
                                 construct_signatures: Vec::new(),
                                 index_signature: None,
                                 index_signature_name: None,
+                                setter_only_names: Vec::new(),
                                 readonly_names: Vec::new(),
                                 method_names: Vec::new(),
                                 node_source: Default::default(),
@@ -9778,6 +9791,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            setter_only_names: Vec::new(),
             readonly_names: Vec::new(),
             method_names: Vec::new(),
             node_source: Default::default(),
@@ -11341,6 +11355,25 @@ impl TypeChecker {
     }
 
     fn merge_interface_info(existing: &mut InterfaceInfo, incoming: InterfaceInfo) {
+        existing.object_type.setter_only_names.retain(|name| {
+            !incoming
+                .object_type
+                .properties
+                .iter()
+                .any(|(key, _)| key == name)
+                || incoming.object_type.setter_only_names.contains(name)
+        });
+        for name in &incoming.object_type.setter_only_names {
+            if !existing
+                .object_type
+                .properties
+                .iter()
+                .any(|(key, _)| key == name)
+            {
+                existing.object_type.setter_only_names.push(name.clone());
+            }
+        }
+
         if existing.type_params.is_empty() && !incoming.type_params.is_empty() {
             existing.type_params = incoming.type_params.clone();
             existing.required_type_params = incoming.required_type_params;
@@ -20908,6 +20941,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    setter_only_names: Vec::new(),
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
                     node_source: Default::default(),
@@ -21067,6 +21101,7 @@ impl TypeChecker {
             let own_props: Vec<_> = info.object_type.properties.clone();
             let optional_props = info.optional_props.clone();
             let mut node_source = info.object_type.node_source.clone();
+            let mut setter_only_names = info.object_type.setter_only_names.clone();
             let mut method_names: Vec<std::string::String> = info.object_type.method_names.clone();
             // First collect inherited members from extended interfaces.
             // tsc resolveObjectTypeMembers lists own members first, then
@@ -21095,6 +21130,9 @@ impl TypeChecker {
                         if !inherited_props.iter().any(|(name, _)| name == &property.0) {
                             if !own_props.iter().any(|(name, _)| name == &property.0) {
                                 node_source.copy_property_from(&ext_obj.node_source, &property.0);
+                                if ext_obj.setter_only_names.contains(&property.0) {
+                                    setter_only_names.push(property.0.clone());
+                                }
                             }
                             inherited_props.push(property.clone());
                         }
@@ -21157,6 +21195,7 @@ impl TypeChecker {
                 construct_signatures: construct_sigs,
                 index_signature: index_sig,
                 index_signature_name: None,
+                setter_only_names,
                 readonly_names: Vec::new(),
                 method_names,
                 node_source,
@@ -21433,6 +21472,7 @@ impl TypeChecker {
                     )
                 }),
                 index_signature_name: info.index_signature_name.clone(),
+                setter_only_names: info.setter_only_names.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
                 node_source: info.node_source.clone(),
@@ -21682,6 +21722,7 @@ impl TypeChecker {
                     )
                 }),
                 index_signature_name: info.index_signature_name.clone(),
+                setter_only_names: info.setter_only_names.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
                 node_source: info.node_source.clone(),
@@ -22339,6 +22380,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            setter_only_names: Vec::new(),
             readonly_names: Vec::new(),
             method_names: Vec::new(),
             node_source: Default::default(),
@@ -22754,6 +22796,7 @@ impl TypeChecker {
                     construct_signatures: info.construct_signatures.clone(),
                     index_signature: info.index_signature.clone(),
                     index_signature_name: info.index_signature_name.clone(),
+                    setter_only_names: info.setter_only_names.clone(),
                     readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
                     node_source: info.node_source.clone(),
@@ -22926,6 +22969,7 @@ impl TypeChecker {
             };
             Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 node_source: info.node_source.clone(),
+                setter_only_names: info.setter_only_names.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info
                     .method_names
@@ -23216,6 +23260,7 @@ impl TypeChecker {
                 construct_signatures: info.construct_signatures.clone(),
                 index_signature: info.index_signature.clone(),
                 index_signature_name: info.index_signature_name.clone(),
+                setter_only_names: info.setter_only_names.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
                 node_source: info.node_source.clone(),
@@ -23489,6 +23534,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: Some((Arc::new(args[0].clone()), Arc::new(args[1].clone()))),
                     index_signature_name: None,
+                    setter_only_names: Vec::new(),
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
                     node_source: Default::default(),
@@ -24064,6 +24110,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    setter_only_names: Vec::new(),
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
                     node_source: Default::default(),
@@ -26258,6 +26305,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            setter_only_names: Vec::new(),
             readonly_names: Vec::new(),
             method_names: Vec::new(),
             node_source: Default::default(),
@@ -26302,6 +26350,7 @@ impl TypeChecker {
                         construct_signatures: Vec::new(),
                         index_signature: None,
                         index_signature_name: None,
+                        setter_only_names: Vec::new(),
                         readonly_names: Vec::new(),
                         method_names: Vec::new(),
                         node_source: Default::default(),
@@ -42464,6 +42513,7 @@ impl TypeChecker {
                 construct_signatures: info.construct_signatures.clone(),
                 index_signature: info.index_signature.clone(),
                 index_signature_name: info.index_signature_name.clone(),
+                setter_only_names: info.setter_only_names.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
                 node_source: info.node_source.clone(),
@@ -42818,6 +42868,7 @@ impl TypeChecker {
                     )
                 }),
                 index_signature_name: info.index_signature_name.clone(),
+                setter_only_names: info.setter_only_names.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
                 node_source: info.node_source.clone(),
@@ -42953,6 +43004,15 @@ impl TypeChecker {
         match &expanded {
             Type::ObjectType(info) => {
                 for (name, ty) in &info.properties {
+                    // Adapted from getSpreadSymbol: a setter declaration has
+                    // no getter to supply a value when the property is copied.
+                    let read_type;
+                    let ty = if info.setter_only_names.contains(name) {
+                        read_type = Arc::new(Type::Undefined);
+                        &read_type
+                    } else {
+                        ty
+                    };
                     if let Some((_, existing)) = properties.iter_mut().find(|(key, _)| key == name)
                     {
                         if let Type::Optional(incoming) = ty.as_ref() {
@@ -43186,7 +43246,7 @@ impl TypeChecker {
         else {
             return widened;
         };
-        let asserted: Vec<std::string::String> = props
+        let mut asserted: Vec<std::string::String> = props
             .iter()
             .filter_map(|prop| match prop {
                 ObjLitProp::Property(property)
@@ -43202,6 +43262,44 @@ impl TypeChecker {
                 _ => None,
             })
             .collect();
+        // getSpreadSymbol returns a regular undefined type for setter-only
+        // members. It is not a fresh `undefined` initializer to widen to any.
+        if before
+            .properties
+            .iter()
+            .any(|(_, ty)| matches!(ty.as_ref(), Type::Undefined))
+        {
+            let mut copied_undefined = rustc_hash::FxHashSet::default();
+            for property in props {
+                let name = match property {
+                    ObjLitProp::Property(property) => self.prop_name_to_string(&property.key),
+                    ObjLitProp::Method(method) => self.prop_name_to_string(&method.name),
+                    ObjLitProp::Get(accessor) | ObjLitProp::Set(accessor) => {
+                        self.prop_name_to_string(&accessor.name)
+                    }
+                    ObjLitProp::Shorthand(name, _) | ObjLitProp::ShorthandDefault(name, _, _) => {
+                        name.to_string()
+                    }
+                    ObjLitProp::Spread(expression, _) => {
+                        let mut copied = Vec::new();
+                        let _ = self.merge_spread_into_object_properties(
+                            &self.infer_expr_type(expression),
+                            &mut copied,
+                        );
+                        for (name, ty) in copied {
+                            if matches!(ty.as_ref(), Type::Undefined) {
+                                copied_undefined.insert(name);
+                            } else {
+                                copied_undefined.remove(&name);
+                            }
+                        }
+                        continue;
+                    }
+                };
+                copied_undefined.remove(&name);
+            }
+            asserted.extend(copied_undefined);
+        }
         if asserted.is_empty() {
             return widened;
         }
@@ -43228,6 +43326,7 @@ impl TypeChecker {
             construct_signatures: after.construct_signatures.clone(),
             index_signature: after.index_signature.clone(),
             index_signature_name: after.index_signature_name.clone(),
+            setter_only_names: after.setter_only_names.clone(),
             readonly_names: after.readonly_names.clone(),
             method_names: after.method_names.clone(),
             node_source: after.node_source.clone(),
@@ -43268,6 +43367,7 @@ impl TypeChecker {
                     construct_signatures: info.construct_signatures.clone(),
                     index_signature: info.index_signature.clone(),
                     index_signature_name: info.index_signature_name.clone(),
+                    setter_only_names: info.setter_only_names.clone(),
                     readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
                     node_source: info.node_source.clone(),
@@ -43355,6 +43455,7 @@ impl TypeChecker {
                     construct_signatures: info.construct_signatures.clone(),
                     index_signature: info.index_signature.clone(),
                     index_signature_name: info.index_signature_name.clone(),
+                    setter_only_names: info.setter_only_names.clone(),
                     readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
                     node_source: info.node_source.clone(),
@@ -44547,6 +44648,7 @@ impl TypeChecker {
                     construct_signatures,
                     index_signature,
                     index_signature_name: None,
+                    setter_only_names: info.setter_only_names.clone(),
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
                     node_source: info.node_source.clone(),
@@ -48031,6 +48133,7 @@ mod tests {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            setter_only_names: Vec::new(),
             readonly_names: Vec::new(),
             method_names: Vec::new(),
             node_source: Default::default(),
