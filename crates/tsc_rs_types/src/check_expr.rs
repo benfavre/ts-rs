@@ -2126,7 +2126,7 @@ impl TypeChecker {
     /// `undefined` (or a `T | undefined` value) is allowed. Rest params keep
     /// their declared type (unwrapped elsewhere). Idempotent when `T` already
     /// admits `undefined`.
-    fn optional_param_type(name: &str, t: Type) -> Type {
+    pub(super) fn optional_param_type(name: &str, t: Type) -> Type {
         if !name.starts_with('?') || Self::type_includes_undefined(&t) {
             return t;
         }
@@ -3231,6 +3231,16 @@ impl TypeChecker {
     }
 
     pub(crate) fn check_parameter_decorators(&mut self, parameters: &[Param], valid: bool) {
+        self.check_parameter_decorators_on_member(parameters, valid, None);
+    }
+
+    fn check_parameter_decorators_on_member(
+        &mut self,
+        parameters: &[Param],
+        valid: bool,
+        member: Option<&ClassMember>,
+    ) {
+        let mut index = 0;
         for parameter in parameters {
             let is_this_parameter =
                 matches!(&parameter.name.kind, PatKind::Ident(name) if name == "this");
@@ -3246,11 +3256,19 @@ impl TypeChecker {
                     self.report_js_syntactic_invalid_decorator(&parameter.decorators);
                 }
             } else {
+                let target = if parameter.decorators.is_empty() {
+                    None
+                } else {
+                    member
+                        .and_then(|member| self.legacy_member_decorator_target(member, Some(index)))
+                };
                 self.check_decorators_at_site(
                     &parameter.decorators,
                     valid,
                     decorator_types::DecoratorSite::Parameter,
+                    target.as_ref(),
                 );
+                index += 1;
             }
         }
     }
@@ -10889,6 +10907,7 @@ impl TypeChecker {
                     &class_decl.decorators,
                     !legacy_decorators,
                     decorator_types::DecoratorSite::Class,
+                    None,
                 );
                 // Give every class expression a stable internal class identity,
                 // including anonymous expressions. This preserves private
@@ -14090,7 +14109,13 @@ impl TypeChecker {
                 } else {
                     decorator_types::DecoratorSite::Property
                 };
-                self.check_decorators_at_site(&prop.decorators, valid_decorators, site);
+                let target = self.legacy_member_decorator_target(member, None);
+                self.check_decorators_at_site(
+                    &prop.decorators,
+                    valid_decorators,
+                    site,
+                    target.as_ref(),
+                );
                 // A class member's computed name has its own control-flow
                 // container (tsc), so outer variables are assumed assigned.
                 self.fn_nesting_depth += 1;
@@ -14275,11 +14300,13 @@ impl TypeChecker {
                 let legacy_decorators = self.compiler_options.experimental_decorators == Some(true);
                 let has_private_name = matches!(method.name, PropName::Private(_, _));
                 if method.body.is_some() {
+                    let target = self.legacy_member_decorator_target(member, None);
                     self.check_decorators_at_site(
                         &method.decorators,
                         (!legacy_decorators || !class_is_expression)
                             && (!legacy_decorators || !has_private_name),
                         decorator_types::DecoratorSite::Method,
+                        target.as_ref(),
                     );
                 } else {
                     self.report_decorator_on_method_overload(&method.decorators);
@@ -14303,9 +14330,10 @@ impl TypeChecker {
                                     && Self::propname_text_opt(&candidate.name) == method_name
                         )
                     });
-                self.check_parameter_decorators(
+                self.check_parameter_decorators_on_member(
                     &method.params,
                     legacy_decorators && !class_is_expression && method.body.is_some(),
+                    Some(member),
                 );
                 self.params_owner_async = method.is_async;
                 self.check_parameter_runtime_expressions(
@@ -14400,9 +14428,10 @@ impl TypeChecker {
                             ClassMemberKind::Constructor(candidate) if candidate.body.is_some()
                         )
                     });
-                self.check_parameter_decorators(
+                self.check_parameter_decorators_on_member(
                     &ctor.params,
                     legacy_decorators && !class_is_expression && ctor.body.is_some(),
+                    Some(member),
                 );
                 self.check_parameter_runtime_expressions(
                     &ctor.params,
@@ -14518,12 +14547,14 @@ impl TypeChecker {
             ClassMemberKind::GetAccessor(acc) | ClassMemberKind::SetAccessor(acc) => {
                 let legacy_decorators = self.compiler_options.experimental_decorators == Some(true);
                 let has_private_name = matches!(acc.name, PropName::Private(_, _));
+                let target = self.legacy_member_decorator_target(member, None);
                 self.check_decorators_at_site(
                     &acc.decorators,
                     acc.body.is_some()
                         && (!legacy_decorators || !class_is_expression)
                         && (!legacy_decorators || !has_private_name),
                     decorator_types::DecoratorSite::Method,
+                    target.as_ref(),
                 );
                 // A class member's computed name has its own control-flow
                 // container (tsc), so outer variables are assumed assigned.
@@ -14535,9 +14566,10 @@ impl TypeChecker {
                 self.type_only_use_allowed -= u32::from(type_only_name_ok);
                 self.fn_nesting_depth -= 1;
                 let is_setter = matches!(member.kind, ClassMemberKind::SetAccessor(_));
-                self.check_parameter_decorators(
+                self.check_parameter_decorators_on_member(
                     &acc.params,
                     legacy_decorators && !class_is_expression && is_setter && acc.body.is_some(),
+                    Some(member),
                 );
                 self.check_parameter_runtime_expressions(&acc.params, acc.body.is_some(), false);
                 let is_getter = matches!(member.kind, ClassMemberKind::GetAccessor(_));

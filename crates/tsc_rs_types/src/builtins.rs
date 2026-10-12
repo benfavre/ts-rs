@@ -28,6 +28,92 @@ fn builtin_method(params: &[(&str, Type)], ret: Type) -> Type {
     })
 }
 
+/// Structural fallback for standalone checking without parsed lib interfaces.
+/// The caller must verify that the selected libraries declare this global.
+pub(crate) fn typed_property_descriptor(value: Type) -> Type {
+    let properties = [
+        ("enumerable", Type::Boolean),
+        ("configurable", Type::Boolean),
+        ("writable", Type::Boolean),
+        ("value", value.clone()),
+        ("get", builtin_method(&[], value.clone())),
+        ("set", builtin_method(&[("value", value)], Type::Void)),
+    ]
+    .into_iter()
+    .map(|(name, ty)| (name.into(), Arc::new(Type::Optional(Arc::new(ty)))))
+    .collect();
+    Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+        properties,
+        ..ObjectTypeData::default()
+    }))
+}
+
+pub(crate) fn legacy_decorator(name: &str) -> Option<Type> {
+    let key = Type::Union(vec![Type::String, Type::Symbol].into());
+    let object = Type::TypeReference("Object".into(), Arc::from([]));
+    let (params, result, type_params, constraints) = match name {
+        "ClassDecorator" => {
+            let parameter = Type::TypeParameter("TFunction".into());
+            (
+                vec![("target", parameter.clone())],
+                Type::Union(vec![parameter, Type::Void].into()),
+                vec!["TFunction".into()],
+                vec![Some(Type::TypeReference("Function".into(), Arc::from([])))],
+            )
+        }
+        "PropertyDecorator" => (
+            vec![("target", object), ("propertyKey", key)],
+            Type::Void,
+            vec![],
+            vec![],
+        ),
+        "ParameterDecorator" => (
+            vec![
+                ("target", object),
+                (
+                    "propertyKey",
+                    Type::Union(vec![Type::String, Type::Symbol, Type::Undefined].into()),
+                ),
+                ("parameterIndex", Type::Number),
+            ],
+            Type::Void,
+            vec![],
+            vec![],
+        ),
+        "MethodDecorator" => {
+            let descriptor = Type::TypeReference(
+                "TypedPropertyDescriptor".into(),
+                vec![Type::TypeParameter("T".into())].into(),
+            );
+            (
+                vec![
+                    ("target", object),
+                    ("propertyKey", key),
+                    ("descriptor", descriptor.clone()),
+                ],
+                Type::Union(vec![descriptor, Type::Void].into()),
+                vec!["T".into()],
+                vec![None],
+            )
+        }
+        _ => return None,
+    };
+    Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+        call_signatures: vec![FunctionType {
+            params: params
+                .into_iter()
+                .map(|(name, ty)| (name.into(), ty))
+                .collect(),
+            return_type: Arc::new(result),
+            type_param_defaults: vec![None; type_params.len()],
+            type_params,
+            type_param_constraints: constraints,
+            type_predicate: None,
+        }],
+        ..ObjectTypeData::default()
+    })))
+}
+
 fn bprop(name: &str, ty: Type) -> (std::string::String, Arc<Type>) {
     (name.to_string(), Arc::new(ty))
 }

@@ -3030,7 +3030,7 @@ pub struct TypeChecker {
     /// ambient functions and overloads in the current file.
     decorator_parameter_notes: rustc_hash::FxHashMap<
         (std::string::String, usize),
-        Vec<Vec<tsc_rs_ast::RelatedDiagnostic>>,
+        Vec<decorator_types::DecoratorSignatureNotes>,
     >,
     /// Global type/value declarations contributed by non-lib program files.
     /// These remain authoritative across script files and `declare global`
@@ -20285,6 +20285,27 @@ impl TypeChecker {
 
     /// Resolve a TypeReference to its structural ObjectType form using class_info or interface_info.
     fn resolve_type_reference_to_object(&self, name: &str, args: &[Type]) -> Option<Type> {
+        if matches!(
+            name,
+            "TypedPropertyDescriptor"
+                | "ClassDecorator"
+                | "PropertyDecorator"
+                | "MethodDecorator"
+                | "ParameterDecorator"
+        ) && !self.interface_info.contains_key(name)
+            && !self.class_info.contains_key(name)
+            && !self.type_aliases.contains_key(name)
+            && stdlib::stdlib_member_availability(&self.compiler_options)
+                .is_some_and(|library| library.declares_global_type(name))
+        {
+            return if name == "TypedPropertyDescriptor" {
+                Some(builtins::typed_property_descriptor(
+                    args.first().cloned().unwrap_or(Type::Any),
+                ))
+            } else {
+                builtins::legacy_decorator(name)
+            };
+        }
         // Cross-namespace lookup: `extends core.$ZodType<...>` stores the
         // extended name as the qualified string "core.$ZodType" but the
         // interface itself is registered under its bare name "$ZodType"
@@ -23192,7 +23213,8 @@ impl TypeChecker {
                 Type::ObjectType(info)
                     if !info.call_signatures.is_empty() && info.construct_signatures.is_empty()
             );
-        if matches!(source, Type::Constructor(_))
+        if target_class.is_some()
+            || matches!(source, Type::Constructor(_))
             || matches!(target, Type::Constructor(_))
             || matches!(target, Type::ObjectType(info) if !info.construct_signatures.is_empty())
             || (matches!(
@@ -27938,10 +27960,12 @@ impl TypeChecker {
                     class_decl.span,
                     &class_decl.decorators,
                 );
+                let decorator_target = self.legacy_class_decorator_target(class_decl);
                 self.check_decorators_at_site(
                     &class_decl.decorators,
                     true,
                     decorator_types::DecoratorSite::Class,
+                    decorator_target.as_ref(),
                 );
                 if class_decl.name.as_deref() == Some("Object")
                     && class_decl.modifiers & MOD_DECLARE == 0
@@ -32168,6 +32192,20 @@ impl TypeChecker {
     fn structural_object_info(&mut self, ty: &Type) -> Option<ObjectTypeInfo> {
         match ty {
             Type::ObjectType(info) => Some(info.clone()),
+            Type::TypeReference(name, _) if name.starts_with("typeof ") => {
+                self.direct_constructor_static_members(ty).map(|members| {
+                    ObjectTypeInfo::new(ObjectTypeData {
+                        properties: members
+                            .into_iter()
+                            .map(|(name, ty)| (name, Arc::new(ty)))
+                            .collect(),
+                        construct_signatures: self
+                            .direct_constructor_signatures(ty)
+                            .unwrap_or_default(),
+                        ..ObjectTypeData::default()
+                    })
+                })
+            }
             Type::TypeReference(name, args) => {
                 if args.is_empty() && self.class_info.contains_key(name.as_str()) {
                     match self.get_class_instance_type(name) {
@@ -32624,6 +32662,25 @@ impl TypeChecker {
             }
         }
         // Construct signatures: `typeof B` against `typeof A` / `new () => A`.
+        let class_value = |ty: &Type| match ty {
+            Type::TypeReference(name, _) => name.strip_prefix("typeof ").map(str::to_string),
+            Type::Typeof(name) if self.class_info.contains_key(name) => Some(name.clone()),
+            _ => None,
+        };
+        if let (Some(source_class), Some(target_class)) = (class_value(source), class_value(target))
+        {
+            let source_private = self.private_static_member_origins(&source_class);
+            for (name, target_origin) in self.private_static_member_origins(&target_class) {
+                if source_private.iter().any(|(source_name, source_origin)| {
+                    *source_name == name && *source_origin != target_origin
+                }) {
+                    return Some((
+                        format!("Types have separate declarations of a private property '{name}'."),
+                        None,
+                    ));
+                }
+            }
+        }
         if let (Some(source_sigs), Some(target_sigs)) = (
             self.direct_constructor_signatures(source),
             self.direct_constructor_signatures(target),
@@ -33148,10 +33205,12 @@ impl TypeChecker {
                     if let Some(member) =
                         nullish_first.find(|member| !self.is_assignable_to(member, &leaf_target))
                     {
+                        let member_target = Self::strip_nullable_union_target(member, &leaf_target)
+                            .unwrap_or_else(|| leaf_target.clone());
                         text.push_str(&format!(
                             "\n    Type '{}' is not assignable to type '{}'.",
                             member.display_string_single_line(),
-                            leaf_target.display_string_single_line()
+                            member_target.display_string_single_line()
                         ));
                     }
                 }
@@ -43562,6 +43621,11 @@ impl TypeChecker {
         inferred: &mut HashMap<std::string::String, Type>,
     ) {
         if matches!(arg_ty, Type::Any) {
+            // Retain an otherwise unsolved covariant inference as `any`.
+            // A concrete candidate from another site still takes priority.
+            if INFER_CONTRA_DEPTH.with(|depth| depth.get() % 2 == 0) {
+                inferred.entry(name.to_string()).or_insert(Type::Any);
+            }
             return;
         }
         let contravariant = INFER_CONTRA_DEPTH.with(|depth| depth.get() % 2 == 1);
@@ -43574,7 +43638,9 @@ impl TypeChecker {
                 }
             });
             if let Some(existing) = table.get(name) {
-                if existing != arg_ty && !matches!(existing, Type::Any) {
+                if matches!(existing, Type::Any) {
+                    table.insert(name.to_string(), arg_ty.clone());
+                } else if existing != arg_ty {
                     let union = Type::flatten_union(vec![existing.clone(), arg_ty.clone()]);
                     table.insert(name.to_string(), union);
                 }
@@ -43648,24 +43714,7 @@ impl TypeChecker {
             })
             .collect();
         let mut inferred =
-            Self::infer_type_arguments(call_arg_types, &resolved_params, type_params);
-        let covariant = LAST_INFER_COVARIANT.with(|last| std::mem::take(&mut *last.borrow_mut()));
-        for (name, candidates) in covariant {
-            // Only candidates that are whole arguments bound to a bare `T`:
-            // members split off a union argument (one candidate in tsc) and
-            // callback return types keep the recorder's union.
-            if candidates.len() < 2
-                || !candidates.iter().all(|candidate| {
-                    matches!(candidate, Type::Null | Type::Undefined)
-                        || call_arg_types.contains(candidate)
-                })
-            {
-                continue;
-            }
-            if let Some(choice) = self.common_supertype_candidate(&candidates) {
-                inferred.insert(name, choice);
-            }
-        }
+            self.infer_with_common_supertype(call_arg_types, &resolved_params, type_params);
         let unsolved: Vec<_> = type_params
             .iter()
             .filter(|name| !inferred.contains_key(*name))
@@ -43679,7 +43728,53 @@ impl TypeChecker {
                 sources.push(source);
                 targets.push((name.clone(), target));
             }
-            inferred.extend(Self::infer_type_arguments(&sources, &targets, &unsolved));
+            inferred.extend(self.infer_with_common_supertype(&sources, &targets, &unsolved));
+        }
+        inferred
+    }
+
+    fn infer_with_common_supertype(
+        &self,
+        sources: &[Type],
+        targets: &[(String, Type)],
+        parameters: &[String],
+    ) -> HashMap<String, Type> {
+        let mut inferred = Self::infer_type_arguments(sources, targets, parameters);
+        let covariant = LAST_INFER_COVARIANT.with(|last| std::mem::take(&mut *last.borrow_mut()));
+        // A union supplied at one inference site is one candidate. Do not
+        // select between its constituents after the recorder splits it.
+        // Callback parameters can also fix contextual inferences, so only
+        // extend common-supertype selection to parameterless callbacks here.
+        fn supplies_candidate(source: &Type, candidate: &Type) -> bool {
+            if source == candidate {
+                return true;
+            }
+            match source {
+                Type::ObjectType(info) => info
+                    .properties
+                    .iter()
+                    .any(|(_, ty)| supplies_candidate(ty, candidate)),
+                Type::Function(function) if function.params.is_empty() => {
+                    supplies_candidate(&function.return_type, candidate)
+                }
+                Type::Array(element) | Type::Optional(element) => {
+                    supplies_candidate(element, candidate)
+                }
+                _ => false,
+            }
+        }
+        for (name, candidates) in covariant {
+            if !candidates.iter().all(|candidate| {
+                matches!(candidate, Type::Null | Type::Undefined)
+                    || sources
+                        .iter()
+                        .any(|source| supplies_candidate(source, candidate))
+            }) {
+                continue;
+            }
+            if let Some(choice) = self.common_supertype_candidate(&candidates) {
+                inferred.insert(name, choice);
+            }
         }
         inferred
     }
@@ -43701,7 +43796,8 @@ impl TypeChecker {
         let judgeable = |ty: &Type| {
             matches!(
                 ty,
-                Type::String
+                Type::Void
+                    | Type::String
                     | Type::Number
                     | Type::Boolean
                     | Type::BigInt

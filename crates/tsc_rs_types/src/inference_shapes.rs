@@ -271,16 +271,45 @@ impl TypeChecker {
         }
     }
 
-    fn inference_constructor_shape(&self, ty: &Type) -> Option<Type> {
-        self.direct_constructor_static_members(ty).map(|members| {
-            Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
-                properties: members
-                    .into_iter()
-                    .map(|(name, ty)| (name, Arc::new(ty)))
-                    .collect(),
-                construct_signatures: self.direct_constructor_signatures(ty).unwrap_or_default(),
-                ..ObjectTypeData::default()
-            }))
-        })
+    pub(super) fn inference_constructor_shape(&self, ty: &Type) -> Option<Type> {
+        self.direct_constructor_static_members(ty)
+            .map(|mut members| {
+                let signatures = self.direct_constructor_signatures(ty).unwrap_or_default();
+                if !members.iter().any(|(name, _)| name == "prototype") {
+                    if let Some(signature) = signatures.first() {
+                        let class_value = match ty {
+                            Type::TypeReference(name, _) => name.starts_with("typeof "),
+                            Type::Typeof(name) => {
+                                self.class_info.contains_key(name)
+                                    || matches!(self.lookup_var(name), Some(Type::TypeReference(name, _)) if name.starts_with("typeof "))
+                            }
+                            _ => false,
+                        };
+                        let arguments = signature
+                            .type_params
+                            .iter()
+                            .map(|name| (name.clone(), Type::Any))
+                            .collect();
+                        members.push((
+                            "prototype".into(),
+                            if class_value {
+                                Self::substitute(&signature.return_type, &arguments)
+                            } else {
+                                // A construct signature alone inherits the
+                                // untyped Function.prototype property.
+                                Type::Any
+                            },
+                        ));
+                    }
+                }
+                Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                    properties: members
+                        .into_iter()
+                        .map(|(name, ty)| (name, Arc::new(ty)))
+                        .collect(),
+                    construct_signatures: signatures,
+                    ..ObjectTypeData::default()
+                }))
+            })
     }
 }
