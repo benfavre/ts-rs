@@ -647,6 +647,7 @@ pub fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
         ),
 
         Type::Function(f) => Type::Function(FunctionType {
+            source: f.source.clone(),
             type_param_constraints: f
                 .type_param_constraints
                 .iter()
@@ -701,6 +702,7 @@ pub fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
             index_signature_name: obj.index_signature_name.clone(),
             readonly_names: obj.readonly_names.clone(),
             method_names: obj.method_names.clone(),
+            node_method_names: obj.node_method_names.clone(),
         })),
 
         Type::TypeReference(name, args) => Type::TypeReference(
@@ -761,6 +763,7 @@ pub fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
                 inner_substitutions.remove(parameter);
             }
             Type::Constructor(crate::ConstructorType {
+                source: ctor.source.clone(),
                 is_abstract: ctor.is_abstract,
                 params: ctor
                     .params
@@ -891,6 +894,7 @@ fn substitute_function_type(
     substitutions: &HashMap<String, Type>,
 ) -> FunctionType {
     FunctionType {
+        source: f.source.clone(),
         type_param_constraints: f
             .type_param_constraints
             .iter()
@@ -993,6 +997,7 @@ mod tests {
         let result = infer_type_arguments(
             &["T".to_string()],
             &[Type::Function(FunctionType {
+                source: Default::default(),
                 params: vec![],
                 return_type: Arc::new(Type::TypeParameter("T".to_string())),
                 type_params: vec![],
@@ -1001,6 +1006,7 @@ mod tests {
                 type_predicate: None,
             })],
             &[Type::Function(FunctionType {
+                source: Default::default(),
                 params: vec![],
                 return_type: Arc::new(Type::String),
                 type_params: vec![],
@@ -1028,6 +1034,7 @@ mod tests {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }))],
             &[Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
                 properties: vec![("value".to_string(), Arc::new(Type::Boolean))],
@@ -1037,6 +1044,7 @@ mod tests {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }))],
         );
         assert_eq!(result.get("T"), Some(&Type::Boolean));
@@ -1147,6 +1155,7 @@ mod tests {
         subs.insert("T".to_string(), Type::Boolean);
 
         let input = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("x".to_string(), Type::TypeParameter("T".to_string()))],
             return_type: Arc::new(Type::TypeParameter("T".to_string())),
             type_params: vec!["T".to_string()],
@@ -1158,6 +1167,7 @@ mod tests {
         assert_eq!(
             output,
             Type::Function(FunctionType {
+                source: Default::default(),
                 params: vec![("x".to_string(), Type::Boolean)],
                 return_type: Arc::new(Type::Boolean),
                 type_params: vec!["T".to_string()],

@@ -226,6 +226,7 @@ impl TypeChecker {
         };
         (
             ConstructorType {
+                source: Default::default(),
                 is_abstract: false,
                 params,
                 return_type: Arc::new(Self::substitute(&return_type, &substitutions)),
@@ -336,6 +337,7 @@ impl TypeChecker {
             }
             return Some((
                 ConstructorType {
+                    source: function.source.clone(),
                     is_abstract: false,
                     params: function.params.clone(),
                     return_type: function.return_type.clone(),

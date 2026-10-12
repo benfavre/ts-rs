@@ -545,6 +545,7 @@ new C("", value => { value = 1; });
 #[test]
 fn constructor_types_display_with_valid_precedence_and_parameter_syntax() {
     let constructor = Type::Constructor(ConstructorType {
+        source: Default::default(),
         is_abstract: true,
         params: vec![
             ("?value".into(), Type::TypeParameter("T".into())),
@@ -576,6 +577,7 @@ fn constructor_types_display_with_valid_precedence_and_parameter_syntax() {
             properties: Vec::new(),
             call_signatures: Vec::new(),
             construct_signatures: vec![ConstructorType {
+                source: Default::default(),
                 is_abstract: false,
                 params: vec![("?value".into(), Type::TypeParameter("T".into()))],
                 return_type: Arc::new(Type::TypeParameter("T".into())),
@@ -587,6 +589,7 @@ fn constructor_types_display_with_valid_precedence_and_parameter_syntax() {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         },
     ));
     assert_eq!(
@@ -599,9 +602,11 @@ fn constructor_types_display_with_valid_precedence_and_parameter_syntax() {
             properties: Vec::new(),
             call_signatures: Vec::new(),
             construct_signatures: vec![ConstructorType {
+                source: Default::default(),
                 is_abstract: false,
                 params: Vec::new(),
                 return_type: Arc::new(Type::Function(FunctionType {
+                    source: Default::default(),
                     params: Vec::new(),
                     return_type: Arc::new(Type::String),
                     type_params: Vec::new(),
@@ -617,6 +622,7 @@ fn constructor_types_display_with_valid_precedence_and_parameter_syntax() {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         },
     ));
     assert_eq!(returns_function.display_string(), "new () => () => string");

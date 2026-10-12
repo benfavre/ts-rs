@@ -94,6 +94,7 @@ fn substitute_inner(ty: &Type, name: &str, replacement: &Type) -> Type {
         ),
 
         Type::Function(ft) => Type::Function(FunctionType {
+            source: ft.source.clone(),
             type_param_constraints: ft
                 .type_param_constraints
                 .iter()
@@ -184,6 +185,7 @@ fn substitute_inner(ty: &Type, name: &str, replacement: &Type) -> Type {
             ty.clone()
         }
         Type::Constructor(ct) => Type::Constructor(crate::ConstructorType {
+            source: ct.source.clone(),
             is_abstract: ct.is_abstract,
             params: ct
                 .params
@@ -295,6 +297,7 @@ fn substitute_object(obj: &ObjectTypeInfo, name: &str, replacement: &Type) -> Ob
             .call_signatures
             .iter()
             .map(|ft| FunctionType {
+                source: ft.source.clone(),
                 type_param_constraints: ft
                     .type_param_constraints
                     .iter()
@@ -334,6 +337,7 @@ fn substitute_object(obj: &ObjectTypeInfo, name: &str, replacement: &Type) -> Ob
         index_signature_name: obj.index_signature_name.clone(),
         readonly_names: obj.readonly_names.clone(),
         method_names: obj.method_names.clone(),
+        node_method_names: obj.node_method_names.clone(),
     })
 }
 
@@ -673,6 +677,7 @@ pub fn expand_mapped(
         index_signature_name: None,
         readonly_names: Vec::new(),
         method_names: Vec::new(),
+        node_method_names: Vec::new(),
     }))
 }
 
@@ -1383,6 +1388,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         let result = resolve_keyof(&obj);
         assert_eq!(
@@ -1420,6 +1426,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         let result = resolve_indexed_access(&obj, &Type::StringLiteral("name".into()));
         assert_eq!(result, Type::String);
@@ -1452,6 +1459,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         let idx = Type::Union(
             vec![

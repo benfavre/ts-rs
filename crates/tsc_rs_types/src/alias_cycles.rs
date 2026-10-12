@@ -820,6 +820,7 @@ impl TypeChecker {
             ]
         };
         Type::Function(FunctionType {
+            source: Default::default(),
             type_param_constraints: Vec::new(),
             params,
             return_type: function.return_type.clone(),

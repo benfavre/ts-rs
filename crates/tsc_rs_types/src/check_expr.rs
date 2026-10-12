@@ -813,11 +813,13 @@ impl TypeChecker {
                         index_signature_name: None,
                         readonly_names: Vec::new(),
                         method_names: Vec::new(),
+                        node_method_names: Vec::new(),
                     }))),
                 ),
                 (
                     "resolve".to_string(),
                     Arc::new(Type::Function(FunctionType {
+                        source: Default::default(),
                         type_param_constraints: Vec::new(),
                         params: vec![("specifier".to_string(), Type::String)],
                         return_type: Arc::new(Type::String),
@@ -829,6 +831,7 @@ impl TypeChecker {
                 (
                     "resolve".to_string(),
                     Arc::new(Type::Function(FunctionType {
+                        source: Default::default(),
                         type_param_constraints: Vec::new(),
                         params: vec![("specifier".to_string(), Type::String)],
                         return_type: Arc::new(Type::String),
@@ -844,6 +847,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }))
     }
 
@@ -2621,6 +2625,7 @@ impl TypeChecker {
             }
         }
         ConstructorType {
+            source: signature.source.clone(),
             is_abstract: signature.is_abstract,
             params: signature
                 .params
@@ -2814,6 +2819,7 @@ impl TypeChecker {
             let functions = candidates
                 .iter()
                 .map(|signature| FunctionType {
+                    source: signature.source.clone(),
                     params: signature.params.clone(),
                     return_type: signature.return_type.clone(),
                     type_params: signature.type_params.clone(),
@@ -5529,6 +5535,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
+                    node_method_names: self.object_node_method_names(props),
                 }));
             }
             ExprKind::ArrayLit(elems) if contextual_type.is_some() => {
@@ -6090,6 +6097,13 @@ impl TypeChecker {
                         ),
                     };
                 Type::Function(FunctionType {
+                    source: self.signature_source(
+                        &arrow.params,
+                        &params,
+                        arrow.type_params.as_deref(),
+                        arrow.return_type.as_ref(),
+                        &ret_type,
+                    ),
                     type_param_constraints,
                     params,
                     return_type: Arc::new(ret_type),
@@ -6304,6 +6318,13 @@ impl TypeChecker {
                         ),
                     };
                 Type::Function(FunctionType {
+                    source: self.signature_source(
+                        &fn_decl.params,
+                        &params,
+                        fn_decl.type_params.as_deref(),
+                        fn_decl.return_type.as_ref(),
+                        &ret,
+                    ),
                     type_param_constraints,
                     params,
                     return_type: Arc::new(ret),
@@ -8697,6 +8718,7 @@ impl TypeChecker {
                                 "length" => Type::Number,
                                 "name" => Type::String,
                                 "bind" | "call" | "apply" => Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![("thisArg".to_string(), Type::Any)],
                                     return_type: Arc::new(Type::Any),
@@ -9499,6 +9521,7 @@ impl TypeChecker {
                         "length" => Type::Number,
                         "name" => Type::String,
                         "bind" | "call" | "apply" => Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![("thisArg".to_string(), Type::Any)],
                             return_type: Arc::new(Type::Any),
@@ -9880,6 +9903,7 @@ impl TypeChecker {
                 }
                 match &obj_ty {
                     Type::Array(elem) if is_symbol_iterator => Type::Function(FunctionType {
+                        source: Default::default(),
                         type_param_constraints: Vec::new(),
                         params: Vec::new(),
                         return_type: Arc::new(Type::TypeReference(
@@ -10294,6 +10318,7 @@ impl TypeChecker {
                                                 index_signature_name: None,
                                                 readonly_names: Vec::new(),
                                                 method_names: Vec::new(),
+                                                node_method_names: Vec::new(),
                                             })
                                         }
                                         Type::ObjectType(info)
@@ -10930,6 +10955,13 @@ impl TypeChecker {
                             properties.push((
                                 name,
                                 Arc::new(Type::Function(FunctionType {
+                                    source: self.signature_source(
+                                        &m.params,
+                                        &params,
+                                        m.type_params.as_deref(),
+                                        m.return_type.as_ref(),
+                                        &ret,
+                                    ),
                                     type_param_constraints: Vec::new(),
                                     params,
                                     return_type: Arc::new(ret),
@@ -11065,6 +11097,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
+                    node_method_names: self.object_node_method_names(props),
                 }))
             }
             ExprKind::Arrow(arrow) => {
@@ -11233,6 +11266,13 @@ impl TypeChecker {
                 self.pop_active_type_param_names(pushed_type_params);
                 self.pop_scope();
                 Type::Function(FunctionType {
+                    source: self.signature_source(
+                        &arrow.params,
+                        &params,
+                        arrow.type_params.as_deref(),
+                        arrow.return_type.as_ref(),
+                        &ret_type,
+                    ),
                     type_param_constraints: self
                         .resolve_type_param_constraints(arrow.type_params.as_deref()),
                     params,
@@ -11354,6 +11394,13 @@ impl TypeChecker {
                 self.pop_active_type_param_names(pushed_type_params);
                 self.pop_scope();
                 Type::Function(FunctionType {
+                    source: self.signature_source(
+                        &fn_decl.params,
+                        &params,
+                        fn_decl.type_params.as_deref(),
+                        fn_decl.return_type.as_ref(),
+                        &ret,
+                    ),
                     type_param_constraints: self
                         .resolve_type_param_constraints(fn_decl.type_params.as_deref()),
                     params,
@@ -13535,6 +13582,7 @@ impl TypeChecker {
                             index_signature_name: None,
                             readonly_names: Vec::new(),
                             method_names: Vec::new(),
+                            node_method_names: Vec::new(),
                         }));
                     }
                 }

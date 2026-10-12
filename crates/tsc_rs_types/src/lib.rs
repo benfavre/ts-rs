@@ -58,7 +58,9 @@ mod tuple_access;
 mod tuple_bindings;
 mod type_computations;
 pub mod type_facts;
+mod type_nodes;
 mod type_only_aliases;
+pub use type_nodes::SignatureSource;
 pub mod type_ops;
 mod unknown_receivers;
 mod unreachable_exprs;
@@ -600,6 +602,8 @@ pub struct TypePredicate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionType {
+    /// Source provenance for type-node printing; excluded from semantic identity.
+    pub source: SignatureSource,
     pub params: Vec<(std::string::String, Type)>,
     pub return_type: Arc<Type>,
     pub type_params: Vec<std::string::String>,
@@ -632,6 +636,9 @@ pub struct ObjectTypeData {
     /// `fn: () => T`), for display only: tsc prints them in method style.
     /// Ignored by equality and hashing — it never changes type identity.
     pub method_names: Vec<std::string::String>,
+    /// Object-literal method declarations for the opt-in type-node printer.
+    /// Kept separate from hover spelling and excluded from structural identity.
+    pub node_method_names: Vec<std::string::String>,
     /// Readonly property declarations, retained for display and write checks.
     /// Like method spelling, ignored by structural equality and hashing.
     pub readonly_names: Vec<std::string::String>,
@@ -724,6 +731,8 @@ impl std::ops::DerefMut for ObjectTypeInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ConstructorType {
+    /// Source provenance for type-node printing; excluded from semantic identity.
+    pub source: SignatureSource,
     pub is_abstract: bool,
     pub params: Vec<(std::string::String, Type)>,
     pub return_type: Arc<Type>,
@@ -743,6 +752,7 @@ pub(crate) fn alpha_normalize_constructor(
         .zip(canonical.iter().cloned())
         .collect::<HashMap<_, _>>();
     ConstructorType {
+        source: constructor.source.clone(),
         is_abstract: constructor.is_abstract,
         params: constructor
             .params
@@ -2094,7 +2104,23 @@ pub enum TypeSpanKind {
 #[derive(Debug, Clone)]
 pub struct TypeAtSpan {
     pub type_string: String,
+    /// Type-node printer text used by compiler compatibility baselines.
+    pub node_text: String,
+    /// Synthetic-node underlining, measured in UTF-16 code units.
+    pub underline: String,
     pub kind: TypeSpanKind,
+}
+
+impl TypeAtSpan {
+    fn new(ty: &Type, kind: TypeSpanKind) -> Self {
+        let printed = type_nodes::print_type(ty);
+        Self {
+            type_string: ty.display_string(),
+            node_text: printed.text,
+            underline: printed.underline,
+            kind,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4037,6 +4063,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
+                    node_method_names: Vec::new(),
                 }),
                 optional_props: Vec::new(),
                 member_locations: rustc_hash::FxHashMap::default(),
@@ -4163,10 +4190,7 @@ impl TypeChecker {
         if let Some(spans) = &mut self.expression_type_spans {
             spans.insert(
                 (span.start, span.end),
-                TypeAtSpan {
-                    type_string: ty.display_string(),
-                    kind: TypeSpanKind::Declaration,
-                },
+                TypeAtSpan::new(ty, TypeSpanKind::Declaration),
             );
         }
     }
@@ -4204,13 +4228,10 @@ impl TypeChecker {
         } else {
             TypeSpanKind::Expression
         };
-        self.expression_type_spans.as_mut().unwrap().insert(
-            (span.start, span.end),
-            TypeAtSpan {
-                type_string: ty.display_string(),
-                kind,
-            },
-        );
+        self.expression_type_spans
+            .as_mut()
+            .unwrap()
+            .insert((span.start, span.end), TypeAtSpan::new(ty, kind));
     }
 
     /// Record a type display string for an expression position, but only
@@ -7160,6 +7181,7 @@ impl TypeChecker {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }));
             *class_type = Type::Intersection(vec![static_surface, class_type.clone()].into());
         }
@@ -7602,6 +7624,7 @@ impl TypeChecker {
                 index_signature_name: object.index_signature_name.clone(),
                 readonly_names: object.readonly_names.clone(),
                 method_names: object.method_names.clone(),
+                node_method_names: object.node_method_names.clone(),
             })),
             Type::Intersection(members) => Type::Intersection(
                 members
@@ -8466,6 +8489,7 @@ impl TypeChecker {
                         &mut info.properties,
                         name,
                         Arc::new(Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params,
                             return_type: Arc::new(return_type),
@@ -9122,6 +9146,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }))
     }
 
@@ -9157,6 +9182,7 @@ impl TypeChecker {
                                 index_signature_name: None,
                                 readonly_names: Vec::new(),
                                 method_names: Vec::new(),
+                                node_method_names: Vec::new(),
                             })),
                         ));
                     }
@@ -9465,6 +9491,7 @@ impl TypeChecker {
                                 index_signature_name: None,
                                 readonly_names: Vec::new(),
                                 method_names: Vec::new(),
+                                node_method_names: Vec::new(),
                             }));
                         Type::Intersection(vec![static_surface, nominal].into())
                     } else {
@@ -9753,6 +9780,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         *value = Type::Intersection(vec![static_surface, nominal].into());
         Ok(())
@@ -12808,10 +12836,7 @@ impl TypeChecker {
             if let Some(spans) = &mut self.expression_type_spans {
                 spans.insert(
                     (pat.span.start, pat.span.end),
-                    TypeAtSpan {
-                        type_string: ty.display_string(),
-                        kind: TypeSpanKind::BindingPattern,
-                    },
+                    TypeAtSpan::new(&ty, TypeSpanKind::BindingPattern),
                 );
             }
         }
@@ -13335,6 +13360,13 @@ impl TypeChecker {
         self.pop_active_type_param_names(pushed_type_params);
         self.pop_scope();
         Type::Function(FunctionType {
+            source: self.signature_source(
+                &method.params,
+                &params,
+                method.type_params.as_deref(),
+                method.return_type.as_ref(),
+                &ret,
+            ),
             type_param_constraints: Vec::new(),
             params,
             return_type: Arc::new(ret),
@@ -15491,6 +15523,7 @@ impl TypeChecker {
                                 Type::Function(signature)
                             } else {
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![(
                                         "...args".to_string(),
@@ -16015,6 +16048,7 @@ impl TypeChecker {
                     let fn_type = Type::Function(ft);
                     // Record function type at name position for hover
                     let name_span = fn_decl.name_span.unwrap_or(fn_decl.span);
+                    self.record_expression_type_span(name_span, &fn_type);
                     self.expression_types
                         .insert(name_span.start, fn_type.display_string());
                     self.declare_var(name, fn_type);
@@ -19786,6 +19820,7 @@ impl TypeChecker {
             "length" => Some(Type::Number),
             "name" => Some(Type::String),
             "apply" | "call" | "bind" => Some(Type::Function(FunctionType {
+                source: Default::default(),
                 type_param_constraints: Vec::new(),
                 params: vec![
                     ("thisArg".to_string(), Type::Any),
@@ -20875,6 +20910,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
+                    node_method_names: Vec::new(),
                 }));
                 return Some(self.is_assignable_to(&shape, target));
             }
@@ -21117,6 +21153,7 @@ impl TypeChecker {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names,
+                node_method_names: Vec::new(),
             }));
 
             // Substitute type args in own properties
@@ -21254,6 +21291,7 @@ impl TypeChecker {
             ),
             Type::Keyof(inner) => Type::Keyof(Arc::new(Self::substitute_this(inner, receiver))),
             Type::Function(ft) => Type::Function(FunctionType {
+                source: ft.source.clone(),
                 type_param_constraints: ft
                     .type_param_constraints
                     .iter()
@@ -21282,6 +21320,7 @@ impl TypeChecker {
                 type_predicate: ft.type_predicate.clone(),
             }),
             Type::Constructor(ct) => Type::Constructor(ConstructorType {
+                source: ct.source.clone(),
                 is_abstract: ct.is_abstract,
                 params: ct
                     .params
@@ -21319,6 +21358,7 @@ impl TypeChecker {
                     .call_signatures
                     .iter()
                     .map(|cs| FunctionType {
+                        source: cs.source.clone(),
                         type_param_constraints: cs
                             .type_param_constraints
                             .iter()
@@ -21351,6 +21391,7 @@ impl TypeChecker {
                     .construct_signatures
                     .iter()
                     .map(|cs| ConstructorType {
+                        source: cs.source.clone(),
                         is_abstract: cs.is_abstract,
                         params: cs
                             .params
@@ -21388,6 +21429,7 @@ impl TypeChecker {
                 index_signature_name: info.index_signature_name.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
+                node_method_names: info.node_method_names.clone(),
             })),
             Type::Optional(inner) => {
                 Type::Optional(Arc::new(Self::substitute_this(inner, receiver)))
@@ -21453,6 +21495,7 @@ impl TypeChecker {
                     .collect();
                 let new_ret = Self::rewrite_type_param_refs(&ft.return_type, &scoped_params);
                 Type::Function(FunctionType {
+                    source: ft.source.clone(),
                     type_param_constraints: ft
                         .type_param_constraints
                         .iter()
@@ -21484,6 +21527,7 @@ impl TypeChecker {
                     .filter(|name| !ct.type_params.iter().any(|bound| bound.as_str() == *name))
                     .collect();
                 Type::Constructor(ConstructorType {
+                    source: ct.source.clone(),
                     is_abstract: ct.is_abstract,
                     params: ct
                         .params
@@ -21543,6 +21587,7 @@ impl TypeChecker {
                             })
                             .collect();
                         FunctionType {
+                            source: cs.source.clone(),
                             type_param_constraints: cs
                                 .type_param_constraints
                                 .iter()
@@ -21589,6 +21634,7 @@ impl TypeChecker {
                             })
                             .collect();
                         ConstructorType {
+                            source: cs.source.clone(),
                             is_abstract: cs.is_abstract,
                             params: cs
                                 .params
@@ -21632,6 +21678,7 @@ impl TypeChecker {
                 index_signature_name: info.index_signature_name.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
+                node_method_names: info.node_method_names.clone(),
             })),
             Type::Conditional {
                 check,
@@ -22288,6 +22335,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         })))
     }
 
@@ -22702,6 +22750,7 @@ impl TypeChecker {
                     index_signature_name: info.index_signature_name.clone(),
                     readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
+                    node_method_names: info.node_method_names.clone(),
                 }))
             }
             // Keyof: simplify the inner and, if it became a concrete
@@ -22870,6 +22919,7 @@ impl TypeChecker {
                 None => Vec::new(),
             };
             Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                node_method_names: info.node_method_names.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info
                     .method_names
@@ -23162,8 +23212,10 @@ impl TypeChecker {
                 index_signature_name: info.index_signature_name.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
+                node_method_names: info.node_method_names.clone(),
             })),
             Type::Constructor(constructor) => Type::Constructor(ConstructorType {
+                source: constructor.source.clone(),
                 is_abstract: constructor.is_abstract,
                 params: constructor
                     .params
@@ -23433,6 +23485,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
+                    node_method_names: Vec::new(),
                 })))
             }
             _ => None,
@@ -23461,6 +23514,7 @@ impl TypeChecker {
                 .map(|name| (name.clone(), Type::Any))
                 .collect();
             let erased = ConstructorType {
+                source: source.source.clone(),
                 params: source
                     .params
                     .iter()
@@ -23534,11 +23588,13 @@ impl TypeChecker {
                 )
             };
         let source_shape = ConstructorType {
+            source: Default::default(),
             params: source_params,
             return_type: Arc::new(source_return),
             ..source.clone()
         };
         let target_shape = ConstructorType {
+            source: Default::default(),
             params: target_params,
             return_type: Arc::new(target_return),
             ..target.clone()
@@ -24004,6 +24060,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
+                    node_method_names: Vec::new(),
                 }));
                 return self.is_assignable_to(&surface, target);
             }
@@ -26197,6 +26254,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         })))
     }
 
@@ -26240,6 +26298,7 @@ impl TypeChecker {
                         index_signature_name: None,
                         readonly_names: Vec::new(),
                         method_names: Vec::new(),
+                        node_method_names: Vec::new(),
                     })));
                 }
             }
@@ -33711,6 +33770,7 @@ impl TypeChecker {
                     } else {
                         let as_function = |sig: &ConstructorType| {
                             Type::Function(FunctionType {
+                                source: sig.source.clone(),
                                 type_param_constraints: sig.type_param_constraints.clone(),
                                 params: sig.params.clone(),
                                 return_type: sig.return_type.clone(),
@@ -42400,6 +42460,7 @@ impl TypeChecker {
                 index_signature_name: info.index_signature_name.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
+                node_method_names: info.node_method_names.clone(),
             })),
             Type::Union(members) => Type::flatten_union(members.iter().map(widen_leaf).collect()),
             other => other.clone(),
@@ -42699,6 +42760,7 @@ impl TypeChecker {
     fn erase_inferred_unique_symbols(ty: &Type) -> Type {
         fn erase_function(function: &FunctionType) -> FunctionType {
             FunctionType {
+                source: function.source.clone(),
                 type_param_constraints: function.type_param_constraints.clone(),
                 params: function.params.clone(),
                 return_type: Arc::new(TypeChecker::erase_inferred_unique_symbols(
@@ -42711,6 +42773,7 @@ impl TypeChecker {
         }
         fn erase_constructor(constructor: &ConstructorType) -> ConstructorType {
             ConstructorType {
+                source: constructor.source.clone(),
                 is_abstract: constructor.is_abstract,
                 params: constructor.params.clone(),
                 return_type: Arc::new(TypeChecker::erase_inferred_unique_symbols(
@@ -42751,6 +42814,7 @@ impl TypeChecker {
                 index_signature_name: info.index_signature_name.clone(),
                 readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
+                node_method_names: info.node_method_names.clone(),
             })),
             Type::Function(function) => Type::Function(erase_function(function)),
             Type::Array(element) => {
@@ -43160,6 +43224,7 @@ impl TypeChecker {
             index_signature_name: after.index_signature_name.clone(),
             readonly_names: after.readonly_names.clone(),
             method_names: after.method_names.clone(),
+            node_method_names: after.node_method_names.clone(),
         }))
     }
 
@@ -43199,6 +43264,7 @@ impl TypeChecker {
                     index_signature_name: info.index_signature_name.clone(),
                     readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
+                    node_method_names: info.node_method_names.clone(),
                 }))
             }
             Type::Array(elem) => Type::Array(Arc::new(Self::widen_nested_literals(elem))),
@@ -43239,6 +43305,7 @@ impl TypeChecker {
                     Self::widen_nested_literals(&ft.return_type)
                 };
                 Type::Function(FunctionType {
+                    source: ft.source.clone(),
                     type_param_constraints: ft.type_param_constraints.clone(),
                     params: ft.params.clone(),
                     return_type: Arc::new(widened_ret),
@@ -43284,6 +43351,7 @@ impl TypeChecker {
                     index_signature_name: info.index_signature_name.clone(),
                     readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
+                    node_method_names: info.node_method_names.clone(),
                 }))
             }
             Type::Union(members) => {
@@ -44023,6 +44091,7 @@ impl TypeChecker {
             .map(|name| (name.clone(), Type::Any))
             .collect();
         FunctionType {
+            source: ft.source.clone(),
             params: ft
                 .params
                 .iter()
@@ -44108,6 +44177,7 @@ impl TypeChecker {
         };
         let instantiate =
             |ft: &FunctionType, map: &HashMap<std::string::String, Type>| FunctionType {
+                source: ft.source.clone(),
                 params: ft
                     .params
                     .iter()
@@ -44312,6 +44382,7 @@ impl TypeChecker {
                 })
                 .collect();
             renamed = FunctionType {
+                source: ft.source.clone(),
                 type_param_constraints: ft
                     .type_param_constraints
                     .iter()
@@ -44348,6 +44419,7 @@ impl TypeChecker {
             &renamed
         };
         FunctionType {
+            source: ft.source.clone(),
             type_param_constraints: ft
                 .type_param_constraints
                 .iter()
@@ -44393,6 +44465,7 @@ impl TypeChecker {
             map
         };
         ConstructorType {
+            source: constructor.source.clone(),
             is_abstract: constructor.is_abstract,
             params: constructor
                 .params
@@ -44470,6 +44543,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
+                    node_method_names: Vec::new(),
                 }))
             }
             Type::TypeReference(name, args) => Type::TypeReference(
@@ -45751,6 +45825,7 @@ mod tests {
     #[test]
     fn test_display_function() {
         let ty = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("x".to_string(), Type::Number)],
             return_type: Arc::new(Type::String),
             type_params: Vec::new(),
@@ -47632,6 +47707,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("T".to_string(), Type::Number);
         let ft = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("x".to_string(), Type::TypeParameter("T".to_string()))],
             return_type: Arc::new(Type::TypeParameter("T".to_string())),
             type_params: vec!["T".to_string()],
@@ -47666,6 +47742,7 @@ mod tests {
         let mut map2 = HashMap::new();
         map2.insert("U".to_string(), Type::Boolean);
         let ft2 = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("x".to_string(), Type::TypeParameter("U".to_string()))],
             return_type: Arc::new(Type::TypeParameter("T".to_string())),
             type_params: vec!["T".to_string()],
@@ -47809,6 +47886,7 @@ mod tests {
     #[test]
     fn test_inference_does_not_pair_different_type_reference_wrappers() {
         let callback_arg = Type::Function(FunctionType {
+            source: Default::default(),
             params: Vec::new(),
             return_type: Arc::new(Type::Union(
                 vec![
@@ -47823,6 +47901,7 @@ mod tests {
             type_predicate: None,
         });
         let callback_param = Type::Function(FunctionType {
+            source: Default::default(),
             params: Vec::new(),
             return_type: Arc::new(Type::Union(
                 vec![
@@ -47857,6 +47936,7 @@ mod tests {
         );
 
         let promised_callback_arg = Type::Function(FunctionType {
+            source: Default::default(),
             params: Vec::new(),
             return_type: Arc::new(Type::Union(
                 vec![
@@ -47947,6 +48027,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }))
     }
 
@@ -48095,6 +48176,7 @@ mod tests {
         let mut args = HashMap::new();
         args.insert("T".to_string(), Type::Number);
         let ft = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("x".to_string(), Type::TypeParameter("T".to_string()))],
             return_type: Arc::new(Type::TypeParameter("T".to_string())),
             type_params: vec![],
@@ -48350,6 +48432,7 @@ mod tests {
         // ReturnType<T> = T extends (...args: any[]) => infer R ? R : any
         let check = Type::TypeParameter("T".to_string());
         let extends = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("args".to_string(), Type::Any)],
             return_type: Arc::new(Type::Infer("R".to_string())),
             type_params: vec![],
@@ -48362,6 +48445,7 @@ mod tests {
         let false_type = Type::Any;
 
         let source_fn = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("x".to_string(), Type::Number)],
             return_type: Arc::new(Type::String),
             type_params: vec![],
@@ -48386,6 +48470,7 @@ mod tests {
         // Parameters<T> = T extends (...args: infer P) => any ? P : never
         let check = Type::TypeParameter("T".to_string());
         let extends = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("args".to_string(), Type::Infer("P".to_string()))],
             return_type: Arc::new(Type::Any),
             type_params: vec![],
@@ -48398,6 +48483,7 @@ mod tests {
         let false_type = Type::Never;
 
         let source_fn = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![
                 ("a".to_string(), Type::Number),
                 ("b".to_string(), Type::String),
@@ -48489,6 +48575,7 @@ mod tests {
         // with T = number (not a function)
         let check = Type::TypeParameter("T".to_string());
         let extends = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("args".to_string(), Type::Any)],
             return_type: Arc::new(Type::Infer("R".to_string())),
             type_params: vec![],

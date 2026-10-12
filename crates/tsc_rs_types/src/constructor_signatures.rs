@@ -120,6 +120,7 @@ impl TypeChecker {
             parameters
                 .into_iter()
                 .map(|params| ConstructorType {
+                    source: Default::default(),
                     is_abstract: own.is_abstract,
                     params,
                     return_type: return_type.clone(),

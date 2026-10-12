@@ -6730,7 +6730,9 @@ impl BaselineRunner {
                             | tsc_rs_types::TypeSpanKind::BindingPattern
                     )
                 })
-                .map(|(&(start, end), entry)| (start, end, entry.type_string.clone()))
+                .map(|(&(start, end), entry)| {
+                    (start, end, entry.node_text.clone(), entry.underline.clone())
+                })
                 .collect();
             let tokens = tsc_rs_scanner::Scanner::new(&file.content).scan_all();
             for (&start, ty) in &check_output.expression_types {
@@ -6738,31 +6740,38 @@ impl BaselineRunner {
                     continue;
                 }
                 if let Ok(index) = tokens.binary_search_by_key(&start, |token| token.span.start) {
-                    entries.push((start, tokens[index].span.end, ty.clone()));
+                    entries.push((
+                        start,
+                        tokens[index].span.end,
+                        ty.clone(),
+                        "^".repeat(ty.encode_utf16().count()),
+                    ));
                 }
             }
-            entries.sort_by_key(|&(start, end, _)| (start, std::cmp::Reverse(end)));
-            let mut types_by_line: std::collections::BTreeMap<usize, Vec<(String, String)>> =
-                std::collections::BTreeMap::new();
-            for (start, end, ty) in entries {
+            entries.sort_by_key(|&(start, end, _, _)| (start, std::cmp::Reverse(end)));
+            let mut types_by_line: std::collections::BTreeMap<
+                usize,
+                Vec<(String, String, String)>,
+            > = std::collections::BTreeMap::new();
+            for (start, end, ty, underline) in entries {
                 let line = line_index_from_starts(&line_starts, start as usize);
                 let text = file
                     .content
                     .get(start as usize..end as usize)
                     .expect("checked expression span must lie within the source");
-                types_by_line
-                    .entry(line)
-                    .or_default()
-                    .push((text.replace(['\r', '\n'], ""), ty));
+                types_by_line.entry(line).or_default().push((
+                    text.replace(['\r', '\n'], ""),
+                    ty,
+                    underline,
+                ));
             }
 
             let mut annotations = Vec::new();
             for (line, entries) in types_by_line {
-                for (expr_text, type_str) in entries {
+                for (expr_text, type_str, carets) in entries {
                     let mut annotation = format!(">{} : {}\n", expr_text, type_str);
                     // Caret line
                     let prefix_len = expr_text.encode_utf16().count();
-                    let carets = "^".repeat(type_str.encode_utf16().count());
                     annotation.push_str(&format!(">{} : {}\n", " ".repeat(prefix_len), carets));
                     annotations.push((line, annotation));
                 }

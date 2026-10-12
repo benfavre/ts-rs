@@ -330,7 +330,7 @@ impl TypeChecker {
                     .map(|params| params.iter().map(|param| param.name.clone()).collect())
                     .unwrap_or_default();
                 self.enter_type_resolution_type_params(type_params.iter());
-                let params = fn_type
+                let params: Vec<_> = fn_type
                     .params
                     .iter()
                     .map(|p| {
@@ -359,6 +359,13 @@ impl TypeChecker {
                 let ret = self.resolve_type_node(&fn_type.return_type);
                 let fn_type_pred = self.extract_type_predicate(&fn_type.return_type);
                 let function = Type::Function(FunctionType {
+                    source: self.signature_source(
+                        &fn_type.params,
+                        &params,
+                        fn_type.type_params.as_deref(),
+                        Some(&fn_type.return_type),
+                        &ret,
+                    ),
                     type_param_constraints: self
                         .resolve_type_param_constraints(fn_type.type_params.as_deref()),
                     params,
@@ -378,7 +385,7 @@ impl TypeChecker {
                     .map(|params| params.iter().map(|param| param.name.clone()).collect())
                     .unwrap_or_default();
                 self.enter_type_resolution_type_params(type_params.iter());
-                let params = fn_type
+                let params: Vec<_> = fn_type
                     .params
                     .iter()
                     .map(|p| {
@@ -406,6 +413,13 @@ impl TypeChecker {
                     .collect();
                 let ret = self.resolve_type_node(&fn_type.return_type);
                 let constructor = Type::Constructor(ConstructorType {
+                    source: self.signature_source(
+                        &fn_type.params,
+                        &params,
+                        fn_type.type_params.as_deref(),
+                        Some(&fn_type.return_type),
+                        &ret,
+                    ),
                     is_abstract: fn_type.is_abstract,
                     params,
                     return_type: Arc::new(ret),
@@ -508,6 +522,13 @@ impl TypeChecker {
                             // never inferred NewI and returned an
                             // unsubstituted reference.
                             let ft = FunctionType {
+                                source: self.signature_source(
+                                    &method.params,
+                                    &params,
+                                    method.type_params.as_deref(),
+                                    method.return_type.as_ref(),
+                                    &ret,
+                                ),
                                 type_param_constraints: self
                                     .resolve_type_param_constraints(method.type_params.as_deref()),
                                 params: params.clone(),
@@ -569,6 +590,13 @@ impl TypeChecker {
                                 .map(|t| self.resolve_type_node(t))
                                 .unwrap_or(Type::Any);
                             let function = FunctionType {
+                                source: self.signature_source(
+                                    &cs.params,
+                                    &params,
+                                    cs.type_params.as_deref(),
+                                    cs.return_type.as_ref(),
+                                    &ret,
+                                ),
                                 type_param_constraints: self
                                     .resolve_type_param_constraints(cs.type_params.as_deref()),
                                 params,
@@ -634,6 +662,13 @@ impl TypeChecker {
                                 })
                                 .unwrap_or_default();
                             let constructor = ConstructorType {
+                                source: self.signature_source(
+                                    &cs.params,
+                                    &params,
+                                    cs.type_params.as_deref(),
+                                    cs.return_type.as_ref(),
+                                    &ret,
+                                ),
                                 is_abstract: false,
                                 params,
                                 return_type: Arc::new(ret),
@@ -710,6 +745,7 @@ impl TypeChecker {
                     index_signature_name: index_sig_name,
                     readonly_names,
                     method_names,
+                    node_method_names: Vec::new(),
                 }));
                 self.record_type_literal_member_locations(&ty, members);
                 ty
@@ -1822,6 +1858,13 @@ impl TypeChecker {
         let type_param_constraints =
             self.resolve_type_param_constraints(fn_decl.type_params.as_deref());
         FunctionType {
+            source: self.signature_source(
+                &fn_decl.params,
+                &params,
+                fn_decl.type_params.as_deref(),
+                fn_decl.return_type.as_ref(),
+                &ret,
+            ),
             type_param_constraints,
             params,
             return_type: Arc::new(ret),
@@ -1914,7 +1957,7 @@ impl TypeChecker {
         &self,
         sig: &tsc_rs_symbols::OverloadSignature,
     ) -> FunctionType {
-        let params = sig
+        let params: Vec<_> = sig
             .params
             .iter()
             .map(|p| {
@@ -1951,6 +1994,7 @@ impl TypeChecker {
             })
             .collect();
         FunctionType {
+            source: self.overload_signature_source(sig, &params, &ret),
             type_param_constraints: Vec::new(),
             params,
             return_type: Arc::new(ret),
@@ -2342,6 +2386,13 @@ impl TypeChecker {
                             properties.push((
                                 name,
                                 Arc::new(Type::Function(FunctionType {
+                                    source: self.signature_source(
+                                        &m.params,
+                                        &params,
+                                        m.type_params.as_deref(),
+                                        m.return_type.as_ref(),
+                                        &ret,
+                                    ),
                                     type_param_constraints: Vec::new(),
                                     params,
                                     return_type: Arc::new(ret),
@@ -2376,6 +2427,7 @@ impl TypeChecker {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names,
+                    node_method_names: Vec::new(),
                 }))
             }
             ExprKind::Ident(name) => crate::infer_param_binding(name)
@@ -2387,7 +2439,7 @@ impl TypeChecker {
                 Arc::from([]),
             ),
             ExprKind::Arrow(arrow) => {
-                let params = arrow
+                let params: Vec<_> = arrow
                     .params
                     .iter()
                     .map(|p| {
@@ -2440,6 +2492,13 @@ impl TypeChecker {
                     .map(|tps| tps.iter().map(|tp| tp.name.clone()).collect())
                     .unwrap_or_default();
                 Type::Function(FunctionType {
+                    source: self.signature_source(
+                        &arrow.params,
+                        &params,
+                        arrow.type_params.as_deref(),
+                        arrow.return_type.as_ref(),
+                        &ret,
+                    ),
                     type_param_constraints: Vec::new(),
                     params,
                     return_type: Arc::new(ret),
@@ -3393,6 +3452,7 @@ pub(crate) fn implied_binding_pattern_type(pattern: &Pat) -> Option<Type> {
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
+                    node_method_names: Vec::new(),
                 })))
             }
             _ => None,

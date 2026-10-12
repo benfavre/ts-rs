@@ -948,6 +948,13 @@ impl TypeChecker {
                             }
                         });
                     let mut ft = FunctionType {
+                        source: self.signature_source(
+                            &method.params,
+                            &params,
+                            method.type_params.as_deref(),
+                            method.return_type.as_ref(),
+                            &ret,
+                        ),
                         type_param_constraints: Vec::new(),
                         params,
                         return_type: Arc::new(ret),
@@ -1372,6 +1379,13 @@ impl TypeChecker {
                         .map(|t| self.resolve_type_node(t))
                         .unwrap_or(Type::Any);
                     let ft = FunctionType {
+                        source: self.signature_source(
+                            &method.params,
+                            &params,
+                            method.type_params.as_deref(),
+                            method.return_type.as_ref(),
+                            &ret,
+                        ),
                         type_param_constraints: method
                             .type_params
                             .as_deref()
@@ -1433,6 +1447,13 @@ impl TypeChecker {
                         .map(|t| self.resolve_type_node(t))
                         .unwrap_or(Type::Void);
                     let ft = FunctionType {
+                        source: self.signature_source(
+                            &cs.params,
+                            &params,
+                            cs.type_params.as_deref(),
+                            cs.return_type.as_ref(),
+                            &ret,
+                        ),
                         type_param_constraints: Vec::new(),
                         params,
                         return_type: Arc::new(ret),
@@ -1450,7 +1471,7 @@ impl TypeChecker {
                         .map(|params| params.iter().map(|param| param.name.clone()).collect())
                         .unwrap_or_default();
                     self.enter_type_resolution_type_params(type_params.iter());
-                    let params = signature
+                    let params: Vec<_> = signature
                         .params
                         .iter()
                         .map(|parameter| {
@@ -1494,6 +1515,13 @@ impl TypeChecker {
                         })
                         .unwrap_or_default();
                     let constructor = ConstructorType {
+                        source: self.signature_source(
+                            &signature.params,
+                            &params,
+                            signature.type_params.as_deref(),
+                            signature.return_type.as_ref(),
+                            &return_type,
+                        ),
                         is_abstract: false,
                         params,
                         return_type: Arc::new(return_type),
@@ -1626,6 +1654,7 @@ impl TypeChecker {
                 .unwrap_or_default(),
             is_global: !self.file_is_module_flag,
             object_type: ObjectTypeInfo::new(ObjectTypeData {
+                node_method_names: Vec::new(),
                 properties: props,
                 call_signatures: call_sigs,
                 construct_signatures: construct_sigs,
@@ -3067,6 +3096,7 @@ impl TypeChecker {
                         index_signature_name: iface.object_type.index_signature_name.clone(),
                         readonly_names: Vec::new(),
                         method_names,
+                        node_method_names: Vec::new(),
                     }));
                 }
                 return Type::TypeReference(class_name.to_string(), Arc::from([] as [Type; 0]));
@@ -3183,6 +3213,7 @@ impl TypeChecker {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names,
+            node_method_names: Vec::new(),
         }))
     }
 

@@ -771,6 +771,7 @@ impl TypeChecker {
 
 fn heritage_signatures(ty: &Type, construct: bool) -> Option<Vec<ConstructorType>> {
     let from_function = |signature: &FunctionType| ConstructorType {
+        source: signature.source.clone(),
         is_abstract: false,
         params: signature.params.clone(),
         return_type: Arc::clone(&signature.return_type),

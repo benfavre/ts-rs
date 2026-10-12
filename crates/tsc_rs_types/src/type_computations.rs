@@ -63,6 +63,7 @@ pub(crate) fn substitute_inner(ty: &Type, type_args: &HashMap<std::string::Strin
                 is_asserts: pred.is_asserts,
             });
             Type::Function(FunctionType {
+                source: ft.source.clone(),
                 type_param_constraints: ft
                     .type_param_constraints
                     .iter()
@@ -85,6 +86,7 @@ pub(crate) fn substitute_inner(ty: &Type, type_args: &HashMap<std::string::Strin
                 inner_args.remove(parameter);
             }
             Type::Constructor(ConstructorType {
+                source: constructor.source.clone(),
                 is_abstract: constructor.is_abstract,
                 params: constructor
                     .params
@@ -115,6 +117,7 @@ pub(crate) fn substitute_inner(ty: &Type, type_args: &HashMap<std::string::Strin
                 .call_signatures
                 .iter()
                 .map(|cs| FunctionType {
+                    source: cs.source.clone(),
                     type_param_constraints: cs
                         .type_param_constraints
                         .iter()
@@ -163,6 +166,7 @@ pub(crate) fn substitute_inner(ty: &Type, type_args: &HashMap<std::string::Strin
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }))
         }
         Type::Conditional {
@@ -1004,6 +1008,7 @@ pub(crate) fn evaluate_mapped_type_inner(
         index_signature_name: None,
         readonly_names: Vec::new(),
         method_names: Vec::new(),
+        node_method_names: Vec::new(),
     }))
 }
 
@@ -1106,6 +1111,7 @@ pub(crate) fn resolve_type_level_computation_inner(
                 inner_args.remove(parameter);
             }
             Type::Constructor(ConstructorType {
+                source: constructor.source.clone(),
                 is_abstract: constructor.is_abstract,
                 params: constructor
                     .params
@@ -1165,6 +1171,7 @@ mod tests {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }))]
             .into(),
         );
@@ -1201,6 +1208,7 @@ mod tests {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }))]
             .into(),
         );
@@ -1220,6 +1228,7 @@ mod tests {
     #[test]
     fn infer_constructor_parameter_tuple() {
         let source = Type::Constructor(ConstructorType {
+            source: Default::default(),
             is_abstract: false,
             params: vec![
                 ("value".into(), Type::String),
@@ -1231,6 +1240,7 @@ mod tests {
             type_param_defaults: Vec::new(),
         });
         let pattern = Type::Constructor(ConstructorType {
+            source: Default::default(),
             is_abstract: true,
             params: vec![("...args".into(), Type::Infer("P".into()))],
             return_type: Arc::new(Type::Any),

@@ -135,6 +135,7 @@ impl TypeChecker {
                 let mut source = source.clone();
                 if !source.type_params.is_empty() && target.type_params.is_empty() {
                     let signature = FunctionType {
+                        source: source.source.clone(),
                         type_params: source.type_params.clone(),
                         type_param_constraints: source.type_param_constraints.clone(),
                         type_param_defaults: source.type_param_defaults.clone(),

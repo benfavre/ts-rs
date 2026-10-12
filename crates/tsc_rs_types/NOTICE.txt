@@ -26,3 +26,18 @@ relater_p1.rs elaborateArrayLiteral / elaborateElement.
 The license texts are retained in licenses/ts-rust-MIT.txt and
 licenses/TypeScript-Apache-2.0.txt. Other original code in this crate
 remains under the repository's MIT license.
+
+Source-aware signature type-node serialization
+
+src/type_nodes.rs adapts parameterToParameterDeclarationName,
+typeToTypeNodeHelperWithPossibleReusableTypeNode,
+typeParameterToDeclarationWithConstraint and signatureToSignatureDeclarationHelper
+from the same pingdotgg/ts-rust commit (nodebuilder_impl_p2.rs), derived from
+Microsoft TypeScript nodebuilderimpl.go. The copyright holders and MIT / Apache
+License, Version 2.0 terms above also apply to these adaptations.
+
+Changes made here: source metadata is attached to the native signatures and
+excluded from structural equality and hashing; unchanged annotations are
+serialized from the native AST. Generic substitutions retain the declaration
+provenance, while changed types are synthesized. An opt-in dual text writer
+records UTF-16 synthetic-node underlining independently of hover formatting.

@@ -541,6 +541,7 @@ fn assign_inner(
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
+                    node_method_names: Vec::new(),
                 }));
             return assign_to_object(target_obj, target, &source_object, opts, dejavu);
         }
@@ -1372,6 +1373,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         let obj2 = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![("y".into(), Arc::new(Type::String))],
@@ -1381,6 +1383,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         let target = Type::Intersection(vec![obj1.clone(), obj2.clone()].into());
         let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
@@ -1394,6 +1397,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         assert!(is_assignable(&target, &source));
     }
@@ -1434,6 +1438,7 @@ mod tests {
     #[test]
     fn function_covariant_return() {
         let target = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![],
             return_type: Arc::new(Type::String),
             type_params: vec![],
@@ -1442,6 +1447,7 @@ mod tests {
             type_predicate: None,
         });
         let source = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![],
             return_type: Arc::new(Type::StringLiteral("x".into())),
             type_params: vec![],
@@ -1457,6 +1463,7 @@ mod tests {
         // target: (x: string) => void
         // source: (x: any) => void    -- any is wider, so it's fine
         let target = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("x".into(), Type::String)],
             return_type: Arc::new(Type::Void),
             type_params: vec![],
@@ -1465,6 +1472,7 @@ mod tests {
             type_predicate: None,
         });
         let source = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("x".into(), Type::Any)],
             return_type: Arc::new(Type::Void),
             type_params: vec![],
@@ -1479,6 +1487,7 @@ mod tests {
     fn function_fewer_params_ok() {
         // TypeScript allows callbacks with fewer params.
         let target = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("a".into(), Type::String), ("b".into(), Type::Number)],
             return_type: Arc::new(Type::Void),
             type_params: vec![],
@@ -1487,6 +1496,7 @@ mod tests {
             type_predicate: None,
         });
         let source = Type::Function(FunctionType {
+            source: Default::default(),
             params: vec![("a".into(), Type::String)],
             return_type: Arc::new(Type::Void),
             type_params: vec![],
@@ -1507,6 +1517,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![
@@ -1519,6 +1530,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         assert!(is_assignable(&target, &source));
     }
@@ -1536,6 +1548,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
             properties: vec![("name".into(), Arc::new(Type::String))],
@@ -1545,6 +1558,7 @@ mod tests {
             index_signature_name: None,
             readonly_names: Vec::new(),
             method_names: Vec::new(),
+            node_method_names: Vec::new(),
         }));
         assert!(!is_assignable(&target, &source));
     }

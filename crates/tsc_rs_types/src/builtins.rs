@@ -15,6 +15,7 @@ pub(crate) struct BuiltinTypes {
 
 fn builtin_method(params: &[(&str, Type)], ret: Type) -> Type {
     Type::Function(FunctionType {
+        source: Default::default(),
         type_param_constraints: Vec::new(),
         params: params
             .iter()
@@ -100,6 +101,7 @@ pub(crate) fn legacy_decorator(name: &str) -> Option<Type> {
     };
     Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
         call_signatures: vec![FunctionType {
+            source: Default::default(),
             params: params
                 .into_iter()
                 .map(|(name, ty)| (name.into(), ty))
@@ -273,6 +275,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -301,6 +304,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -317,6 +321,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -330,10 +335,12 @@ impl BuiltinTypes {
                     bprop(
                         "map",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "callbackfn".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![
                                         ("value".to_string(), Type::Any),
@@ -355,10 +362,12 @@ impl BuiltinTypes {
                     bprop(
                         "filter",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "predicate".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![
                                         ("value".to_string(), Type::Any),
@@ -387,10 +396,12 @@ impl BuiltinTypes {
                     bprop(
                         "forEach",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "callbackfn".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![
                                         ("value".to_string(), Type::Any),
@@ -412,10 +423,12 @@ impl BuiltinTypes {
                     bprop(
                         "find",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "predicate".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![("value".to_string(), Type::Any)],
                                     return_type: Arc::new(Type::Unknown),
@@ -434,10 +447,12 @@ impl BuiltinTypes {
                     bprop(
                         "findIndex",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "predicate".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![("value".to_string(), Type::Any)],
                                     return_type: Arc::new(Type::Unknown),
@@ -494,10 +509,12 @@ impl BuiltinTypes {
                     bprop(
                         "some",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "predicate".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![("value".to_string(), Type::Any)],
                                     return_type: Arc::new(Type::Unknown),
@@ -516,10 +533,12 @@ impl BuiltinTypes {
                     bprop(
                         "every",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "predicate".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![("value".to_string(), Type::Any)],
                                     return_type: Arc::new(Type::Unknown),
@@ -542,10 +561,12 @@ impl BuiltinTypes {
                     bprop(
                         "flatMap",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "callback".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![("value".to_string(), Type::Any)],
                                     // U | ReadonlyArray<U> accepts scalar and readonly results alike.
@@ -569,6 +590,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -579,10 +601,12 @@ impl BuiltinTypes {
                     bprop(
                         "then",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "onfulfilled".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![("value".to_string(), Type::Any)],
                                     return_type: Arc::new(Type::Any),
@@ -604,10 +628,12 @@ impl BuiltinTypes {
                     bprop(
                         "catch",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "onrejected".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![("reason".to_string(), Type::Any)],
                                     return_type: Arc::new(Type::Any),
@@ -629,10 +655,12 @@ impl BuiltinTypes {
                     bprop(
                         "finally",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "onfinally".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: Vec::new(),
                                     return_type: Arc::new(Type::Void),
@@ -658,6 +686,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -683,10 +712,12 @@ impl BuiltinTypes {
                     bprop(
                         "forEach",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "callbackfn".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![
                                         ("value".to_string(), Type::Any),
@@ -712,6 +743,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -736,10 +768,12 @@ impl BuiltinTypes {
                     bprop(
                         "forEach",
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![(
                                 "callbackfn".to_string(),
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: vec![("value".to_string(), Type::Any)],
                                     return_type: Arc::new(Type::Void),
@@ -762,6 +796,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -801,6 +836,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -822,6 +858,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -842,6 +879,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -873,6 +911,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -985,6 +1024,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             })),
         );
 
@@ -1007,6 +1047,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             })),
         );
 
@@ -1042,6 +1083,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             })),
         );
 
@@ -1119,6 +1161,7 @@ impl BuiltinTypes {
                 ],
                 call_signatures: Vec::new(),
                 construct_signatures: vec![crate::ConstructorType {
+                    source: Default::default(),
                     is_abstract: false,
                     params: vec![("?value".to_string(), Type::Any)],
                     return_type: Arc::new(Type::TypeReference(
@@ -1133,6 +1176,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
         static_members.insert(
@@ -1155,6 +1199,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
         static_members.insert(
@@ -1193,6 +1238,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
         static_members.insert(
@@ -1248,6 +1294,7 @@ impl BuiltinTypes {
                             &[(
                                 "callbackfn",
                                 Type::Function(FunctionType {
+                                    source: Default::default(),
                                     type_param_constraints: Vec::new(),
                                     params: Vec::new(),
                                     return_type: Arc::new(Type::Any),
@@ -1266,6 +1313,7 @@ impl BuiltinTypes {
                 index_signature_name: None,
                 readonly_names: Vec::new(),
                 method_names: Vec::new(),
+                node_method_names: Vec::new(),
             }),
         );
 
@@ -1320,10 +1368,12 @@ impl BuiltinTypes {
         };
         let callback = |ret: Type| -> Type {
             Type::Function(FunctionType {
+                source: Default::default(),
                 type_param_constraints: Vec::new(),
                 params: vec![(
                     "callbackfn".to_string(),
                     Type::Function(FunctionType {
+                        source: Default::default(),
                         type_param_constraints: Vec::new(),
                         params: callback_params(),
                         return_type: Arc::new(ret),
@@ -1343,10 +1393,12 @@ impl BuiltinTypes {
             "length" => Some(Type::Number),
             // Methods with elem-typed callbacks
             "forEach" => Some(Type::Function(FunctionType {
+                source: Default::default(),
                 type_param_constraints: Vec::new(),
                 params: vec![(
                     "callbackfn".to_string(),
                     Type::Function(FunctionType {
+                        source: Default::default(),
                         type_param_constraints: Vec::new(),
                         params: callback_params(),
                         return_type: Arc::new(Type::Void),
@@ -1362,10 +1414,12 @@ impl BuiltinTypes {
             })),
             "map" => Some(callback(Type::Any)),
             "filter" => Some(Type::Function(FunctionType {
+                source: Default::default(),
                 type_param_constraints: Vec::new(),
                 params: vec![(
                     "predicate".to_string(),
                     Type::Function(FunctionType {
+                        source: Default::default(),
                         type_param_constraints: Vec::new(),
                         params: callback_params(),
                         return_type: Arc::new(Type::Unknown),
@@ -1380,10 +1434,12 @@ impl BuiltinTypes {
                 type_predicate: None,
             })),
             "find" | "findLast" => Some(Type::Function(FunctionType {
+                source: Default::default(),
                 type_param_constraints: Vec::new(),
                 params: vec![(
                     "predicate".to_string(),
                     Type::Function(FunctionType {
+                        source: Default::default(),
                         type_param_constraints: Vec::new(),
                         params: callback_params(),
                         return_type: Arc::new(Type::Unknown),
@@ -1398,10 +1454,12 @@ impl BuiltinTypes {
                 type_predicate: None,
             })),
             "findIndex" | "findLastIndex" => Some(Type::Function(FunctionType {
+                source: Default::default(),
                 type_param_constraints: Vec::new(),
                 params: vec![(
                     "predicate".to_string(),
                     Type::Function(FunctionType {
+                        source: Default::default(),
                         type_param_constraints: Vec::new(),
                         params: callback_params(),
                         return_type: Arc::new(Type::Unknown),
@@ -1416,10 +1474,12 @@ impl BuiltinTypes {
                 type_predicate: None,
             })),
             "some" | "every" => Some(Type::Function(FunctionType {
+                source: Default::default(),
                 type_param_constraints: Vec::new(),
                 params: vec![(
                     "predicate".to_string(),
                     Type::Function(FunctionType {
+                        source: Default::default(),
                         type_param_constraints: Vec::new(),
                         params: callback_params(),
                         return_type: Arc::new(Type::Unknown),
@@ -1434,11 +1494,13 @@ impl BuiltinTypes {
                 type_predicate: None,
             })),
             "reduce" => Some(Type::Function(FunctionType {
+                source: Default::default(),
                 type_param_constraints: Vec::new(),
                 params: vec![
                     (
                         "callbackfn".to_string(),
                         Type::Function(FunctionType {
+                            source: Default::default(),
                             type_param_constraints: Vec::new(),
                             params: vec![
                                 ("acc".to_string(), Type::Any),

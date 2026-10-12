@@ -181,6 +181,7 @@ impl TypeChecker {
             } else if !assignable {
                 let object = |ty: Type, method: bool| {
                     Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                        node_method_names: Vec::new(),
                         properties: vec![(name.clone(), Arc::new(ty))],
                         call_signatures: Vec::new(),
                         construct_signatures: Vec::new(),

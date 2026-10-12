@@ -1164,6 +1164,7 @@ impl TypeChecker {
             "undefined" => Type::Undefined,
             "object" => Type::Object,
             "function" => Type::Function(FunctionType {
+                source: Default::default(),
                 type_param_constraints: Vec::new(),
                 params: Vec::new(),
                 return_type: Arc::new(Type::Any),

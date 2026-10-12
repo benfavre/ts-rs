@@ -351,6 +351,7 @@ impl TypeChecker {
             }
         }
         FunctionType {
+            source: signature.source.clone(),
             params: signature
                 .params
                 .iter()
@@ -437,6 +438,7 @@ impl TypeChecker {
             properties.push((
                 "[Symbol.hasInstance]".into(),
                 Arc::new(Type::Function(FunctionType {
+                    source: Default::default(),
                     params: vec![("value".into(), Type::Any)],
                     return_type: Arc::new(Type::Boolean),
                     type_params: vec![],
