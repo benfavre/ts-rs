@@ -5619,34 +5619,11 @@ impl TypeChecker {
                     } else {
                         self.check_expr(elem)
                     };
-                    let ty = if self.is_widening_literal_expression(elem) {
-                        let preserves_literal = elem_ctx
-                            .as_ref()
-                            .is_some_and(|context| self.literal_of_contextual_type(&ty, context));
-                        if preserves_literal
-                            || tuple_ctx.is_none()
-                                && elem_ctx.is_none()
-                                && matches!(ty, Type::BooleanLiteral(_))
-                        {
-                            ty
-                        } else {
-                            // Contextual checking already handled nested
-                            // object/array members. Only widen this element's
-                            // literal type; widening its properties again can
-                            // erase a null assignment error inside an object.
-                            match ty {
-                                Type::Union(members) => Type::flatten_union(
-                                    members
-                                        .iter()
-                                        .map(|member| self.widen_type(member))
-                                        .collect(),
-                                ),
-                                ty => self.widen_type(&ty),
-                            }
-                        }
-                    } else {
-                        ty
-                    };
+                    let ty = self.contextual_literal_type(
+                        ty,
+                        elem_ctx.as_ref(),
+                        self.is_widening_literal_expression(elem),
+                    );
                     checked_types.push(ty);
                 }
                 // Preserve the literal's positional shape under a tuple
@@ -10686,7 +10663,7 @@ impl TypeChecker {
                     let preserve_narrow = Self::is_const_assertion_expr(elem)
                         || !self.is_widening_literal_expression(elem);
                     let widened = if preserve_narrow {
-                        ty
+                        Self::widened_unique_symbol_type(ty)
                     } else {
                         self.widen_array_elem(&ty)
                     };

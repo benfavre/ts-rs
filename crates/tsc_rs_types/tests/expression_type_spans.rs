@@ -115,3 +115,31 @@ fn class_literal_and_computed_names_keep_complete_source_spans() {
     assert_eq!(entry(source, &result, "[Symbol.iterator]"), "() => void");
     assert_eq!(entry(source, &result, "value"), "number");
 }
+
+#[test]
+fn readonly_property_names_use_the_class_member_type() {
+    let source = "const FOO = 'FOO'; class Bar { readonly tag = FOO; value = FOO; static readonly code = 1; }";
+    let result = check(source, true);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(entry(source, &result, "tag"), "\"FOO\"");
+    assert_eq!(entry(source, &result, "value"), "string");
+    assert_eq!(entry(source, &result, "code"), "1");
+}
+
+#[test]
+fn alias_name_types_are_separate_from_expanded_hover_bodies() {
+    let source =
+        "type Choice = 'a' | 'b'; type List<T> = T[]; type Scalar = string; type Identity<T> = T;";
+    let result = check(source, true);
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(entry(source, &result, "Choice"), "Choice");
+    assert_eq!(entry(source, &result, "List"), "List<T>");
+    assert_eq!(entry(source, &result, "Scalar"), "string");
+    assert_eq!(entry(source, &result, "Identity"), "T");
+    let ordinary = check(source, false);
+    assert_eq!(ordinary.expression_types, result.expression_types);
+    assert_eq!(
+        result.expression_types[&(source.find("Choice").unwrap() as u32)],
+        "type_alias_body=\"a\" | \"b\""
+    );
+}

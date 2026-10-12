@@ -128,7 +128,7 @@ impl TypeChecker {
     /// its keys — `keyof typeof CODES` for a declared object const is a
     /// string-literal union, as tsc resolves it. Anything else
     /// stays an unevaluated `keyof`.
-    fn keyof_of(operand: Type) -> Type {
+    pub(super) fn keyof_of(operand: Type) -> Type {
         if matches!(
             operand,
             Type::Null | Type::Undefined | Type::Unknown | Type::Never

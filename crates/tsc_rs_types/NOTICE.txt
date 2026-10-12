@@ -1,0 +1,28 @@
+Contextual literal classification and widening
+
+src/contextual_literals.rs contains code adapted from pingdotgg/ts-rust,
+commit 22ae6fa87aed1d4bde7272ab68452fae1f928e4a (checker_p28.rs and checker_p30.rs).
+https://github.com/pingdotgg/ts-rust
+Copyright (c) 2026 T3 Tools Inc. Licensed under the MIT License.
+
+That code is a Rust port of the native TypeScript compiler,
+Microsoft TypeScript commit 673a5f17d713bdc8c7185f18a9c11e3c4ac5d781:
+checker.go isLiteralOfContextualType, maybeTypeOfKind,
+getWidenedLiteralType, getWidenedUniqueESSymbolType and
+getWidenedLiteralLikeTypeForContextualType.
+https://github.com/microsoft/TypeScript
+Copyright (c) Microsoft Corporation. Licensed under the Apache License, Version 2.0.
+
+Changes made here: native Type variants replace flags and arena IDs;
+aliases, enum members, boolean/optional wrappers and lexical constraints
+are resolved through adapters to the existing checker. Constraint cycles
+are detected and acyclic chains are preserved.
+Literal freshness comes from the native expression and binding metadata.
+Array initialization preserves the resulting regular element types;
+generic element diagnostics and unique-symbol array display are integrated
+with the native checker. The generic element guard follows
+relater_p1.rs elaborateArrayLiteral / elaborateElement.
+
+The license texts are retained in licenses/ts-rust-MIT.txt and
+licenses/TypeScript-Apache-2.0.txt. Other original code in this crate
+remains under the repository's MIT license.

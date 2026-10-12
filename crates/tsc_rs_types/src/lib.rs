@@ -16,6 +16,7 @@ mod check_expr;
 mod check_narrowing;
 mod check_uncalled;
 mod constructor_signatures;
+mod contextual_literals;
 pub mod control_flow;
 mod decorator_types;
 mod diagnostics;
@@ -1404,6 +1405,12 @@ impl Type {
                 buf.push('n');
             }
             Type::Array(elem) => {
+                if let Type::UniqueSymbol(name) = elem.as_ref() {
+                    buf.push_str("(typeof ");
+                    buf.push_str(TypeChecker::unique_symbol_display_name(name));
+                    buf.push_str(")[]");
+                    return;
+                }
                 // Parenthesize the element when its display string
                 // would otherwise be parsed at lower precedence than
                 // `T[]`. Unions, intersections, conditionals and
@@ -16032,20 +16039,20 @@ impl TypeChecker {
                             }
                             ClassMemberKind::Property(prop) => {
                                 let prop_name_span = prop.name.span();
-                                let ty = prop
-                                    .type_ann
-                                    .as_ref()
-                                    .map(|t| self.resolve_type_node(t))
-                                    .unwrap_or_else(|| {
-                                        prop.initializer
-                                            .as_ref()
-                                            .map(|init| {
-                                                Self::widen_nested_literals(
-                                                    &self.infer_expr_type(init),
-                                                )
-                                            })
-                                            .unwrap_or(Type::Any)
-                                    });
+                                // Use the member type computed for the class.
+                                // Re-inferring here widened readonly literals
+                                // and discarded unique-symbol identities.
+                                let property_name = self.prop_name_to_string(&prop.name);
+                                let properties = if prop.modifiers & MOD_STATIC != 0 {
+                                    &info.static_properties
+                                } else {
+                                    &info.instance_properties
+                                };
+                                let ty = properties
+                                    .iter()
+                                    .find(|(name, _)| name == &property_name)
+                                    .map(|(_, ty)| ty.clone())
+                                    .unwrap_or(Type::Any);
                                 // The parser can recover a statement keyword as an
                                 // empty property before the following declaration
                                 // (`var x` or `function f`). It is not a name node.
@@ -16256,6 +16263,30 @@ impl TypeChecker {
                 // reference. Falls through to the raw display when
                 // simplify can't make progress.
                 if let Some(name_span) = type_alias.name_span {
+                    // Alias hover stores the expanded body below. The name's
+                    // semantic type has a separate span so consumers do not
+                    // mistake that hover protocol for a TypeScript type.
+                    let declaration_type = match &resolved {
+                        Type::Union(_)
+                        | Type::Intersection(_)
+                        | Type::ObjectType(_)
+                        | Type::Array(_)
+                        | Type::Tuple(_)
+                        | Type::Function(_)
+                        | Type::Constructor(_)
+                        | Type::Mapped { .. }
+                        | Type::Conditional { .. }
+                        | Type::Readonly(_) => Type::TypeReference(
+                            type_alias.name.clone(),
+                            type_params
+                                .iter()
+                                .cloned()
+                                .map(Type::TypeParameter)
+                                .collect(),
+                        ),
+                        other => other.clone(),
+                    };
+                    self.record_expression_type_span(name_span, &declaration_type);
                     let displayed = if type_params.is_empty() {
                         // Non-generic alias: use display-mode simplifier
                         // (folds mapped types too) so
@@ -19079,7 +19110,11 @@ impl TypeChecker {
             let Some(target_elem) = element_target(index) else {
                 continue;
             };
-            if self.contains_unresolved_type_param(&target_elem) {
+            // A declared parameter is a real target. Upstream only skips
+            // deferred indexed accesses here, not every generic constituent.
+            let parameter_target = self.active_type_parameter_name(&target_elem).is_some()
+                || matches!(&target_elem, Type::Keyof(owner) if self.active_type_parameter_name(owner).is_some());
+            if self.contains_unresolved_type_param(&target_elem) && !parameter_target {
                 continue;
             }
             // The `undefined` identifier is the undefined type here.
@@ -19107,8 +19142,21 @@ impl TypeChecker {
                     continue;
                 }
             }
-            let display = self.elaboration_display_type(&source_elem, &target_elem);
+            let display = if parameter_target && self.is_widening_literal_expression(item) {
+                self.widened_literal_type(source_elem.clone())
+            } else {
+                self.elaboration_display_type(&source_elem, &target_elem)
+            };
             self.push_not_assignable(&display, &target_elem, item.span);
+            if let Some(keys) = self.contextual_key_constraint(&target_elem) {
+                if !self.is_assignable_to(&source_elem, &keys) {
+                    let reason = self.leaf_reason_text(&source_elem, &keys);
+                    if let Some(diagnostic) = self.diagnostics.last_mut() {
+                        diagnostic.message.push_str("\n  ");
+                        diagnostic.message.push_str(&reason.replace('\n', "\n  "));
+                    }
+                }
+            }
         }
         reported
     }
@@ -25206,6 +25254,26 @@ impl TypeChecker {
                 };
             }
         }
+        // A concrete key must be present for every instantiation of T. The
+        // constraint supplies those guaranteed keys; an unconstrained T has
+        // none. Abstract key-to-key relations are handled separately.
+        if let Type::Keyof(owner) = target {
+            if self.active_type_parameter_name(owner).is_some()
+                && matches!(
+                    source,
+                    Type::String
+                        | Type::Number
+                        | Type::Symbol
+                        | Type::StringLiteral(_)
+                        | Type::NumberLiteral(_)
+                        | Type::UniqueSymbol(_)
+                )
+            {
+                return self
+                    .contextual_key_constraint(target)
+                    .is_some_and(|keys| self.is_assignable_to(source, &keys));
+            }
+        }
         // Unresolved TypeReference, IndexedAccess, Keyof, Typeof, Conditional,
         // Mapped, TypeParameter, Infer: treat as compatible since we can't evaluate them.
         if matches!(
@@ -27634,10 +27702,15 @@ impl TypeChecker {
                         } else {
                             init_ty
                         };
-                        let init_ty = if decl
-                            .init
-                            .as_deref()
-                            .is_some_and(Self::is_const_assertion_expr)
+                        let init_ty = if (matches!(init_ty, Type::Array(_))
+                            && decl
+                                .init
+                                .as_deref()
+                                .is_some_and(Self::has_checked_array_elements))
+                            || decl
+                                .init
+                                .as_deref()
+                                .is_some_and(Self::is_const_assertion_expr)
                         {
                             init_ty
                         } else {
@@ -42415,73 +42488,6 @@ impl TypeChecker {
         }
     }
 
-    /// tsc isLiteralOfContextualType: a fresh literal keeps its literal type
-    /// only when the contextual type could hold a literal of that kind — a
-    /// literal / template / enum context of the same kind, some member of a
-    /// union or intersection, or a type parameter whose constraint has that
-    /// primitive or such a literal.
-    pub(crate) fn literal_of_contextual_type(&self, candidate: &Type, ctx: &Type) -> bool {
-        let same_kind = |c: &Type, t: &Type| -> bool {
-            match (t, c) {
-                (
-                    Type::StringLiteral(_)
-                    | Type::TemplateLiteral { .. }
-                    | Type::StringMapping { .. },
-                    Type::StringLiteral(_),
-                ) => true,
-                (Type::NumberLiteral(_), Type::NumberLiteral(_)) => true,
-                (Type::Boolean | Type::BooleanLiteral(_), Type::BooleanLiteral(_)) => true,
-                (Type::BigIntLiteral(_), Type::BigIntLiteral(_)) => true,
-                (Type::EnumVariant { .. }, Type::NumberLiteral(_) | Type::StringLiteral(_)) => true,
-                _ => false,
-            }
-        };
-        match ctx {
-            Type::Union(members) | Type::Intersection(members) => members
-                .iter()
-                .any(|member| self.literal_of_contextual_type(candidate, member)),
-            Type::Optional(inner) => self.literal_of_contextual_type(candidate, inner),
-            Type::TypeReference(name, args) if args.is_empty() => {
-                if self.enum_target_member_values(name).is_some() {
-                    return matches!(candidate, Type::NumberLiteral(_) | Type::StringLiteral(_));
-                }
-                if self.type_param_name_is_active(name) {
-                    return self.literal_of_type_param_constraint(candidate, ctx);
-                }
-                match self.resolve_type_for_assignability(ctx) {
-                    Some(resolved) if resolved != *ctx => {
-                        self.literal_of_contextual_type(candidate, &resolved)
-                    }
-                    _ => false,
-                }
-            }
-            Type::TypeParameter(_) => self.literal_of_type_param_constraint(candidate, ctx),
-            other => same_kind(candidate, other),
-        }
-    }
-
-    fn literal_of_type_param_constraint(&self, candidate: &Type, param: &Type) -> bool {
-        let Some(constraint) = self.typeparam_constraint_apparent(param) else {
-            return false;
-        };
-        fn has_primitive(ty: &Type, wanted: fn(&Type) -> bool) -> bool {
-            match ty {
-                Type::Union(members) | Type::Intersection(members) => {
-                    members.iter().any(|m| has_primitive(m, wanted))
-                }
-                other => wanted(other),
-            }
-        }
-        let primitive_match = match candidate {
-            Type::StringLiteral(_) => has_primitive(&constraint, |t| matches!(t, Type::String)),
-            Type::NumberLiteral(_) => has_primitive(&constraint, |t| matches!(t, Type::Number)),
-            Type::BooleanLiteral(_) => has_primitive(&constraint, |t| matches!(t, Type::Boolean)),
-            Type::BigIntLiteral(_) => has_primitive(&constraint, |t| matches!(t, Type::BigInt)),
-            _ => false,
-        };
-        primitive_match || self.literal_of_contextual_type(candidate, &constraint)
-    }
-
     /// tsc getWidenedLiteralLikeTypeForContextualType (mutable locations): a
     /// literal element/property of an array or object literal widens to its
     /// base type unless the contextual type could hold that literal.
@@ -43010,18 +43016,13 @@ impl TypeChecker {
             // not fresh initializer literals subject to widening.
             return original.clone();
         }
-        if let (
-            Some(Expr {
-                kind: ExprKind::ArrayLit(_),
-                ..
-            }),
-            Type::Array(element),
-        ) = (init, original)
-        {
+        if let (Some(initializer), Type::Array(element)) = (init, original) {
             // Array inference already widened fresh elements individually.
             // Re-widening here erases regular literals supplied by assertions,
             // annotations, or spreads from literal-typed arrays and tuples.
-            if self.strict_null_checks || !matches!(element.as_ref(), Type::Null | Type::Undefined)
+            if Self::has_checked_array_elements(initializer)
+                && (self.strict_null_checks
+                    || !matches!(element.as_ref(), Type::Null | Type::Undefined))
             {
                 return original.clone();
             }
@@ -44148,11 +44149,7 @@ impl TypeChecker {
             ),
             None => {
                 let name = self.active_type_parameter_name(target)?;
-                let constraint = self
-                    .type_param_constraint_stack
-                    .iter()
-                    .rev()
-                    .find_map(|frame| frame.get(name.as_str()).cloned());
+                let constraint = self.contextual_literal_constraint(target);
                 if constraint.is_none() && !self.type_param_declared_unconstrained(&name) {
                     return None;
                 }
