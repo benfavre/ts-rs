@@ -768,6 +768,7 @@ impl TypeChecker {
                 .any(|(_, value)| matches!(value, Type::Number | Type::NumberLiteral(_)));
         let numeric_index = match index_type {
             Type::Any | Type::Number | Type::NumberLiteral(_) => true,
+            Type::StringLiteral(_) => self.index_applies_to_property(index_type, &Type::Number),
             // An unresolved identifier is error-typed locally, but tsc
             // continues the enum lookup as `any` and reports TS2356 for the
             // resulting string reverse-map value alongside TS2304.
@@ -894,7 +895,7 @@ impl TypeChecker {
         true
     }
 
-    fn report_invalid_assignment_target(&mut self, target: &Expr) -> bool {
+    pub(super) fn report_invalid_assignment_target(&mut self, target: &Expr) -> bool {
         // tsc's getAssignmentTarget walks through parentheses and non-null
         // assertions only: `(Foo as any) = null` is not an assignment to the
         // class binding.
@@ -1941,7 +1942,19 @@ impl TypeChecker {
             Type::TypeReference(name, args) => {
                 if args.is_empty() {
                     if let Some(interface) = self.interface_info.get(name.as_str()) {
-                        return Self::tuple_from_indexed_members(&interface.object_type.properties);
+                        if let Some(tuple) =
+                            Self::tuple_from_indexed_members(&interface.object_type.properties)
+                        {
+                            return Some(tuple);
+                        }
+                        for (base, arguments) in &interface.extends {
+                            if let Some(tuple) = self.tuple_like_context(
+                                &Type::TypeReference(base.clone(), arguments.clone()),
+                                depth + 1,
+                            ) {
+                                return Some(tuple);
+                            }
+                        }
                     }
                 }
                 let resolved = self.resolve_type_for_assignability(ctx)?;
@@ -3385,11 +3398,14 @@ impl TypeChecker {
                             );
                         }
                         _ => {
-                            self.check_expr(initializer);
+                            let context =
+                                crate::resolve_types::implied_binding_pattern_type(&parameter.name);
+                            self.check_expr_contextual(initializer, context.as_ref());
                         }
                     }
                     self.param_initializer_async_len = saved_initializer;
                 }
+                self.defer_parameter_widening(parameter);
             }
         }
         self.provisional_param_names = saved_provisional;
@@ -3643,7 +3659,8 @@ impl TypeChecker {
             }
             PatKind::Assign(pattern, initializer) => {
                 self.check_binding_pattern_runtime_expressions(pattern);
-                self.check_expr(initializer);
+                let context = crate::resolve_types::implied_binding_pattern_type(pattern);
+                self.check_expr_contextual(initializer, context.as_ref());
             }
             PatKind::Rest(pattern) => self.check_binding_pattern_runtime_expressions(pattern),
         }
@@ -5003,8 +5020,83 @@ impl TypeChecker {
         contextual_type: Option<&Type>,
     ) -> Type {
         let ty = self.check_expr_contextual_inner(expr, contextual_type);
+        let ty = self.object_literal_index_type(expr, ty);
+        self.record_widening_expression(expr, &ty);
+        if matches!(expr.kind, ExprKind::ArrayLit(_) | ExprKind::ObjectLit(_)) {
+            self.record_expr_type(expr.span.start, &ty);
+        }
         self.record_checked_expression_type(expr, &ty);
         ty
+    }
+
+    fn check_conditional_expression(
+        &mut self,
+        cond: &CondExpr,
+        contextual_type: Option<&Type>,
+    ) -> Type {
+        // Apply narrowing to both branches of the ternary the same
+        // way `StmtKind::If` does it. Without this, the helper
+        //   function pickString(value: unknown, fallback: string): string {
+        //     return typeof value === "string" ? value : fallback;
+        //   }
+        // was evaluating the true-branch `value` without the
+        // typeof narrowing in scope and producing `unknown | string`
+        // for the conditional result, then tripping TS2322 against
+        // the `string` return type. The narrowing scope must wrap
+        // each branch's `check_expr` so `lookup_var(value)` in the
+        // true branch returns `string` and `lookup_var(value)` in
+        // the false branch returns the negated complement.
+        self.check_syntactic_truthiness(&cond.test);
+        self.check_uncalled_function_condition(&cond.test, Some(&cond.consequent), None);
+        self.uncalled_condition_depth += 1;
+        self.check_expr(&cond.test);
+        self.uncalled_condition_depth -= 1;
+        let (consequent_narrows, alternate_narrows) = self.analyze_narrowing(&cond.test);
+        self.push_scope();
+        for (name, ty) in &consequent_narrows {
+            self.narrow_var(name, ty.clone());
+        }
+        let supers_before_cons = self.super_call_count;
+        // A literal `false` test makes the consequent unreachable
+        // (tsc reports no TS2454 there); likewise `true` for the
+        // alternate.
+        let consequent_dead = matches!(cond.test.kind, ExprKind::BoolLit(false));
+        let alternate_dead = matches!(cond.test.kind, ExprKind::BoolLit(true));
+        if consequent_dead {
+            self.unreachable_read_depth += 1;
+        }
+        let t = if contextual_type.is_some() {
+            self.check_expr_contextual(&cond.consequent, contextual_type)
+        } else {
+            self.check_expr(&cond.consequent)
+        };
+        if consequent_dead {
+            self.unreachable_read_depth -= 1;
+        }
+        let supers_in_cons = self.super_call_count - supers_before_cons;
+        self.pop_scope();
+        self.push_scope();
+        for (name, ty) in &alternate_narrows {
+            self.narrow_var(name, ty.clone());
+        }
+        let supers_before_alt = self.super_call_count;
+        if alternate_dead {
+            self.unreachable_read_depth += 1;
+        }
+        let f = if contextual_type.is_some() {
+            self.check_expr_contextual(&cond.alternate, contextual_type)
+        } else {
+            self.check_expr(&cond.alternate)
+        };
+        if alternate_dead {
+            self.unreachable_read_depth -= 1;
+        }
+        self.pop_scope();
+        // TS17009 join rule (`cond ? super() : super()`).
+        if supers_in_cons > 0 && self.super_call_count > supers_before_alt {
+            self.declare_var(THIS_OK_MARKER, Type::Never);
+        }
+        Self::reduce_empty_array_union(Type::flatten_union(vec![t, f]))
     }
 
     fn check_expr_contextual_inner(&mut self, expr: &Expr, contextual_type: Option<&Type>) -> Type {
@@ -5016,6 +5108,9 @@ impl TypeChecker {
                 // arrow span starts at the parameter name)
                 self.record_expr_type_if_absent(expr.span.start, &ty);
                 return ty;
+            }
+            ExprKind::Cond(cond) if contextual_type.is_some() => {
+                return self.check_conditional_expression(cond, contextual_type);
             }
             ExprKind::Paren(inner) => {
                 let ty = self.check_expr_contextual(inner, contextual_type);
@@ -5164,12 +5259,19 @@ impl TypeChecker {
                                 self.declare_pattern_vars(&param.name, Type::Any);
                                 self.completion_mark_parameter(param);
                             }
+                            let expected = acc
+                                .return_type
+                                .as_ref()
+                                .map(|ty| self.resolve_type_node(ty));
+                            self.return_type_stack.push(expected);
                             self.hoist_block_declarations(&acc.body);
                             self.jump_function_depth += 1;
                             for stmt in &acc.body {
                                 self.check_stmt(stmt);
                             }
                             self.jump_function_depth -= 1;
+                            self.finish_widening_function(Some(&key), acc.name.span());
+                            self.return_type_stack.pop();
                             self.var_first_types = saved_var_first_types;
                             self.pop_scope();
                             let getter_ty = acc
@@ -5210,12 +5312,15 @@ impl TypeChecker {
                                 self.declare_pattern_vars(&param.name, param_ty);
                                 self.completion_mark_parameter(param);
                             }
+                            self.return_type_stack.push(Some(Type::Any));
                             self.hoist_block_declarations(&acc.body);
                             self.jump_function_depth += 1;
                             for stmt in &acc.body {
                                 self.check_stmt(stmt);
                             }
                             self.jump_function_depth -= 1;
+                            self.finish_widening_function(Some(&key), acc.name.span());
+                            self.return_type_stack.pop();
                             self.var_first_types = saved_var_first_types;
                             self.pop_scope();
                             properties.push((key, Arc::new(setter_ty)));
@@ -5278,14 +5383,23 @@ impl TypeChecker {
                     _ => None,
                 };
                 let mut checked_types = Vec::new();
-                for elem in elems.iter().flatten() {
+                for elem in elems {
+                    let Some(elem) = elem else {
+                        checked_types.push(Type::Undefined);
+                        continue;
+                    };
                     // A spread of a tuple contributes its elements; a spread of
                     // an array is a rest element in tuple context (tsc
                     // checkArrayLiteral) and its element type otherwise.
                     if let ExprKind::Spread(inner) = &elem.kind {
                         let inner_ty = self.check_expr(inner);
                         // A lib iterable contributes what it yields.
-                        if let Some(element) = Self::lib_iterable_element_type(&inner_ty) {
+                        let spread_element = if matches!(inner_ty, Type::Union(_)) {
+                            self.for_of_binding_element_type(&inner_ty, false)
+                        } else {
+                            Self::lib_iterable_element_type(&inner_ty)
+                        };
+                        if let Some(element) = spread_element {
                             checked_types.push(if tuple_ctx.is_some() {
                                 Type::Rest(Arc::new(Type::Array(Arc::new(element))))
                             } else {
@@ -5331,6 +5445,34 @@ impl TypeChecker {
                     } else {
                         self.check_expr(elem)
                     };
+                    let ty = if self.is_widening_literal_expression(elem) {
+                        let preserves_literal = elem_ctx
+                            .as_ref()
+                            .is_some_and(|context| self.literal_of_contextual_type(&ty, context));
+                        if preserves_literal
+                            || tuple_ctx.is_none()
+                                && elem_ctx.is_none()
+                                && matches!(ty, Type::BooleanLiteral(_))
+                        {
+                            ty
+                        } else {
+                            // Contextual checking already handled nested
+                            // object/array members. Only widen this element's
+                            // literal type; widening its properties again can
+                            // erase a null assignment error inside an object.
+                            match ty {
+                                Type::Union(members) => Type::flatten_union(
+                                    members
+                                        .iter()
+                                        .map(|member| self.widen_type(member))
+                                        .collect(),
+                                ),
+                                ty => self.widen_type(&ty),
+                            }
+                        }
+                    } else {
+                        ty
+                    };
                     checked_types.push(ty);
                 }
                 // Preserve the literal's positional shape under a tuple
@@ -5352,13 +5494,7 @@ impl TypeChecker {
                         elem_types.push(ty);
                     }
                 }
-                let elem_ty = if elem_types.is_empty() {
-                    Type::Any
-                } else if elem_types.len() == 1 {
-                    elem_types.into_iter().next().unwrap()
-                } else {
-                    Type::Union(elem_types.into())
-                };
+                let elem_ty = self.array_literal_union(elem_types);
                 return Type::Array(Arc::new(elem_ty));
             }
             _ => {}
@@ -5612,6 +5748,7 @@ impl TypeChecker {
                             .filter(|_| arrow.type_params.is_none())
                             .and_then(|cps| Self::contextual_param_at(cps, i))
                         {
+                            self.mark_contextual_widening_parameter(p);
                             // Use contextual parameter type; a `?` on the
                             // parameter adds `undefined` under strictNullChecks.
                             if p.optional && self.strict_null_checks {
@@ -5772,6 +5909,10 @@ impl TypeChecker {
                         }
                     }
                 };
+                if let ArrowBody::Expr(body) = &arrow.body {
+                    self.collect_widening_return(body);
+                }
+                self.finish_contextual_widening_function(None, expr.span, contextual_type);
                 self.return_type_stack.pop();
                 self.return_is_async_stack.pop();
                 self.generator_stack.pop();
@@ -5912,6 +6053,7 @@ impl TypeChecker {
                             .filter(|_| fn_decl.type_params.is_none())
                             .and_then(|cps| Self::contextual_param_at(cps, i))
                         {
+                            self.mark_contextual_widening_parameter(p);
                             // A `?` on the parameter adds `undefined` under strict.
                             if p.optional && self.strict_null_checks {
                                 Type::flatten_union(vec![cp.1.clone(), Type::Undefined])
@@ -5974,6 +6116,11 @@ impl TypeChecker {
                         fn_decl.is_generator,
                     );
                 }
+                self.finish_contextual_widening_function(
+                    fn_decl.name.as_deref(),
+                    fn_decl.name_span.unwrap_or(self.error_span_for_expr(expr)),
+                    contextual_type,
+                );
                 self.return_type_stack.pop();
                 self.return_is_async_stack.pop();
                 self.generator_stack.pop();
@@ -6026,7 +6173,28 @@ impl TypeChecker {
         }
         self.expr_depth.store(depth + 1, Ordering::Relaxed);
         let result = self.check_expr_inner(expr);
+        let result = self.object_literal_index_type(expr, result);
+        if matches!(expr.kind, ExprKind::ObjectLit(_)) {
+            self.record_expr_type(expr.span.start, &result);
+        }
+        self.record_widening_expression(expr, &result);
         self.record_checked_expression_type(expr, &result);
+        if Self::is_const_assertion_expr(expr) && matches!(result, Type::Tuple(_)) {
+            // Const-array inference retains the tuple's shape internally;
+            // its expression type also exposes the assertion's readonly view.
+            let readonly = Type::Readonly(Arc::new(result.clone()));
+            self.record_expr_type(expr.span.start, &readonly);
+            self.record_checked_expression_type(expr, &readonly);
+            let operand = match &expr.kind {
+                ExprKind::As(assertion) => Some(assertion.expr.as_ref()),
+                ExprKind::TypeAssertion(assertion) => Some(assertion.expr.as_ref()),
+                _ => None,
+            };
+            if let Some(operand) = operand {
+                self.record_expr_type(operand.span.start, &readonly);
+                self.record_checked_expression_type(operand, &readonly);
+            }
+        }
         self.expr_depth.store(depth, Ordering::Relaxed);
         result
     }
@@ -8052,12 +8220,14 @@ impl TypeChecker {
                         .unwrap_or_else(|| self.check_expr(&mem.object)),
                     _ => {
                         let ty = self.check_expr(&mem.object);
+                        let ty = self.widen_fresh_array_type(&mem.object, ty);
                         // For a call whose callee this member access is.
                         self.checked_member_object =
                             Some((std::ptr::from_ref::<Expr>(&mem.object) as usize, ty.clone()));
                         ty
                     }
                 };
+                obj_ty = self.widen_fresh_array_type(&mem.object, obj_ty);
                 if self.is_global_object_type(&obj_ty) && !self.current_file_is_js() {
                     if let Some(ty) = self.global_this_member_type(&property_name, property_span) {
                         return ty;
@@ -9286,18 +9456,19 @@ impl TypeChecker {
                 }
             }
             ExprKind::ElemAccess(ea) => {
-                if let Some(narrowed) = self
-                    .known_element_path(expr)
-                    .and_then(|key| self.lookup_narrowed(&key))
-                {
-                    return narrowed;
-                }
-                if let Some(narrowed) =
-                    Self::element_path(expr).and_then(|key| self.lookup_narrowed(&key))
-                {
-                    return narrowed;
+                let skip_path_narrowing = self.assign_lhs_declared;
+                self.assign_lhs_declared = false;
+                if !skip_path_narrowing {
+                    if let Some(narrowed) = self
+                        .known_element_path(expr)
+                        .or_else(|| Self::element_path(expr))
+                        .and_then(|key| self.lookup_narrowed(&key))
+                    {
+                        return narrowed;
+                    }
                 }
                 let obj_ty = self.check_expr(&ea.object);
+                let obj_ty = self.widen_fresh_array_type(&ea.object, obj_ty);
                 let idx_ty = self.check_expr(&ea.index);
                 if (self.is_global_object_expression(&ea.object)
                     || self.is_global_object_type(&obj_ty))
@@ -9436,6 +9607,9 @@ impl TypeChecker {
                     self.record_expr_type(expr.span.start, &member);
                     return member;
                 }
+                if self.report_missing_element_index(expr, &obj_ty, &idx_ty) {
+                    return Type::Any;
+                }
                 // A program alias of an object type (and `Record<string, V>`)
                 // indexes like the object type it names. Its index-signature
                 // reads stay without the noUncheckedIndexedAccess `undefined`:
@@ -9559,63 +9733,7 @@ impl TypeChecker {
                     _ => Type::Any,
                 }
             }
-            ExprKind::Cond(cond) => {
-                // Apply narrowing to both branches of the ternary the same
-                // way `StmtKind::If` does it. Without this, the helper
-                //   function pickString(value: unknown, fallback: string): string {
-                //     return typeof value === "string" ? value : fallback;
-                //   }
-                // was evaluating the true-branch `value` without the
-                // typeof narrowing in scope and producing `unknown | string`
-                // for the conditional result, then tripping TS2322 against
-                // the `string` return type. The narrowing scope must wrap
-                // each branch's `check_expr` so `lookup_var(value)` in the
-                // true branch returns `string` and `lookup_var(value)` in
-                // the false branch returns the negated complement.
-                self.check_syntactic_truthiness(&cond.test);
-                self.check_uncalled_function_condition(&cond.test, Some(&cond.consequent), None);
-                self.uncalled_condition_depth += 1;
-                self.check_expr(&cond.test);
-                self.uncalled_condition_depth -= 1;
-                let (consequent_narrows, alternate_narrows) = self.analyze_narrowing(&cond.test);
-                self.push_scope();
-                for (name, ty) in &consequent_narrows {
-                    self.narrow_var(name, ty.clone());
-                }
-                let supers_before_cons = self.super_call_count;
-                // A literal `false` test makes the consequent unreachable
-                // (tsc reports no TS2454 there); likewise `true` for the
-                // alternate.
-                let consequent_dead = matches!(cond.test.kind, ExprKind::BoolLit(false));
-                let alternate_dead = matches!(cond.test.kind, ExprKind::BoolLit(true));
-                if consequent_dead {
-                    self.unreachable_read_depth += 1;
-                }
-                let t = self.check_expr(&cond.consequent);
-                if consequent_dead {
-                    self.unreachable_read_depth -= 1;
-                }
-                let supers_in_cons = self.super_call_count - supers_before_cons;
-                self.pop_scope();
-                self.push_scope();
-                for (name, ty) in &alternate_narrows {
-                    self.narrow_var(name, ty.clone());
-                }
-                let supers_before_alt = self.super_call_count;
-                if alternate_dead {
-                    self.unreachable_read_depth += 1;
-                }
-                let f = self.check_expr(&cond.alternate);
-                if alternate_dead {
-                    self.unreachable_read_depth -= 1;
-                }
-                self.pop_scope();
-                // TS17009 join rule (`cond ? super() : super()`).
-                if supers_in_cons > 0 && self.super_call_count > supers_before_alt {
-                    self.declare_var(THIS_OK_MARKER, Type::Never);
-                }
-                Self::reduce_empty_array_union(Type::flatten_union(vec![t, f]))
-            }
+            ExprKind::Cond(cond) => self.check_conditional_expression(cond, None),
             ExprKind::Assign(assign) => {
                 let readonly_write = self.report_readonly_property_write(&assign.left);
                 if assign.op == AssignOp::Assign && matches!(&assign.right.kind, ExprKind::This) {
@@ -9801,7 +9919,9 @@ impl TypeChecker {
                         }
                         // `a['value'] = …` writes through the setter too.
                         ExprKind::ElemAccess(access) => {
+                            self.assign_lhs_declared = true;
                             let ty = self.check_expr(&assign.left);
+                            self.assign_lhs_declared = false;
                             match &access.index.kind {
                                 ExprKind::StrLit(property) => self
                                     .setter_write_type_of(&access.object, property.as_str())
@@ -10024,6 +10144,17 @@ impl TypeChecker {
                         assign.left.kind,
                         ExprKind::ObjectLit(_) | ExprKind::ArrayLit(_)
                     );
+                let empty_array_target = assign.op == AssignOp::Assign
+                    && matches!(&assign.left.kind, ExprKind::ArrayLit(elements) if elements.is_empty());
+                if empty_array_target {
+                    self.check_array_pattern_iterable(
+                        &Pat {
+                            kind: PatKind::Array(Vec::new()),
+                            span: assign.left.span,
+                        },
+                        &right_ty,
+                    );
+                }
                 // Invalid compound operands take precedence over reference
                 // checks. Simple assignment patterns are checked separately.
                 let invalid_reference = !destructuring
@@ -10036,6 +10167,7 @@ impl TypeChecker {
                 }
                 if assign.op == AssignOp::Assign
                     && !object_target
+                    && !empty_array_target
                     && !invalid_reference
                     && !matches!(left_ty, Type::Any | Type::Error)
                 {
@@ -10095,24 +10227,32 @@ impl TypeChecker {
                 // post-assignment reads.
                 if assign.op == AssignOp::Assign {
                     // A property path (`a.b = v`): what was known about it
-                    // and the paths below it no longer holds; a non-nullish
-                    // value leaves the path without its nullish members.
-                    if let Some(path) = Self::member_path(&assign.left).filter(|path| {
-                        matches!(assign.left.kind, ExprKind::Member(_)) && path.contains('.')
-                    }) {
+                    // and the paths below it no longer holds. Keep only the
+                    // declared constituents compatible with the assigned value.
+                    let property_path = match &assign.left.kind {
+                        ExprKind::Member(_) => Self::member_path(&assign.left),
+                        ExprKind::ElemAccess(_) => self
+                            .known_element_path(&assign.left)
+                            .or_else(|| Self::element_path(&assign.left)),
+                        _ => None,
+                    };
+                    if let Some(path) = property_path {
                         self.clear_narrowed_var(&path);
                         self.clear_narrowed_paths_under(&path);
                         if !matches!(right_ty, Type::Any | Type::Error)
                             && !Self::type_is_nullish(&right_ty)
                             && !self.type_admits_nullish(&right_ty)
                         {
-                            if let Some(declared) = self.resolve_member_path_type(&path) {
-                                let narrowed = self.remove_null_undefined(&declared);
-                                if narrowed != declared
-                                    && !matches!(declared, Type::Any | Type::Error)
-                                {
-                                    self.narrow_var(&path, narrowed);
-                                }
+                            let declared = self
+                                .resolve_member_path_type(&path)
+                                .unwrap_or_else(|| self.infer_expr_type(&assign.left));
+                            let narrowed = self.assignment_reduced_type(
+                                &self.remove_null_undefined(&declared),
+                                &right_ty,
+                            );
+                            if narrowed != declared && !matches!(declared, Type::Any | Type::Error)
+                            {
+                                self.narrow_var(&path, narrowed);
                             }
                         }
                     }
@@ -10167,8 +10307,15 @@ impl TypeChecker {
                 right_ty
             }
             ExprKind::ArrayLit(elems) => {
+                if self.assignment_pattern_depth > 0 && elems.is_empty() {
+                    return Type::Tuple(Vec::new().into());
+                }
                 let mut elem_types = Vec::new();
-                for elem in elems.iter().flatten() {
+                for elem in elems {
+                    let Some(elem) = elem else {
+                        elem_types.push(Type::Undefined);
+                        continue;
+                    };
                     let ty = if let Some((name, default_expr)) = self.pattern_default_target(elem) {
                         // `[x = ""] = [1]`: the element target is the VARIABLE
                         // `x`; its declared type — not the default's literal
@@ -10196,8 +10343,8 @@ impl TypeChecker {
                     } else {
                         self.check_expr(elem)
                     };
-                    let preserve_narrow =
-                        Self::is_const_assertion_expr(elem) || !Self::is_fresh_literal_expr(elem);
+                    let preserve_narrow = Self::is_const_assertion_expr(elem)
+                        || !self.is_widening_literal_expression(elem);
                     let widened = if preserve_narrow {
                         ty
                     } else {
@@ -10207,20 +10354,7 @@ impl TypeChecker {
                         elem_types.push(widened);
                     }
                 }
-                // tsc orders nullish members last in inferred element unions
-                // (`[undefined, "q"]` → `(string | undefined)[]`).
-                elem_types.sort_by_key(|t| matches!(t, Type::Null | Type::Undefined));
-                let elem_ty = if elem_types.is_empty() {
-                    Type::Any
-                } else if elem_types.len() == 1 {
-                    elem_types.into_iter().next().unwrap()
-                } else if let Some(bct) = self.best_common_type(&elem_types) {
-                    // A candidate that all others are assignable to is the best
-                    // common type (tsc collapses `[i, {..}]` to `I[]`).
-                    bct
-                } else {
-                    Type::Union(elem_types.into())
-                };
+                let elem_ty = self.array_literal_element_type(elem_types);
                 Type::Array(Arc::new(elem_ty))
             }
             ExprKind::ObjectLit(props) => {
@@ -10468,6 +10602,7 @@ impl TypeChecker {
                             );
                             self.return_is_async_stack.pop();
                             self.generator_stack.pop();
+                            self.finish_widening_function(Some(&name), m.name.span());
                             self.return_type_stack.pop();
                             self.fn_nesting_depth -= 1;
                             self.jump_function_depth -= 1;
@@ -10517,12 +10652,19 @@ impl TypeChecker {
                                 self.declare_pattern_vars(&param.name, Type::Any);
                                 self.completion_mark_parameter(param);
                             }
+                            let expected = acc
+                                .return_type
+                                .as_ref()
+                                .map(|ty| self.resolve_type_node(ty));
+                            self.return_type_stack.push(expected);
                             self.hoist_block_declarations(&acc.body);
                             self.jump_function_depth += 1;
                             for s in &acc.body {
                                 self.check_stmt(s);
                             }
                             self.jump_function_depth -= 1;
+                            self.finish_widening_function(Some(&name), acc.name.span());
+                            self.return_type_stack.pop();
                             self.check_function_completion(
                                 &acc.body,
                                 acc.return_type.as_ref(),
@@ -10576,12 +10718,15 @@ impl TypeChecker {
                                 self.declare_pattern_vars(&param.name, pty);
                                 self.completion_mark_parameter(param);
                             }
+                            self.return_type_stack.push(Some(Type::Any));
                             self.hoist_block_declarations(&acc.body);
                             self.jump_function_depth += 1;
                             for s in &acc.body {
                                 self.check_stmt(s);
                             }
                             self.jump_function_depth -= 1;
+                            self.finish_widening_function(Some(&name), acc.name.span());
+                            self.return_type_stack.pop();
                             self.var_first_types = saved_var_first_types;
                             self.pop_scope();
                             properties.push((name, Arc::new(Type::Any)));
@@ -10751,6 +10896,10 @@ impl TypeChecker {
                         }
                     }
                 };
+                if let ArrowBody::Expr(body) = &arrow.body {
+                    self.collect_widening_return(body);
+                }
+                self.finish_widening_function(None, expr.span);
                 self.return_type_stack.pop();
                 self.return_is_async_stack.pop();
                 self.generator_stack.pop();
@@ -10841,6 +10990,13 @@ impl TypeChecker {
                         (pname, pty)
                     })
                     .collect();
+                let expected = fn_decl
+                    .return_type
+                    .as_ref()
+                    .map(|ty| self.resolve_type_node(ty));
+                self.return_type_stack
+                    .push(self.unwrap_async_return(expected, fn_decl.is_async));
+                self.return_is_async_stack.push(fn_decl.is_async);
                 self.generator_stack.push(fn_decl.is_generator);
                 if let Some(ref body) = fn_decl.body {
                     self.hoist_block_declarations(body);
@@ -10855,6 +11011,12 @@ impl TypeChecker {
                         fn_decl.is_generator,
                     );
                 }
+                self.finish_widening_function(
+                    fn_decl.name.as_deref(),
+                    fn_decl.name_span.unwrap_or(self.error_span_for_expr(expr)),
+                );
+                self.return_type_stack.pop();
+                self.return_is_async_stack.pop();
                 self.generator_stack.pop();
                 let ret = if let Some(ref rt) = fn_decl.return_type {
                     self.resolve_type_node(rt)
@@ -11143,6 +11305,7 @@ impl TypeChecker {
                 // diagnostics far from the spread site (e.g. `validEmails:
                 // Set[]` in apps/app/src/utils/emailSuppressionFilter.ts).
                 match &ty {
+                    Type::Union(_) => self.for_of_binding_element_type(&ty, false).unwrap_or(ty),
                     Type::Array(elem) => Type::clone(elem),
                     Type::Tuple(elems) if !elems.is_empty() => {
                         Type::flatten_union(elems.iter().cloned().collect())
@@ -13925,7 +14088,7 @@ impl TypeChecker {
     /// TS18004: a shorthand property whose name resolves to nothing. The name
     /// is resolved like a bare identifier; tsc words the "cannot find name"
     /// error (TS2304/TS2552) for this position as TS18004.
-    fn check_shorthand_name_exists(&mut self, name: &str, span: Span) {
+    pub(super) fn check_shorthand_name_exists(&mut self, name: &str, span: Span) {
         self.check_type_only_value_use(name, Span::new(span.start, span.start + name.len() as u32));
         if self.lookup_var(name).is_some()
             || crate::strict_reserved::is_reserved_word(name)
@@ -14261,6 +14424,10 @@ impl TypeChecker {
                     } else {
                         self.check_expr(init)
                     };
+                    if decl_ty.is_none() {
+                        let name = self.prop_name_to_string(&prop.name);
+                        self.report_widening_declaration(init, 7008, &name, prop.name.span());
+                    }
                     if let Some(dt) = decl_ty.clone() {
                         let assignable = self.is_assignable_to(&init_ty, &dt);
                         // tsc: elaborate into a fresh literal / arrow body
@@ -14409,6 +14576,8 @@ impl TypeChecker {
                         method.is_generator,
                     );
                 }
+                let name = self.prop_name_to_string(&method.name);
+                self.finish_widening_function(Some(&name), method.name.span());
                 self.return_type_stack.pop();
                 self.return_is_async_stack.pop();
                 self.generator_stack.pop();
@@ -14681,6 +14850,8 @@ impl TypeChecker {
                         );
                     }
                 }
+                let name = self.prop_name_to_string(&acc.name);
+                self.finish_widening_function(Some(&name), acc.name.span());
                 self.return_type_stack.pop();
                 self.var_first_types = saved_var_first_types;
                 self.fn_nesting_depth -= 1;

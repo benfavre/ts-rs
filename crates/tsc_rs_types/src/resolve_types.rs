@@ -1671,7 +1671,7 @@ impl TypeChecker {
 
     pub(crate) fn resolve_fn_type(&self, fn_decl: &FnDecl) -> FunctionType {
         let _own_type_params = crate::type_params_in_resolution(fn_decl.type_params.as_deref());
-        let params = fn_decl
+        let params: Vec<(String, Type)> = fn_decl
             .params
             .iter()
             .map(|p| {
@@ -1703,7 +1703,7 @@ impl TypeChecker {
                                 if p.dotdotdot {
                                     Type::Any
                                 } else {
-                                    implied_array_pattern_type(&p.name).unwrap_or(Type::Any)
+                                    implied_binding_pattern_type(&p.name).unwrap_or(Type::Any)
                                 }
                             })
                     });
@@ -1713,7 +1713,24 @@ impl TypeChecker {
         let ret = if let Some(ref rt) = fn_decl.return_type {
             self.resolve_type_node(rt)
         } else if let Some(ref body) = fn_decl.body {
-            let inferred = self.infer_return_type_from_stmts(body);
+            // Hoisting can resolve a signature outside its parameter scope.
+            // A default initializer still supplies the parameter's body type.
+            let defaults = fn_decl
+                .params
+                .iter()
+                .zip(&params)
+                .filter_map(|(parameter, (_, ty))| {
+                    if parameter.initializer.is_none() {
+                        return None;
+                    }
+                    match &parameter.name.kind {
+                        PatKind::Ident(name) => Some((name.to_string(), ty.clone())),
+                        _ => None,
+                    }
+                })
+                .collect();
+            let inferred =
+                crate::with_infer_param_scope(defaults, || self.infer_return_type_from_stmts(body));
             // An async function ALWAYS returns a Promise. When the return type
             // is inferred (no annotation), wrap the body-completion type in
             // `Promise<…>` — otherwise a bare `return;` / fall-through leaves
@@ -2143,6 +2160,7 @@ impl TypeChecker {
 
     pub(crate) fn infer_expr_type(&self, expr: &Expr) -> Type {
         let ty = self.infer_expr_type_unsimplified(expr);
+        let ty = self.object_literal_index_type(expr, ty);
         // A call's instantiated return type may carry a conditional that
         // its type arguments now decide (`B<N extends F ? U<N> : N>`).
         match (&expr.kind, &ty) {
@@ -2170,10 +2188,14 @@ impl TypeChecker {
             ExprKind::Template(_) => Type::String,
             ExprKind::ArrayLit(elems) => {
                 let mut elem_types = Vec::new();
-                for elem in elems.iter().flatten() {
+                for elem in elems {
+                    let Some(elem) = elem else {
+                        elem_types.push(Type::Undefined);
+                        continue;
+                    };
                     let inferred = self.infer_expr_type(elem);
-                    let preserve_narrow =
-                        Self::is_const_assertion_expr(elem) || !Self::is_fresh_literal_expr(elem);
+                    let preserve_narrow = Self::is_const_assertion_expr(elem)
+                        || !self.is_widening_literal_expression(elem);
                     let ty = if preserve_narrow {
                         inferred
                     } else {
@@ -2183,17 +2205,7 @@ impl TypeChecker {
                         elem_types.push(ty);
                     }
                 }
-                // tsc orders nullish members last in inferred element unions.
-                elem_types.sort_by_key(|t| matches!(t, Type::Null | Type::Undefined));
-                let elem_ty = if elem_types.is_empty() {
-                    Type::Any
-                } else if elem_types.len() == 1 {
-                    elem_types.into_iter().next().unwrap()
-                } else if let Some(bct) = self.best_common_type(&elem_types) {
-                    bct
-                } else {
-                    Type::Union(elem_types.into())
-                };
+                let elem_ty = self.array_literal_element_type(elem_types);
                 Type::Array(Arc::new(elem_ty))
             }
             ExprKind::ObjectLit(props) => {
@@ -2951,6 +2963,7 @@ impl TypeChecker {
                     return narrowed;
                 }
                 let obj_ty = self.infer_expr_type(&mem.object);
+                let obj_ty = self.widen_fresh_array_type(&mem.object, obj_ty);
                 match &obj_ty {
                     Type::ObjectType(info) => {
                         info.properties
@@ -3043,6 +3056,7 @@ impl TypeChecker {
             }
             ExprKind::ElemAccess(ea) => {
                 let obj_ty = self.infer_expr_type(&ea.object);
+                let obj_ty = self.widen_fresh_array_type(&ea.object, obj_ty);
                 match &obj_ty {
                     Type::Array(elem) => Type::clone(&elem),
                     Type::Tuple(elems) => {
@@ -3067,6 +3081,7 @@ impl TypeChecker {
                     return element;
                 }
                 match &ty {
+                    Type::Union(_) => self.for_of_binding_element_type(&ty, false).unwrap_or(ty),
                     Type::Array(element) => Type::clone(element),
                     Type::Tuple(elements) if !elements.is_empty() => {
                         Type::flatten_union(elements.iter().cloned().collect())
@@ -3247,10 +3262,50 @@ impl TypeChecker {
 /// The type an array binding pattern implies when nothing else types it:
 /// `[a, b]` is `[any, any]`, a defaulted element is optional, a rest element
 /// is `...any[]`, and nested array patterns nest.
-pub(crate) fn implied_array_pattern_type(pattern: &Pat) -> Option<Type> {
+pub(crate) fn implied_binding_pattern_type(pattern: &Pat) -> Option<Type> {
     let PatKind::Array(elements) = &pattern.kind else {
-        return None;
+        return match &pattern.kind {
+            PatKind::Assign(pattern, _) => implied_binding_pattern_type(pattern),
+            PatKind::Object(properties) => {
+                let mut members = Vec::new();
+                for property in properties {
+                    let (name, ty) = match property {
+                        ObjPatProp::KeyValue(key, pattern) => {
+                            let name = match key {
+                                PropName::Ident(name, _) | PropName::String(name, _) => {
+                                    name.to_string()
+                                }
+                                PropName::Number(name, _) => {
+                                    TypeChecker::normalize_numeric_name(name)
+                                }
+                                _ => continue,
+                            };
+                            (
+                                name,
+                                implied_binding_pattern_type(pattern).unwrap_or(Type::Any),
+                            )
+                        }
+                        ObjPatProp::Shorthand(name, _)
+                        | ObjPatProp::ShorthandAssign(name, _, _) => (name.to_string(), Type::Any),
+                        ObjPatProp::Rest(_) => continue,
+                    };
+                    members.push((name, Arc::new(ty)));
+                }
+                Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                    properties: members,
+                    call_signatures: Vec::new(),
+                    construct_signatures: Vec::new(),
+                    index_signature: None,
+                    index_signature_name: None,
+                    method_names: Vec::new(),
+                })))
+            }
+            _ => None,
+        };
     };
+    if elements.is_empty() || matches!(elements.as_slice(), [Some(ArrayPatElem::Rest(_))]) {
+        return Some(Type::Array(Arc::new(Type::Any)));
+    }
     let types = elements
         .iter()
         .map(|element| match element {
@@ -3258,9 +3313,9 @@ pub(crate) fn implied_array_pattern_type(pattern: &Pat) -> Option<Type> {
             Some(ArrayPatElem::Rest(_)) => Type::Rest(Arc::new(Type::Array(Arc::new(Type::Any)))),
             Some(ArrayPatElem::Pat(inner)) => match &inner.kind {
                 PatKind::Assign(target, _) => Type::Optional(Arc::new(
-                    implied_array_pattern_type(target).unwrap_or(Type::Any),
+                    implied_binding_pattern_type(target).unwrap_or(Type::Any),
                 )),
-                _ => implied_array_pattern_type(inner).unwrap_or(Type::Any),
+                _ => implied_binding_pattern_type(inner).unwrap_or(Type::Any),
             },
         })
         .collect::<Vec<_>>();

@@ -26,7 +26,9 @@ impl TypeChecker {
         let mut next = automatic.then_some(0.0);
         let mut members = Vec::new();
         for member in &declaration.members {
-            if !matches!(member.name, PropName::Ident(_, _) | PropName::String(_, _)) {
+            if matches!(&member.name, PropName::Computed(expression, _)
+                if !matches!(expression.kind, ExprKind::StrLit(_) | ExprKind::NumLit(_)))
+            {
                 continue;
             }
             let name = self.prop_name_to_string(&member.name);

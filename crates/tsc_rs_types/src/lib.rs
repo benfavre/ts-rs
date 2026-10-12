@@ -28,12 +28,14 @@ mod global_access;
 mod global_import_aliases;
 mod import_alias_conflicts;
 mod import_attributes;
+mod index_access;
 mod index_constraints;
 mod index_signatures;
 pub mod inference;
 mod inference_shapes;
 mod interface_heritage;
 mod intersection_reduction;
+mod iteration_assignments;
 mod javascript_aliases;
 mod jsdoc;
 mod jump_targets;
@@ -58,6 +60,7 @@ mod unknown_receivers;
 mod unreachable_exprs;
 mod unused_type_params;
 mod use_before_decl;
+mod widening;
 
 use builtins::BuiltinTypes;
 use diagnostics::*;
@@ -95,6 +98,9 @@ thread_local! {
     /// getInferredType prefers covariant inferences).
     static INFER_CONTRA_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static INFER_CONTRA: std::cell::RefCell<HashMap<std::string::String, Vec<Type>>> =
+        std::cell::RefCell::new(HashMap::new());
+    static INFER_STRICT_CONSTRUCTORS: Cell<bool> = const { Cell::new(false) };
+    static LAST_INFER_CONTRA: std::cell::RefCell<HashMap<std::string::String, Vec<Type>>> =
         std::cell::RefCell::new(HashMap::new());
 }
 
@@ -1404,6 +1410,7 @@ impl Type {
                         | Type::Conditional { .. }
                         | Type::Function(_)
                         | Type::Constructor(_)
+                        | Type::Readonly(_)
                 ) || matches!(
                     // Single-call-signature object literals display in arrow
                     // form — same precedence problem as Function.
@@ -2445,6 +2452,9 @@ pub fn source_file_has_ts_nocheck(file: &SourceFile) -> bool {
 #[derive(Clone)]
 struct CheckerScope {
     vars: rustc_hash::FxHashMap<std::string::String, TypeId>,
+    /// Const bindings inferred from widening literal expressions. Explicit
+    /// literal annotations and const assertions retain their regular literals.
+    widening_literal_bindings: rustc_hash::FxHashSet<std::string::String>,
     /// Type-space declarations owned by this lexical scope. Runtime bindings
     /// cannot model aliases/interfaces because those names do not create
     /// values, but they still shadow missing standard-library type names.
@@ -2609,6 +2619,10 @@ pub struct TypeChecker {
     /// `dedup_map`.
     expression_types: rustc_hash::FxHashMap<u32, std::string::String>,
     expression_type_spans: Option<rustc_hash::FxHashMap<(u32, u32), TypeAtSpan>>,
+    widening_types: HashMap<(u32, u32), Arc<widening::WideningInfo>>,
+    widening_returns: HashMap<usize, Vec<Arc<widening::WideningInfo>>>,
+    widening_parameters: HashMap<(u32, u32), widening::ParameterWidening>,
+    contextual_widening_parameters: HashSet<(u32, u32)>,
     /// Completion facts are captured while lexical bindings are still active,
     /// independently of optional expression-type tracking for editor features.
     completion_never_calls: rustc_hash::FxHashSet<u32>,
@@ -3352,6 +3366,10 @@ impl Clone for TypeChecker {
             arena: self.arena.clone(),
             expression_types: self.expression_types.clone(),
             expression_type_spans: self.expression_type_spans.clone(),
+            widening_types: self.widening_types.clone(),
+            widening_returns: self.widening_returns.clone(),
+            widening_parameters: self.widening_parameters.clone(),
+            contextual_widening_parameters: self.contextual_widening_parameters.clone(),
             completion_never_calls: rustc_hash::FxHashSet::default(),
             completion_exhaustive_switches: rustc_hash::FxHashSet::default(),
             diagnostics: self.diagnostics.clone(),
@@ -3584,6 +3602,7 @@ impl TypeChecker {
     pub fn new() -> Self {
         let global = CheckerScope {
             vars: rustc_hash::FxHashMap::default(),
+            widening_literal_bindings: rustc_hash::FxHashSet::default(),
             type_names: rustc_hash::FxHashSet::default(),
             narrowed: rustc_hash::FxHashMap::default(),
             condition_aliases: rustc_hash::FxHashMap::default(),
@@ -3610,6 +3629,10 @@ impl TypeChecker {
             ]),
             expression_types: rustc_hash::FxHashMap::default(),
             expression_type_spans: None,
+            widening_types: HashMap::new(),
+            widening_returns: HashMap::new(),
+            widening_parameters: HashMap::new(),
+            contextual_widening_parameters: HashSet::new(),
             completion_never_calls: rustc_hash::FxHashSet::default(),
             completion_exhaustive_switches: rustc_hash::FxHashSet::default(),
             diagnostics: Vec::new(),
@@ -12030,6 +12053,7 @@ impl TypeChecker {
         for stmt in &file.statements {
             self.check_stmt(stmt);
         }
+        self.finish_parameter_widening();
         self.check_external_emit_helpers(file);
         self.drop_unresolved_type_only_uses();
         self.unqualify_relation_message_types();
@@ -12352,6 +12376,7 @@ impl TypeChecker {
         // copy initializer expression types to name positions.
         self.backfill_var_types(&file.statements);
 
+        self.finish_parameter_widening();
         self.check_external_emit_helpers(file);
         self.drop_unresolved_type_only_uses();
         self.unqualify_relation_message_types();
@@ -12437,6 +12462,7 @@ impl TypeChecker {
         let idx = self.scopes.len();
         self.scopes.push(CheckerScope {
             vars: rustc_hash::FxHashMap::default(),
+            widening_literal_bindings: rustc_hash::FxHashSet::default(),
             type_names: rustc_hash::FxHashSet::default(),
             narrowed: rustc_hash::FxHashMap::default(),
             condition_aliases: rustc_hash::FxHashMap::default(),
@@ -12455,6 +12481,9 @@ impl TypeChecker {
     }
 
     fn declare_var(&mut self, name: &str, ty: Type) {
+        self.scopes[self.current_scope]
+            .widening_literal_bindings
+            .remove(name);
         self.scopes[self.current_scope]
             .this_alias_receivers
             .remove(name);
@@ -12970,6 +12999,25 @@ impl TypeChecker {
 
     fn extract_declared_member_type_opt(&self, ty: &Type, name: &str) -> Option<Type> {
         match ty {
+            Type::Tuple(elements) => name
+                .parse::<usize>()
+                .ok()
+                .filter(|index| index.to_string() == name)
+                .and_then(|index| elements.get(index))
+                .map(Self::binding_member_value_type),
+            Type::Array(element)
+                if name
+                    .parse::<usize>()
+                    .is_ok_and(|index| index.to_string() == name) =>
+            {
+                Some(
+                    if self.compiler_options.no_unchecked_indexed_access == Some(true) {
+                        Type::flatten_union(vec![Type::clone(element), Type::Undefined])
+                    } else {
+                        Type::clone(element)
+                    },
+                )
+            }
             Type::ObjectType(obj) => {
                 for (prop_name, prop_ty) in &obj.properties {
                     // Strip optional/rest prefix for matching
@@ -13120,6 +13168,7 @@ impl TypeChecker {
                 let pty = if let Some(ref ann) = p.type_ann {
                     self.resolve_type_node(ann)
                 } else if let Some(cp) = ctx_params.and_then(|cps| cps.get(i)) {
+                    self.mark_contextual_widening_parameter(p);
                     cp.1.clone()
                 } else if let Some(ref init) = p.initializer {
                     self.infer_expr_type(init)
@@ -13159,6 +13208,8 @@ impl TypeChecker {
         );
         self.return_is_async_stack.pop();
         self.generator_stack.pop();
+        let name = self.prop_name_to_string(&method.name);
+        self.finish_contextual_widening_function(Some(&name), method.name.span(), contextual_type);
         self.return_type_stack.pop();
         self.fn_nesting_depth -= 1;
         self.jump_function_depth -= 1;
@@ -13567,10 +13618,73 @@ impl TypeChecker {
             .or_else(|| self.iterator_protocol_element_type(ty))
     }
 
+    fn for_of_binding_element_type(&self, ty: &Type, is_await: bool) -> Option<Type> {
+        self.for_of_binding_element_type_inner(ty, is_await, 0)
+    }
+
+    fn for_of_binding_element_type_inner(
+        &self,
+        ty: &Type,
+        is_await: bool,
+        depth: usize,
+    ) -> Option<Type> {
+        if depth >= 16 {
+            return None;
+        }
+        if let Type::Union(members) = ty {
+            return members
+                .iter()
+                .map(|member| self.for_of_binding_element_type_inner(member, is_await, depth + 1))
+                .collect::<Option<Vec<_>>>()
+                .map(Type::flatten_union)
+                .map(Self::tsc_primitive_union_order);
+        }
+        let element = if !is_await {
+            self.for_of_element_type(ty)
+        } else {
+            match ty {
+                Type::TypeReference(name, args)
+                    if matches!(
+                        name.as_str(),
+                        "AsyncIterable"
+                            | "AsyncIterableIterator"
+                            | "AsyncIterator"
+                            | "AsyncGenerator"
+                    ) =>
+                {
+                    args.first().cloned()
+                }
+                _ => self
+                    .iterator_protocol_element_type_inner(ty, true)
+                    .or_else(|| self.for_of_element_type(ty)),
+            }
+        };
+        let Some(element) = element else {
+            return self
+                .declared_type_param_constraint(ty)
+                .or_else(|| self.resolve_type_for_assignability(ty))
+                .filter(|resolved| resolved != ty)
+                .and_then(|resolved| {
+                    self.for_of_binding_element_type_inner(&resolved, is_await, depth + 1)
+                });
+        };
+        let element = if is_await {
+            self.awaited_type(&element, 0)
+                .unwrap_or_else(|| Type::TypeReference("Awaited".to_string(), vec![element].into()))
+        } else {
+            element
+        };
+        Some(Self::tsc_primitive_union_order(element))
+    }
+
     /// The element type of a user iterable through the iterator protocol:
     /// `[Symbol.iterator]()` returns an iterator whose `next()` returns
     /// `{ value: T }`.
     pub(crate) fn iterator_protocol_element_type(&self, ty: &Type) -> Option<Type> {
+        self.iterator_protocol_element_type_inner(ty, false)
+    }
+
+    fn iterator_protocol_element_type_inner(&self, ty: &Type, is_async: bool) -> Option<Type> {
         let returns = |method: Type| -> Option<Type> {
             match method {
                 Type::Function(function) => Some(Type::clone(&function.return_type)),
@@ -13581,7 +13695,12 @@ impl TypeChecker {
                 _ => None,
             }
         };
-        let iterator = returns(self.extract_member_type_opt(ty, "[Symbol.iterator]")?)?;
+        let iterator_key = if is_async {
+            "[Symbol.asyncIterator]"
+        } else {
+            "[Symbol.iterator]"
+        };
+        let iterator = returns(self.extract_member_type_opt(ty, iterator_key)?)?;
         // `[Symbol.iterator]() { return this; }` (inferred as `this`, or
         // unknown here) on a type with its own `next` is itself the iterator.
         let iterator = match iterator {
@@ -13590,8 +13709,13 @@ impl TypeChecker {
             other => other,
         };
         let result = returns(self.extract_member_type_opt(&iterator, "next")?)?;
+        let result = if is_async {
+            self.awaited_type(&result, 0)?
+        } else {
+            result
+        };
         let value = self.extract_member_type_opt(&result, "value")?;
-        Some(self.widen_type(&value))
+        Some(value)
     }
 
     pub(crate) fn iterated_element_type(&self, ty: &Type) -> Option<Type> {
@@ -14555,23 +14679,21 @@ impl TypeChecker {
                 self.declare_pattern_vars(&decl.name, Type::Any);
                 continue;
             };
-            let element = if fo.is_await {
-                None
-            } else {
-                let iterated = self.infer_expr_type(&fo.right);
-                self.for_of_element_type(&iterated)
-            };
+            let iterated = self.infer_expr_type(&fo.right);
+            let iterated = self.widen_fresh_array_type(&fo.right, iterated);
+            let element = self.for_of_binding_element_type(&iterated, fo.is_await);
             match element {
-                Some(element)
-                    if self.check_definite_assignment
+                Some(element) => {
+                    let unassigned = self.check_definite_assignment
                         && !matches!(element, Type::Any | Type::Unknown | Type::Error)
-                        && !Self::type_includes_undefined(&element) =>
-                {
+                        && !Self::type_includes_undefined(&element);
                     self.declare_var(name, element);
-                    self.uninitialized_vars.insert(
-                        name.to_string(),
-                        (self.fn_nesting_depth, self.current_scope),
-                    );
+                    if unassigned {
+                        self.uninitialized_vars.insert(
+                            name.to_string(),
+                            (self.fn_nesting_depth, self.current_scope),
+                        );
+                    }
                 }
                 _ => self.declare_var(name, Type::Any),
             }
@@ -15665,6 +15787,8 @@ impl TypeChecker {
                             ann,
                             var_stmt.kind == VarKind::Const,
                         )
+                    } else if self.is_auto_array_declaration(decl, var_stmt.modifiers) {
+                        Type::Array(Arc::new(Type::Any))
                     } else if let Some(ref init) = decl.init {
                         let inferred_unique = match &decl.name.kind {
                             PatKind::Ident(name) => self.inferred_unique_symbol(
@@ -15711,6 +15835,7 @@ impl TypeChecker {
                         ty,
                         var_stmt.kind == VarKind::Const,
                     );
+                    self.mark_widening_literal_binding(decl, is_const);
                 }
             }
             StmtKind::FnDecl(fn_decl) => {
@@ -15724,6 +15849,11 @@ impl TypeChecker {
                             .type_ann
                             .as_ref()
                             .map(|t| self.resolve_type_node(t))
+                            .or_else(|| {
+                                p.initializer.as_ref().map(|init| {
+                                    Self::widen_nested_literals(&self.infer_expr_type(init))
+                                })
+                            })
                             .unwrap_or(Type::Any);
                         self.declare_pattern_vars(&p.name, pty);
                     }
@@ -15865,16 +15995,12 @@ impl TypeChecker {
             StmtKind::EnumDecl(enum_decl) => {
                 self.record_enum_member_locations(&enum_decl.name, enum_decl);
                 let members = self.enum_declaration_values(enum_decl, self.ambient_depth > 0);
-                for (member, (_, value_type)) in enum_decl
-                    .members
-                    .iter()
-                    .filter(|member| {
-                        matches!(member.name, PropName::Ident(_, _) | PropName::String(_, _))
-                    })
-                    .zip(&members)
-                {
-                    self.expression_types
-                        .insert(member.name.span().start, value_type.display_string());
+                for member in &enum_decl.members {
+                    let name = self.prop_name_to_string(&member.name);
+                    if let Some((_, value_type)) = members.iter().find(|(key, _)| *key == name) {
+                        self.expression_types
+                            .insert(member.name.span().start, value_type.display_string());
+                    }
                 }
                 self.declare_var(&Self::enum_marker_name(&enum_decl.name), Type::Never);
                 Self::merge_enum_members((&mut self.enum_info), enum_decl.name.clone(), members);
@@ -16007,8 +16133,9 @@ impl TypeChecker {
                     .insert(type_alias.name.clone(), (type_params, resolved, required));
             }
             StmtKind::Export(export_decl) => match &export_decl.kind {
-                ExportDeclKind::Decl(decl) => self.register_top_level(decl),
-                ExportDeclKind::DefaultDecl(decl) => self.register_top_level(decl),
+                ExportDeclKind::Decl(decl) | ExportDeclKind::DefaultDecl(decl) => {
+                    self.register_top_level(&Self::with_exported_variable_modifier(decl));
+                }
                 _ => {}
             },
             _ => {}
@@ -16551,6 +16678,10 @@ impl TypeChecker {
         self.file_import_binding_names = Self::import_binding_names(&file.statements);
         self.file_named_import_sources = rustc_hash::FxHashMap::default();
         self.explicit_any_bindings.clear();
+        self.widening_types.clear();
+        self.widening_returns.clear();
+        self.widening_parameters.clear();
+        self.contextual_widening_parameters.clear();
         for statement in &file.statements {
             let StmtKind::Import(import) = &statement.kind else {
                 continue;
@@ -17091,29 +17222,6 @@ impl TypeChecker {
             }
             PatKind::Assign(pattern, _) | PatKind::Rest(pattern) => {
                 self.mark_pattern_assigned(pattern)
-            }
-        }
-    }
-
-    /// A for-in/for-of head expression is an assignment target: an
-    /// identifier there is written, not read (TS2454), and destructuring
-    /// patterns there are assignment patterns.
-    fn check_for_in_of_target(&mut self, expression: &Expr) {
-        match &expression.kind {
-            ExprKind::Ident(name) => {
-                let saved = self.assignment_target_span;
-                self.assignment_target_span = Some(expression.span);
-                self.check_expr(expression);
-                self.assignment_target_span = saved;
-                self.uninitialized_vars.remove(name.as_str());
-            }
-            ExprKind::ObjectLit(_) | ExprKind::ArrayLit(_) => {
-                self.assignment_pattern_depth += 1;
-                self.check_expr(expression);
-                self.assignment_pattern_depth -= 1;
-            }
-            _ => {
-                self.check_expr(expression);
             }
         }
     }
@@ -19472,26 +19580,34 @@ impl TypeChecker {
         }
     }
 
-    /// In a union of array types, a concrete `T[]` (element not `any`) absorbs
-    /// a coexisting `any[]` — the shape produced when one conditional branch is
-    /// an empty array literal (`cond ? [1] : []` → `number[]`, not
-    /// `number[] | any[]`; tsc infers the empty branch as `never[]` and reduces
-    /// it away, while our checker types it `any[]`). Order-independent; only
-    /// fires when a concrete array member is present, so a bare `any` / plain
-    /// unions are untouched.
+    /// Reduce array subtypes contributed by conditional branches. Empty
+    /// literals contribute never[] (undefined[] without strictNullChecks),
+    /// while an actual any[] branch absorbs the other array alternatives.
     fn reduce_empty_array_union(ty: Type) -> Type {
         let Type::Union(members) = &ty else {
             return ty;
         };
+        let has_any_array = members
+            .iter()
+            .any(|m| matches!(m, Type::Array(e) if matches!(e.as_ref(), Type::Any)));
+        let empty = |element: &Type| {
+            matches!(element, Type::Never)
+                || !WIDEN_STRICT_NULL_CHECKS.with(Cell::get)
+                    && matches!(element, Type::Null | Type::Undefined)
+        };
         let has_concrete_array = members
             .iter()
-            .any(|m| matches!(m, Type::Array(e) if !matches!(e.as_ref(), Type::Any)));
+            .any(|m| matches!(m, Type::Array(e) if !empty(e)));
         if !has_concrete_array {
             return ty;
         }
         let kept: Vec<Type> = members
             .iter()
-            .filter(|m| !matches!(m, Type::Array(e) if matches!(e.as_ref(), Type::Any)))
+            .filter(|m| match m {
+                Type::Array(element) if has_any_array => matches!(element.as_ref(), Type::Any),
+                Type::Array(element) => !empty(element),
+                _ => true,
+            })
             .cloned()
             .collect();
         Type::flatten_union(kept)
@@ -19520,6 +19636,144 @@ impl TypeChecker {
                 Type::flatten_union(widened)
             }
             other => Self::widen_nested_literals(other),
+        }
+    }
+
+    /// Reduce an inferred array's element union before considering its best
+    /// common type. The checked and speculative paths must agree: nested
+    /// unions flatten, broad primitives absorb literals, and intrinsic types
+    /// retain their canonical order regardless of element order.
+    fn array_literal_element_type(&self, candidates: Vec<Type>) -> Type {
+        let union = self.array_literal_union(candidates);
+        match &union {
+            Type::Union(members) => self.best_common_type(members).unwrap_or(union),
+            _ => union,
+        }
+    }
+
+    fn array_literal_union(&self, candidates: Vec<Type>) -> Type {
+        if candidates.is_empty() {
+            return if self.strict_null_checks {
+                Type::Never
+            } else {
+                Type::Undefined
+            };
+        }
+        let mut union = Type::flatten_union(candidates);
+        if !self.strict_null_checks {
+            if let Type::Union(members) = &union {
+                let non_nullish: Vec<_> = members
+                    .iter()
+                    .filter(|member| !matches!(member, Type::Null | Type::Undefined))
+                    .cloned()
+                    .collect();
+                union = if non_nullish.is_empty() {
+                    if members.contains(&Type::Null) {
+                        Type::Null
+                    } else {
+                        Type::Undefined
+                    }
+                } else {
+                    Type::flatten_union(non_nullish)
+                };
+            }
+        }
+        union
+    }
+
+    fn widen_fresh_array_type(&self, expression: &Expr, ty: Type) -> Type {
+        let mut expression = expression;
+        while let ExprKind::Paren(inner) = &expression.kind {
+            expression = inner;
+        }
+        if !self.strict_null_checks && matches!(expression.kind, ExprKind::ArrayLit(_)) {
+            if let Type::Array(element) = &ty {
+                if matches!(element.as_ref(), Type::Null | Type::Undefined) {
+                    return Type::Array(Arc::new(Type::Any));
+                }
+            }
+        }
+        ty
+    }
+
+    fn is_auto_array_declaration(&self, declaration: &VarDeclarator, modifiers: u32) -> bool {
+        if !(self.no_implicit_any || self.current_file_is_js())
+            || declaration.type_ann.is_some()
+            || !matches!(declaration.name.kind, PatKind::Ident(_))
+            || modifiers & (MOD_EXPORT | MOD_DECLARE) != 0
+            || self.ambient_depth > 0
+        {
+            return false;
+        }
+        let Some(mut initializer) = declaration.init.as_deref() else {
+            return false;
+        };
+        while let ExprKind::Paren(inner) = &initializer.kind {
+            initializer = inner;
+        }
+        matches!(&initializer.kind, ExprKind::ArrayLit(elements) if elements.is_empty())
+    }
+
+    fn with_exported_variable_modifier(statement: &Stmt) -> std::borrow::Cow<'_, Stmt> {
+        let StmtKind::Var(variables) = &statement.kind else {
+            return std::borrow::Cow::Borrowed(statement);
+        };
+        // Export syntax wraps the declaration, so the inner variable statement
+        // may not carry the modifier used by variable inference.
+        let mut variables = variables.clone();
+        variables.modifiers |= MOD_EXPORT;
+        std::borrow::Cow::Owned(Stmt {
+            kind: StmtKind::Var(variables),
+            span: statement.span,
+        })
+    }
+
+    fn is_widening_literal_expression(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Paren(inner) | ExprKind::NonNull(inner) => {
+                self.is_widening_literal_expression(inner)
+            }
+            ExprKind::Ident(name) => self.nearest_binding_scope(name).is_some_and(|scope| {
+                self.scopes[scope]
+                    .widening_literal_bindings
+                    .contains(name.as_str())
+            }),
+            ExprKind::Cond(condition) => {
+                self.is_widening_literal_expression(&condition.consequent)
+                    || self.is_widening_literal_expression(&condition.alternate)
+            }
+            ExprKind::Unary(unary) if matches!(unary.op, UnaryOp::Pos | UnaryOp::Neg) => {
+                self.is_widening_literal_expression(&unary.argument)
+            }
+            _ => Self::is_fresh_literal_expr(expr),
+        }
+    }
+
+    fn mark_widening_literal_binding(&mut self, declaration: &VarDeclarator, is_const: bool) {
+        if is_const
+            && declaration.type_ann.is_none()
+            && declaration
+                .init
+                .as_deref()
+                .is_some_and(|init| self.is_widening_literal_expression(init))
+        {
+            if let PatKind::Ident(name) = &declaration.name.kind {
+                if self.lookup_var(name).is_some_and(|ty| {
+                    matches!(
+                        ty,
+                        Type::StringLiteral(_)
+                            | Type::NumberLiteral(_)
+                            | Type::BooleanLiteral(_)
+                            | Type::BigIntLiteral(_)
+                            | Type::EnumVariant { .. }
+                            | Type::Union(_)
+                    )
+                }) {
+                    self.scopes[self.current_scope]
+                        .widening_literal_bindings
+                        .insert(name.to_string());
+                }
+            }
         }
     }
 
@@ -19731,7 +19985,7 @@ impl TypeChecker {
             self.check_assertion_comparability(se, te, span);
             return;
         }
-        if self.is_assignable_to(source, target) || self.is_assignable_to(target, source) {
+        if self.assertion_types_overlap(source, target, 0) {
             return;
         }
         // A union source is comparable when any one constituent is (tsc
@@ -19758,18 +20012,128 @@ impl TypeChecker {
         {
             return;
         }
-        self.diagnostics.push(Diagnostic {
-            code: 2352,
-            message: format!(
+        let mut message = format!(
                 "Conversion of type '{}' to type '{}' may be a mistake because neither type sufficiently overlaps with the other. If this was intentional, convert the expression to 'unknown' first.",
                 source.display_string(),
                 target.display_string()
-            ),
+            );
+        if let Some(missing) = crate::assign::pure_missing_properties(target, source) {
+            if let [name] = missing.as_slice() {
+                message.push_str(&format!(
+                    "\n  Property '{name}' is missing in type '{}' but required in type '{}'.",
+                    source.display_string(),
+                    target.display_string(),
+                ));
+            } else {
+                message.push_str(&format!(
+                    "\n  Type '{}' is missing the following properties from type '{}': {}",
+                    source.display_string(),
+                    target.display_string(),
+                    missing.join(", "),
+                ));
+            }
+        }
+        self.diagnostics.push(Diagnostic {
+            code: 2352,
+            message,
             category: DiagnosticCategory::Error,
             file_name: None,
             span: Some(span),
             related: None,
         });
+    }
+
+    /// Comparability is bidirectional at each member, not just once for the
+    /// whole object. One property may narrow while another widens in a cast.
+    fn assertion_types_overlap(&self, source: &Type, target: &Type, depth: u8) -> bool {
+        if self.is_assignable_to(source, target) || self.is_assignable_to(target, source) {
+            return true;
+        }
+        if depth >= 8 {
+            return false;
+        }
+        if let Type::Union(members) = source {
+            return members
+                .iter()
+                .any(|member| self.assertion_types_overlap(member, target, depth + 1));
+        }
+        if let Type::Union(members) = target {
+            return members
+                .iter()
+                .any(|member| self.assertion_types_overlap(source, member, depth + 1));
+        }
+        for (candidate, other) in [(source, target), (target, source)] {
+            if let Type::TypeReference(name, _) = candidate {
+                if let Some(values) = self.enum_target_member_values(name) {
+                    return values
+                        .iter()
+                        .any(|value| self.assertion_types_overlap(value, other, depth + 1));
+                }
+                // Preserve nominal class rules. Interfaces and aliases can
+                // contribute the structural members of a comparable object.
+                if self.interface_info.contains_key(name.as_str())
+                    || self.type_aliases.contains_key(name.as_str())
+                {
+                    if let Some(resolved) = self
+                        .resolve_type_for_assignability(candidate)
+                        .or_else(|| {
+                            if let Type::TypeReference(name, args) = candidate {
+                                self.resolve_type_reference_to_object(name, args)
+                            } else {
+                                None
+                            }
+                        })
+                        .filter(|resolved| resolved != candidate)
+                    {
+                        return self.assertion_types_overlap(&resolved, other, depth + 1);
+                    }
+                }
+            }
+        }
+        match (source, target) {
+            (Type::Array(source), Type::Array(target)) => {
+                self.assertion_types_overlap(source, target, depth + 1)
+            }
+            (Type::ObjectType(source), Type::ObjectType(target)) => {
+                let simple = |info: &ObjectTypeInfo| {
+                    info.call_signatures.is_empty()
+                        && info.construct_signatures.is_empty()
+                        && info.index_signature.is_none()
+                };
+                if !simple(source) || !simple(target) {
+                    return false;
+                }
+                let direction = |source: &ObjectTypeInfo, target: &ObjectTypeInfo| {
+                    target.properties.iter().all(|(name, expected)| {
+                        match source.properties.iter().find(|(actual, _)| {
+                            actual.trim_start_matches('?') == name.trim_start_matches('?')
+                        }) {
+                            Some((actual_name, actual)) => {
+                                let optional = |name: &str, ty: &Type| {
+                                    name.starts_with('?') || matches!(ty, Type::Optional(_))
+                                };
+                                let unwrap = |ty: &Arc<Type>| match ty.as_ref() {
+                                    Type::Optional(inner) => Type::clone(inner),
+                                    other => other.clone(),
+                                };
+                                (!optional(actual_name, actual) || optional(name, expected))
+                                    && self.assertion_types_overlap(
+                                        &unwrap(actual),
+                                        &unwrap(expected),
+                                        depth + 1,
+                                    )
+                            }
+                            None => {
+                                name.starts_with('?')
+                                    || matches!(expected.as_ref(), Type::Optional(_))
+                            }
+                        }
+                    })
+                };
+                direction(source, target) || direction(target, source)
+            }
+            _ => false,
+        }
     }
 
     /// (member name -> declaring class) for every private member on the
@@ -24098,7 +24462,7 @@ impl TypeChecker {
                     }
                 }
                 for (name, ty) in &info.properties {
-                    if name.starts_with('?') {
+                    if name.starts_with('?') || matches!(ty.as_ref(), Type::Optional(_)) {
                         continue;
                     }
                     let n = name.as_str();
@@ -26837,10 +27201,15 @@ impl TypeChecker {
                             // narrow under the contextual type instead
                             // of widening to `string`.
                             self.check_expr_contextual(init, declared_type.as_ref())
+                        } else if matches!(decl.name.kind, PatKind::Array(_) | PatKind::Object(_)) {
+                            let context =
+                                crate::resolve_types::implied_binding_pattern_type(&decl.name);
+                            self.check_expr_contextual(init, context.as_ref())
                         } else {
                             self.check_expr(init)
                         }
                     });
+                    self.report_variable_widening(decl, var_stmt);
                     let condition_alias = if is_const
                         && matches!(&decl.name.kind, PatKind::Ident(_))
                         && init_type
@@ -26967,6 +27336,8 @@ impl TypeChecker {
                         inferred_unique
                     } else if let Some(ref decl_ty) = declared_type {
                         decl_ty.clone()
+                    } else if self.is_auto_array_declaration(decl, var_stmt.modifiers) {
+                        Type::Array(Arc::new(Type::Any))
                     } else if let Some(init_ty) = init_type {
                         // The lightweight registration pass knows the return
                         // type of the standard `Symbol()` / `Symbol.for()`
@@ -27011,7 +27382,7 @@ impl TypeChecker {
                                 Type::ObjectType(_)
                                 | Type::Array(_)
                                 | Type::Tuple(_)
-                                | Type::Function(_) => Self::keep_const_asserted_properties(
+                                | Type::Function(_) => self.keep_const_asserted_properties(
                                     decl.init.as_deref(),
                                     &init_ty,
                                     Self::widen_nested_literals(&init_ty),
@@ -27021,7 +27392,7 @@ impl TypeChecker {
                             }
                         } else {
                             // let/var: widen everything including nested literals
-                            Self::keep_const_asserted_properties(
+                            self.keep_const_asserted_properties(
                                 decl.init.as_deref(),
                                 &init_ty,
                                 Self::widen_nested_literals(&init_ty),
@@ -27159,6 +27530,7 @@ impl TypeChecker {
                         ty,
                         var_stmt.kind == VarKind::Const,
                     );
+                    self.mark_widening_literal_binding(decl, is_const);
                     if let (PatKind::Ident(name), Some(receiver)) = (&decl.name.kind, this_receiver)
                     {
                         self.scopes[self.current_scope]
@@ -27330,6 +27702,7 @@ impl TypeChecker {
                     self.check_expr(e)
                 };
                 // TS2322: check return expression against declared return type
+                self.collect_widening_return(e);
                 if let Some(Some(expected_ret)) = self.return_type_stack.last().cloned() {
                     // Inside an async function `return` automatically
                     // flattens a `Promise<X>` to `X`. The declared return
@@ -27594,6 +27967,7 @@ impl TypeChecker {
                 }
                 self.push_scope();
                 // Register loop variable — for-in always yields string
+                let mut iterated_type = None;
                 match &fi.left {
                     ForInOfLeft::Var(vs) => {
                         for decl in &vs.declarations {
@@ -27620,11 +27994,11 @@ impl TypeChecker {
                         let key_type = self.for_in_key_type(&object_type);
                         let readonly = self.report_readonly_property_write(expression);
                         self.check_for_in_expression(expression, &key_type, readonly);
+                        iterated_type = Some(object_type);
                     }
                 }
-                if !matches!(fi.left, ForInOfLeft::Expr(_)) {
-                    self.check_expr(&fi.right);
-                }
+                let iterated_type = iterated_type.unwrap_or_else(|| self.check_expr(&fi.right));
+                self.mark_numeric_for_in_key(&fi.left, &iterated_type);
                 self.check_stmt(&fi.body);
                 self.pop_scope();
             }
@@ -27676,22 +28050,31 @@ impl TypeChecker {
                     self.check_stmt(&fo.body);
                     return;
                 }
-                // An identifier target is assigned, not declared: remember its
-                // declared type before the loop scope shadows it.
-                let assigned_target_type = match &fo.left {
-                    ForInOfLeft::Pat(Pat {
-                        kind: PatKind::Ident(name),
-                        ..
-                    }) => self.lookup_declared_var(name),
-                    ForInOfLeft::Expr(target) if matches!(target.kind, ExprKind::Member(_)) => {
-                        let saved = self.assign_lhs_declared;
-                        self.assign_lhs_declared = true;
-                        let ty = self.check_expr(target);
-                        self.assign_lhs_declared = saved;
-                        Some(ty)
+                let mut loop_names = Vec::new();
+                match &fo.left {
+                    ForInOfLeft::Var(declarations) => {
+                        for declaration in &declarations.declarations {
+                            Self::collect_pattern_binding_names(&declaration.name, &mut loop_names);
+                        }
                     }
-                    _ => None,
-                };
+                    ForInOfLeft::Pat(pattern) => {
+                        Self::collect_pattern_binding_names(pattern, &mut loop_names)
+                    }
+                    ForInOfLeft::Expr(expression) => {
+                        if let ExprKind::Ident(name) = &expression.kind {
+                            loop_names.push(name.to_string());
+                        }
+                    }
+                }
+                let unassigned_before_loop: Vec<_> = loop_names
+                    .into_iter()
+                    .filter_map(|name| {
+                        self.uninitialized_vars
+                            .get(&name)
+                            .copied()
+                            .map(|origin| (name, origin))
+                    })
+                    .collect();
                 self.push_scope();
                 // Register loop variable
                 match &fo.left {
@@ -27705,55 +28088,103 @@ impl TypeChecker {
                             if let PatKind::Ident(name) = &decl.name.kind {
                                 self.uninitialized_vars.remove(name.as_str());
                             }
-                            self.declare_pattern_vars(&decl.name, Type::Any);
+                            let mut names = Vec::new();
+                            Self::collect_pattern_binding_names(&decl.name, &mut names);
+                            for name in names {
+                                self.declare_var(&name, Type::Any);
+                            }
                         }
                     }
-                    ForInOfLeft::Pat(pat) => {
-                        self.check_binding_pattern_runtime_expressions(pat);
-                        self.mark_pattern_assigned(pat);
-                        self.declare_pattern_vars(pat, Type::Any);
-                    }
-                    ForInOfLeft::Expr(expression) => {
-                        self.report_readonly_property_write(expression);
-                        self.check_for_in_of_target(expression);
-                    }
+                    ForInOfLeft::Pat(_) | ForInOfLeft::Expr(_) => {}
                 }
                 let iterated = self.check_expr(&fo.right);
+                let implicit_nullish_element = !self.strict_null_checks
+                    && matches!(&iterated, Type::Array(element) if matches!(element.as_ref(), Type::Null | Type::Undefined));
+                let iterated = self.widen_fresh_array_type(&fo.right, iterated);
                 // A literal `undefined`/`null` operand gets TS18050 instead.
                 let nullish_literal = matches!(&fo.right.kind, ExprKind::NullLit)
                     || matches!(&fo.right.kind, ExprKind::Ident(name) if name == "undefined");
+                if let ForInOfLeft::Var(declarations) = &fo.left {
+                    let element = self
+                        .for_of_binding_element_type(&iterated, fo.is_await)
+                        .unwrap_or(Type::Any);
+                    for declaration in &declarations.declarations {
+                        if self.no_implicit_any
+                            && implicit_nullish_element
+                            && declaration.type_ann.is_none()
+                        {
+                            if let PatKind::Ident(name) = &declaration.name.kind {
+                                self.diagnostics.push(Diagnostic {
+                                    code: 7005,
+                                    message: format!(
+                                        "Variable '{name}' implicitly has an 'any' type."
+                                    ),
+                                    category: DiagnosticCategory::Error,
+                                    file_name: None,
+                                    span: Some(declaration.name.span),
+                                    related: None,
+                                });
+                            }
+                        }
+                        self.declare_pattern_vars_with_defaults(
+                            &declaration.name,
+                            element.clone(),
+                            declarations.kind == VarKind::Const,
+                        );
+                    }
+                }
                 if !fo.is_await
                     && !nullish_literal
                     && !self.report_not_iterable(&iterated, fo.right.span, true)
                 {
                     if let (ForInOfLeft::Var(vs), Some(element)) =
-                        (&fo.left, self.iterated_element_type(&iterated))
+                        (&fo.left, self.for_of_element_type(&iterated))
                     {
                         for decl in &vs.declarations {
                             self.check_array_pattern_iterable(&decl.name, &element);
                             self.check_binding_pattern_access(&decl.name, &element);
                         }
                     }
-                    // `for (v of xs)`: each element is assigned to the target.
-                    let target_span = match &fo.left {
-                        ForInOfLeft::Pat(pattern) => pattern.span,
-                        ForInOfLeft::Expr(target) => target.span,
-                        ForInOfLeft::Var(_) => Span::new(0, 0),
-                    };
-                    if let (Some(target_ty), Some(element)) =
-                        (&assigned_target_type, self.for_of_element_type(&iterated))
-                    {
-                        let element = Self::tsc_primitive_union_order(element);
-                        if !matches!(element, Type::Any | Type::Error | Type::Unknown)
-                            && !matches!(target_ty, Type::Any | Type::Error)
-                            && !self.is_assignable_to(&element, target_ty)
-                        {
-                            self.push_not_assignable(&element, target_ty, target_span);
-                        }
+                }
+                let mut assigned_flows = Vec::new();
+                let element = self
+                    .for_of_binding_element_type(&iterated, fo.is_await)
+                    .unwrap_or(Type::Any);
+                match &fo.left {
+                    ForInOfLeft::Pat(pattern) => {
+                        self.check_for_of_assignment_pattern(pattern, &element, &mut assigned_flows)
                     }
+                    ForInOfLeft::Expr(expression) => self.check_for_of_assignment_expression(
+                        expression,
+                        &element,
+                        &mut assigned_flows,
+                    ),
+                    ForInOfLeft::Var(_) => {}
                 }
                 self.check_stmt(&fo.body);
+                let exit_flows: Vec<_> = assigned_flows
+                    .into_iter()
+                    .map(|(path, before)| {
+                        let after = self
+                            .lookup_narrowed(&path)
+                            .unwrap_or_else(|| before.clone());
+                        (
+                            path,
+                            Self::tsc_primitive_union_order(Type::flatten_union(vec![
+                                before, after,
+                            ])),
+                        )
+                    })
+                    .collect();
                 self.pop_scope();
+                for (path, ty) in exit_flows {
+                    if !unassigned_before_loop.iter().any(|(name, _)| *name == path) {
+                        self.narrow_var(&path, ty);
+                    }
+                }
+                // The iterand may be empty, so assigning its target inside
+                // the loop does not establish assignment on the exit path.
+                self.uninitialized_vars.extend(unassigned_before_loop);
             }
             StmtKind::Block(stmts) => {
                 self.push_scope();
@@ -27771,7 +28202,10 @@ impl TypeChecker {
                     self.scopes[completed_scope].vars.keys().cloned().collect();
                 self.pop_scope();
                 for (name, type_id) in narrowed {
-                    if !locals.contains(&name) && self.lookup_declared_var(&name).is_some() {
+                    let root = name.split(['.', '[']).next().unwrap_or(&name);
+                    if !locals.contains(root)
+                        && (root == "this" || self.lookup_declared_var(root).is_some())
+                    {
                         self.scopes[self.current_scope]
                             .narrowed
                             .insert(name, type_id);
@@ -27908,6 +28342,10 @@ impl TypeChecker {
                 if pushed_tp {
                     self.type_param_constraint_stack.pop();
                 }
+                self.finish_widening_function(
+                    fn_decl.name.as_deref(),
+                    fn_decl.name_span.unwrap_or(fn_decl.span),
+                );
                 self.return_type_stack.pop();
                 self.return_is_async_stack.pop();
                 self.generator_stack.pop();
@@ -28658,8 +29096,9 @@ impl TypeChecker {
                 }
             }
             StmtKind::Export(export_decl) => match &export_decl.kind {
-                ExportDeclKind::Decl(decl) => self.check_stmt(decl),
-                ExportDeclKind::DefaultDecl(decl) => self.check_stmt(decl),
+                ExportDeclKind::Decl(decl) | ExportDeclKind::DefaultDecl(decl) => {
+                    self.check_stmt(&Self::with_exported_variable_modifier(decl));
+                }
                 ExportDeclKind::All { source, .. } => {
                     if !self.export_declaration_not_permitted_in_namespace(
                         export_decl.span,
@@ -41597,7 +42036,7 @@ impl TypeChecker {
                     Type::StringLiteral(_),
                 ) => true,
                 (Type::NumberLiteral(_), Type::NumberLiteral(_)) => true,
-                (Type::BooleanLiteral(_), Type::BooleanLiteral(_)) => true,
+                (Type::Boolean | Type::BooleanLiteral(_), Type::BooleanLiteral(_)) => true,
                 (Type::BigIntLiteral(_), Type::BigIntLiteral(_)) => true,
                 (Type::EnumVariant { .. }, Type::NumberLiteral(_) | Type::StringLiteral(_)) => true,
                 _ => false,
@@ -41964,7 +42403,24 @@ impl TypeChecker {
         match &expanded {
             Type::ObjectType(info) => {
                 for (name, ty) in &info.properties {
-                    if !properties.iter().any(|(k, _)| k == name) {
+                    if let Some((_, existing)) = properties.iter_mut().find(|(key, _)| key == name)
+                    {
+                        if let Type::Optional(incoming) = ty.as_ref() {
+                            let (optional, previous) = match existing.as_ref() {
+                                Type::Optional(inner) => (true, Type::clone(inner)),
+                                previous => (false, previous.clone()),
+                            };
+                            let merged =
+                                self.array_literal_union(vec![previous, Type::clone(incoming)]);
+                            *existing = Arc::new(if optional {
+                                Type::Optional(Arc::new(merged))
+                            } else {
+                                merged
+                            });
+                        } else {
+                            *existing = Arc::clone(ty);
+                        }
+                    } else {
                         properties.push((name.clone(), Arc::clone(ty)));
                     }
                 }
@@ -42136,7 +42592,44 @@ impl TypeChecker {
     /// `{ mode: "manual" as const }`: a property whose initializer is a
     /// const assertion keeps its literal type through the declaration's
     /// widening (the asserted literal is not a fresh one).
-    fn keep_const_asserted_properties(init: Option<&Expr>, original: &Type, widened: Type) -> Type {
+    fn keep_const_asserted_properties(
+        &self,
+        init: Option<&Expr>,
+        original: &Type,
+        widened: Type,
+    ) -> Type {
+        let mut unwrapped = init;
+        while let Some(Expr {
+            kind: ExprKind::Paren(inner),
+            ..
+        }) = unwrapped
+        {
+            unwrapped = Some(inner);
+        }
+        if matches!(
+            unwrapped.map(|expr| &expr.kind),
+            Some(ExprKind::As(_) | ExprKind::TypeAssertion(_))
+        ) {
+            // An assertion supplies a regular type; its member literals are
+            // not fresh initializer literals subject to widening.
+            return original.clone();
+        }
+        if let (
+            Some(Expr {
+                kind: ExprKind::ArrayLit(_),
+                ..
+            }),
+            Type::Array(element),
+        ) = (init, original)
+        {
+            // Array inference already widened fresh elements individually.
+            // Re-widening here erases regular literals supplied by assertions,
+            // annotations, or spreads from literal-typed arrays and tuples.
+            if self.strict_null_checks || !matches!(element.as_ref(), Type::Null | Type::Undefined)
+            {
+                return original.clone();
+            }
+        }
         let (
             Some(Expr {
                 kind: ExprKind::ObjectLit(props),
@@ -43567,6 +44060,7 @@ impl TypeChecker {
         LAST_INFER_COVARIANT.with(|last| *last.borrow_mut() = covariant);
         let contra =
             INFER_CONTRA.with(|contra| std::mem::replace(&mut *contra.borrow_mut(), saved_contra));
+        LAST_INFER_CONTRA.with(|last| *last.borrow_mut() = contra.clone());
         INFER_CONTRA_DEPTH.with(|depth| depth.set(saved_depth));
         for (name, candidates) in contra {
             if result.contains_key(&name) {
@@ -43713,8 +44207,22 @@ impl TypeChecker {
                 (name.clone(), resolved)
             })
             .collect();
+        let sources = call_arg_types
+            .iter()
+            .zip(&resolved_params)
+            .map(|(source, (_, target))| {
+                // A callable alias can supply contravariant candidates even
+                // when another argument has already inferred a covariant one.
+                if matches!(target, Type::Function(_)) {
+                    self.prepare_inference_shapes(source, target, type_params, 0)
+                        .0
+                } else {
+                    source.clone()
+                }
+            })
+            .collect::<Vec<_>>();
         let mut inferred =
-            self.infer_with_common_supertype(call_arg_types, &resolved_params, type_params);
+            self.infer_with_common_supertype(&sources, &resolved_params, type_params);
         let unsolved: Vec<_> = type_params
             .iter()
             .filter(|name| !inferred.contains_key(*name))
@@ -43739,8 +44247,12 @@ impl TypeChecker {
         targets: &[(String, Type)],
         parameters: &[String],
     ) -> HashMap<String, Type> {
+        let previous_strict =
+            INFER_STRICT_CONSTRUCTORS.with(|flag| flag.replace(self.strict_function_types));
         let mut inferred = Self::infer_type_arguments(sources, targets, parameters);
+        INFER_STRICT_CONSTRUCTORS.with(|flag| flag.set(previous_strict));
         let covariant = LAST_INFER_COVARIANT.with(|last| std::mem::take(&mut *last.borrow_mut()));
+        let contravariant = LAST_INFER_CONTRA.with(|last| std::mem::take(&mut *last.borrow_mut()));
         // A union supplied at one inference site is one candidate. Do not
         // select between its constituents after the recorder splits it.
         // Callback parameters can also fix contextual inferences, so only
@@ -43750,10 +44262,18 @@ impl TypeChecker {
                 return true;
             }
             match source {
-                Type::ObjectType(info) => info
-                    .properties
-                    .iter()
-                    .any(|(_, ty)| supplies_candidate(ty, candidate)),
+                Type::ObjectType(info) => {
+                    info.properties
+                        .iter()
+                        .any(|(_, ty)| supplies_candidate(ty, candidate))
+                        || info
+                            .construct_signatures
+                            .iter()
+                            .any(|signature| constructor_supplies_candidate(signature, candidate))
+                }
+                Type::Constructor(signature) => {
+                    constructor_supplies_candidate(signature, candidate)
+                }
                 Type::Function(function) if function.params.is_empty() => {
                     supplies_candidate(&function.return_type, candidate)
                 }
@@ -43763,20 +44283,123 @@ impl TypeChecker {
                 _ => false,
             }
         }
-        for (name, candidates) in covariant {
-            if !candidates.iter().all(|candidate| {
+        fn constructor_supplies_candidate(signature: &ConstructorType, candidate: &Type) -> bool {
+            // Distinct overloads supply separate candidates, while a union
+            // within one signature remains a single candidate.
+            signature
+                .params
+                .iter()
+                .any(|(_, ty)| supplies_candidate(ty, candidate))
+                || supplies_candidate(&signature.return_type, candidate)
+        }
+        fn supplies_contravariant_parameter(source: &Type, candidate: &Type) -> bool {
+            if let Type::Function(signature) = source {
+                if signature
+                    .params
+                    .iter()
+                    .any(|(_, ty)| supplies_candidate(ty, candidate))
+                {
+                    return true;
+                }
+            }
+            let signatures = match source {
+                Type::Constructor(signature) => std::slice::from_ref(signature),
+                Type::ObjectType(info) => info.construct_signatures.as_slice(),
+                _ => &[],
+            };
+            if signatures.iter().any(|signature| {
+                signature
+                    .params
+                    .iter()
+                    .any(|(_, ty)| supplies_candidate(ty, candidate))
+            }) {
+                return true;
+            }
+            match source {
+                Type::ObjectType(info) => info
+                    .properties
+                    .iter()
+                    .any(|(_, ty)| supplies_contravariant_parameter(ty, candidate)),
+                Type::Function(function) if function.params.is_empty() => {
+                    supplies_contravariant_parameter(&function.return_type, candidate)
+                }
+                Type::Array(element) | Type::Optional(element) => {
+                    supplies_contravariant_parameter(element, candidate)
+                }
+                _ => false,
+            }
+        }
+        let independent_candidates = |candidates: &[Type]| {
+            candidates.iter().all(|candidate| {
                 matches!(candidate, Type::Null | Type::Undefined)
                     || sources
                         .iter()
                         .any(|source| supplies_candidate(source, candidate))
-            }) {
+            })
+        };
+        for (name, candidates) in &covariant {
+            if !independent_candidates(candidates) {
                 continue;
             }
-            if let Some(choice) = self.common_supertype_candidate(&candidates) {
-                inferred.insert(name, choice);
+            if let Some(choice) = self.common_supertype_candidate(candidates) {
+                inferred.insert(name.clone(), choice);
+            }
+        }
+        for (name, candidates) in contravariant {
+            if !self.strict_function_types
+                || candidates.is_empty()
+                || !candidates.iter().all(|candidate| {
+                    sources
+                        .iter()
+                        .any(|source| supplies_contravariant_parameter(source, candidate))
+                })
+                || !candidates.iter().all(|ty| {
+                    self.known_inference_candidate(ty)
+                        || matches!(
+                            ty,
+                            Type::Never | Type::Unknown | Type::Null | Type::Undefined
+                        )
+                })
+            {
+                continue;
+            }
+            let mut choice = &candidates[0];
+            for candidate in &candidates[1..] {
+                if self.is_assignable_to(candidate, choice) {
+                    choice = candidate;
+                }
+            }
+            let prefer_covariant = covariant.contains_key(&name)
+                && inferred.get(&name).is_some_and(|ty| {
+                    !matches!(ty, Type::Any | Type::Never)
+                        && candidates
+                            .iter()
+                            .any(|candidate| self.is_assignable_to(ty, candidate))
+                });
+            if !prefer_covariant {
+                inferred.insert(name, choice.clone());
             }
         }
         inferred
+    }
+
+    fn known_inference_candidate(&self, ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Void
+                | Type::String
+                | Type::Number
+                | Type::Boolean
+                | Type::BigInt
+                | Type::Symbol
+                | Type::StringLiteral(_)
+                | Type::NumberLiteral(_)
+                | Type::BooleanLiteral(_)
+                | Type::BigIntLiteral(_)
+        ) || matches!(ty, Type::TypeReference(name, args)
+            if args.is_empty()
+                && (self.interface_info.contains_key(name.as_str())
+                    || self.class_info.contains_key(name.as_str())))
     }
 
     /// tsc getCommonSupertype over covariant inference candidates: nullable
@@ -43793,25 +44416,10 @@ impl TypeChecker {
         }
         // Only plain, fully known shapes: type parameters, unresolved
         // references and deferred forms keep today's union.
-        let judgeable = |ty: &Type| {
-            matches!(
-                ty,
-                Type::Void
-                    | Type::String
-                    | Type::Number
-                    | Type::Boolean
-                    | Type::BigInt
-                    | Type::Symbol
-                    | Type::StringLiteral(_)
-                    | Type::NumberLiteral(_)
-                    | Type::BooleanLiteral(_)
-                    | Type::BigIntLiteral(_)
-            ) || matches!(ty, Type::TypeReference(name, args)
-                    if args.is_empty()
-                        && (self.interface_info.contains_key(name.as_str())
-                            || self.class_info.contains_key(name.as_str())))
-        };
-        if !rest.iter().all(|candidate| judgeable(candidate)) {
+        if !rest
+            .iter()
+            .all(|candidate| self.known_inference_candidate(candidate))
+        {
             return None;
         }
         let widened: Vec<Type> = rest
@@ -43992,12 +44600,19 @@ impl TypeChecker {
                                 .any(|bound| bound.as_str() == *name)
                         })
                         .collect::<HashSet<_>>();
+                    let strict = INFER_STRICT_CONSTRUCTORS.with(Cell::get);
+                    if strict {
+                        INFER_CONTRA_DEPTH.with(|depth| depth.set(depth.get() + 1));
+                    }
                     for ((_, argument), (_, parameter)) in arg_constructor
                         .params
                         .iter()
                         .zip(param_constructor.params.iter())
                     {
                         Self::infer_from_types(argument, parameter, &scoped_type_params, inferred);
+                    }
+                    if strict {
+                        INFER_CONTRA_DEPTH.with(|depth| depth.set(depth.get() - 1));
                     }
                     Self::infer_from_types(
                         &arg_constructor.return_type,
@@ -44059,6 +44674,10 @@ impl TypeChecker {
                                     .any(|bound| bound.as_str() == *name)
                             })
                             .collect::<HashSet<_>>();
+                        let strict = INFER_STRICT_CONSTRUCTORS.with(Cell::get);
+                        if strict {
+                            INFER_CONTRA_DEPTH.with(|depth| depth.set(depth.get() + 1));
+                        }
                         for ((_, argument_type), (_, parameter_type)) in
                             argument.params.iter().zip(parameter.params.iter())
                         {
@@ -44068,6 +44687,9 @@ impl TypeChecker {
                                 &scoped_type_params,
                                 inferred,
                             );
+                        }
+                        if strict {
+                            INFER_CONTRA_DEPTH.with(|depth| depth.set(depth.get() - 1));
                         }
                         Self::infer_from_types(
                             &argument.return_type,
@@ -44369,16 +44991,21 @@ mod tests {
     #[test]
     fn test_empty_array_literal() {
         let out = parse_and_check("[];");
-        assert!(out.expression_types.values().any(|t| t == "any[]"));
+        assert!(out.diagnostics.is_empty());
+        assert_eq!(
+            out.expression_types.get(&0).map(String::as_str),
+            Some("undefined[]")
+        );
     }
 
     #[test]
     fn test_mixed_array_literal() {
         let out = parse_and_check("[1, \"hello\"];");
-        assert!(out
-            .expression_types
-            .values()
-            .any(|t| t == "number | string[]" || t == "(number | string)[]"));
+        assert!(out.diagnostics.is_empty());
+        assert_eq!(
+            out.expression_types.get(&0).map(String::as_str),
+            Some("(string | number)[]")
+        );
     }
 
     // -----------------------------------------------------------------------

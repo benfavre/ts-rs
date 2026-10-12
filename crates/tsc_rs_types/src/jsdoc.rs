@@ -31,6 +31,7 @@ struct Tag {
 
 #[derive(Debug, Clone)]
 struct JsDoc {
+    start: u32,
     end: u32,
     tags: Vec<Tag>,
 }
@@ -199,6 +200,7 @@ fn collect(file: &SourceFile) -> Vec<JsDoc> {
         let tags = parse_tags(text, comment.pos as usize);
         if !tags.is_empty() {
             docs.push(JsDoc {
+                start: comment.pos,
                 end: comment.end,
                 tags,
             });
@@ -1005,6 +1007,34 @@ impl Walker<'_> {
     }
 
     fn class(&mut self, class: &mut ClassDecl) {
+        let mut declared_properties = Vec::new();
+        for member in &class.members {
+            if let ClassMemberKind::Constructor(constructor) = &member.kind {
+                if let Some(body) = &constructor.body {
+                    for statement in body {
+                        self.constructor_property_annotations(statement, &mut declared_properties);
+                    }
+                }
+            }
+        }
+        for property in declared_properties {
+            let ClassMemberKind::Property(inferred) = &property.kind else {
+                continue;
+            };
+            fn name(name: &PropName) -> Option<&str> {
+                match name {
+                    PropName::Ident(name, _) | PropName::String(name, _) => Some(name.as_str()),
+                    _ => None,
+                }
+            }
+            if class.members.iter().any(|member| matches!(&member.kind,
+                ClassMemberKind::Property(existing) if name(&existing.name) == name(&inferred.name)
+            )) {
+                continue;
+            }
+            class.members.push(property);
+            self.changed = true;
+        }
         for member in &mut class.members {
             let doc = self.doc_before(member.span.start).cloned();
             match &mut member.kind {
@@ -1073,6 +1103,124 @@ impl Walker<'_> {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// A constructor's `/** @type {T} */ this.x = value` declares an instance
+    /// property, just as an annotated class field does. Preserve that contract
+    /// instead of inferring the property solely from its initializer.
+    fn constructor_property_annotations(
+        &self,
+        statement: &Stmt,
+        properties: &mut Vec<ClassMember>,
+    ) {
+        match &statement.kind {
+            StmtKind::Expr(expression) => {
+                let ExprKind::Assign(assignment) = &expression.kind else {
+                    return;
+                };
+                if assignment.op != AssignOp::Assign {
+                    return;
+                }
+                let name = match &assignment.left.kind {
+                    ExprKind::Member(member) if matches!(member.object.kind, ExprKind::This) => {
+                        PropName::Ident(
+                            member.property.clone(),
+                            Span::new(
+                                assignment.left.span.end - member.property.len() as u32,
+                                assignment.left.span.end,
+                            ),
+                        )
+                    }
+                    ExprKind::ElemAccess(access)
+                        if matches!(access.object.kind, ExprKind::This) =>
+                    {
+                        let ExprKind::StrLit(name) = &access.index.kind else {
+                            return;
+                        };
+                        PropName::String(name.clone(), access.index.span)
+                    }
+                    _ => return,
+                };
+                let Some(annotation) = self
+                    .doc_before(statement.span.start)
+                    .filter(|doc| {
+                        // A same-line trailing comment belongs to the prior
+                        // token, not to the following property assignment.
+                        self.text[..doc.start as usize]
+                            .rsplit(['\n', '\r'])
+                            .next()
+                            .is_some_and(|prefix| prefix.trim().is_empty())
+                    })
+                    .and_then(|doc| Self::tag(doc, "type"))
+                    .and_then(|tag| self.type_of(tag))
+                else {
+                    return;
+                };
+                properties.push(ClassMember {
+                    span: assignment.left.span,
+                    kind: ClassMemberKind::Property(ClassProp {
+                        name,
+                        type_ann: Some(annotation),
+                        initializer: None,
+                        modifiers: 0,
+                        optional: false,
+                        definite: false,
+                        decorators: Vec::new(),
+                    }),
+                });
+            }
+            StmtKind::Block(body) => {
+                for statement in body {
+                    self.constructor_property_annotations(statement, properties);
+                }
+            }
+            StmtKind::If(branch) => {
+                self.constructor_property_annotations(&branch.consequent, properties);
+                if let Some(alternate) = &branch.alternate {
+                    self.constructor_property_annotations(alternate, properties);
+                }
+            }
+            StmtKind::For(loop_) => self.constructor_property_annotations(&loop_.body, properties),
+            StmtKind::ForIn(loop_) => {
+                self.constructor_property_annotations(&loop_.body, properties)
+            }
+            StmtKind::ForOf(loop_) => {
+                self.constructor_property_annotations(&loop_.body, properties)
+            }
+            StmtKind::While(loop_) => {
+                self.constructor_property_annotations(&loop_.body, properties)
+            }
+            StmtKind::DoWhile(loop_) => {
+                self.constructor_property_annotations(&loop_.body, properties)
+            }
+            StmtKind::Labeled(label) => {
+                self.constructor_property_annotations(&label.body, properties)
+            }
+            StmtKind::Switch(switch) => {
+                for case in &switch.cases {
+                    for statement in &case.consequent {
+                        self.constructor_property_annotations(statement, properties);
+                    }
+                }
+            }
+            StmtKind::Try(try_) => {
+                for statement in &try_.block {
+                    self.constructor_property_annotations(statement, properties);
+                }
+                if let Some(catch) = &try_.handler {
+                    for statement in &catch.body {
+                        self.constructor_property_annotations(statement, properties);
+                    }
+                }
+                if let Some(finally) = &try_.finalizer {
+                    for statement in finally {
+                        self.constructor_property_annotations(statement, properties);
+                    }
+                }
+            }
+            // Functions and nested classes have a different `this` receiver.
+            _ => {}
         }
     }
 

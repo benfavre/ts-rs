@@ -957,6 +957,14 @@ impl TypeChecker {
             Type::NumberLiteral(key) => Self::canonical_numeric_property_name(&key),
             _ => return None,
         };
+        let mut characters = key.chars();
+        if characters
+            .next()
+            .is_some_and(tsc_rs_scanner::char_utils::is_unicode_identifier_start)
+            && characters.all(tsc_rs_scanner::char_utils::is_unicode_identifier_continue)
+        {
+            return Some(format!("{base}.{key}"));
+        }
         Some(format!("{base}[{key:?}]"))
     }
 

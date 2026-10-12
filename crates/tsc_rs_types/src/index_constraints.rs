@@ -16,6 +16,13 @@ pub(super) struct ComputedIndexMember {
 }
 
 impl TypeChecker {
+    pub(super) fn inherited_element_index_keys(&self, receiver: &Type) -> Vec<Type> {
+        self.inherited_index_constraints(receiver, &mut HashSet::new())
+            .into_iter()
+            .map(|index| index.key)
+            .collect()
+    }
+
     pub(super) fn known_literal_index_read(
         &self,
         receiver: &Type,
