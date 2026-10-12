@@ -2043,3 +2043,51 @@ All 4,247 public Rust tests pass, with 37 ignored, and `make ci` passes.
 The measured compiler commit is `7750e4c1d`. The preceding
 snapshot, measured on 2026-10-12, is retained at
 `docs/compatibility-metrics-2026-10-12-1eb8300a4.json`.
+
+## 2026-10-12: inherited indices and element-access diagnostics
+
+Element access follows inherited array and index signatures, including generic
+base types and unchecked reads. Missing indices produce the appropriate static
+member and get/set suggestions. Fresh object reads preserve undefined results
+and widen fresh property literals; enum and unique-symbol keys retain their
+correct diagnostics. Duplicate index signatures use the first declaration
+for reads and report TS2374; explicit intersections combine indexed values.
+Object spreads report definite overwrites, while logical
+AND expressions retain the appropriate falsy values. Boolean flow and function
+parameter scopes preserve the information needed for return inference.
+Upstream test cases and reference baselines are unchanged.
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,951 | 4,960 |
+| Conformance | 4,022 | 4,030 |
+
+| Type baseline | Passes before | After |
+|---|---:|---:|
+| Compiler | 638 | 640 |
+| Conformance | 613 | 613 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 86.91% | 86.92% | 64.12% | 64.44% |
+| Conformance | 89.98% | 89.99% | 71.77% | 72.49% |
+
+False-positive diagnostics change from 1,440 to 1,446 in compiler
+and from 2,297 to 2,316 in conformance. The accuracy report includes all option variants.
+
+QuickInfo passes increase from 304 to 306. Comparing every supported
+LSP failure set finds no newly failing cases or additional skips.
+
+Whole-case baselines gain 17 diagnostic matches and 2 type matches.
+All twelve measured baseline lanes have zero passed-to-failed cases and no
+new skips. The public JavaScript, diagnostic and type results match the six
+private verification manifests exactly.
+
+Cache-free reports cover JavaScript, diagnostics, symbols, types, expanded
+JavaScript/declarations, diagnostic accuracy and all supported LSP operations.
+Skips are excluded from pass rates. Remaining failures remain visible in the
+published snapshot; this batch does not establish full TypeScript compatibility.
+
+All 4,382 public Rust tests pass, with 37 ignored, and `make ci` passes.
+The measured compiler commit is `e7658c63d`. The preceding
+snapshot is retained at `docs/compatibility-metrics-2026-10-12-7750e4c1d.json`.
