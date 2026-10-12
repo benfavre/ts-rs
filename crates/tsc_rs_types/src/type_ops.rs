@@ -332,6 +332,7 @@ fn substitute_object(obj: &ObjectTypeInfo, name: &str, replacement: &Type) -> Ob
             )
         }),
         index_signature_name: obj.index_signature_name.clone(),
+        readonly_names: obj.readonly_names.clone(),
         method_names: obj.method_names.clone(),
     })
 }
@@ -670,6 +671,7 @@ pub fn expand_mapped(
         construct_signatures: Vec::new(),
         index_signature: None,
         index_signature_name: None,
+        readonly_names: Vec::new(),
         method_names: Vec::new(),
     }))
 }
@@ -1379,6 +1381,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         let result = resolve_keyof(&obj);
@@ -1415,6 +1418,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         let result = resolve_indexed_access(&obj, &Type::StringLiteral("name".into()));
@@ -1446,6 +1450,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         let idx = Type::Union(

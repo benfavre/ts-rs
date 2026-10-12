@@ -93,7 +93,8 @@ impl TypeChecker {
                         ObjPatProp::ShorthandAssign(name, default, _) => {
                             let value = crate::with_infer_param_scope(bindings.clone(), || {
                                 self.binding_initializer_type(
-                                    self.extract_member_type_opt(&ty, name),
+                                    self.extract_member_type_opt(&ty, name)
+                                        .or_else(|| matches!(ty, Type::Any).then_some(Type::Any)),
                                     default,
                                     preserve_default_literals,
                                     annotated,
@@ -180,7 +181,7 @@ impl TypeChecker {
     }
 
     fn binding_source_type(&self, ty: &Type) -> Type {
-        self.tuple_index_receiver(ty, 0).unwrap_or_else(|| {
+        self.array_or_tuple_type(ty, 0).unwrap_or_else(|| {
             self.resolve_type_for_assignability(ty)
                 .unwrap_or_else(|| ty.clone())
         })

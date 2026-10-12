@@ -31,6 +31,14 @@ fn elements(ty: &Type) -> Option<&[Type]> {
     }
 }
 
+fn array_element(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::Array(element) => Some(element),
+        Type::Readonly(inner) => array_element(inner),
+        _ => None,
+    }
+}
+
 fn element_value(ty: &Type, strict: bool) -> Type {
     match ty {
         Type::Optional(inner) if strict => {
@@ -80,10 +88,27 @@ pub(crate) fn indexed_type(
             .collect::<Option<Vec<_>>>()
             .map(|values| combine(values, writing));
     }
+    if let Type::Readonly(inner) = receiver {
+        return indexed_type(inner, index, strict, unchecked, writing);
+    }
+    if let Type::Array(element) = receiver {
+        if matches!(index, Type::StringLiteral(key) if key == "length") {
+            return Some(Type::Number);
+        }
+        return (numeric_key(index).is_some() || matches!(index, Type::Number | Type::Any)).then(
+            || {
+                if unchecked && !writing {
+                    Type::flatten_union(vec![Type::clone(element), Type::Undefined])
+                } else {
+                    Type::clone(element)
+                }
+            },
+        );
+    }
     if let Type::Union(members) = receiver {
         // An array constituent supplies a numeric index signature for the
         // entire union. Tuple-only unions instead retain their known slots.
-        let has_array = members.iter().any(|ty| matches!(ty, Type::Array(_)));
+        let has_array = members.iter().any(|ty| array_element(ty).is_some());
         let negative = numeric_key(index)
             .is_some_and(|key| key.parse::<f64>().is_ok_and(|number| number < 0.0));
         let numeric = numeric_key(index).is_some() || matches!(index, Type::Number | Type::Any);
@@ -219,7 +244,7 @@ impl TypeChecker {
                 Some(format!("[{}]", shown.join(", ")))
             }
             TypeNodeKind::Tuple(_) => self
-                .tuple_index_receiver(&self.resolve_type_node(annotation), 0)
+                .array_or_tuple_type(&self.resolve_type_node(annotation), 0)
                 .map(|shape| self.tuple_diagnostic_name(&shape)),
             _ => None,
         }
@@ -277,10 +302,10 @@ impl TypeChecker {
         };
         let metadata = if Self::is_const_assertion_expr(initializer) {
             self.lookup_var(name)
-                .filter(|ty| matches!(ty, Type::Tuple(_)))
+                .filter(|ty| elements(ty).is_some())
                 .map(|ty| TupleBindingMetadata {
-                    display: format!("readonly {}", self.tuple_diagnostic_name(ty)),
-                    readonly: true,
+                    display: self.tuple_diagnostic_name(ty),
+                    readonly: matches!(ty, Type::Readonly(_)),
                     children: Vec::new(),
                 })
         } else {
@@ -299,7 +324,10 @@ impl TypeChecker {
                 .tuple_metadata
                 .get(name.as_str())
                 .cloned(),
-            ExprKind::Paren(inner) => self.tuple_expression_metadata(inner),
+            ExprKind::Paren(inner) | ExprKind::NonNull(inner) => {
+                self.tuple_expression_metadata(inner)
+            }
+            ExprKind::Satisfies(assertion) => self.tuple_expression_metadata(&assertion.expr),
             ExprKind::As(assertion) => self.tuple_annotation_metadata(&assertion.type_node),
             ExprKind::TypeAssertion(assertion) => {
                 self.tuple_annotation_metadata(&assertion.type_node)
@@ -316,7 +344,7 @@ impl TypeChecker {
     /// Tuple slots are named readonly properties; the rest of the numeric
     /// domain uses the tuple's readonly index signature. Keep these separate:
     /// an out-of-bounds write still has its ordinary type and bounds errors.
-    pub(super) fn report_readonly_tuple_write(
+    pub(super) fn report_readonly_sequence_write(
         &mut self,
         target: &Expr,
         deleting: bool,
@@ -339,7 +367,7 @@ impl TypeChecker {
             _ => return None,
         };
         let receiver = self.infer_expr_type(object);
-        let shape = self.tuple_index_receiver(&self.remove_null_undefined(&receiver), 0)?;
+        let shape = self.array_or_tuple_type(&self.remove_null_undefined(&receiver), 0)?;
         let metadata = self.tuple_expression_metadata(object);
         let syntax_readonly = metadata.as_ref().is_some_and(|metadata| metadata.readonly);
         let members = match &shape {
@@ -349,7 +377,6 @@ impl TypeChecker {
         let readonly = members
             .iter()
             .filter(|member| syntax_readonly || matches!(member, Type::Readonly(_)))
-            .filter_map(elements)
             .collect::<Vec<_>>();
         if readonly.is_empty() {
             return None;
@@ -360,7 +387,7 @@ impl TypeChecker {
             let key = numeric_key(&index);
             let length = matches!(&index, Type::StringLiteral(key) if key == "length");
             if length
-                || readonly.iter().any(|items| {
+                || members.iter().filter_map(elements).any(|items| {
                     key.as_ref().is_some_and(|key| {
                         key.parse::<usize>().is_ok_and(|index| {
                             index
@@ -450,16 +477,17 @@ impl TypeChecker {
         })
     }
 
-    pub(super) fn tuple_index_receiver(&self, receiver: &Type, depth: usize) -> Option<Type> {
+    pub(super) fn array_or_tuple_type(&self, receiver: &Type, depth: usize) -> Option<Type> {
         if depth >= 16 {
             return None;
         }
         match receiver {
+            Type::Array(_) => Some(receiver.clone()),
             Type::Tuple(items) => {
                 let mut expanded = Vec::new();
                 for item in items.iter() {
                     if let Type::Rest(inner) = item {
-                        if let Some(Type::Tuple(rest)) = self.tuple_index_receiver(inner, depth + 1)
+                        if let Some(Type::Tuple(rest)) = self.array_or_tuple_type(inner, depth + 1)
                         {
                             expanded.extend(rest.iter().cloned());
                             continue;
@@ -475,27 +503,36 @@ impl TypeChecker {
                 Some(Type::Tuple(expanded.into()))
             }
             Type::Readonly(inner) => self
-                .tuple_index_receiver(inner, depth + 1)
+                .array_or_tuple_type(inner, depth + 1)
                 .map(|ty| Type::Readonly(Arc::new(ty))),
+            Type::TypeReference(name, args)
+                if matches!(name.as_str(), "Array" | "ReadonlyArray") && args.len() == 1 =>
+            {
+                let array = Type::Array(Arc::new(args[0].clone()));
+                Some(if name == "ReadonlyArray" {
+                    Type::Readonly(Arc::new(array))
+                } else {
+                    array
+                })
+            }
             Type::Union(members) => members
                 .iter()
                 .map(|member| match member {
                     Type::Array(_) => Some(member.clone()),
-                    _ => self.tuple_index_receiver(member, depth + 1),
+                    _ => self.array_or_tuple_type(member, depth + 1),
                 })
                 .collect::<Option<Vec<_>>>()
-                .filter(|members| members.iter().any(|member| elements(member).is_some()))
                 .map(Type::flatten_union),
             _ => {
                 if let Some(constraint) = self.declared_type_param_constraint(receiver) {
                     if constraint != *receiver {
-                        return self.tuple_index_receiver(&constraint, depth + 1);
+                        return self.array_or_tuple_type(&constraint, depth + 1);
                     }
                 }
                 if let Type::TypeReference(name, args) = receiver {
                     if let Some(alias) = self.expand_type_alias_once(name, args) {
                         if alias != *receiver {
-                            return self.tuple_index_receiver(&alias, depth + 1);
+                            return self.array_or_tuple_type(&alias, depth + 1);
                         }
                     }
                 }
@@ -540,7 +577,7 @@ impl TypeChecker {
         unchecked: bool,
         display: Option<&str>,
     ) -> Option<Type> {
-        let shape = self.tuple_index_receiver(receiver, 0)?;
+        let shape = self.array_or_tuple_type(receiver, 0)?;
         let index = self
             .declared_type_param_constraint(index)
             .unwrap_or_else(|| index.clone());

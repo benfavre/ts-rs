@@ -217,11 +217,42 @@ fn assign_inner(
 
     // ---- Wrapper unwrapping (before structural checks) ------------------
 
-    // Readonly is transparent for assignability.
+    // Mutable containers can flow into readonly ones, but not conversely.
     if let Type::Readonly(inner) = target {
+        if let Type::Union(members) = source {
+            for member in members.iter() {
+                assign_with(target, member, opts, dejavu)?;
+            }
+            return Ok(());
+        }
+        let source = if let Type::Readonly(inner) = source {
+            inner.as_ref()
+        } else {
+            source
+        };
         return assign_with(inner, source, opts, dejavu);
     }
     if let Type::Readonly(inner) = source {
+        match target {
+            Type::Array(_) | Type::Tuple(_) => return Err(not_assignable(target, source)),
+            Type::Union(members) => {
+                return if members
+                    .iter()
+                    .any(|member| assign_with(member, source, opts, dejavu).is_ok())
+                {
+                    Ok(())
+                } else {
+                    Err(not_assignable(target, source))
+                }
+            }
+            Type::Intersection(members) => {
+                for member in members.iter() {
+                    assign_with(member, source, opts, dejavu)?;
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
         return assign_with(target, inner, opts, dejavu);
     }
 
@@ -508,6 +539,7 @@ fn assign_inner(
                     construct_signatures: vec![source_ctor.clone()],
                     index_signature: None,
                     index_signature_name: None,
+                    readonly_names: Vec::new(),
                     method_names: Vec::new(),
                 }));
             return assign_to_object(target_obj, target, &source_object, opts, dejavu);
@@ -1338,6 +1370,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         let obj2 = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
@@ -1346,6 +1379,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         let target = Type::Intersection(vec![obj1.clone(), obj2.clone()].into());
@@ -1358,6 +1392,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         assert!(is_assignable(&target, &source));
@@ -1470,6 +1505,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
@@ -1481,6 +1517,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         assert!(is_assignable(&target, &source));
@@ -1497,6 +1534,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         let source = Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
@@ -1505,6 +1543,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         assert!(!is_assignable(&target, &source));

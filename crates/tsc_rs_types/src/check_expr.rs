@@ -811,6 +811,7 @@ impl TypeChecker {
                             Arc::new(Type::Union(vec![Type::String, Type::Undefined].into())),
                         )),
                         index_signature_name: None,
+                        readonly_names: Vec::new(),
                         method_names: Vec::new(),
                     }))),
                 ),
@@ -841,6 +842,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }))
     }
@@ -1189,7 +1191,7 @@ impl TypeChecker {
     /// a property access (TS2703); under strictNullChecks a deleted declared
     /// property must admit `undefined` (TS2790).
     fn check_delete_operand(&mut self, operand: &Expr) {
-        if self.report_readonly_tuple_write(operand, true).is_some() {
+        if self.report_readonly_sequence_write(operand, true).is_some() {
             return;
         }
         let mut inner = operand;
@@ -1781,7 +1783,7 @@ impl TypeChecker {
     }
 
     pub(super) fn report_readonly_property_write(&mut self, target: &Expr) -> bool {
-        if let Some(readonly) = self.report_readonly_tuple_write(target, false) {
+        if let Some(readonly) = self.report_readonly_sequence_write(target, false) {
             return readonly;
         }
         let inferred_index;
@@ -2173,6 +2175,37 @@ impl TypeChecker {
                 self.check_expr_contextual(arg, context.as_ref())
             })
             .collect()
+    }
+
+    fn report_missing_callee_callback_parameters(&mut self, callee: &Expr, args: &[Box<Expr>]) {
+        let ExprKind::Member(member) = &callee.kind else {
+            return;
+        };
+        let property_span = Span::new(
+            callee.span.end.saturating_sub(member.property.len() as u32),
+            callee.span.end,
+        );
+        // A diagnosed missing method has no signature to contextualize its
+        // callbacks. Unresolved library and generic calls remain conservative.
+        if !self.diagnostics.iter().any(|diagnostic| {
+            matches!(diagnostic.code, 2339 | 2550 | 2551) && diagnostic.span == Some(property_span)
+        }) {
+            return;
+        }
+        for argument in args {
+            let mut argument = argument.as_ref();
+            while let ExprKind::Paren(inner) = &argument.kind {
+                argument = inner;
+            }
+            let parameters = match &argument.kind {
+                ExprKind::Arrow(arrow) => &arrow.params,
+                ExprKind::FnExpr(function) => &function.params,
+                _ => continue,
+            };
+            for parameter in parameters {
+                self.report_uncontextualized_parameter(parameter, true);
+            }
+        }
     }
 
     /// Classify expressions whose truthiness is fixed by JavaScript syntax,
@@ -5222,6 +5255,16 @@ impl TypeChecker {
     }
 
     fn check_expr_contextual_inner(&mut self, expr: &Expr, contextual_type: Option<&Type>) -> Type {
+        if matches!(expr.kind, ExprKind::As(_) | ExprKind::TypeAssertion(_))
+            && Self::is_const_assertion_expr(expr)
+        {
+            if let Some(context) = contextual_type {
+                let ty = self.check_expr(expr);
+                let ty = self.const_tuple_context(ty, context, expr);
+                self.record_expr_type(expr.span.start, &ty);
+                return ty;
+            }
+        }
         match &expr.kind {
             ExprKind::Arrow(_) | ExprKind::FnExpr(_) => {
                 let ty = self.check_arrow_or_fn_contextual(expr, contextual_type);
@@ -5484,6 +5527,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    readonly_names: Vec::new(),
                     method_names: Vec::new(),
                 }));
             }
@@ -5534,6 +5578,10 @@ impl TypeChecker {
                                 .resolve_type_for_assignability(&inner_ty)
                                 .unwrap_or(inner_ty),
                             _ => inner_ty,
+                        };
+                        let inner_ty = match inner_ty {
+                            Type::Readonly(inner) => Type::clone(&inner),
+                            other => other,
                         };
                         match inner_ty {
                             Type::Tuple(elements) => {
@@ -6305,10 +6353,8 @@ impl TypeChecker {
         }
         self.record_widening_expression(expr, &result);
         self.record_checked_expression_type(expr, &result);
-        if Self::is_const_assertion_expr(expr) && matches!(result, Type::Tuple(_)) {
-            // Const-array inference retains the tuple's shape internally;
-            // its expression type also exposes the assertion's readonly view.
-            let readonly = Type::Readonly(Arc::new(result.clone()));
+        if Self::is_const_assertion_expr(expr) && matches!(result, Type::Readonly(_)) {
+            let readonly = result.clone();
             self.record_expr_type(expr.span.start, &readonly);
             self.record_checked_expression_type(expr, &readonly);
             let operand = match &expr.kind {
@@ -7397,13 +7443,35 @@ impl TypeChecker {
                     let param_types: Vec<(Type, bool)> = match &callee_ty {
                         Type::Function(ft) => {
                             if !ft.type_params.is_empty() {
-                                // Infer generics from non-callback args first
+                                // Apply declared constraints before provisional inference:
+                                // a const tuple in a mutable array context remains mutable.
+                                let constraints: HashMap<_, _> = ft
+                                    .type_params
+                                    .iter()
+                                    .zip(ft.type_param_constraints.iter())
+                                    .filter_map(|(name, constraint)| {
+                                        constraint.as_ref().map(|ty| (name.clone(), ty.clone()))
+                                    })
+                                    .collect();
                                 let for_inference: Vec<Type> = call
                                     .args
                                     .iter()
-                                    .map(|arg| match &arg.kind {
+                                    .enumerate()
+                                    .map(|(index, arg)| match &arg.kind {
                                         ExprKind::Arrow(_) | ExprKind::FnExpr(_) => Type::Any,
-                                        _ => self.infer_expr_type(arg),
+                                        _ => {
+                                            let ty = self.infer_expr_type(arg);
+                                            if Self::is_const_assertion_expr(arg) {
+                                                if let Some((_, param)) = ft.params.get(index) {
+                                                    return self.const_tuple_context(
+                                                        ty,
+                                                        &Self::substitute(param, &constraints),
+                                                        arg,
+                                                    );
+                                                }
+                                            }
+                                            ty
+                                        }
                                     })
                                     .collect();
                                 let type_param_map = if let Some(ref ta) = call.type_args {
@@ -7416,7 +7484,16 @@ impl TypeChecker {
                                     // Widen literals before generic inference
                                     let widened: Vec<Type> = for_inference
                                         .iter()
-                                        .map(|t| self.widen_argument_for_inference(t))
+                                        .zip(call.args.iter())
+                                        .map(|(ty, arg)| {
+                                            if matches!(ty, Type::Tuple(_))
+                                                && Self::is_const_assertion_expr(arg)
+                                            {
+                                                ty.clone()
+                                            } else {
+                                                self.widen_argument_for_inference(ty)
+                                            }
+                                        })
                                         .collect();
                                     self.infer_type_arguments_for_call(
                                         &widened,
@@ -7491,6 +7568,7 @@ impl TypeChecker {
                     }
                     let arg_types =
                         self.check_arguments_contextual_once(&call.args, contextual_params);
+                    self.report_missing_callee_callback_parameters(&call.callee, &call.args);
                     self.in_super_call_args = saved_isa;
 
                     // TS17009: a `super(...)` call legalizes `this`. At the
@@ -7675,10 +7753,7 @@ impl TypeChecker {
                             match (cb_ret, &with_this) {
                                 (Some(ret), Type::Array(_)) => {
                                     let elem = if method_name.as_deref() == Some("flatMap") {
-                                        match ret {
-                                            Type::Array(inner) => Type::clone(&inner),
-                                            other => other,
-                                        }
+                                        self.iterated_element_type(&ret).unwrap_or(ret)
                                     } else {
                                         ret
                                     };
@@ -8599,12 +8674,22 @@ impl TypeChecker {
                 };
                 let alias_source = alias_receiver.is_some().then(|| member_obj.clone());
                 let member_obj = alias_receiver.unwrap_or(member_obj);
-                let member_obj = match self.tuple_index_receiver(&member_obj, 0) {
+                let member_obj = match self.array_or_tuple_type(&member_obj, 0) {
                     Some(readonly @ Type::Readonly(_)) => readonly,
                     _ => member_obj,
                 };
                 let member_ty = lazy_alias_member.unwrap_or_else(|| match &member_obj {
-                    Type::Readonly(inner) => self.resolve_member_on_type(inner, &mem.property),
+                    Type::Readonly(inner) => {
+                        if self.readonly_sequence_member_missing(&mem.property) {
+                            self.diagnostics.push(self.missing_property_diagnostic(
+                                &member_obj, &mem.property,
+                                &obj_ty.display_string_single_line(), property_span,
+                            ));
+                            Type::Error
+                        } else {
+                            self.readonly_sequence_member_type(inner, &mem.property)
+                        }
+                    }
                     Type::ObjectType(info) => {
                         if let Some((_, prop_ty)) =
                             info.properties.iter().find(|(n, _)| n == &mem.property)
@@ -9746,18 +9831,41 @@ impl TypeChecker {
                         ty
                     }
                 };
-                if let Some(value) = self.check_tuple_element_access(
-                    ea,
-                    &obj_ty,
-                    &idx_ty,
-                    self.assignment_target_span == Some(expr.span),
-                    unchecked && self.strict_null_checks,
-                ) {
+                if let Some(value) = (!is_symbol_iterator)
+                    .then(|| {
+                        self.check_tuple_element_access(
+                            ea,
+                            &obj_ty,
+                            &idx_ty,
+                            self.assignment_target_span == Some(expr.span),
+                            unchecked && self.strict_null_checks,
+                        )
+                    })
+                    .flatten()
+                {
                     return value;
                 }
                 if let Some(member) = self.known_literal_index_read(&obj_ty, &idx_ty, 0) {
                     self.record_expr_type(expr.span.start, &member);
                     return member;
+                }
+                if let (Some(Type::Readonly(inner)), Type::StringLiteral(property)) =
+                    (self.array_or_tuple_type(&obj_ty, 0), &idx_ty)
+                {
+                    if self.readonly_sequence_member_missing(property) {
+                        if self.no_implicit_any {
+                            self.diagnostics.push(Diagnostic {
+                                code: 7015,
+                                message: "Element implicitly has an 'any' type because index expression is not of type 'number'.".to_string(),
+                                category: DiagnosticCategory::Error,
+                                file_name: None,
+                                span: Some(ea.index.span),
+                                related: None,
+                            });
+                        }
+                        return Type::Any;
+                    }
+                    return self.readonly_sequence_member_type(&inner, property);
                 }
                 if self.assignment_target_span != Some(expr.span) {
                     if let Some(value) = self.fresh_dynamic_index_type(&ea.object, &obj_ty, &idx_ty)
@@ -10126,6 +10234,7 @@ impl TypeChecker {
                 } else {
                     self.check_expr(&assign.left)
                 };
+                self.record_checked_expression_type(&assign.left, &left_ty);
                 // Reading through parentheses visits the identifier checker,
                 // which marks a write assigned. The RHS still precedes that
                 // write, so restore its pending state until the RHS is checked.
@@ -10206,6 +10315,7 @@ impl TypeChecker {
                                                 construct_signatures: Vec::new(),
                                                 index_signature: None,
                                                 index_signature_name: None,
+                                                readonly_names: Vec::new(),
                                                 method_names: Vec::new(),
                                             })
                                         }
@@ -10976,6 +11086,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    readonly_names: Vec::new(),
                     method_names: Vec::new(),
                 }))
             }
@@ -12279,7 +12390,13 @@ impl TypeChecker {
                                 // An intersection fixes the inference context:
                                 // null must remain a candidate for T & {}, so
                                 // substitution can reduce that parameter to never.
-                                if intersection_target && matches!(ty, Type::Null | Type::Undefined)
+                                if (intersection_target
+                                    && matches!(ty, Type::Null | Type::Undefined))
+                                    || (matches!(ty, Type::Tuple(_))
+                                        && call
+                                            .args
+                                            .get(index)
+                                            .is_some_and(|arg| Self::is_const_assertion_expr(arg)))
                                 {
                                     ty.clone()
                                 } else {
@@ -13439,6 +13556,7 @@ impl TypeChecker {
                                 Arc::new(args[1].clone()),
                             )),
                             index_signature_name: None,
+                            readonly_names: Vec::new(),
                             method_names: Vec::new(),
                         }));
                     }
@@ -14294,7 +14412,7 @@ impl TypeChecker {
                     let ty = self
                         .array_assignment_context(inner)
                         .unwrap_or_else(|| self.destructuring_target_type(inner));
-                    let ty = self.tuple_index_receiver(&ty, 0).unwrap_or(ty);
+                    let ty = self.array_or_tuple_type(&ty, 0).unwrap_or(ty);
                     if let Type::Tuple(items) = ty {
                         types.extend(items.iter().cloned());
                     } else {

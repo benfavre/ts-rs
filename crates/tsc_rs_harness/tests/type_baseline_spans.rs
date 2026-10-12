@@ -79,3 +79,59 @@ fn missing_unary_operands_have_empty_source_labels() {
     assert!(output.contains("> : any\n"), "{output}");
     assert!(!output.contains(">;"), "{output}");
 }
+
+#[test]
+fn destructuring_annotations_use_binding_names() {
+    let output = baseline("declare const input: any; const { value } = input; const [item] = [1];");
+    assert!(output.contains(">value : any\n"), "{output}");
+    assert!(output.contains(">item : number\n"), "{output}");
+    assert!(
+        !output.contains(">{ :") && !output.contains(">[ :"),
+        "{output}"
+    );
+}
+
+#[test]
+fn class_members_and_assignment_targets_match_upstream_types_baselines() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let runner = BaselineRunner::new(&root);
+    for (suite, relative) in [
+        (
+            Suite::Conformance,
+            "conformance/classes/classDeclarations/classBody/classBodyWithStatements.ts",
+        ),
+        (
+            Suite::Conformance,
+            "conformance/parser/ecmascript5/RegressionTests/parser585151.ts",
+        ),
+        (Suite::Compiler, "compiler/ClassDeclaration21.ts"),
+        (Suite::Compiler, "compiler/MemberAccessorDeclaration15.ts"),
+        (Suite::Compiler, "compiler/optionalSetterParam.ts"),
+        (Suite::Compiler, "compiler/newLineFlagWithLF.ts"),
+        (
+            Suite::Compiler,
+            "compiler/sourceMapValidationDestructuringVariableStatementArrayBindingPattern4.ts",
+        ),
+        (
+            Suite::Conformance,
+            "conformance/parser/ecmascript6/ComputedPropertyNames/parserComputedPropertyName12.ts",
+        ),
+    ] {
+        let case = root.join("tests/cases").join(relative);
+        assert!(case.is_file(), "{}", case.display());
+        let result = runner.run_case_with_kind(&case, suite, BaselineKind::Types);
+        assert!(
+            result.baseline_exists && result.passed,
+            "{relative}: {:?}",
+            result.diff
+        );
+    }
+}
+
+#[test]
+fn keyword_field_names_remain_visible_when_they_are_not_recovery_tokens() {
+    let output = baseline("class C { var; function; } class D { foo bar; }");
+    for name in ["var", "function", "foo", "bar"] {
+        assert!(output.contains(&format!(">{name} : any\n")), "{output}");
+    }
+}

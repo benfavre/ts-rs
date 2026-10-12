@@ -262,6 +262,7 @@ fn is_definitely_falsy(ty: &Type) -> bool {
 /// Returns true if the type is always truthy.
 fn is_definitely_truthy(ty: &Type) -> bool {
     match ty {
+        Type::Readonly(inner) => is_definitely_truthy(inner),
         Type::BooleanLiteral(true) => true,
         Type::NumberLiteral(n) => n != "0" && n != "-0" && n != "NaN",
         Type::StringLiteral(s) => !s.is_empty(),
@@ -468,6 +469,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         let b = Type::ObjectType(crate::ObjectTypeInfo::new(crate::ObjectTypeData {
@@ -476,6 +478,7 @@ mod tests {
             construct_signatures: vec![],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         let ty = Type::Union(vec![a.clone(), b.clone()].into());

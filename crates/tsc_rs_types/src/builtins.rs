@@ -271,6 +271,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -298,6 +299,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -313,6 +315,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -545,7 +548,8 @@ impl BuiltinTypes {
                                 Type::Function(FunctionType {
                                     type_param_constraints: Vec::new(),
                                     params: vec![("value".to_string(), Type::Any)],
-                                    return_type: Arc::new(Type::Array(Arc::new(Type::Any))),
+                                    // U | ReadonlyArray<U> accepts scalar and readonly results alike.
+                                    return_type: Arc::new(Type::Any),
                                     type_params: Vec::new(),
                                     type_param_defaults: Vec::new(),
                                     type_predicate: None,
@@ -563,6 +567,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -651,6 +656,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -704,6 +710,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -753,6 +760,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -791,6 +799,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -811,6 +820,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -830,6 +840,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -860,6 +871,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -971,6 +983,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             })),
         );
@@ -992,6 +1005,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             })),
         );
@@ -1026,6 +1040,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             })),
         );
@@ -1116,6 +1131,7 @@ impl BuiltinTypes {
                 }],
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -1137,6 +1153,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -1174,6 +1191,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );
@@ -1246,6 +1264,7 @@ impl BuiltinTypes {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }),
         );

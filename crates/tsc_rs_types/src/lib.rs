@@ -47,6 +47,7 @@ mod overload_compatibility;
 mod private_names;
 mod property_suggestions;
 mod protected_access;
+mod readonly_containers;
 mod reserved_type_names;
 mod resolve_types;
 mod static_overrides;
@@ -630,6 +631,9 @@ pub struct ObjectTypeData {
     /// `fn: () => T`), for display only: tsc prints them in method style.
     /// Ignored by equality and hashing — it never changes type identity.
     pub method_names: Vec<std::string::String>,
+    /// Readonly property declarations, retained for display and write checks.
+    /// Like method spelling, ignored by structural equality and hashing.
+    pub readonly_names: Vec<std::string::String>,
 }
 
 impl PartialEq for ObjectTypeData {
@@ -1702,6 +1706,9 @@ impl Type {
                         None => (base, false),
                     };
                     opt |= prefix_opt;
+                    if info.readonly_names.iter().any(|name| name == base) {
+                        buf.push_str("readonly ");
+                    }
                     let mut t: &Type = t;
                     if let Type::Optional(inner) = t {
                         opt = true;
@@ -2073,6 +2080,8 @@ pub enum TypeSpanKind {
     Expression,
     Declaration,
     NullLiteral,
+    /// Destructuring containers have hover types but are not expression nodes.
+    BindingPattern,
 }
 
 #[derive(Debug, Clone)]
@@ -4013,6 +4022,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    readonly_names: Vec::new(),
                     method_names: Vec::new(),
                 }),
                 optional_props: Vec::new(),
@@ -7125,6 +7135,7 @@ impl TypeChecker {
                 construct_signatures: Vec::new(),
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }));
             *class_type = Type::Intersection(vec![static_surface, class_type.clone()].into());
@@ -7566,6 +7577,7 @@ impl TypeChecker {
                 construct_signatures: object.construct_signatures.clone(),
                 index_signature: object.index_signature.clone(),
                 index_signature_name: object.index_signature_name.clone(),
+                readonly_names: object.readonly_names.clone(),
                 method_names: object.method_names.clone(),
             })),
             Type::Intersection(members) => Type::Intersection(
@@ -8270,7 +8282,7 @@ impl TypeChecker {
             ExprKind::Paren(inner) => {
                 self.local_const_initializer_type_from_bindings(inner, local_bindings)
             }
-            ExprKind::ArrayLit(elements) => Type::Tuple(
+            ExprKind::ArrayLit(elements) => Type::Readonly(Arc::new(Type::Tuple(
                 elements
                     .iter()
                     .map(|element| {
@@ -8285,7 +8297,7 @@ impl TypeChecker {
                             .unwrap_or(Type::Undefined)
                     })
                     .collect(),
-            ),
+            ))),
             ExprKind::ObjectLit(properties) => self
                 .local_object_initializer_type(initializer, properties, local_bindings, true)
                 .unwrap_or_else(|| self.infer_const_asserted_expr(initializer)),
@@ -8297,7 +8309,6 @@ impl TypeChecker {
             }
             _ => self
                 .local_initializer_type_from_bindings(initializer, local_bindings)
-                .map(|ty| Self::freeze_as_const(&ty))
                 .unwrap_or_else(|| self.infer_const_asserted_expr(initializer)),
         }
     }
@@ -9086,6 +9097,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }))
     }
@@ -9120,6 +9132,7 @@ impl TypeChecker {
                                 construct_signatures: Vec::new(),
                                 index_signature: None,
                                 index_signature_name: None,
+                                readonly_names: Vec::new(),
                                 method_names: Vec::new(),
                             })),
                         ));
@@ -9427,6 +9440,7 @@ impl TypeChecker {
                                 construct_signatures: Vec::new(),
                                 index_signature: None,
                                 index_signature_name: None,
+                                readonly_names: Vec::new(),
                                 method_names: Vec::new(),
                             }));
                         Type::Intersection(vec![static_surface, nominal].into())
@@ -9714,6 +9728,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }));
         *value = Type::Intersection(vec![static_surface, nominal].into());
@@ -12764,6 +12779,17 @@ impl TypeChecker {
         annotated: bool,
     ) {
         use tsc_rs_ast::{ArrayPatElem, ObjPatProp, PatKind};
+        if matches!(pat.kind, PatKind::Object(_) | PatKind::Array(_)) {
+            if let Some(spans) = &mut self.expression_type_spans {
+                spans.insert(
+                    (pat.span.start, pat.span.end),
+                    TypeAtSpan {
+                        type_string: ty.display_string(),
+                        kind: TypeSpanKind::BindingPattern,
+                    },
+                );
+            }
+        }
         match &pat.kind {
             PatKind::Ident(name) => {
                 if !pat.span.is_empty() && !name.is_empty() && name != "<error>" {
@@ -12804,16 +12830,22 @@ impl TypeChecker {
                 }
                 for prop in props {
                     match prop {
-                        ObjPatProp::Shorthand(name, _) => {
+                        ObjPatProp::Shorthand(name, span) => {
                             let member_ty = self.extract_member_type(&ty, name);
+                            self.record_expression_type_span(*span, &member_ty);
                             self.declare_var(name, member_ty);
                         }
-                        ObjPatProp::ShorthandAssign(name, default_value, _) => {
+                        ObjPatProp::ShorthandAssign(name, default_value, span) => {
                             let member_ty = self.binding_initializer_type(
-                                self.extract_member_type_opt(&ty, name),
+                                self.extract_member_type_opt(&ty, name)
+                                    .or_else(|| matches!(ty, Type::Any).then_some(Type::Any)),
                                 default_value,
                                 preserve_default_literals,
                                 annotated,
+                            );
+                            self.record_expression_type_span(
+                                Span::new(span.start, span.start + name.len() as u32),
+                                &member_ty,
                             );
                             self.declare_var(name, member_ty);
                         }
@@ -15979,10 +16011,7 @@ impl TypeChecker {
                                 // help read them (inferred returns come from
                                 // build_class_info).
                                 let name_span = m.name.span();
-                                let mname = match &m.name {
-                                    PropName::Ident(n, _) | PropName::String(n, _) => n.clone(),
-                                    _ => continue,
-                                };
+                                let mname = self.prop_name_to_string(&m.name);
                                 let ft = if m.modifiers & MOD_STATIC != 0 {
                                     info.static_methods
                                         .iter()
@@ -15995,10 +16024,10 @@ impl TypeChecker {
                                         .map(|(_, f)| f.clone())
                                 };
                                 if let Some(ft) = ft {
-                                    self.expression_types.insert(
-                                        name_span.start,
-                                        Type::Function(ft).display_string(),
-                                    );
+                                    let ty = Type::Function(ft);
+                                    self.record_expression_type_span(name_span, &ty);
+                                    self.expression_types
+                                        .insert(name_span.start, ty.display_string());
                                 }
                             }
                             ClassMemberKind::Property(prop) => {
@@ -16017,6 +16046,20 @@ impl TypeChecker {
                                             })
                                             .unwrap_or(Type::Any)
                                     });
+                                // The parser can recover a statement keyword as an
+                                // empty property before the following declaration
+                                // (`var x` or `function f`). It is not a name node.
+                                let recovered_keyword = prop.type_ann.is_none()
+                                    && prop.initializer.is_none()
+                                    && self
+                                        .syntax_error_starts
+                                        .binary_search(&prop_name_span.start)
+                                        .is_ok()
+                                    && matches!(&prop.name, PropName::Ident(name, _)
+                                        if tsc_rs_scanner::TokenKind::keyword_from_str(name).is_keyword());
+                                if !recovered_keyword {
+                                    self.record_expression_type_span(prop_name_span, &ty);
+                                }
                                 if !matches!(ty, Type::Any) {
                                     self.expression_types
                                         .insert(prop_name_span.start, ty.display_string());
@@ -16035,9 +16078,23 @@ impl TypeChecker {
                                             Type::Any
                                         }
                                     });
+                                self.record_expression_type_span(name_span, &ty);
                                 if !matches!(ty, Type::Any) {
                                     self.expression_types
                                         .insert(name_span.start, ty.display_string());
+                                }
+                            }
+                            ClassMemberKind::SetAccessor(acc) => {
+                                let name = self.prop_name_to_string(&acc.name);
+                                let properties = if acc.modifiers & MOD_STATIC != 0 {
+                                    &info.static_properties
+                                } else {
+                                    &info.instance_properties
+                                };
+                                if let Some((_, ty)) =
+                                    properties.iter().find(|(key, _)| key == &name)
+                                {
+                                    self.record_expression_type_span(acc.name.span(), ty);
                                 }
                             }
                             _ => {}
@@ -18291,6 +18348,22 @@ impl TypeChecker {
     /// Source display for an elaborated leaf: fresh literals widen unless the
     /// contextual type is literal-like; nested literals widen per property.
     fn elaboration_display_type(&self, source: &Type, target: &Type) -> Type {
+        let resolved_target = self
+            .resolve_type_for_assignability(target)
+            .unwrap_or_else(|| target.clone());
+        if self.array_keyof_accepts(source, &resolved_target).is_some() {
+            return source.clone();
+        }
+        if let Type::Union(members) = source {
+            if members
+                .iter()
+                .all(|member| matches!(member, Type::Array(_) | Type::Readonly(_)))
+            {
+                let mut members = members.to_vec();
+                members.sort_by_key(|member| matches!(member, Type::Readonly(_)));
+                return Type::Union(members.into());
+            }
+        }
         let is_literal = |ty: &Type| {
             matches!(
                 ty,
@@ -19118,6 +19191,9 @@ impl TypeChecker {
     /// three members that includes null/undefined relates to the non-nullable
     /// member when exactly one remains.
     fn is_definitely_non_nullable(ty: &Type) -> bool {
+        if let Type::Readonly(inner) = ty {
+            return Self::is_definitely_non_nullable(inner);
+        }
         matches!(
             ty,
             Type::String
@@ -19194,6 +19270,10 @@ impl TypeChecker {
     fn display_type_through_primitive_alias(&self, ty: &Type) -> Type {
         if let Type::TypeReference(..) = ty {
             if let Some(resolved) = self.resolve_type_for_assignability(ty) {
+                if matches!(&resolved, Type::Keyof(object) if self.array_or_tuple_type(object, 0).is_some())
+                {
+                    return resolved;
+                }
                 if matches!(
                     resolved,
                     Type::String
@@ -19298,6 +19378,17 @@ impl TypeChecker {
     fn push_not_assignable(&mut self, source: &Type, target: &Type, span: Span) {
         let stripped_target = Self::strip_nullable_union_target(source, target);
         let target = stripped_target.as_ref().unwrap_or(target);
+        if let Some(message) = self.readonly_assignment_reason(source, target) {
+            self.diagnostics.push(Diagnostic {
+                code: 4104,
+                message,
+                category: DiagnosticCategory::Error,
+                file_name: None,
+                span: Some(span),
+                related: None,
+            });
+            return;
+        }
         let src_disp = self
             .elaboration_display_type(&self.display_type_through_primitive_alias(source), target)
             .display_string();
@@ -19307,6 +19398,22 @@ impl TypeChecker {
         let tgt_disp = self
             .display_type_through_primitive_alias(target)
             .display_string();
+        let readonly_missing = self.readonly_missing_properties(source, target);
+        if let [name] = readonly_missing.as_slice() {
+            self.diagnostics
+                .push(diagnostics::error_property_missing_single(
+                    name, &src_disp, &tgt_disp, span,
+                ));
+            return;
+        } else if !readonly_missing.is_empty() {
+            self.diagnostics.push(diagnostics::error_missing_properties(
+                &readonly_missing,
+                &src_disp,
+                &tgt_disp,
+                span,
+            ));
+            return;
+        }
         // Array-typed target with an object-like source: tsc reports the
         // missing ARRAY-INTERFACE members — the classic TS2740
         // "Type 'C3' is missing the following properties from type 'any[]':
@@ -19547,12 +19654,17 @@ impl TypeChecker {
                     })
                     .unwrap_or_else(|| tgt_disp.clone());
                 diagnostic.message.push_str("\n  ");
-                diagnostic.message.push_str(&format!(
-                    "Type '{}' is not assignable to type '{}'.",
-                    self.elaboration_display_type(&member, target)
-                        .display_string_single_line(),
-                    member_target
-                ));
+                let reason = self
+                    .readonly_assignment_reason(&member, target)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Type '{}' is not assignable to type '{}'.",
+                            self.elaboration_display_type(&member, target)
+                                .display_string_single_line(),
+                            member_target
+                        )
+                    });
+                diagnostic.message.push_str(&reason);
             } else if let Some((line, related)) = self.assignability_elaboration(source, target) {
                 diagnostic.message.push_str("\n  ");
                 diagnostic.message.push_str(&line.replace('\n', "\n  "));
@@ -20129,6 +20241,12 @@ impl TypeChecker {
     /// Comparability is bidirectional at each member, not just once for the
     /// whole object. One property may narrow while another widens in a cast.
     fn assertion_types_overlap(&self, source: &Type, target: &Type, depth: u8) -> bool {
+        if let Type::Readonly(inner) = source {
+            return self.assertion_types_overlap(inner, target, depth + 1);
+        }
+        if let Type::Readonly(inner) = target {
+            return self.assertion_types_overlap(source, inner, depth + 1);
+        }
         if self.is_assignable_to(source, target) || self.is_assignable_to(target, source) {
             return true;
         }
@@ -20689,6 +20807,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    readonly_names: Vec::new(),
                     method_names: Vec::new(),
                 }));
                 return Some(self.is_assignable_to(&shape, target));
@@ -20930,6 +21049,7 @@ impl TypeChecker {
                 construct_signatures: construct_sigs,
                 index_signature: index_sig,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names,
             }));
 
@@ -21200,6 +21320,7 @@ impl TypeChecker {
                     )
                 }),
                 index_signature_name: info.index_signature_name.clone(),
+                readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
             })),
             Type::Optional(inner) => {
@@ -21443,6 +21564,7 @@ impl TypeChecker {
                     )
                 }),
                 index_signature_name: info.index_signature_name.clone(),
+                readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
             })),
             Type::Conditional {
@@ -22098,6 +22220,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         })))
     }
@@ -22294,7 +22417,7 @@ impl TypeChecker {
                     }
                 }
                 let resolved = self
-                    .tuple_index_receiver(&obj_struct, 0)
+                    .array_or_tuple_type(&obj_struct, 0)
                     .and_then(|tuple| {
                         tuple_access::indexed_type(
                             &tuple,
@@ -22511,6 +22634,7 @@ impl TypeChecker {
                     construct_signatures: info.construct_signatures.clone(),
                     index_signature: info.index_signature.clone(),
                     index_signature_name: info.index_signature_name.clone(),
+                    readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
                 }))
             }
@@ -22680,6 +22804,7 @@ impl TypeChecker {
                 None => Vec::new(),
             };
             Some(Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
+                readonly_names: info.readonly_names.clone(),
                 method_names: info
                     .method_names
                     .iter()
@@ -22969,6 +23094,7 @@ impl TypeChecker {
                 construct_signatures: info.construct_signatures.clone(),
                 index_signature: info.index_signature.clone(),
                 index_signature_name: info.index_signature_name.clone(),
+                readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
             })),
             Type::Constructor(constructor) => Type::Constructor(ConstructorType {
@@ -23239,6 +23365,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: Some((Arc::new(args[0].clone()), Arc::new(args[1].clone()))),
                     index_signature_name: None,
+                    readonly_names: Vec::new(),
                     method_names: Vec::new(),
                 })))
             }
@@ -23512,6 +23639,9 @@ impl TypeChecker {
     /// or primitive shapes (class constructors, enums and namespaces keep
     /// their `typeof` identity).
     pub(crate) fn is_concrete_typeof_target(resolved: &Type) -> bool {
+        if let Type::Readonly(inner) = resolved {
+            return Self::is_concrete_typeof_target(inner);
+        }
         matches!(
             resolved,
             Type::ObjectType(_)
@@ -23538,15 +23668,47 @@ impl TypeChecker {
     }
 
     fn is_assignable_to_inner(&self, source: &Type, target: &Type) -> bool {
+        if let Some(accepts) = self.array_keyof_accepts(source, target) {
+            return accepts;
+        }
         if let Type::Readonly(inner) = target {
-            let source = match source {
+            let source = self
+                .array_or_tuple_type(source, 0)
+                .unwrap_or_else(|| source.clone());
+            if let Type::Union(members) = &source {
+                return members
+                    .iter()
+                    .all(|member| self.is_assignable_to(member, target));
+            }
+            let source = match &source {
                 Type::Readonly(inner) => inner.as_ref(),
                 other => other,
             };
             return self.is_assignable_to(source, inner);
         }
         if let Type::Readonly(inner) = source {
-            return self.is_assignable_to(inner, target);
+            if !self.readonly_missing_properties(source, target).is_empty() {
+                return false;
+            }
+            let target = self
+                .array_or_tuple_type(target, 0)
+                .unwrap_or_else(|| target.clone());
+            match &target {
+                Type::Array(_) | Type::Tuple(_) => return false,
+                Type::Readonly(_) => return self.is_assignable_to(source, &target),
+                Type::Union(members) => {
+                    return members
+                        .iter()
+                        .any(|member| self.is_assignable_to(source, member))
+                }
+                Type::Intersection(members) => {
+                    return members
+                        .iter()
+                        .all(|member| self.is_assignable_to(source, member))
+                }
+                _ => {}
+            }
+            return self.is_assignable_to(inner, &target);
         }
         // Arrays and callable/constructable values are non-primitive objects.
         if matches!(target, Type::Object)
@@ -23774,6 +23936,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    readonly_names: Vec::new(),
                     method_names: Vec::new(),
                 }));
                 return self.is_assignable_to(&surface, target);
@@ -25946,6 +26109,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         })))
     }
@@ -25988,6 +26152,7 @@ impl TypeChecker {
                         construct_signatures: Vec::new(),
                         index_signature: None,
                         index_signature_name: None,
+                        readonly_names: Vec::new(),
                         method_names: Vec::new(),
                     })));
                 }
@@ -27299,6 +27464,8 @@ impl TypeChecker {
                                     | ExprKind::Call(_)
                                     | ExprKind::New(_)
                                     | ExprKind::Template(_)
+                                    | ExprKind::As(_)
+                                    | ExprKind::TypeAssertion(_)
                             )
                         {
                             // Same literal-narrowing extension as the
@@ -27320,6 +27487,7 @@ impl TypeChecker {
                         .as_ref()
                         .filter(|ty| matches!(ty, Type::BooleanLiteral(_)))
                         .cloned();
+                    let initial_flow_type = init_type.clone();
                     let condition_alias = if is_const
                         && matches!(&decl.name.kind, PatKind::Ident(_))
                         && init_type
@@ -27481,6 +27649,11 @@ impl TypeChecker {
                         if decl.init.as_deref().is_some_and(|init| {
                             Self::is_const_assertion_expr(init)
                                 || self.is_readonly_tuple_expression(init)
+                                // A tuple returned by a call or read from an existing
+                                // value has regular element types, not fresh literals.
+                                || (matches!(init_ty, Type::Tuple(_))
+                                    && matches!(Self::skip_reference_wrappers(init).kind,
+                                        ExprKind::Call(_) | ExprKind::Ident(_) | ExprKind::Member(_) | ExprKind::ElemAccess(_)))
                         }) {
                             init_ty
                         } else if is_const {
@@ -27643,6 +27816,27 @@ impl TypeChecker {
                     let boolean_flow = matches!(ty, Type::Boolean)
                         .then_some(initial_boolean_literal)
                         .flatten();
+                    let initializer_flow = initial_flow_type.as_ref().and_then(|source| {
+                        let target = self
+                            .resolve_type_for_assignability(&ty)
+                            .unwrap_or_else(|| ty.clone());
+                        if matches!(target, Type::Union(_))
+                            && matches!(
+                                self.array_or_tuple_type(source, 0),
+                                Some(Type::Readonly(_))
+                            )
+                        {
+                            let reduced = self.assignment_reduced_type(&target, source);
+                            (reduced != target).then_some(reduced)
+                        } else {
+                            self.array_keyof_accepts(source, &target)
+                                .filter(|accepted| *accepted)
+                                .map(|_| match source {
+                                    Type::NumberLiteral(_) => Type::Number,
+                                    other => other.clone(),
+                                })
+                        }
+                    });
                     self.declare_pattern_vars_with_context(
                         &decl.name,
                         ty,
@@ -27652,7 +27846,9 @@ impl TypeChecker {
                     // Boolean is a union of two literals. Its declaration
                     // widens, but a checked initializer still establishes the
                     // current flow constituent until a subsequent write.
-                    if let (PatKind::Ident(name), Some(value)) = (&decl.name.kind, boolean_flow) {
+                    if let (PatKind::Ident(name), Some(value)) =
+                        (&decl.name.kind, initializer_flow.or(boolean_flow))
+                    {
                         self.narrow_var(name, value);
                     }
                     self.mark_widening_literal_binding(decl, is_const);
@@ -27818,6 +28014,8 @@ impl TypeChecker {
                             | ExprKind::NumLit(_)
                             | ExprKind::BoolLit(_)
                             | ExprKind::Paren(_)
+                            | ExprKind::As(_)
+                            | ExprKind::TypeAssertion(_)
                             | ExprKind::Template(_)
                             | ExprKind::Call(_)
                             | ExprKind::New(_)
@@ -27881,7 +28079,11 @@ impl TypeChecker {
                             self.widen_for_message(Some(e), &effective_ret, &expected_ret);
                         // TypeScript underlines `return` keyword (6 chars) for return-type mismatches
                         let return_kw_span = Span::new(stmt.span.start, stmt.span.start + 6);
-                        if matches!(widened, Type::Union(_)) {
+                        if matches!(widened, Type::Union(_))
+                            || self
+                                .readonly_assignment_reason(&widened, &expected_ret)
+                                .is_some()
+                        {
                             self.push_not_assignable(&widened, &expected_ret, return_kw_span);
                         } else {
                             let mut diagnostic = error_not_assignable(
@@ -32917,6 +33119,36 @@ impl TypeChecker {
         source: &Type,
         target: &Type,
     ) -> Option<(std::string::String, Option<RelatedDiagnostic>)> {
+        if let Some(reason) = self.readonly_assignment_reason(source, target) {
+            return Some((reason, None));
+        }
+        if let Type::Union(members) = target {
+            if let Some(reason) = members
+                .iter()
+                .find_map(|member| self.readonly_assignment_reason(source, member))
+            {
+                return Some((reason, None));
+            }
+        }
+        if let Type::Intersection(members) = target {
+            if let Some(reason) = members
+                .iter()
+                .find_map(|member| self.readonly_assignment_reason(source, member))
+            {
+                return Some((reason, None));
+            }
+        }
+        if let Type::Readonly(inner) = target {
+            let source = self
+                .array_or_tuple_type(source, 0)
+                .unwrap_or_else(|| source.clone());
+            let source = if let Type::Readonly(inner) = &source {
+                inner.as_ref()
+            } else {
+                &source
+            };
+            return self.assignability_elaboration(source, inner);
+        }
         // tsc reportRelationError: a global wrapper object against its own
         // primitive gets the "Prefer using 'string'" hint.
         if let Type::TypeReference(name, args) = source {
@@ -33778,6 +34010,9 @@ impl TypeChecker {
                         leaf_target,
                     ),
                 };
+                if let Some(reason) = self.readonly_assignment_reason(&leaf_source, &leaf_target) {
+                    return Some((format!("{header}\n  {reason}"), None));
+                }
                 let mut text = format!(
                     "{header}\n  Type '{}' is not assignable to type '{}'.",
                     leaf_source.display_string_single_line(),
@@ -42012,6 +42247,7 @@ impl TypeChecker {
                 construct_signatures: info.construct_signatures.clone(),
                 index_signature: info.index_signature.clone(),
                 index_signature_name: info.index_signature_name.clone(),
+                readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
             })),
             Type::Union(members) => Type::flatten_union(members.iter().map(widen_leaf).collect()),
@@ -42111,6 +42347,9 @@ impl TypeChecker {
         let resolved_target = self
             .resolve_type_for_assignability(&effective)
             .unwrap_or_else(|| effective.clone());
+        if self.array_keyof_accepts(source, &resolved_target).is_some() {
+            return source.clone();
+        }
         let tuple_context = self.tuple_like_context(&resolved_target, 0);
         match (source, &resolved_target) {
             (Type::Tuple(elements), _) => {
@@ -42426,6 +42665,7 @@ impl TypeChecker {
                     )
                 }),
                 index_signature_name: info.index_signature_name.clone(),
+                readonly_names: info.readonly_names.clone(),
                 method_names: info.method_names.clone(),
             })),
             Type::Function(function) => Type::Function(erase_function(function)),
@@ -42839,6 +43079,7 @@ impl TypeChecker {
             construct_signatures: after.construct_signatures.clone(),
             index_signature: after.index_signature.clone(),
             index_signature_name: after.index_signature_name.clone(),
+            readonly_names: after.readonly_names.clone(),
             method_names: after.method_names.clone(),
         }))
     }
@@ -42877,6 +43118,7 @@ impl TypeChecker {
                     construct_signatures: info.construct_signatures.clone(),
                     index_signature: info.index_signature.clone(),
                     index_signature_name: info.index_signature_name.clone(),
+                    readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
                 }))
             }
@@ -42942,13 +43184,12 @@ impl TypeChecker {
             // Arrays become readonly — check_expr for ArrayLit already widened
             // element types. Use ReadonlyArray<T> which displays as `readonly T[]`.
             Type::Array(elem) => {
-                let frozen_elem = Self::freeze_as_const(elem);
-                Type::TypeReference("ReadonlyArray".into(), vec![frozen_elem].into())
+                Type::Readonly(Arc::new(Type::Array(Arc::new(Self::freeze_as_const(elem)))))
             }
             // Tuples: freeze each element
-            Type::Tuple(elems) => {
-                Type::Tuple(elems.iter().map(|e| Self::freeze_as_const(e)).collect())
-            }
+            Type::Tuple(elems) => Type::Readonly(Arc::new(Type::Tuple(
+                elems.iter().map(|e| Self::freeze_as_const(e)).collect(),
+            ))),
             // Object types: freeze property values
             Type::ObjectType(info) => {
                 let frozen_props = info
@@ -42962,6 +43203,7 @@ impl TypeChecker {
                     construct_signatures: info.construct_signatures.clone(),
                     index_signature: info.index_signature.clone(),
                     index_signature_name: info.index_signature_name.clone(),
+                    readonly_names: info.readonly_names.clone(),
                     method_names: info.method_names.clone(),
                 }))
             }
@@ -43334,7 +43576,7 @@ impl TypeChecker {
     }
 
     fn resolve_member_on_type_impl(&self, ty: &Type, property: &str) -> Type {
-        if let Some(value) = self.tuple_index_receiver(ty, 0).and_then(|shape| {
+        if let Some(value) = self.array_or_tuple_type(ty, 0).and_then(|shape| {
             crate::tuple_access::indexed_type(
                 &shape,
                 &Type::StringLiteral(property.to_owned()),
@@ -43346,7 +43588,13 @@ impl TypeChecker {
             return value;
         }
         match ty {
-            Type::Readonly(inner) => self.resolve_member_on_type(inner, property),
+            Type::Readonly(inner) => {
+                if self.readonly_sequence_member_missing(property) {
+                    Type::Error
+                } else {
+                    self.readonly_sequence_member_type(inner, property)
+                }
+            }
             Type::ObjectType(info) => {
                 if let Some((_, prop_ty)) = info.properties.iter().find(|(n, _)| n == property) {
                     match prop_ty.as_ref() {
@@ -43522,6 +43770,9 @@ impl TypeChecker {
     /// property replaces the generic line, type-parameter notes follow it,
     /// and any deeper reason nests under it (+2 spaces per level, relative).
     fn leaf_reason_text(&mut self, source: &Type, target: &Type) -> std::string::String {
+        if let Some(reason) = self.readonly_assignment_reason(source, target) {
+            return reason;
+        }
         let mut text = format!(
             "Type '{}' is not assignable to type '{}'.",
             source.display_string_single_line(),
@@ -44142,6 +44393,7 @@ impl TypeChecker {
                     construct_signatures,
                     index_signature,
                     index_signature_name: None,
+                    readonly_names: Vec::new(),
                     method_names: Vec::new(),
                 }))
             }
@@ -44651,10 +44903,23 @@ impl TypeChecker {
                 };
                 Self::infer_from_types(arg_inner, param_inner, type_params, inferred);
             }
-            Type::Array(param_elem) => {
-                if let Type::Array(arg_elem) = arg_ty {
-                    Self::infer_from_types(arg_elem, param_elem, type_params, inferred);
+            Type::Array(param_elem) => match arg_ty {
+                Type::Array(arg_elem) => {
+                    Self::infer_from_types(arg_elem, param_elem, type_params, inferred)
                 }
+                Type::Tuple(elements) => {
+                    for element in elements.iter() {
+                        Self::infer_from_types(element, param_elem, type_params, inferred);
+                    }
+                }
+                _ => {}
+            },
+            Type::Readonly(param_inner) => {
+                let arg_inner = match arg_ty {
+                    Type::Readonly(inner) => inner.as_ref(),
+                    other => other,
+                };
+                Self::infer_from_types(arg_inner, param_inner, type_params, inferred);
             }
             Type::Tuple(param_elems) => {
                 if let Type::Tuple(arg_elems) = arg_ty {
@@ -47605,6 +47870,7 @@ mod tests {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         }))
     }

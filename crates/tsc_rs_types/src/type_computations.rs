@@ -161,6 +161,7 @@ pub(crate) fn substitute_inner(ty: &Type, type_args: &HashMap<std::string::Strin
                 construct_signatures: construct_sigs,
                 index_signature: index_sig,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }))
         }
@@ -1001,6 +1002,7 @@ pub(crate) fn evaluate_mapped_type_inner(
         construct_signatures: Vec::new(),
         index_signature: None,
         index_signature_name: None,
+        readonly_names: Vec::new(),
         method_names: Vec::new(),
     }))
 }
@@ -1161,6 +1163,7 @@ mod tests {
                 construct_signatures: vec![],
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }))]
             .into(),
@@ -1196,6 +1199,7 @@ mod tests {
                 construct_signatures: vec![],
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }))]
             .into(),

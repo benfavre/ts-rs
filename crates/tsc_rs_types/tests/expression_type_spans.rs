@@ -76,3 +76,42 @@ fn collecting_exact_spans_preserves_diagnostics_and_hover_types() {
         format!("{:?}", inspected.diagnostics)
     );
 }
+
+#[test]
+fn assignment_targets_keep_the_declared_type_and_full_expression() {
+    let source = "let value: number | string = 1; value = 'text';";
+    let result = check(source, true);
+    assert_eq!(entry(source, &result, "value = 'text'"), "\"text\"");
+    let start = source.find("value =").unwrap() as u32;
+    assert_eq!(
+        result.expression_type_spans[&(start, start + 5)].type_string,
+        "string | number"
+    );
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+}
+
+#[test]
+fn destructured_names_have_types_without_treating_containers_as_expressions() {
+    let source =
+        "declare const input: any; const { value, other = 1 } = input; const [first] = [2];";
+    let result = check(source, true);
+    assert_eq!(entry(source, &result, "value"), "any");
+    assert_eq!(entry(source, &result, "other"), "any");
+    assert_eq!(entry(source, &result, "first"), "number");
+    let start = source.find("{ value").unwrap() as u32;
+    assert!(result
+        .expression_type_spans
+        .iter()
+        .any(|(&(from, _), entry)| from == start
+            && entry.kind == tsc_rs_types::TypeSpanKind::BindingPattern));
+}
+
+#[test]
+fn class_literal_and_computed_names_keep_complete_source_spans() {
+    let source = "class C { 0() {} 'name' = 1; [Symbol.iterator]() {} set value(v: number) {} }";
+    let result = check(source, true);
+    assert_eq!(entry(source, &result, "0"), "() => void");
+    assert_eq!(entry(source, &result, "'name'"), "number");
+    assert_eq!(entry(source, &result, "[Symbol.iterator]"), "() => void");
+    assert_eq!(entry(source, &result, "value"), "number");
+}

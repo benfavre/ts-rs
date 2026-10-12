@@ -585,6 +585,7 @@ fn constructor_types_display_with_valid_precedence_and_parameter_syntax() {
             }],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         },
     ));
@@ -614,6 +615,7 @@ fn constructor_types_display_with_valid_precedence_and_parameter_syntax() {
             }],
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names: Vec::new(),
         },
     ));

@@ -280,7 +280,11 @@ impl TypeChecker {
         if let ExprKind::Paren(inner) = &expression.kind {
             return self.const_asserted_widening_info(inner, ty);
         }
-        if let (ExprKind::ArrayLit(elements), Type::Tuple(types)) = (&expression.kind, ty) {
+        let shape = match ty {
+            Type::Readonly(inner) => inner.as_ref(),
+            other => other,
+        };
+        if let (ExprKind::ArrayLit(elements), Type::Tuple(types)) = (&expression.kind, shape) {
             let entries = elements
                 .iter()
                 .zip(types.iter())
@@ -290,7 +294,7 @@ impl TypeChecker {
                 })
                 .collect::<Vec<_>>();
             return Arc::new(WideningInfo {
-                ty: Type::Readonly(Arc::new(ty.clone())),
+                ty: ty.clone(),
                 contains: entries.iter().any(|entry| entry.contains),
                 shape: WideningShape::Tuple(entries),
             });

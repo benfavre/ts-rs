@@ -699,6 +699,7 @@ pub fn substitute(ty: &Type, substitutions: &HashMap<String, Type>) -> Type {
                 )
             }),
             index_signature_name: obj.index_signature_name.clone(),
+            readonly_names: obj.readonly_names.clone(),
             method_names: obj.method_names.clone(),
         })),
 
@@ -1025,6 +1026,7 @@ mod tests {
                 construct_signatures: vec![],
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }))],
             &[Type::ObjectType(ObjectTypeInfo::new(ObjectTypeData {
@@ -1033,6 +1035,7 @@ mod tests {
                 construct_signatures: vec![],
                 index_signature: None,
                 index_signature_name: None,
+                readonly_names: Vec::new(),
                 method_names: Vec::new(),
             }))],
         );

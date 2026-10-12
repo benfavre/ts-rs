@@ -245,9 +245,26 @@ impl TypeChecker {
                     .as_ref()
                     .map(|args| args.iter().map(|a| self.resolve_type_node(a)).collect())
                     .unwrap_or_default();
-                // Expand Array<T> and ReadonlyArray<T> to T[]
+                // Preserve container mutability when normalizing array references.
                 if matches!(name.as_str(), "Array" | "ReadonlyArray") && args.len() == 1 {
-                    return Type::Array(Arc::new(args.first().cloned().unwrap()));
+                    let array = Type::Array(Arc::new(args[0].clone()));
+                    return if name == "ReadonlyArray" {
+                        Type::Readonly(Arc::new(array))
+                    } else {
+                        array
+                    };
+                }
+                if name == "Readonly"
+                    && args.len() == 1
+                    && !self.alias_name_means_registered_alias(&name)
+                {
+                    match self.array_or_tuple_type(&args[0], 0) {
+                        Some(readonly @ Type::Readonly(_)) => return readonly,
+                        Some(array @ (Type::Array(_) | Type::Tuple(_))) => {
+                            return Type::Readonly(Arc::new(array));
+                        }
+                        _ => {}
+                    }
                 }
                 // A name that several files declare, written in a file that
                 // declares or imports one of those interfaces: refer to that
@@ -416,6 +433,7 @@ impl TypeChecker {
             }
             TypeNodeKind::TypeLit(members) => {
                 let mut method_names: Vec<std::string::String> = Vec::new();
+                let mut readonly_names = Vec::new();
                 let mut props = Vec::new();
                 let mut call_sigs = Vec::new();
                 let mut construct_sigs = Vec::new();
@@ -425,6 +443,9 @@ impl TypeChecker {
                     match &member.kind {
                         TypeMemberKind::PropertySig(prop) => {
                             let name = self.prop_name_to_string(&prop.name);
+                            if prop.readonly {
+                                readonly_names.push(name.clone());
+                            }
                             let ty = prop
                                 .type_ann
                                 .as_ref()
@@ -687,6 +708,7 @@ impl TypeChecker {
                     construct_signatures: construct_sigs,
                     index_signature: index_sig,
                     index_signature_name: index_sig_name,
+                    readonly_names,
                     method_names,
                 }));
                 self.record_type_literal_member_locations(&ty, members);
@@ -904,7 +926,7 @@ impl TypeChecker {
 
     fn resolve_readonly_type_node(&self, inner: &TypeNode) -> Type {
         let ty = self.resolve_type_node(inner);
-        if matches!(ty, Type::Tuple(_)) {
+        if matches!(ty, Type::Tuple(_) | Type::Array(_)) {
             Type::Readonly(Arc::new(ty))
         } else {
             ty
@@ -1283,7 +1305,7 @@ impl TypeChecker {
     }
 
     pub(crate) fn qualified_property_type(&self, owner: Type, property_name: &str) -> Option<Type> {
-        if let Some(value) = self.tuple_index_receiver(&owner, 0).and_then(|shape| {
+        if let Some(value) = self.array_or_tuple_type(&owner, 0).and_then(|shape| {
             crate::tuple_access::indexed_type(
                 &shape,
                 &Type::StringLiteral(property_name.to_string()),
@@ -2144,7 +2166,7 @@ impl TypeChecker {
     pub(crate) fn infer_const_asserted_expr(&self, expr: &Expr) -> Type {
         match &expr.kind {
             ExprKind::Paren(inner) => self.infer_const_asserted_expr(inner),
-            ExprKind::ArrayLit(elements) => Type::Tuple(
+            ExprKind::ArrayLit(elements) => Type::Readonly(Arc::new(Type::Tuple(
                 elements
                     .iter()
                     .map(|element| {
@@ -2154,7 +2176,7 @@ impl TypeChecker {
                             .unwrap_or(Type::Undefined)
                     })
                     .collect(),
-            ),
+            ))),
             ExprKind::ObjectLit(properties) => {
                 let Type::ObjectType(mut info) = self.infer_expr_type(expr) else {
                     return Self::freeze_as_const(&self.infer_expr_type(expr));
@@ -2173,6 +2195,11 @@ impl TypeChecker {
                         *ty = Arc::new(self.infer_const_asserted_expr(&property.value));
                     }
                 }
+                info.readonly_names = info
+                    .properties
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect();
                 Type::ObjectType(info)
             }
             ExprKind::As(assertion) if Self::is_const_assertion_expr(expr) => {
@@ -2181,7 +2208,7 @@ impl TypeChecker {
             ExprKind::TypeAssertion(assertion) if Self::is_const_assertion_expr(expr) => {
                 self.infer_const_asserted_expr(&assertion.expr)
             }
-            _ => Self::freeze_as_const(&self.infer_expr_type(expr)),
+            _ => self.infer_expr_type(expr),
         }
     }
 
@@ -2347,6 +2374,7 @@ impl TypeChecker {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    readonly_names: Vec::new(),
                     method_names,
                 }))
             }
@@ -3099,7 +3127,7 @@ impl TypeChecker {
                 let obj_ty = self.widen_fresh_array_type(&ea.object, obj_ty);
                 let obj_ty = self.fresh_index_receiver_type(&ea.object, obj_ty);
                 let index = self.infer_expr_type(&ea.index);
-                if let Some(value) = self.tuple_index_receiver(&obj_ty, 0).and_then(|shape| {
+                if let Some(value) = self.array_or_tuple_type(&obj_ty, 0).and_then(|shape| {
                     crate::tuple_access::indexed_type(
                         &shape,
                         &index,
@@ -3363,6 +3391,7 @@ pub(crate) fn implied_binding_pattern_type(pattern: &Pat) -> Option<Type> {
                     construct_signatures: Vec::new(),
                     index_signature: None,
                     index_signature_name: None,
+                    readonly_names: Vec::new(),
                     method_names: Vec::new(),
                 })))
             }

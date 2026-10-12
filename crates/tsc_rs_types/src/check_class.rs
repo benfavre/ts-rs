@@ -1631,6 +1631,16 @@ impl TypeChecker {
                 construct_signatures: construct_sigs,
                 index_signature: index_sig,
                 index_signature_name: index_sig_name,
+                readonly_names: iface_decl
+                    .members
+                    .iter()
+                    .filter_map(|member| match &member.kind {
+                        TypeMemberKind::PropertySig(property) if property.readonly => {
+                            Some(self.prop_name_to_string(&property.name))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
                 method_names: iface_decl
                     .members
                     .iter()
@@ -3055,6 +3065,7 @@ impl TypeChecker {
                         construct_signatures: iface.object_type.construct_signatures.clone(),
                         index_signature: iface.object_type.index_signature.clone(),
                         index_signature_name: iface.object_type.index_signature_name.clone(),
+                        readonly_names: Vec::new(),
                         method_names,
                     }));
                 }
@@ -3170,6 +3181,7 @@ impl TypeChecker {
             construct_signatures: Vec::new(),
             index_signature: None,
             index_signature_name: None,
+            readonly_names: Vec::new(),
             method_names,
         }))
     }

@@ -6723,7 +6723,13 @@ impl BaselineRunner {
                 .iter()
                 // Upstream's isPartOfTypeNode excludes the null keyword,
                 // including a literal used as a value. Named properties remain.
-                .filter(|(_, entry)| entry.kind != tsc_rs_types::TypeSpanKind::NullLiteral)
+                .filter(|(_, entry)| {
+                    !matches!(
+                        entry.kind,
+                        tsc_rs_types::TypeSpanKind::NullLiteral
+                            | tsc_rs_types::TypeSpanKind::BindingPattern
+                    )
+                })
                 .map(|(&(start, end), entry)| (start, end, entry.type_string.clone()))
                 .collect();
             let tokens = tsc_rs_scanner::Scanner::new(&file.content).scan_all();
