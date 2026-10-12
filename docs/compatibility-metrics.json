@@ -1,6 +1,6 @@
 {
   "measured_at": "2026-10-12",
-  "source_commit": "b7a2dbb4e1305a3383c8061d5aea88b8acf374b6",
+  "source_commit": "4f6150c3ed602867d9c7d920a8aec66017d9961e",
   "source_build": "Public main checkout, release profile, cache-free baseline reports; unchanged upstream cases and reference baselines.",
   "pass_rate_definition": "passed / (passed + failed); skipped cases excluded, never counted as passes.",
   "baselines": {
@@ -31,10 +31,10 @@
       },
       "types": {
         "total": 6529,
-        "passed": 813,
-        "failed": 5621,
+        "passed": 1065,
+        "failed": 5369,
         "skipped": 95,
-        "manifest_sha256": "2cea89640dfbf49d7eedf8c10495c04784311dad0cf699849a187d6828af6115",
+        "manifest_sha256": "161b5d8c8b2c3f7a90aa068f5cca5e0b9353546f82f0c1d4df80c7b3f5c9bffd",
         "command": "target/release/baseline-report --suite compiler --baseline types --no-cache --save-manifest /tmp/compiler-types.json"
       },
       "js-expanded": {
@@ -81,10 +81,10 @@
       },
       "types": {
         "total": 5907,
-        "passed": 782,
-        "failed": 4835,
+        "passed": 981,
+        "failed": 4636,
         "skipped": 290,
-        "manifest_sha256": "133155bac957378cc6b521ab86bf214b7770f4b8cec93d95fff0c4adfd3b570d",
+        "manifest_sha256": "d1746fa097b9cac45b42926b35290469c74fd5ba0f318743313afa343b732f46",
         "command": "target/release/baseline-report --suite conformance --baseline types --no-cache --save-manifest /tmp/conformance-types.json"
       },
       "js-expanded": {
@@ -145,7 +145,7 @@
       "passed": 307,
       "failed": 222,
       "skipped": 10,
-      "report_sha256": "3eb73981b54d0e0a519744f65930e2246c09791151bec834784e0cbccd47391c",
+      "report_sha256": "ce3020a5a31ae2ba651aa8050a2bb46d824d2cde8df177f646e2f6a9af3ffcdf",
       "command": "target/release/lsp-report --op quickinfo --json --top 1000 --show-samples 10000"
     },
     "completions": {
@@ -186,20 +186,20 @@
     "passed": 1810,
     "failed": 553,
     "skipped": 3957,
-    "report_sha256": "421cc57caeedcc16ad40c192f712ee0ee295d5c9dcb6916a34e65868170cebaa",
+    "report_sha256": "463d0383491217762aed6b73f83817112c7416e337788862acb73f74c967808c",
     "command": "target/release/lsp-report --op all --json --top 1000 --show-samples 10000"
   },
   "rust_tests": {
-    "total": 4785,
-    "passed": 4748,
+    "total": 4799,
+    "passed": 4762,
     "failed": 0,
     "skipped": 37,
-    "report_sha256": "926c2b2fa778df881256cfadbb8efa28354f22b6f98770747463bff4aede711f",
+    "report_sha256": "e01d66cb26f85a0f76fb483459d6a0c35c313fee11f89788b067a4183eed6b37",
     "command": "cargo test --workspace"
   },
   "validation": {
     "make_ci": "passed",
-    "ci_log_sha256": "bf4da5ac19994164503d39b95d7d31e370f473c91a02a6f88e4036ddd9b1048e"
+    "ci_log_sha256": "8f94cdda97b679c7ef47e1d187b3d884d4876871596795bf5e081c6acefc24d6"
   },
   "diagnostic_accuracy_definition": "Full expanded errors inventory; matches file basename, line and TS code with multiplicity, excluding configuration-deprecation codes. Does not require exact diagnostic message or column.",
   "lsp_total_definition": "The per-operation tables cover five supported operations. The full inventory includes unsupported cases and reports their skips separately; no skip is a pass."
