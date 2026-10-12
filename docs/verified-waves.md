@@ -2235,3 +2235,56 @@ published snapshot; this batch does not establish full TypeScript compatibility.
 All 4,601 public Rust tests pass, with 37 ignored, and `make ci` passes.
 The measured compiler commit is `46722ed85`. The preceding
 snapshot is retained at `docs/compatibility-metrics-2026-10-12-c0d733123.json`.
+
+## 2026-10-12: exact type baselines and readonly container inference
+
+Exact type baselines now retain assignment targets, destructured binding names,
+class member names and setter types. Destructuring containers remain available
+for hover without being emitted as expression nodes. Defaulted properties of
+any-typed objects retain their any type. Const tuples honor mutable constraints
+and nested, union and return contexts.
+Array and tuple mutability survives aliases, generic inference, members,
+index access and assignments. Readonly sources reject mutable array and tuple
+destinations with TypeScript-compatible error details. Const assertions retain
+nested tuple literals without freezing referenced mutable arrays. Readonly
+property modifiers remain visible in structural type displays. Missing method
+calls also diagnose callbacks that have no contextual parameter signature.
+The batch adds 101 readonly-container cases checked against TypeScript 6.0.3,
+including diagnostic messages, source spans and expression types, plus six
+exact-span and upstream-baseline regression tests. Upstream cases and
+reference baselines are unchanged.
+
+| Suite | Type passes before | After |
+|---|---:|---:|
+| Compiler | 641 | 721 |
+| Conformance | 614 | 737 |
+
+| Diagnostic baseline | Passes before | After |
+|---|---:|---:|
+| Compiler | 4,969 | 4,971 |
+| Conformance | 4,041 | 4,044 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 88.23% | 88.26% | 64.60% | 64.70% |
+| Conformance | 90.08% | 90.12% | 72.73% | 72.76% |
+
+False-positive diagnostics change from 1,285 to 1,283 in compiler
+and from 2,302 to 2,293 in conformance. The accuracy report includes all option variants.
+
+QuickInfo passes change from 306 to 307. Comparing every supported
+LSP failure set finds no newly failing cases or additional skips.
+
+Whole-case baselines gain 5 diagnostic matches and 203 type matches.
+All twelve measured baseline lanes have zero passed-to-failed cases and no
+new skips. The public JavaScript, diagnostic and type results match the six
+private verification manifests exactly.
+
+Cache-free reports cover JavaScript, diagnostics, symbols, types, expanded
+JavaScript/declarations, diagnostic accuracy and all supported LSP operations.
+Skips are excluded from pass rates. Remaining failures remain visible in the
+published snapshot; this batch does not establish full TypeScript compatibility.
+
+All 4,708 public Rust tests pass, with 37 ignored, and `make ci` passes.
+The measured compiler commit is `5999d5373`. The preceding
+snapshot is retained at `docs/compatibility-metrics-2026-10-12-46722ed85.json`.

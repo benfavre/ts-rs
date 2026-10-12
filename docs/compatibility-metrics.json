@@ -1,16 +1,16 @@
 {
   "measured_at": "2026-10-12",
-  "source_commit": "46722ed853b6ac390dee54ed0c0272ae550a02bd",
+  "source_commit": "5999d537330288b5b81142c6ad6b0119baa1f82b",
   "source_build": "Public main checkout, release profile, cache-free baseline reports; unchanged upstream cases and reference baselines.",
   "pass_rate_definition": "passed / (passed + failed); skipped cases excluded, never counted as passes.",
   "baselines": {
     "compiler": {
       "errors": {
         "total": 6529,
-        "passed": 4969,
-        "failed": 1560,
+        "passed": 4971,
+        "failed": 1558,
         "skipped": 0,
-        "manifest_sha256": "ba54f147f0c2b84fdbfbbaad7ea47d481915410a0cf5ddd4faf97f2afc021203",
+        "manifest_sha256": "eba2d1abb3a3bad014ed9d8fbb8be3f94b2bb4185061f42b7275745909b9b543",
         "command": "target/release/baseline-report --suite compiler --baseline errors --no-cache --save-manifest /tmp/compiler-errors.json"
       },
       "js": {
@@ -31,10 +31,10 @@
       },
       "types": {
         "total": 6529,
-        "passed": 641,
-        "failed": 5793,
+        "passed": 721,
+        "failed": 5713,
         "skipped": 95,
-        "manifest_sha256": "a32dd1b32d65b4aa2b69d7832e9b9f875a48f54a69223c6c00f3cce28729cc07",
+        "manifest_sha256": "148468dbe6c33cb2bb161f9407085985571311538574dff6851e049513124db9",
         "command": "target/release/baseline-report --suite compiler --baseline types --no-cache --save-manifest /tmp/compiler-types.json"
       },
       "js-expanded": {
@@ -57,10 +57,10 @@
     "conformance": {
       "errors": {
         "total": 5907,
-        "passed": 4041,
-        "failed": 1866,
+        "passed": 4044,
+        "failed": 1863,
         "skipped": 0,
-        "manifest_sha256": "e396fbd25bb1cb069473b336712b036e4b9bdfdb104d832140ca3985c2a41f3b",
+        "manifest_sha256": "fc6005a6319a206e86006b0999ef4edafeb068152d375ff78309f19e71aa7cdb",
         "command": "target/release/baseline-report --suite conformance --baseline errors --no-cache --save-manifest /tmp/conformance-errors.json"
       },
       "js": {
@@ -81,10 +81,10 @@
       },
       "types": {
         "total": 5907,
-        "passed": 614,
-        "failed": 5003,
+        "passed": 737,
+        "failed": 4880,
         "skipped": 290,
-        "manifest_sha256": "57d56a397613dc3f262b8d160f5c9857b676aada0025c20a5f9be3a36836b890",
+        "manifest_sha256": "5eeefe13b3cb0ccc2c0c1096cc80d9b1b2685de2635969bf1ddd5fdb321a0b84",
         "command": "target/release/baseline-report --suite conformance --baseline types --no-cache --save-manifest /tmp/conformance-types.json"
       },
       "js-expanded": {
@@ -110,16 +110,16 @@
       "suite": "compiler",
       "cases_total": 7257,
       "cases_with_expected": 3512,
-      "cases_perfect": 1985,
+      "cases_perfect": 1990,
       "expected_diagnostics": 14916,
-      "matched": 9635,
-      "false_negatives": 5281,
-      "false_positives": 1285,
-      "recall": 0.6459506570126039,
-      "precision": 0.8823260073260073,
-      "loc_recall": 0.674979887369268,
-      "loc_precision": 0.921978021978022,
-      "report_sha256": "6f157136e4e2a57c5af9e3b72b0d217065e67f2bf3c874c7bfc3b010802ba0f7",
+      "matched": 9650,
+      "false_negatives": 5266,
+      "false_positives": 1283,
+      "recall": 0.646956288549209,
+      "precision": 0.8826488612457697,
+      "loc_recall": 0.6758514347009922,
+      "loc_precision": 0.9220707948413062,
+      "report_sha256": "c6a7dcd6f1ab7516dd4c1598ec03a9a412168b760430b6082ca417bdcb81972b",
       "command": "target/release/typecheck-report --suite compiler --json --top 1000"
     },
     "conformance": {
@@ -128,24 +128,24 @@
       "cases_with_expected": 4271,
       "cases_perfect": 2195,
       "expected_diagnostics": 28735,
-      "matched": 20899,
-      "false_negatives": 7836,
-      "false_positives": 2302,
-      "recall": 0.7273012006264138,
-      "precision": 0.9007801387871213,
-      "loc_recall": 0.7511049243083348,
-      "loc_precision": 0.9302616266540236,
-      "report_sha256": "3453fe471af3685f65e58acf50be3340b9a20888b1b7230f4ff4e9dd8885b89f",
+      "matched": 20907,
+      "false_negatives": 7828,
+      "false_positives": 2293,
+      "recall": 0.7275796067513486,
+      "precision": 0.9011637931034483,
+      "loc_recall": 0.7513833304332695,
+      "loc_precision": 0.9306465517241379,
+      "report_sha256": "6e767a4630ea40c8a9cda7f225b3397ba2326ec06f5e9c382500332c87e52fba",
       "command": "target/release/typecheck-report --suite conformance --json --top 1000"
     }
   },
   "lsp": {
     "quickinfo": {
       "total": 539,
-      "passed": 306,
-      "failed": 223,
+      "passed": 307,
+      "failed": 222,
       "skipped": 10,
-      "report_sha256": "e67694188259916883b95ebba056644be49b163f280d418ca98d839d18c71403",
+      "report_sha256": "29dc1642c58c802b64996536d4820c527115f7e80d4b1d9d3b49149e6444f06f",
       "command": "target/release/lsp-report --op quickinfo --json --top 1000 --show-samples 10000"
     },
     "completions": {
@@ -183,23 +183,23 @@
   },
   "lsp_inventory": {
     "total": 6320,
-    "passed": 1809,
-    "failed": 554,
+    "passed": 1810,
+    "failed": 553,
     "skipped": 3957,
-    "report_sha256": "045ff6ed17f47387f985c6a9c85dc20b2b76ef83ecf1c2f95bc110ec0a2d762d",
+    "report_sha256": "1cbc8295762df3114fcad7accc42565307237add995d8e73fb8258ca4998d665",
     "command": "target/release/lsp-report --op all --json --top 1000 --show-samples 10000"
   },
   "rust_tests": {
-    "total": 4638,
-    "passed": 4601,
+    "total": 4745,
+    "passed": 4708,
     "failed": 0,
     "skipped": 37,
-    "report_sha256": "5f686d6a100525aae6f1f20cdd884115109c228110135aabf1441479f49d9e5e",
+    "report_sha256": "201820c76d94f9a1ee9669b5228f2525a4ccc6cfa1f70a9b19325e59de91a697",
     "command": "cargo test --workspace"
   },
   "validation": {
     "make_ci": "passed",
-    "ci_log_sha256": "a2d09642d82159032f531fb9748191894f46d6ce3d0e58d84b9244d5700c07fc"
+    "ci_log_sha256": "36ebceeb381b891980776bf0f3048f74c1168fba8cc1b70cbae393e66ba47ef1"
   },
   "diagnostic_accuracy_definition": "Full expanded errors inventory; matches file basename, line and TS code with multiplicity, excluding configuration-deprecation codes. Does not require exact diagnostic message or column.",
   "lsp_total_definition": "The per-operation tables cover five supported operations. The full inventory includes unsupported cases and reports their skips separately; no skip is a pass."
