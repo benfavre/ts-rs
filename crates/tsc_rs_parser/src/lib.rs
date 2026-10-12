@@ -4140,6 +4140,16 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
+        if let Some(keyword) = self.eat(TokenKind::Implements) {
+            self.error_at_span(
+                1176,
+                "Interface declaration cannot have 'implements' clause.".into(),
+                keyword,
+            );
+            // Recover the heritage list before parsing the body, so neither
+            // its keyword nor its type names become fake property signatures.
+            self.parse_type_list();
+        }
         let body_start = self.cur_span().start;
         let members = self.parse_object_type_members();
         if self.is_js_file {

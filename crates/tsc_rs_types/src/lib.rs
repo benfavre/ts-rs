@@ -2645,6 +2645,10 @@ pub struct TypeChecker {
     /// `dedup_map`.
     expression_types: rustc_hash::FxHashMap<u32, std::string::String>,
     expression_type_spans: Option<rustc_hash::FxHashMap<(u32, u32), TypeAtSpan>>,
+    /// Source comments excluded from the syntax walk. JSDoc desugaring can
+    /// create type members anchored inside them, but those are not source
+    /// declaration names in a `.types` baseline.
+    expression_type_comments: Arc<[Span]>,
     widening_types: HashMap<(u32, u32), Arc<widening::WideningInfo>>,
     widening_returns: HashMap<usize, Vec<Arc<widening::WideningInfo>>>,
     widening_parameters: HashMap<(u32, u32), widening::ParameterWidening>,
@@ -3392,6 +3396,7 @@ impl Clone for TypeChecker {
             arena: self.arena.clone(),
             expression_types: self.expression_types.clone(),
             expression_type_spans: self.expression_type_spans.clone(),
+            expression_type_comments: Arc::clone(&self.expression_type_comments),
             widening_types: self.widening_types.clone(),
             widening_returns: self.widening_returns.clone(),
             widening_parameters: self.widening_parameters.clone(),
@@ -3656,6 +3661,7 @@ impl TypeChecker {
             ]),
             expression_types: rustc_hash::FxHashMap::default(),
             expression_type_spans: None,
+            expression_type_comments: Arc::from([]),
             widening_types: HashMap::new(),
             widening_returns: HashMap::new(),
             widening_parameters: HashMap::new(),
@@ -4141,6 +4147,16 @@ impl TypeChecker {
     /// Disabled by default so ordinary compilation and hover keep their cost.
     pub fn enable_expression_type_spans(&mut self) {
         self.expression_type_spans = Some(rustc_hash::FxHashMap::default());
+    }
+
+    fn prepare_expression_type_comments(&mut self, file: &SourceFile) {
+        if self.expression_type_spans.is_some() {
+            self.expression_type_comments = file
+                .comments
+                .iter()
+                .map(|comment| Span::new(comment.pos, comment.end))
+                .collect();
+        }
     }
 
     fn record_expression_type_span(&mut self, span: Span, ty: &Type) {
@@ -12033,6 +12049,7 @@ impl TypeChecker {
             .filter_map(|d| d.span.map(|span| span.start))
             .collect();
         self.current_source = Some(file.text.clone());
+        self.prepare_expression_type_comments(file);
         self.prepare_augmentation_module_detection(file);
         self.check_strict_reserved_words(file);
         self.check_node18_resolution_mode_requirements(&file.statements);
@@ -12298,6 +12315,7 @@ impl TypeChecker {
             .filter_map(|d| d.span.map(|span| span.start))
             .collect();
         self.current_source = Some(file.text.clone());
+        self.prepare_expression_type_comments(file);
         self.prepare_augmentation_module_detection(file);
         self.check_strict_reserved_words(file);
         self.check_node18_resolution_mode_requirements(&file.statements);
@@ -31941,6 +31959,7 @@ impl TypeChecker {
 
     fn check_type_member_generic_arity(&mut self, member: &TypeMember) {
         self.check_type_member_implicit_any_return(member);
+        self.record_property_signature_type(member);
         let check_signature = |this: &mut Self,
                                type_params: Option<&[TypeParam]>,
                                params: &[Param],
@@ -32014,6 +32033,7 @@ impl TypeChecker {
 
     fn check_type_member_future_lib_globals(&mut self, member: &TypeMember) {
         self.check_type_member_implicit_any_return(member);
+        self.record_property_signature_type(member);
         let check_signature = |this: &mut Self,
                                type_params: Option<&[TypeParam]>,
                                params: &[Param],
@@ -32071,6 +32091,64 @@ impl TypeChecker {
                 );
             }
         }
+    }
+
+    /// A property signature's name is a declaration name, even inside a type
+    /// literal or interface. TypeWriterWalker visits it independently of its
+    /// annotation. Keep this in the existing scoped type traversal so nested
+    /// members see their enclosing type parameters and namespace aliases.
+    fn record_property_signature_type(&mut self, member: &TypeMember) {
+        if self.expression_type_spans.is_none() {
+            return;
+        }
+        let TypeMemberKind::PropertySig(property) = &member.kind else {
+            return;
+        };
+        let span = property.name.span();
+        let after_comment = self
+            .expression_type_comments
+            .partition_point(|comment| comment.start <= span.start);
+        if after_comment > 0 && self.expression_type_comments[after_comment - 1].end > span.start {
+            return;
+        }
+        let mut ty = property
+            .type_ann
+            .as_ref()
+            .map(|annotation| self.resolve_type_node(annotation))
+            .unwrap_or(Type::Any);
+        // Qualified aliases can remain references during annotation
+        // resolution. Scalar aliases have the scalar's semantic display;
+        // composite aliases retain their name.
+        if matches!(ty, Type::TypeReference(_, _)) {
+            if let Some(resolved) = self.resolve_type_for_assignability(&ty) {
+                if matches!(
+                    resolved,
+                    Type::Any
+                        | Type::Error
+                        | Type::Unknown
+                        | Type::Never
+                        | Type::Void
+                        | Type::Null
+                        | Type::Undefined
+                        | Type::String
+                        | Type::Number
+                        | Type::Boolean
+                        | Type::BigInt
+                        | Type::Symbol
+                        | Type::StringLiteral(_)
+                        | Type::NumberLiteral(_)
+                        | Type::BooleanLiteral(_)
+                        | Type::BigIntLiteral(_)
+                        | Type::TypeParameter(_)
+                ) {
+                    ty = resolved;
+                }
+            }
+        }
+        if property.optional && self.strict_null_checks {
+            ty = Type::flatten_union(vec![ty, Type::Undefined]);
+        }
+        self.record_expression_type_span(property.name.span(), &ty);
     }
 
     fn collect_infer_names_from_type_member(

@@ -143,3 +143,105 @@ fn alias_name_types_are_separate_from_expanded_hover_bodies() {
         "type_alias_body=\"a\" | \"b\""
     );
 }
+
+#[test]
+fn property_signatures_keep_identifier_string_number_and_computed_name_spans() {
+    let source = "declare const key: unique symbol; interface I { count: number; 'caption': string; 42: boolean; [key]: number; }";
+    let result = check(source, true);
+    for (name, ty) in [
+        ("count", "number"),
+        ("'caption'", "string"),
+        ("42", "boolean"),
+        ("[key]", "number"),
+    ] {
+        assert_eq!(entry(source, &result, name), ty);
+    }
+    assert_eq!(
+        result.expression_types,
+        check(source, false).expression_types
+    );
+}
+
+#[test]
+fn nested_type_literal_property_names_have_semantic_types() {
+    let source = "type Outer<T> = { child: { value: T }; flag: boolean }; declare const x: { score: number };";
+    let result = check(source, true);
+    assert_eq!(entry(source, &result, "value"), "T");
+    assert_eq!(entry(source, &result, "flag"), "boolean");
+    assert_eq!(entry(source, &result, "score"), "number");
+    assert_eq!(
+        result.expression_types,
+        check(source, false).expression_types
+    );
+}
+
+#[test]
+fn optional_property_signature_names_follow_strict_null_checks() {
+    let source = "interface I { value?: number; optionalAny?: any; }";
+    let file = tsc_rs_parser::parse("case.ts", source);
+    for strict in [false, true] {
+        let symbols = tsc_rs_symbols::bind(&file);
+        let mut checker = TypeChecker::new();
+        checker.enable_expression_type_spans();
+        let result = checker.check_with_options(
+            &file,
+            &symbols,
+            &CompilerOptions {
+                strict_null_checks: Some(strict),
+                ..CompilerOptions::default()
+            },
+        );
+        assert_eq!(
+            entry(source, &result, "value"),
+            if strict {
+                "number | undefined"
+            } else {
+                "number"
+            }
+        );
+        assert_eq!(entry(source, &result, "optionalAny"), "any");
+    }
+}
+
+#[test]
+fn property_signature_spans_preserve_scoped_types_and_diagnostics() {
+    let source = "namespace N { type Value = string; export interface I<T> { text: Value; generic: T; } } interface Other { outer: number; }";
+    let result = check(source, true);
+    assert_eq!(entry(source, &result, "text"), "string");
+    assert_eq!(entry(source, &result, "generic"), "T");
+    assert_eq!(entry(source, &result, "outer"), "number");
+    let ordinary = check(source, false);
+    assert_eq!(result.expression_types, ordinary.expression_types);
+    assert_eq!(
+        format!("{:?}", result.diagnostics),
+        format!("{:?}", ordinary.diagnostics)
+    );
+}
+
+#[test]
+fn synthesized_jsdoc_properties_are_not_source_declaration_names() {
+    let source = "/** @typedef {Object} Options\n * @property {boolean} flag\n * @property {string} text\n */\n/** @typedef {{ value: number }} Box */\ninterface Actual { real: number; }";
+    let file = tsc_rs_parser::parse("case.js", source);
+    let symbols = tsc_rs_symbols::bind(&file);
+    let mut checker = TypeChecker::new();
+    checker.enable_expression_type_spans();
+    let result = checker.check_with_options(
+        &file,
+        &symbols,
+        &CompilerOptions {
+            allow_js: Some(true),
+            check_js: Some(true),
+            ..CompilerOptions::default()
+        },
+    );
+    assert_eq!(entry(source, &result, "real"), "number");
+    for &(start, _) in result.expression_type_spans.keys() {
+        assert!(
+            file.comments
+                .iter()
+                .all(|comment| start < comment.pos || start >= comment.end),
+            "comment leaked into spans: {:?}",
+            result.expression_type_spans
+        );
+    }
+}
