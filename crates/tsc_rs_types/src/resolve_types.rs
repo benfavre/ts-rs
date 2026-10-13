@@ -1121,10 +1121,13 @@ impl TypeChecker {
             Type::Union(members) => members.iter().any(|member| {
                 let mut single_types = types.to_vec();
                 single_types[idx] = member.clone();
-                Self::match_template_recursive(after_quasi, quasis, &single_types, idx)
+                Self::match_template_recursive(remaining, quasis, &single_types, idx)
             }),
             Type::String => {
                 for end in 0..=after_quasi.len() {
+                    if !after_quasi.is_char_boundary(end) {
+                        continue;
+                    }
                     if Self::match_template_recursive(&after_quasi[end..], quasis, types, idx + 1) {
                         return true;
                     }
@@ -1133,6 +1136,9 @@ impl TypeChecker {
             }
             Type::Number => {
                 for end in 0..=after_quasi.len() {
+                    if !after_quasi.is_char_boundary(end) {
+                        continue;
+                    }
                     let candidate = &after_quasi[..end];
                     if !candidate.is_empty()
                         && candidate.parse::<f64>().is_ok()
@@ -1160,6 +1166,9 @@ impl TypeChecker {
             }
             _ => {
                 for end in 0..=after_quasi.len() {
+                    if !after_quasi.is_char_boundary(end) {
+                        continue;
+                    }
                     if Self::match_template_recursive(&after_quasi[end..], quasis, types, idx + 1) {
                         return true;
                     }
@@ -2101,6 +2110,14 @@ impl TypeChecker {
     pub(crate) fn collect_return_types_from_stmt(&self, stmt: &Stmt, out: &mut Vec<Type>) {
         match &stmt.kind {
             StmtKind::Return(Some(ref expr)) => {
+                if let Some((depth, _, returns)) = &self.contextual_return {
+                    if *depth == self.fn_nesting_depth {
+                        if let Some(ty) = returns.get(&expr.span.start) {
+                            out.push(ty.clone());
+                            return;
+                        }
+                    }
+                }
                 // An unshadowed `undefined` is the undefined value (it has
                 // no scope binding, so the generic lookup falls to `any`).
                 let ty = match &expr.kind {
@@ -2266,7 +2283,7 @@ impl TypeChecker {
 
     /// The type a read of a member declared as `ty` produces: an optional
     /// member (`x?: T`) reads as `T | undefined`.
-    fn member_read_type(ty: &Type) -> Type {
+    pub(super) fn member_read_type(ty: &Type) -> Type {
         match ty {
             Type::Optional(inner) => Type::flatten_union(vec![Type::clone(inner), Type::Undefined]),
             other => other.clone(),
@@ -3126,6 +3143,18 @@ impl TypeChecker {
                     return value;
                 }
                 match &obj_ty {
+                    Type::Namespace(namespace) => namespace
+                        .exports
+                        .iter()
+                        .find(|(name, _)| name == &mem.property)
+                        .map(|(_, ty)| ty.clone())
+                        .unwrap_or(Type::Any),
+                    Type::Module(module) => module
+                        .exports
+                        .iter()
+                        .find(|(name, _)| name == &mem.property)
+                        .map(|(_, ty)| ty.clone())
+                        .unwrap_or(Type::Any),
                     Type::ObjectType(info) => {
                         info.properties
                             .iter()

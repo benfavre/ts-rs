@@ -18829,9 +18829,11 @@ fn completions_at_with_prefs_inner(
         }
 
         if !ident.is_empty() {
-            // Look up the variable's type from expression_types at its declaration
+            // Look up the variable's type from expression_types at its declaration.
+            // A local receiver may shadow a same-named namespace or class.
+            let binding = bare_receiver_binding(sym_table, source, effective_offset);
             for sym in &sym_table.symbols {
-                if sym.name == ident {
+                if sym.name == ident && binding.is_none_or(|binding| binding.id == sym.id) {
                     // Same-file namespace blocks: the binder flattens their
                     // contents, so parse member names from the block text.
                     if sym.flags & tsc_rs_symbols::SYM_MODULE != 0
@@ -24415,6 +24417,33 @@ fn is_class_member_keyword(kw: &str) -> bool {
     )
 }
 
+/// Resolve a bare member receiver through its lexical binding. A property
+/// name in a chain is not a lexical identifier and must use type resolution.
+fn bare_receiver_binding<'a>(
+    sym_table: &'a SymbolTable,
+    source: &str,
+    dot_offset: u32,
+) -> Option<&'a tsc_rs_symbols::Symbol> {
+    let prefix = source.get(..dot_offset.checked_sub(1)? as usize)?;
+    let end = prefix.trim_end().len();
+    let mut start = end;
+    while start > 0 && is_ident_byte(prefix.as_bytes()[start - 1]) {
+        start -= 1;
+    }
+    if start == end || prefix[..start].trim_end().ends_with('.') {
+        return None;
+    }
+    let name = prefix.get(start..end)?;
+    let mut scope = sym_table.scope_graph.innermost_scope_at(start as u32);
+    while let Some(current) = scope.and_then(|id| sym_table.scope_graph.scope(id)) {
+        if let Some(id) = current.bindings.get(name) {
+            return sym_table.get_symbol(*id);
+        }
+        scope = current.parent;
+    }
+    None
+}
+
 /// Return completions for member access (after `.`).
 fn member_completions(
     sym_table: &SymbolTable,
@@ -24425,6 +24454,15 @@ fn member_completions(
     file_name: &str,
 ) -> Vec<Value> {
     // Find the expression type for the expression just before the dot.
+    // A namespace receiver is resolved from its binding below. The type map
+    // is keyed only by start offset, so N and N.method share a slot: a precise
+    // type for the full member expression must not supply Function members
+    // when completing the namespace before that member name.
+    if bare_receiver_binding(sym_table, source_text, dot_offset)
+        .is_some_and(|symbol| symbol.flags & tsc_rs_symbols::SYM_MODULE != 0)
+    {
+        return Vec::new();
+    }
     let mut best_pos: Option<u32> = None;
     let mut best_type: Option<&str> = None;
     for (&pos, ty_str) in &check_out.expression_types {
@@ -34187,6 +34225,57 @@ mod tests {
                 labels
             );
         }
+    }
+
+    // Required labels and the namespace/shadowing exclusions were checked
+    // against the TypeScript 6.0.3 language service.
+    fn namespace_completion_labels(marked: &str) -> Vec<String> {
+        let offset = marked.find("/**/").unwrap();
+        let source = marked.replacen("/**/", "", 1);
+        let (line, character) = offset_to_position(&source, offset as u32);
+        let messages = vec![
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "capabilities": {} } }),
+            json!({ "jsonrpc": "2.0", "method": "textDocument/didOpen", "params": { "textDocument": {
+                "uri": "file:///namespace-completion.ts", "languageId": "typescript", "version": 1, "text": source
+            } } }),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "textDocument/completion", "params": {
+                "textDocument": { "uri": "file:///namespace-completion.ts" }, "position": { "line": line, "character": character }
+            } }),
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "shutdown", "params": null }),
+            json!({ "jsonrpc": "2.0", "method": "exit", "params": null }),
+        ];
+        let responses = run_session(&messages);
+        responses.iter().find(|r| r["id"] == 2).unwrap()["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["label"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_namespace_completion_before_function_member() {
+        let labels = namespace_completion_labels("namespace Values {\n export const value = 1;\n export function read() { return value; }\n}\nValues./**/read();");
+        assert!(labels.iter().any(|label| label == "read"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "value"), "{labels:?}");
+        assert!(!labels.iter().any(|label| label == "apply"), "{labels:?}");
+    }
+
+    #[test]
+    fn test_namespace_completion_merged_class_function_member() {
+        let labels = namespace_completion_labels("class Point { constructor(public x:number) {} }\nnamespace Point {\n export const origin = new Point(0);\n export function equals(a:Point,b:Point) { return a.x === b.x; }\n}\nPoint./**/equals(Point.origin, Point.origin);");
+        assert!(labels.iter().any(|label| label == "equals"), "{labels:?}");
+        assert!(labels.iter().any(|label| label == "origin"), "{labels:?}");
+    }
+
+    #[test]
+    fn test_namespace_completion_respects_shadowing() {
+        let labels = namespace_completion_labels("namespace Values {\n export const exported = 1;\n}\nfunction use(Values: { item: number }) { Values./**/ }");
+        assert!(labels.iter().any(|label| label == "item"), "{labels:?}");
+        assert!(
+            !labels.iter().any(|label| label == "exported"),
+            "{labels:?}"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Source-aware member serialization, adapted from pingdotgg/ts-rust's
-//! nodebuilder_impl_p2.rs and nodebuilder_impl_p3.rs (see NOTICE.txt). The native types remain authoritative;
+//! nodebuilder_impl_p1.rs, nodebuilder_impl_p2.rs and nodebuilder_impl_p3.rs
+//! (see NOTICE.txt). The native types remain authoritative;
 //! a declaration's annotation is reusable only while its resolved type survives
 //! instantiation. Source provenance never participates in type identity.
 
@@ -416,11 +417,13 @@ impl TypeChecker {
 /// The printer records provenance when writing each node, before concatenating
 /// text. In particular, it never infers source ranges from the resulting string.
 #[derive(Default)]
-pub(crate) struct PrintedType {
+pub(crate) struct PrintedType<'a> {
     pub text: String,
     pub underline: String,
+    checker: Option<&'a TypeChecker>,
+    value_parameters: Vec<String>,
 }
-impl PrintedType {
+impl PrintedType<'_> {
     fn write(&mut self, text: &str, original: bool) {
         self.text.push_str(text);
         self.underline.extend(std::iter::repeat_n(
@@ -478,6 +481,13 @@ impl PrintedType {
         source: &SignatureSource,
         separator: &str,
     ) {
+        let parameter_depth = self.value_parameters.len();
+        self.value_parameters
+            .extend(parameters.iter().map(|(name, _)| {
+                name.trim_start_matches("...")
+                    .trim_start_matches('?')
+                    .to_owned()
+            }));
         let source = source.0.as_deref();
         if !type_parameters.is_empty() {
             self.synthetic("<");
@@ -546,6 +556,7 @@ impl PrintedType {
         self.synthetic(")");
         self.synthetic(separator);
         self.annotation(return_type, source.and_then(|s| s.return_type.as_ref()));
+        self.value_parameters.truncate(parameter_depth);
     }
     fn parenthesized(&mut self, ty: &Type, parens: bool) {
         if parens {
@@ -558,6 +569,16 @@ impl PrintedType {
     }
     fn ty(&mut self, ty: &Type) {
         match ty {
+            Type::Namespace(namespace) => {
+                // symbolToTypeNode uses a type query for value-space symbols.
+                // Resolve its symbol chain against the native lexical scopes.
+                let name = self.checker.map_or_else(
+                    || namespace.qualified_name.clone(),
+                    |checker| checker.namespace_type_node_name(namespace, &self.value_parameters),
+                );
+                self.synthetic("typeof ");
+                self.synthetic(&name);
+            }
             Type::Function(signature) => self.signature(signature, " => "),
             Type::Constructor(signature) => self.constructor(signature, " => "),
             Type::Array(element) if matches!(element.as_ref(), Type::UniqueSymbol(_)) => {
@@ -574,6 +595,9 @@ impl PrintedType {
                             | Type::Function(_)
                             | Type::Constructor(_)
                             | Type::Readonly(_)
+                            | Type::Namespace(_)
+                            | Type::Module(_)
+                            | Type::Typeof(_)
                     ),
                 );
                 self.synthetic("[]");
@@ -801,8 +825,18 @@ impl PrintedType {
     }
 }
 
-pub(crate) fn print_type(ty: &Type) -> PrintedType {
+#[cfg(test)]
+pub(crate) fn print_type(ty: &Type) -> PrintedType<'static> {
     let mut result = PrintedType::default();
+    result.ty(ty);
+    result
+}
+
+pub(crate) fn print_type_in_context<'a>(ty: &Type, checker: &'a TypeChecker) -> PrintedType<'a> {
+    let mut result = PrintedType {
+        checker: Some(checker),
+        ..Default::default()
+    };
     result.ty(ty);
     result
 }

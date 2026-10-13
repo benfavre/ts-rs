@@ -235,6 +235,7 @@ fn substitute_inner(ty: &Type, name: &str, replacement: &Type) -> Type {
         }),
 
         Type::Namespace(ns) => Type::Namespace(crate::NamespaceType {
+            qualified_name: ns.qualified_name.clone(),
             name: ns.name.clone(),
             exports: ns
                 .exports

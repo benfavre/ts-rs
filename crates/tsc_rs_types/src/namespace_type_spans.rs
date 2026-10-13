@@ -18,6 +18,7 @@ struct Modules {
     states: HashMap<(u8, usize), Option<Instance>>,
     parents: Vec<String>,
     external_module: Option<String>,
+    ambient_module_depth: usize,
 }
 
 struct ModuleSymbol<'a> {
@@ -84,7 +85,7 @@ impl Modules {
                                     else {
                                         return None;
                                     };
-                                    matches!(&module.name, ModuleName::Ident(name) if name == &member.property)
+                                    matches!(&module.name, ModuleName::Ident(name) if name == member.property)
                                         .then_some(module.as_ref())
                                 })
                                 .collect();
@@ -101,7 +102,7 @@ impl Modules {
                         }
                         Some(ModuleBody::Module(inner)) => {
                             if let ModuleName::Ident(name) = &inner.name {
-                                if name == &member.property {
+                                if name == member.property {
                                     return Some(ModuleSymbol {
                                         scope: declaration as *const ModuleDecl as usize,
                                         name,
@@ -277,7 +278,7 @@ impl Modules {
         state
     }
 
-    fn alias<'a>(&mut self, name: &str, scopes: &[&'a [Stmt]]) -> Instance {
+    fn alias(&mut self, name: &str, scopes: &[&[Stmt]]) -> Instance {
         for (index, scope) in scopes.iter().enumerate().rev() {
             let mut found = None;
             for statement in *scope {
@@ -326,7 +327,13 @@ impl Modules {
                             module.span.start + scanner.token_pos() as u32,
                             module.span.start + scanner.text_pos() as u32,
                         );
-                        checker.record_expression_type_span(span, &Type::Any);
+                        let ty = if self.external_module.is_none() && self.ambient_module_depth == 0
+                        {
+                            Type::Typeof("global".into())
+                        } else {
+                            Type::Any
+                        };
+                        checker.record_expression_type_span(span, &ty);
                         break;
                     }
                     if matches!(
@@ -353,6 +360,8 @@ impl Modules {
                 checker.record_expression_type_span(span, &Type::Typeof(name));
             }
         }
+        let ambient_module = matches!(module.name, ModuleName::String(_));
+        self.ambient_module_depth += usize::from(ambient_module);
         self.parents.push(match &module.name {
             ModuleName::Ident(name) => name.clone(),
             ModuleName::String(name) => format!(
@@ -368,6 +377,7 @@ impl Modules {
             None => {}
         }
         self.parents.pop();
+        self.ambient_module_depth -= usize::from(ambient_module);
     }
 
     fn visit<'a>(
@@ -396,26 +406,179 @@ impl Modules {
 }
 
 impl TypeChecker {
+    fn value_identifier_span(&self, name: &str, range: Span) -> Option<Span> {
+        let text = self
+            .current_source
+            .as_deref()?
+            .get(range.start as usize..range.end as usize)?;
+        let mut scanner = tsc_rs_scanner::TsScanner::new(text);
+        let mut result = None;
+        loop {
+            let token = scanner.scan();
+            if token == tsc_rs_scanner::TokenKind::EndOfFile {
+                break;
+            }
+            if scanner.token_value() == name {
+                result = Some(Span::new(
+                    range.start + scanner.token_pos() as u32,
+                    range.start + scanner.text_pos() as u32,
+                ));
+            }
+        }
+        result
+    }
+
+    pub(crate) fn record_import_binding_type(&mut self, name: &str, range: Span) {
+        if self.expression_type_spans.is_none() {
+            return;
+        }
+        if let Some(span) = self.value_identifier_span(name, range) {
+            let ty = self.lookup_var(name).cloned().unwrap_or(Type::Any);
+            self.record_expression_type_span(span, &ty);
+        }
+    }
+
+    pub(crate) fn record_import_equals_declaration(
+        &mut self,
+        alias: &ImportEqualsDecl,
+        span: Span,
+    ) {
+        if self.expression_type_spans.is_none() {
+            return;
+        }
+        self.record_import_binding_type(
+            &alias.name,
+            Span::new(span.start, alias.module_ref.span.start),
+        );
+        let ty = self.lookup_var(&alias.name).cloned().unwrap_or(Type::Any);
+        self.record_import_entity(&alias.module_ref, &ty);
+    }
+
+    fn record_import_entity(&mut self, entity: &Expr, ty: &Type) {
+        match &entity.kind {
+            ExprKind::Ident(_) => self.record_expression_type_span(entity.span, ty),
+            ExprKind::Member(member) => {
+                let owner = self
+                    .import_equals_namespace_target_type(&member.object)
+                    .filter(|ty| matches!(ty, Type::Namespace(_) | Type::Module(_)))
+                    .unwrap_or(Type::Any);
+                self.record_import_entity(&member.object, &owner);
+                if let Some(span) = self.value_identifier_span(
+                    &member.property,
+                    Span::new(member.object.span.end, entity.span.end),
+                ) {
+                    self.record_expression_type_span(span, ty);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn record_type_query_entity(&mut self, entity: &Expr) {
+        if self.expression_type_spans.is_none() {
+            return;
+        }
+        if let ExprKind::Member(member) = &entity.kind {
+            self.record_type_query_entity(&member.object);
+        }
+        let ty = self.infer_expr_type(entity);
+        self.record_checked_expression_type(entity, &ty);
+    }
+
+    pub(crate) fn record_expression_member_names(&mut self, expression: &Expr, ty: &Type) {
+        match (&expression.kind, ty) {
+            (ExprKind::Member(member), _) => {
+                if let Some(span) = self.value_identifier_span(
+                    &member.property,
+                    Span::new(member.object.span.end, expression.span.end),
+                ) {
+                    self.record_expression_type_span(span, ty);
+                }
+            }
+            (ExprKind::ObjectLit(properties), Type::ObjectType(object)) => {
+                for property in properties {
+                    let name = match property {
+                        ObjLitProp::Property(property) => &property.key,
+                        ObjLitProp::Method(method) => &method.name,
+                        ObjLitProp::Get(accessor) | ObjLitProp::Set(accessor) => &accessor.name,
+                        _ => continue,
+                    };
+                    if matches!(name, PropName::Computed(..)) {
+                        continue;
+                    }
+                    let key = self.prop_name_to_string(name);
+                    if let Some((_, ty)) = object.properties.iter().find(|(name, _)| name == &key) {
+                        self.record_expression_type_span(name.span(), &Self::member_read_type(ty));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Native equivalent of the value-symbol chain selected by the donor's
+    /// symbolToTypeNode. Search lexical scopes from the inside out, retaining
+    /// declaration identity when namespace values have identical exports.
+    pub(crate) fn namespace_type_node_name(
+        &self,
+        namespace: &NamespaceType,
+        parameters: &[String],
+    ) -> String {
+        let path = &namespace.qualified_name;
+        let parts: Vec<_> = path.split('.').collect();
+        let mut scope = self.current_scope;
+        let mut shadowed: HashSet<&str> = parameters.iter().map(String::as_str).collect();
+        loop {
+            let current = &self.scopes[scope];
+            for start in (0..parts.len()).rev() {
+                let root = parts[start];
+                if shadowed.contains(root) {
+                    continue;
+                }
+                let Some(id) = current.vars.get(root) else {
+                    continue;
+                };
+                let mut target = Some(self.arena[*id as usize].clone());
+                for member in &parts[start + 1..] {
+                    target = target.and_then(|ty| self.qualified_property_type(ty, member));
+                }
+                if matches!(target, Some(Type::Namespace(ref ns)) if ns.qualified_name == *path) {
+                    return parts[start..].join(".");
+                }
+            }
+            for alias in &current.namespace_alias_order {
+                if !shadowed.contains(alias.as_str())
+                    && current
+                        .readonly_namespace_aliases
+                        .get(alias)
+                        .is_some_and(|ns| ns.qualified_name == *path)
+                {
+                    return alias.clone();
+                }
+            }
+            shadowed.extend(current.vars.keys().map(String::as_str));
+            let Some(parent) = current.parent else {
+                break;
+            };
+            scope = parent;
+        }
+        if shadowed.contains(parts[0]) {
+            // This flag is initialized before declaration hoisting, when
+            // inferred function signatures may already need a type node.
+            if !self.file_is_module_flag {
+                return format!("globalThis.{path}");
+            }
+            if let Some(file) = self.current_file_name.as_deref() {
+                return format!("{}.{path}", namespace_file_import(file));
+            }
+        }
+        path.clone()
+    }
+
     pub(crate) fn record_namespace_declaration_types(&mut self, file: &SourceFile) {
         if self.expression_type_spans.is_some() {
-            let external_module = Self::file_is_module(file).then(|| {
-                let path = file.file_name.replace('\\', "/");
-                let stem = [
-                    ".d.ts", ".d.mts", ".d.cts", ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js",
-                ]
-                .iter()
-                .find_map(|extension| path.strip_suffix(extension))
-                .unwrap_or(&path);
-                let path = if stem.starts_with('.') || stem.starts_with('/') {
-                    stem.to_string()
-                } else {
-                    format!("./{stem}")
-                };
-                format!(
-                    "import({})",
-                    Type::StringLiteral(path).display_string_single_line()
-                )
-            });
+            let external_module =
+                Self::file_is_module(file).then(|| namespace_file_import(&file.file_name));
             Modules {
                 external_module,
                 ..Default::default()
@@ -423,4 +586,23 @@ impl TypeChecker {
             .visit(self, &file.statements, &[]);
         }
     }
+}
+
+fn namespace_file_import(file: &str) -> String {
+    let path = file.replace('\\', "/");
+    let stem = [
+        ".d.ts", ".d.mts", ".d.cts", ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js",
+    ]
+    .iter()
+    .find_map(|extension| path.strip_suffix(extension))
+    .unwrap_or(&path);
+    let path = if stem.starts_with('.') || stem.starts_with('/') {
+        stem.to_string()
+    } else {
+        format!("./{stem}")
+    };
+    format!(
+        "import({})",
+        Type::StringLiteral(path).display_string_single_line()
+    )
 }

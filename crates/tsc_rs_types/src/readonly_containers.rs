@@ -1,6 +1,45 @@
 use super::*;
 
 impl TypeChecker {
+    /// A spread embeds the elements of its sequence. Readonly applies to
+    /// the containing sequence, not to the values supplied by the spread.
+    pub(super) fn expanded_tuple_elements(&self, elements: &[Type], depth: usize) -> Vec<Type> {
+        if depth >= 8 {
+            return elements.to_vec();
+        }
+        let mut result = Vec::new();
+        for element in elements {
+            if let Type::Rest(inner) = element {
+                // An uninstantiated spread remains the type parameter itself.
+                // Its array constraint does not admit arbitrary arrays: T may
+                // later be instantiated as a narrower tuple.
+                if matches!(inner.as_ref(), Type::TypeParameter(_))
+                    || self.active_type_parameter_name(inner).is_some()
+                {
+                    result.push(element.clone());
+                    continue;
+                }
+                let shape = self
+                    .array_or_tuple_type(inner, 0)
+                    .unwrap_or_else(|| Type::clone(inner));
+                let shape = match &shape {
+                    Type::Readonly(inner) => inner.as_ref(),
+                    other => other,
+                };
+                match shape {
+                    Type::Tuple(items) => {
+                        result.extend(self.expanded_tuple_elements(items, depth + 1));
+                    }
+                    Type::Array(_) => result.push(Type::Rest(Arc::new(shape.clone()))),
+                    _ => result.push(element.clone()),
+                }
+            } else {
+                result.push(element.clone());
+            }
+        }
+        result
+    }
+
     pub(super) fn const_tuple_context(&self, ty: Type, context: &Type, expression: &Expr) -> Type {
         let expression = match &expression.kind {
             ExprKind::As(assertion) => assertion.expr.as_ref(),

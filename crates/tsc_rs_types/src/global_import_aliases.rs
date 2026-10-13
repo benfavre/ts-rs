@@ -153,12 +153,14 @@ impl TypeChecker {
                         Some(id) => match self.get_type(id) {
                             Type::Namespace(namespace) => namespace.clone(),
                             _ => NamespaceType {
+                                qualified_name: name.clone(),
                                 name: name.clone(),
                                 exports: Vec::new(),
                                 readonly_exports: Vec::new(),
                             },
                         },
                         None => NamespaceType {
+                            qualified_name: name.clone(),
                             name: name.clone(),
                             exports: Vec::new(),
                             readonly_exports: Vec::new(),

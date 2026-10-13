@@ -62,3 +62,19 @@ Namespace declaration meaning adapts getModuleInstanceState and export-alias
 resolution from ast/utilities_p3.rs in that same ts-rust revision. Native
 statement slices replace parent-node links and retain cycle-safe resolution
 while projecting namespace name types for the baseline writer.
+
+Namespace value type-node serialization adapts symbolToTypeNode's value-space
+type queries and symbol-chain lookup from nodebuilder_impl_p1.rs at the same
+ts-rust revision. Native qualified namespace identities, lexical scopes and
+ordered import aliases replace donor symbol links. Signature parameter scopes
+participate in name qualification; the existing native inference engine now
+resolves namespace member returns and namespace function exports directly.
+
+Template placeholder relation matching
+
+src/template_relations.rs adapts inferFromLiteralPartsToTemplateLiteral and
+isValidTypeForTemplateLiteralPlaceholder from checker/relater_p3.rs in the
+same pinned pingdotgg/ts-rust revision. Native text segments and Type values
+replace arena IDs and donor string storage. Fixed delimiters determine each
+captured placeholder, which is checked using the native type relation.
+The copyright and license terms above also apply to this adaptation.

@@ -58,6 +58,7 @@ mod resolve_types;
 mod static_overrides;
 mod stdlib;
 mod strict_reserved;
+mod template_relations;
 mod tuple_access;
 mod tuple_bindings;
 mod type_computations;
@@ -896,6 +897,9 @@ pub(crate) fn constructor_parameter_at(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NamespaceType {
     pub name: std::string::String,
+    /// Declaration identity through its containing namespaces. The short name
+    /// remains available for ordinary hover/diagnostic display.
+    pub qualified_name: std::string::String,
     pub exports: Vec<(std::string::String, Type)>,
     /// Exported namespace bindings declared with `const`. These are readonly
     /// properties on the namespace value even though their value type is not
@@ -2124,8 +2128,8 @@ pub struct TypeAtSpan {
 }
 
 impl TypeAtSpan {
-    fn new(ty: &Type, kind: TypeSpanKind) -> Self {
-        let printed = type_nodes::print_type(ty);
+    fn new(ty: &Type, kind: TypeSpanKind, checker: &TypeChecker) -> Self {
+        let printed = type_nodes::print_type_in_context(ty, checker);
         Self {
             type_string: ty.display_string(),
             node_text: printed.text,
@@ -2529,10 +2533,11 @@ struct CheckerScope {
     /// the alias binding without re-walking initializer expressions.
     condition_aliases: rustc_hash::FxHashMap<std::string::String, ConditionAlias>,
     /// Resolved namespace evidence for `import Alias = Namespace.Path`
-    /// bindings in this exact lexical scope. Kept separate from the alias's
-    /// deliberately broad value type so ordinary property checks do not gain
-    /// false precision; the full namespace also resolves alias chains.
+    /// bindings in this exact lexical scope. Alias chains can resolve before
+    /// their value bindings are registered, and retain their original target
+    /// even when a later local declaration shadows that target's path.
     readonly_namespace_aliases: rustc_hash::FxHashMap<std::string::String, NamespaceType>,
+    namespace_alias_order: Vec<String>,
     /// Class receiver captured by a local binding whose type remains the
     /// polymorphic `this` type, including aliases used from nested classes.
     this_alias_receivers: rustc_hash::FxHashMap<String, Type>,
@@ -3031,6 +3036,10 @@ pub struct TypeChecker {
     /// (tsc infers a generic call's type parameters from it, at return-type
     /// priority, when the arguments leave them unsolved).
     contextual_call_returns: HashMap<u32, Type>,
+    /// Context and checked return values for the current contextual callback.
+    /// Nested callbacks save and restore this frame; function depth prevents
+    /// a nested declaration from inheriting its enclosing callback's context.
+    contextual_return: Option<(u32, Type, HashMap<u32, Type>)>,
     /// Memoized structural resolution of a generic type reference
     /// (`resolve_type_reference_to_object`), keyed by (name, type-args). zod's
     /// type graph re-references the same `$ZodType`/internals instantiations
@@ -3453,6 +3462,7 @@ impl Clone for TypeChecker {
             script_global_kinds: HashMap::new(),
             current_file_is_script: false,
             contextual_call_returns: HashMap::new(),
+            contextual_return: None,
             merged_namespace_exports: self.merged_namespace_exports.clone(),
             external_top_level_bindings: self.external_top_level_bindings.clone(),
             external_file_order: self.external_file_order.clone(),
@@ -3676,6 +3686,7 @@ impl TypeChecker {
             narrowed: rustc_hash::FxHashMap::default(),
             condition_aliases: rustc_hash::FxHashMap::default(),
             readonly_namespace_aliases: rustc_hash::FxHashMap::default(),
+            namespace_alias_order: Vec::new(),
             this_alias_receivers: rustc_hash::FxHashMap::default(),
             tuple_metadata: rustc_hash::FxHashMap::default(),
             module_body_kind: None,
@@ -3718,6 +3729,7 @@ impl TypeChecker {
             script_global_kinds: HashMap::new(),
             current_file_is_script: false,
             contextual_call_returns: HashMap::new(),
+            contextual_return: None,
             merged_namespace_exports: std::collections::HashMap::new(),
             external_top_level_bindings: rustc_hash::FxHashMap::default(),
             external_file_order: Vec::new(),
@@ -4201,11 +4213,12 @@ impl TypeChecker {
     }
 
     fn record_expression_type_span(&mut self, span: Span, ty: &Type) {
-        if let Some(spans) = &mut self.expression_type_spans {
-            spans.insert(
-                (span.start, span.end),
-                TypeAtSpan::new(ty, TypeSpanKind::Declaration),
-            );
+        if self.expression_type_spans.is_some() {
+            let record = TypeAtSpan::new(ty, TypeSpanKind::Declaration, self);
+            self.expression_type_spans
+                .as_mut()
+                .unwrap()
+                .insert((span.start, span.end), record);
         }
     }
 
@@ -4242,10 +4255,12 @@ impl TypeChecker {
         } else {
             TypeSpanKind::Expression
         };
+        let record = TypeAtSpan::new(ty, kind, self);
+        self.record_expression_member_names(expr, ty);
         self.expression_type_spans
             .as_mut()
             .unwrap()
-            .insert((span.start, span.end), TypeAtSpan::new(ty, kind));
+            .insert((span.start, span.end), record);
     }
 
     /// Record a type display string for an expression position, but only
@@ -4743,6 +4758,7 @@ impl TypeChecker {
                 let value = match exports.iter().find(|(export, _)| export == "export=") {
                     Some((_, value)) => value.clone(),
                     None => Type::Namespace(NamespaceType {
+                        qualified_name: name.clone(),
                         name: name.clone(),
                         exports,
                         readonly_exports: Vec::new(),
@@ -8910,6 +8926,7 @@ impl TypeChecker {
     fn file_local_qualified_type(&mut self, file: &SourceFile, target: &str) -> Option<Type> {
         let (root, remainder) = target.split_once('.')?;
         let mut namespace = NamespaceType {
+            qualified_name: root.to_string(),
             name: root.to_string(),
             exports: Vec::new(),
             readonly_exports: Vec::new(),
@@ -8944,6 +8961,7 @@ impl TypeChecker {
                         false,
                     );
                     NamespaceType {
+                        qualified_name: root.to_string(),
                         name: root.to_string(),
                         exports: vec![(namespace.name.clone(), Type::Namespace(namespace))],
                         readonly_exports: Vec::new(),
@@ -9622,6 +9640,7 @@ impl TypeChecker {
                                 inherited_ambient,
                             );
                             NamespaceType {
+                                qualified_name: name.clone(),
                                 name: name.clone(),
                                 exports: vec![(inner_ns.name.clone(), Type::Namespace(inner_ns))],
                                 readonly_exports: Vec::new(),
@@ -9700,6 +9719,7 @@ impl TypeChecker {
                     .find(|(name, _)| name == "export=")
                 {
                     let namespace = NamespaceType {
+                        qualified_name: String::new(),
                         name: String::new(),
                         exports: augmentation,
                         readonly_exports: Vec::new(),
@@ -11942,6 +11962,7 @@ impl TypeChecker {
                                 inherited_ambient,
                             );
                             NamespaceType {
+                                qualified_name: name.clone(),
                                 name: name.clone(),
                                 exports: vec![(inner_ns.name.clone(), Type::Namespace(inner_ns))],
                                 readonly_exports: Vec::new(),
@@ -12601,6 +12622,7 @@ impl TypeChecker {
             narrowed: rustc_hash::FxHashMap::default(),
             condition_aliases: rustc_hash::FxHashMap::default(),
             readonly_namespace_aliases: rustc_hash::FxHashMap::default(),
+            namespace_alias_order: Vec::new(),
             this_alias_receivers: rustc_hash::FxHashMap::default(),
             tuple_metadata: rustc_hash::FxHashMap::default(),
             module_body_kind: None,
@@ -12883,11 +12905,12 @@ impl TypeChecker {
     ) {
         use tsc_rs_ast::{ArrayPatElem, ObjPatProp, PatKind};
         if matches!(pat.kind, PatKind::Object(_) | PatKind::Array(_)) {
-            if let Some(spans) = &mut self.expression_type_spans {
-                spans.insert(
-                    (pat.span.start, pat.span.end),
-                    TypeAtSpan::new(&ty, TypeSpanKind::BindingPattern),
-                );
+            if self.expression_type_spans.is_some() {
+                let record = TypeAtSpan::new(&ty, TypeSpanKind::BindingPattern, self);
+                self.expression_type_spans
+                    .as_mut()
+                    .unwrap()
+                    .insert((pat.span.start, pat.span.end), record);
             }
         }
         match &pat.kind {
@@ -15168,10 +15191,36 @@ impl TypeChecker {
                 if sym.flags & tsc_rs_symbols::SYM_FUNCTION == 0 {
                     continue;
                 }
-                let fn_types: Vec<FunctionType> = sigs
+                // The AST retains constraints, binding patterns and source
+                // annotations that the binder's lightweight signature omits.
+                let declarations: Vec<_> = file
+                    .statements
                     .iter()
-                    .map(|sig| self.resolve_overload_signature(sig))
+                    .filter_map(|statement| {
+                        let StmtKind::FnDecl(function) = &Self::unwrap_export_stmt(statement).kind
+                        else {
+                            return None;
+                        };
+                        (function.body.is_none()
+                            && function.name.as_deref() == Some(&sym.name)
+                            && function.name_span.is_some_and(|span| {
+                                sym.declarations
+                                    .iter()
+                                    .any(|declaration| declaration.span == span)
+                            }))
+                        .then_some(function.as_ref())
+                    })
                     .collect();
+                let fn_types: Vec<FunctionType> = if declarations.len() == sigs.len() {
+                    declarations
+                        .into_iter()
+                        .map(|function| self.resolve_fn_type(function))
+                        .collect()
+                } else {
+                    sigs.iter()
+                        .map(|sig| self.resolve_overload_signature(sig))
+                        .collect()
+                };
                 if !fn_types.is_empty() {
                     let implementation = file.statements.iter().find_map(|stmt| {
                         match &Self::unwrap_export_stmt(stmt).kind {
@@ -15207,6 +15256,10 @@ impl TypeChecker {
         for statement in statements {
             let statement = Self::unwrap_export_stmt(statement);
             if let StmtKind::ImportEquals(alias) = &statement.kind {
+                let order = &mut self.scopes[self.current_scope].namespace_alias_order;
+                if !order.contains(&alias.name) {
+                    order.push(alias.name.clone());
+                }
                 unresolved.push(alias.as_ref());
             }
         }
@@ -15342,6 +15395,7 @@ impl TypeChecker {
                     seed_existing,
                 );
                 NamespaceType {
+                    qualified_name: qualified_name.to_string(),
                     name,
                     exports: vec![(inner_ns.name.clone(), Type::Namespace(inner_ns))],
                     readonly_exports: Vec::new(),
@@ -15363,6 +15417,11 @@ impl TypeChecker {
         let namespace_name = match &module_decl.name {
             ModuleName::Ident(name) | ModuleName::String(name) => name.clone(),
         };
+        let namespace_name = self
+            .type_resolution_namespace
+            .as_ref()
+            .map(|owner| format!("{owner}.{namespace_name}"))
+            .unwrap_or(namespace_name);
         let inherited_ambient = self.ambient_depth > 0;
         self.build_namespace_value_exports_with_name(
             module_decl,
@@ -15570,34 +15629,14 @@ impl TypeChecker {
                     }
                     StmtKind::FnDecl(f) => {
                         if let Some(ref fname) = f.name {
-                            // Generic namespace callbacks still use the
-                            // existing approximation until their contextual
-                            // type arguments can be inferred reliably.
-                            let ft = if ambient
-                                && f.body.is_none()
-                                && f.type_params
-                                    .as_ref()
-                                    .is_none_or(|params| params.is_empty())
-                            {
-                                let pushed =
-                                    self.push_active_type_param_names(f.type_params.as_deref());
-                                let signature = self.resolve_fn_type(f);
-                                self.pop_active_type_param_names(pushed);
-                                Type::Function(signature)
-                            } else {
-                                Type::Function(FunctionType {
-                                    source: Default::default(),
-                                    type_param_constraints: Vec::new(),
-                                    params: vec![(
-                                        "...args".to_string(),
-                                        Type::Array(Arc::new(Type::Any)),
-                                    )],
-                                    return_type: Arc::new(Type::Any),
-                                    type_params: Vec::new(),
-                                    type_param_defaults: Vec::new(),
-                                    type_predicate: None,
-                                })
-                            };
+                            let pushed =
+                                self.push_active_type_param_names(f.type_params.as_deref());
+                            let signature =
+                                crate::with_infer_param_scope(ns_locals.clone(), || {
+                                    self.resolve_fn_type(f)
+                                });
+                            self.pop_active_type_param_names(pushed);
+                            let ft = Type::Function(signature);
                             ns_locals.push((fname.clone(), ft.clone()));
                             if exported {
                                 ns_exports.push((fname.clone(), ft));
@@ -15628,6 +15667,8 @@ impl TypeChecker {
                             ambient,
                             seed_existing,
                         );
+                        ns_locals
+                            .push((nested_name.clone(), Type::Namespace(nested_value.clone())));
                         if exported {
                             ns_exports.push((nested_name.clone(), Type::Namespace(nested_value)));
                         }
@@ -15642,6 +15683,7 @@ impl TypeChecker {
         };
         self.type_resolution_namespace = previous_owner;
         NamespaceType {
+            qualified_name: namespace_name.to_string(),
             name,
             exports: ns_exports,
             readonly_exports,
@@ -16270,6 +16312,7 @@ impl TypeChecker {
                                 inherited_ambient,
                             );
                             NamespaceType {
+                                qualified_name: name.clone(),
                                 name: name.clone(),
                                 exports: vec![(inner_ns.name.clone(), Type::Namespace(inner_ns))],
                                 readonly_exports: Vec::new(),
@@ -17392,6 +17435,7 @@ impl TypeChecker {
                                     || Self::value_absorbs_namespace(&value))
                             {
                                 let synthetic = NamespaceType {
+                                    qualified_name: String::new(),
                                     name: String::new(),
                                     exports: vec![("default".into(), value.clone())],
                                     readonly_exports: Vec::new(),
@@ -25478,12 +25522,16 @@ impl TypeChecker {
                 types: source_types,
             } = source
             {
-                return source_quasis.as_ref() == quasis.as_ref()
+                if source_quasis.as_ref() == quasis.as_ref()
                     && source_types.len() == types.len()
                     && source_types
                         .iter()
                         .zip(types.iter())
-                        .all(|(s, t)| self.is_assignable_to(s, t));
+                        .all(|(s, t)| self.is_assignable_to(s, t))
+                {
+                    return true;
+                }
+                return self.template_parts_assignable(source_quasis, source_types, quasis, types);
             }
         }
 
@@ -25719,6 +25767,8 @@ impl TypeChecker {
 
         // Tuple to tuple
         if let (Type::Tuple(s_elems), Type::Tuple(t_elems)) = (source, target) {
+            let s_elems = self.expanded_tuple_elements(s_elems, 0);
+            let t_elems = self.expanded_tuple_elements(t_elems, 0);
             if let Some(rest_index) = t_elems
                 .iter()
                 .position(|element| matches!(element, Type::Rest(_)))
@@ -25727,7 +25777,12 @@ impl TypeChecker {
                     .iter()
                     .filter(|element| !matches!(element, Type::Optional(_)))
                     .count();
-                if s_elems.len() < required_prefix {
+                let suffix = &t_elems[rest_index + 1..];
+                let required_suffix = suffix
+                    .iter()
+                    .filter(|element| !matches!(element, Type::Optional(_)))
+                    .count();
+                if s_elems.len() < required_prefix + required_suffix {
                     return false;
                 }
                 for (index, target_element) in t_elems[..rest_index].iter().enumerate() {
@@ -25741,6 +25796,14 @@ impl TypeChecker {
                         return false;
                     }
                 }
+                let suffix_start = s_elems.len().saturating_sub(suffix.len());
+                if !s_elems[suffix_start..]
+                    .iter()
+                    .zip(suffix)
+                    .all(|(source, target)| self.is_assignable_to(source, target))
+                {
+                    return false;
+                }
                 let rest_element = match &t_elems[rest_index] {
                     Type::Rest(inner) => match inner.as_ref() {
                         Type::Array(item) => item.as_ref(),
@@ -25748,17 +25811,19 @@ impl TypeChecker {
                     },
                     _ => unreachable!(),
                 };
-                return s_elems[rest_index..].iter().all(|source_element| {
-                    let source_element = match source_element {
-                        Type::Rest(inner) => match inner.as_ref() {
-                            Type::Array(item) => item.as_ref(),
+                return s_elems[rest_index.min(suffix_start)..suffix_start]
+                    .iter()
+                    .all(|source_element| {
+                        let source_element = match source_element {
+                            Type::Rest(inner) => match inner.as_ref() {
+                                Type::Array(item) => item.as_ref(),
+                                other => other,
+                            },
+                            Type::Optional(inner) => inner.as_ref(),
                             other => other,
-                        },
-                        Type::Optional(inner) => inner.as_ref(),
-                        other => other,
-                    };
-                    self.is_assignable_to(source_element, rest_element)
-                });
+                        };
+                        self.is_assignable_to(source_element, rest_element)
+                    });
             }
             // A shorter source may omit trailing optional target elements.
             if s_elems.len() <= t_elems.len()
@@ -28198,7 +28263,13 @@ impl TypeChecker {
                     .return_type_stack
                     .last()
                     .and_then(|opt| opt.as_ref())
-                    .cloned();
+                    .cloned()
+                    .or_else(|| {
+                        self.contextual_return
+                            .as_ref()
+                            .filter(|(depth, _, _)| *depth == self.fn_nesting_depth)
+                            .map(|(_, context, _)| context.clone())
+                    });
                 // Contextual-type the return expression by the declared
                 // return type so nested literals (`return [{ kind: "a" }]`
                 // against `() => { kind: "a" | "b" }[]`) survive narrowing.
@@ -28234,6 +28305,11 @@ impl TypeChecker {
                 };
                 // TS2322: check return expression against declared return type
                 self.collect_widening_return(e);
+                if let Some((depth, _, returns)) = &mut self.contextual_return {
+                    if *depth == self.fn_nesting_depth {
+                        returns.insert(e.span.start, ret_ty.clone());
+                    }
+                }
                 if let Some(Some(expected_ret)) = self.return_type_stack.last().cloned() {
                     // Inside an async function `return` automatically
                     // flattens a `Promise<X>` to `X`. The declared return
@@ -28903,6 +28979,33 @@ impl TypeChecker {
                 // nested/local function declarations that register_top_level skips)
                 if let Some(ref name) = fn_decl.name {
                     let name_span = fn_decl.name_span.unwrap_or(fn_decl.span);
+                    if let Some(spans) = &self.expression_type_spans {
+                        // The declaration's signature retains its own source
+                        // annotations. A variable with the same name, or an
+                        // interned equal signature, must not replace them.
+                        let overloads = self.overloads.get(name).filter(|sigs| !sigs.is_empty());
+                        if overloads.is_some()
+                            || !spans.contains_key(&(name_span.start, name_span.end))
+                        {
+                            let ty = if let Some(signatures) = overloads {
+                                if let [signature] = signatures.as_slice() {
+                                    Type::Function(signature.clone())
+                                } else {
+                                    Type::Intersection(
+                                        signatures
+                                            .iter()
+                                            .cloned()
+                                            .map(Type::Function)
+                                            .collect::<Vec<_>>()
+                                            .into(),
+                                    )
+                                }
+                            } else {
+                                Type::Function(self.resolve_fn_type(fn_decl))
+                            };
+                            self.record_expression_type_span(name_span, &ty);
+                        }
+                    }
                     if !self.expression_types.contains_key(&name_span.start) {
                         let ft = self.resolve_fn_type(fn_decl);
                         let fn_type = Type::Function(ft);
@@ -29879,6 +29982,12 @@ impl TypeChecker {
                 self.with_depth -= 1;
             }
             StmtKind::Import(_import_decl) => {
+                if let ImportClause::Require(name) = &_import_decl.specifiers {
+                    self.record_import_binding_type(
+                        name,
+                        Span::new(_import_decl.span.start, _import_decl.source_span.start),
+                    );
+                }
                 let mut namespace_require = false;
                 // TS1147: inside a namespace (not `declare module "m"`) an
                 // `import x = require("m")` cannot name an external module.
@@ -30041,6 +30150,7 @@ impl TypeChecker {
             }
             StmtKind::ImportEquals(ie) => {
                 // `import x = require("m")` participates in module resolution
+                self.record_import_equals_declaration(ie, stmt.span);
                 // like a plain import, including Node typings suggestions
                 // and the classic resolution variant of module-not-found.
                 if self.check_module_resolution {
@@ -30477,6 +30587,7 @@ impl TypeChecker {
             self.declare_var(
                 &name,
                 Type::Namespace(NamespaceType {
+                    qualified_name: name.clone(),
                     name: name.clone(),
                     exports: merged,
                     readonly_exports: Vec::new(),
@@ -31217,6 +31328,10 @@ impl TypeChecker {
         ie: &tsc_rs_ast::ImportEqualsDecl,
         report_errors: bool,
     ) -> bool {
+        if let Some(namespace) = self.namespace_alias_type_for_binding(&ie.name).cloned() {
+            self.declare_var(&ie.name, Type::Namespace(namespace));
+            return true;
+        }
         if let Some(ty) = self.import_equals_namespace_target_type(&ie.module_ref) {
             if self.is_global_object_type(&ty) {
                 self.declare_var(&ie.name, ty);
@@ -32533,6 +32648,7 @@ impl TypeChecker {
                 }
             }
             TypeNodeKind::TypeQuery(expression) => {
+                self.record_type_query_entity(expression);
                 self.check_type_query_future_lib_global(expression);
             }
             TypeNodeKind::Array(inner)
@@ -39012,23 +39128,44 @@ impl TypeChecker {
         &mut self,
         md: &tsc_rs_ast::ModuleDecl,
     ) -> Vec<(std::string::String, Type)> {
+        let name = match &md.name {
+            ModuleName::Ident(name) | ModuleName::String(name) => name,
+        };
+        let path = self
+            .type_resolution_namespace
+            .as_ref()
+            .map(|owner| format!("{owner}.{name}"))
+            .unwrap_or_else(|| name.clone());
+        self.dotted_namespace_exports_with_path(md, &path)
+    }
+
+    fn dotted_namespace_exports_with_path(
+        &mut self,
+        md: &tsc_rs_ast::ModuleDecl,
+        path: &str,
+    ) -> Vec<(String, Type)> {
         match &md.body {
             Some(ModuleBody::Module(nested)) => {
                 let ModuleName::Ident(inner) = &nested.name else {
                     return Vec::new();
                 };
-                let exports = self.dotted_namespace_exports(nested);
+                let inner_path = format!("{path}.{inner}");
+                let exports = self.dotted_namespace_exports_with_path(nested, &inner_path);
                 self.dotted_namespace_value_names.insert(inner.clone());
                 vec![(
                     inner.clone(),
                     Type::Namespace(NamespaceType {
+                        qualified_name: inner_path,
                         name: inner.clone(),
                         exports,
                         readonly_exports: Vec::new(),
                     }),
                 )]
             }
-            _ => self.build_namespace_value_exports(md).exports,
+            _ => {
+                self.build_namespace_value_exports_with_name(md, path, self.ambient_depth > 0)
+                    .exports
+            }
         }
     }
 
@@ -45257,6 +45394,34 @@ impl TypeChecker {
             }
             Type::Tuple(param_elems) => {
                 if let Type::Tuple(arg_elems) = arg_ty {
+                    if let Some(rest) = param_elems
+                        .iter()
+                        .position(|element| matches!(element, Type::Rest(_)))
+                    {
+                        let suffix = param_elems.len() - rest - 1;
+                        if arg_elems.len() >= rest + suffix {
+                            for (argument, parameter) in
+                                arg_elems[..rest].iter().zip(&param_elems[..rest])
+                            {
+                                Self::infer_from_types(argument, parameter, type_params, inferred);
+                            }
+                            let end = arg_elems.len() - suffix;
+                            if let Type::Rest(parameter) = &param_elems[rest] {
+                                Self::infer_from_types(
+                                    &Type::Tuple(arg_elems[rest..end].to_vec().into()),
+                                    parameter,
+                                    type_params,
+                                    inferred,
+                                );
+                            }
+                            for (argument, parameter) in
+                                arg_elems[end..].iter().zip(&param_elems[rest + 1..])
+                            {
+                                Self::infer_from_types(argument, parameter, type_params, inferred);
+                            }
+                            return;
+                        }
+                    }
                     for (ae, pe) in arg_elems.iter().zip(param_elems.iter()) {
                         Self::infer_from_types(ae, pe, type_params, inferred);
                     }

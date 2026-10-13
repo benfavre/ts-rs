@@ -2104,7 +2104,7 @@ impl TypeChecker {
     /// `undefined`), or the element of a trailing rest element beyond the
     /// fixed length. `None` when the parameter is not a plain tuple (unions
     /// of tuples stay lenient through the array path).
-    fn rest_tuple_position_type(&self, pty: &Type, k: usize) -> Option<Type> {
+    fn rest_tuple_position_type(&self, pty: &Type, k: usize, count: usize) -> Option<Type> {
         let mut t = pty.clone();
         for _ in 0..4 {
             match &t {
@@ -2119,6 +2119,23 @@ impl TypeChecker {
         let Type::Tuple(elements) = &t else {
             return None;
         };
+        let elements = self.expanded_tuple_elements(elements, 0);
+        if let Some(rest) = elements
+            .iter()
+            .position(|item| matches!(item, Type::Rest(_)))
+        {
+            let suffix = elements.len() - rest - 1;
+            if k >= rest {
+                if suffix > 0 && k >= count.saturating_sub(suffix) {
+                    return elements
+                        .get(elements.len().saturating_sub(count - k))
+                        .cloned();
+                }
+                if let Type::Rest(inner) = &elements[rest] {
+                    return Some(self.rest_param_element_type(inner));
+                }
+            }
+        }
         if let Some(element) = elements.get(k) {
             return Some(match element {
                 Type::Optional(inner) => {
@@ -5583,7 +5600,7 @@ impl TypeChecker {
                     _ => None,
                 };
                 let mut checked_types = Vec::new();
-                for elem in elems {
+                for (syntax_index, elem) in elems.iter().enumerate() {
                     let Some(elem) = elem else {
                         checked_types.push(Type::Undefined);
                         continue;
@@ -5638,7 +5655,34 @@ impl TypeChecker {
                     }
                     let index = checked_types.len();
                     let elem_ctx = tuple_ctx
-                        .and_then(|elements| Self::tuple_position_type(elements, index))
+                        .and_then(|elements| {
+                            let following = &elems[syntax_index + 1..];
+                            let rest = elements
+                                .iter()
+                                .position(|item| matches!(item, Type::Rest(_)));
+                            if let Some(rest) = rest.filter(|rest| index >= *rest) {
+                                // Fixed target suffixes align from the right.
+                                // A later spread has unknown width, so it
+                                // cannot establish a suffix position here.
+                                if elements.len() - rest - 1 > following.len()
+                                    && !following
+                                        .iter()
+                                        .flatten()
+                                        .any(|item| matches!(item.kind, ExprKind::Spread(_)))
+                                {
+                                    return Some(
+                                        match &elements[elements.len() - following.len() - 1] {
+                                            Type::Optional(inner) => Type::flatten_union(vec![
+                                                Type::clone(inner),
+                                                Type::Undefined,
+                                            ]),
+                                            other => other.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                            Self::tuple_position_type(elements, index)
+                        })
                         .or_else(|| array_elem_ctx.clone());
                     let ty = if elem_ctx.is_some()
                         && matches!(
@@ -5999,7 +6043,11 @@ impl TypeChecker {
                         let inferred = if ctx_ret_type.is_some()
                             && matches!(
                                 e.kind,
-                                ExprKind::Arrow(_) | ExprKind::FnExpr(_) | ExprKind::ObjectLit(_)
+                                ExprKind::Arrow(_)
+                                    | ExprKind::FnExpr(_)
+                                    | ExprKind::ObjectLit(_)
+                                    | ExprKind::Paren(_)
+                                    | ExprKind::ArrayLit(_)
                             ) {
                             self.check_expr_contextual(e, ctx_ret_type.as_ref())
                         } else if let Some(awaited) = arrow
@@ -6065,6 +6113,11 @@ impl TypeChecker {
                         }
                     }
                     ArrowBody::Block(stmts) => {
+                        let saved_contextual_return = self.contextual_return.take();
+                        self.contextual_return = ctx_ret_type
+                            .as_ref()
+                            .filter(|ty| !matches!(ty, Type::Any | Type::Unknown | Type::Void))
+                            .map(|ty| (self.fn_nesting_depth, ty.clone(), HashMap::new()));
                         self.hoist_block_declarations(stmts);
                         for s in stmts {
                             self.check_stmt(s);
@@ -6076,7 +6129,7 @@ impl TypeChecker {
                             arrow.is_async,
                             false,
                         );
-                        match arrow.return_type.as_ref() {
+                        let result = match arrow.return_type.as_ref() {
                             Some(t) => self.resolve_type_node(t),
                             None => {
                                 let inferred = self.infer_return_type_from_block(stmts);
@@ -6091,7 +6144,9 @@ impl TypeChecker {
                                     inferred
                                 }
                             }
-                        }
+                        };
+                        self.contextual_return = saved_contextual_return;
+                        result
                     }
                 };
                 if let ArrowBody::Expr(body) = &arrow.body {
@@ -7465,7 +7520,7 @@ impl TypeChecker {
                     }
 
                     // Determine parameter types for contextual typing of callback args
-                    let param_types: Vec<(Type, bool)> = match &callee_ty {
+                    let mut param_types: Vec<(Type, bool)> = match &callee_ty {
                         Type::Function(ft) => {
                             if !ft.type_params.is_empty() {
                                 // Apply declared constraints before provisional inference:
@@ -7552,6 +7607,36 @@ impl TypeChecker {
                         }
                         _ => Vec::new(),
                     };
+
+                    // The native Array.map signature models its generic result
+                    // as any. A contextual array result supplies U before the
+                    // callback is checked, so literal-valued properties retain
+                    // the expected type rather than widening prematurely.
+                    if let ExprKind::Member(member) = &call.callee.kind {
+                        if member.property == "map"
+                            && self
+                                .array_or_tuple_type(&self.infer_expr_type(&member.object), 0)
+                                .is_some()
+                        {
+                            let element = self
+                                .contextual_call_returns
+                                .get(&expr.span.start)
+                                .and_then(|context| self.array_or_tuple_type(context, 0))
+                                .and_then(|shape| match shape {
+                                    Type::Array(element) => Some(element),
+                                    Type::Readonly(inner) => match inner.as_ref() {
+                                        Type::Array(element) => Some(element.clone()),
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                });
+                            if let (Some(element), Some((Type::Function(callback), _))) =
+                                (element, param_types.first_mut())
+                            {
+                                callback.return_type = element;
+                            }
+                        }
+                    }
 
                     // Check arguments with contextual types for callbacks.
                     // For super(...) args, arrows are exempt from TS17009
@@ -12700,6 +12785,8 @@ impl TypeChecker {
                                     self.rest_tuple_position_type(
                                         slot_ty,
                                         position.saturating_sub(last_param_idx),
+                                        (arg_types.len() - 1 + elements.len())
+                                            .saturating_sub(last_param_idx),
                                     )
                                     .unwrap_or_else(|| self.rest_param_element_type(slot_ty))
                                 } else {
@@ -12731,8 +12818,12 @@ impl TypeChecker {
                         // string]`) types each remaining argument by its
                         // position in the tuple.
                         let rest_position = i.saturating_sub(last_param_idx);
-                        self.rest_tuple_position_type(pty, rest_position)
-                            .unwrap_or_else(|| self.rest_param_element_type(pty))
+                        self.rest_tuple_position_type(
+                            pty,
+                            rest_position,
+                            arg_types.len().saturating_sub(last_param_idx),
+                        )
+                        .unwrap_or_else(|| self.rest_param_element_type(pty))
                     } else {
                         // Optional param (`p?: T`) accepts `T | undefined`.
                         Self::optional_param_type(pname, pty.clone())
@@ -13265,8 +13356,11 @@ impl TypeChecker {
                 .properties
                 .iter()
                 .any(|(_, p)| self.contextual_type_keeps_literals(p, depth - 1)),
-            Type::TypeReference(_, args) if args.is_empty() => {
-                match self.resolve_type_for_assignability(ty) {
+            Type::TypeReference(name, args) if args.is_empty() => {
+                match self
+                    .resolve_type_for_assignability(ty)
+                    .or_else(|| self.resolve_type_reference_to_object(name, args))
+                {
                     Some(resolved) if resolved != *ty => {
                         self.contextual_type_keeps_literals(&resolved, depth - 1)
                     }
