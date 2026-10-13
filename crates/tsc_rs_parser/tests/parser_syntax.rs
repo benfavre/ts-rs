@@ -1,6 +1,119 @@
 use tsc_rs_parser::parse;
 
 #[test]
+fn missing_commas_after_rest_parameters_report_the_following_token() {
+    // The parser retains grammar diagnostics for the compiler to filter when
+    // syntax errors are present. TypeScript 6.0.3 only reports the missing
+    // separator in these cases, not the recovered parameter's TS1014.
+    for (file, source, token) in [
+        (
+            "input.ts",
+            "class C { constructor(...public rest: string[]) {} }",
+            "rest",
+        ),
+        ("input.ts", "function f(...args next) {}", "next"),
+        ("input.js", "function f(...args next) {}", "next"),
+        (
+            "input.tsx",
+            "function f(...args next) { return <span />; }",
+            "next",
+        ),
+        ("input.ts", "function f(...args [next]) {}", "["),
+        (
+            "input.ts",
+            "function f(...args /*missing*/ next: number) {}",
+            "next",
+        ),
+        ("input.ts", "function f(...args\nnext) {}", "next"),
+        ("input.ts", "function f(...args public next) {}", "public"),
+    ] {
+        let parsed = parse(file, source);
+        let start = source.find(token).unwrap() as u32;
+        let rest = source.find("...").unwrap() as u32;
+        let diagnostics: Vec<_> = parsed
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let span = diagnostic.span.unwrap();
+                (
+                    diagnostic.code,
+                    span.start,
+                    span.end,
+                    diagnostic.message.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            diagnostics,
+            [
+                (1005, start, start + token.len() as u32, "',' expected."),
+                (
+                    1014,
+                    rest,
+                    rest + 3,
+                    "A rest parameter must be last in a parameter list.",
+                ),
+            ],
+            "{file}: {source}"
+        );
+    }
+}
+
+#[test]
+fn missing_rest_parameter_separator_preserves_recovered_parameters_and_body() {
+    let source = "function f(...args next: string) { return next; }";
+    let parsed = parse("input.ts", source);
+    let tsc_rs_ast::StmtKind::FnDecl(function) = &parsed.statements[0].kind else {
+        panic!("expected function declaration");
+    };
+    assert_eq!(function.params.len(), 2);
+    assert!(function.params[0].dotdotdot);
+    assert!(!function.params[1].dotdotdot);
+    for (param, expected) in function.params.iter().zip(["args", "next"]) {
+        assert!(matches!(&param.name.kind, tsc_rs_ast::PatKind::Ident(name) if name == expected));
+    }
+    assert!(function.params[1].type_ann.is_some());
+    let body = function.body.as_ref().expect("body remains attached");
+    assert_eq!(body.len(), 1);
+    assert!(matches!(body[0].kind, tsc_rs_ast::StmtKind::Return(_)));
+}
+
+#[test]
+fn correctly_separated_rest_parameters_and_speculative_expressions_are_unchanged() {
+    for (file, source) in [
+        (
+            "input.ts",
+            "function f(first: string, ...rest: string[]) {}",
+        ),
+        ("input.js", "function f(...rest) { return rest; }"),
+        ("input.ts", "const f = (...rest: string[]) => rest;"),
+        (
+            "input.ts",
+            "f(...args, next); const value = a ? (b ? c : d) : e;",
+        ),
+        ("input.tsx", "const view = <span>{f(...args, next)}</span>;"),
+    ] {
+        let parsed = parse(file, source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+    let parsed = parse("input.ts", "function f(...rest, next) {}");
+    let codes: Vec<_> = parsed
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code)
+        .collect();
+    assert_eq!(
+        codes,
+        [1014],
+        "a written comma leaves rest-position grammar intact"
+    );
+}
+
+#[test]
 fn incomplete_if_statements_report_errors_without_consuming_enclosing_braces() {
     use tsc_rs_ast::{ClassMemberKind, ExprKind, PropName, StmtKind};
 

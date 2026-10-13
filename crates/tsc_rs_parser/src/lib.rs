@@ -5652,6 +5652,9 @@ impl<'a> Parser<'a> {
                         && self.pos != before_pos
                         && self.pos != last_pos
                     {
+                        // Report the syntactic separator error so the compiler
+                        // can suppress grammar-only rest-position diagnostics.
+                        self.error_code(1005, "',' expected.".into());
                         last_pos = self.pos;
                         continue;
                     }
