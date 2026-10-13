@@ -3139,3 +3139,57 @@ All 5,600 public Rust tests pass, with zero failures and
 37 ignored. Formatting, `make ci` and workspace Clippy pass.
 Measured public source: `cdcf42764`. The previous snapshot remains
 at `docs/compatibility-metrics-2026-10-13-a7f80796d.json`.
+
+## 2026-10-13: compatibility rounds 1-10
+
+Ten verified rounds improve parser diagnostics, conditional type constraints,
+JavaScript resource disposal and declaration emission. Each round preserves
+previous passes, oracle identities and skip counts across all twelve compiler
+and conformance matrices. Public measurements match the private results.
+
+| Round | Change | Newly passing comparisons |
+|---|---|---:|
+| 1 | [preserve internal namespace import aliases](https://github.com/benfavre/ts-rs/commit/11820b47e2ea768c4cdd4b170b9ea8e51b561f72) | 17 |
+| 2 | [preserve resource scopes around derived constructors](https://github.com/benfavre/ts-rs/commit/4ccb1b7ff6318c0b567e6916406966cbdb099348) | 1 |
+| 3 | [diagnose incomplete if statement recovery](https://github.com/benfavre/ts-rs/commit/7cd2c5e4c85c58589029ce6059d38662bb6b75f2) | 4 |
+| 4 | [report duplicate function implementations](https://github.com/benfavre/ts-rs/commit/cb0f80d4ece56ae4dc5e0163908cc60d9bcd3f20) | 3 |
+| 5 | [diagnose decimal exponents without digits](https://github.com/benfavre/ts-rs/commit/277bfedc2c18344f7ee9247b36f7fbc2ec4ca53e) | 4 |
+| 6 | [separate declaration baseline groups once](https://github.com/benfavre/ts-rs/commit/e4548505e819e79736231f8929b0a18a88f3f7af) (measurement correction) | 67 |
+| 7 | [check primitive conditional constraints](https://github.com/benfavre/ts-rs/commit/d18afe729f3d00dc65104362a2b707325609e78c) | 1 |
+| 8 | [diagnose declared export assignment modifiers](https://github.com/benfavre/ts-rs/commit/6a938ef1e71c4142be21eab7868973bb70f6afb3) | 2 |
+| 9 | [respect line breaks before conditional extends](https://github.com/benfavre/ts-rs/commit/3f532aa25b0b3901aaa92fe0b9c8c6bc17cb912a) | 4 |
+| 10 | [omit empty destructuring from declarations](https://github.com/benfavre/ts-rs/commit/75023f14b9056b8d1ce6a07eff6ed2156f5a3bbb) | 3 |
+
+The declaration section separator correction accounts for 67 additional passing
+variant comparisons (41 compiler and 26 conformance). It changes report assembly;
+emitted declaration payload bytes remain identical. These are measurement
+corrections, not 67 new compiler behaviors. Other gains change compiler behavior.
+Variant comparisons are not counts of distinct source programs.
+
+| Suite | Baseline | Before | After | Failed | Skipped |
+|---|---|---:|---:|---:|---:|
+| Compiler | Diagnostics | 4,995 | 5,002 | 1,527 | 0 |
+| Compiler | JavaScript | 6,032 | 6,032 | 0 | 497 |
+| Compiler | Types | 1,971 | 1,972 | 4,462 | 95 |
+| Compiler | Symbols | 1,731 | 1,732 | 4,702 | 95 |
+| Compiler | Expanded JavaScript | 6,494 | 6,494 | 210 | 497 |
+| Compiler | Expanded declarations | 5,844 | 5,904 | 800 | 497 |
+| Conformance | Diagnostics | 4,053 | 4,061 | 1,846 | 0 |
+| Conformance | JavaScript | 5,388 | 5,388 | 0 | 519 |
+| Conformance | Types | 1,471 | 1,471 | 4,146 | 290 |
+| Conformance | Symbols | 1,590 | 1,590 | 4,027 | 290 |
+| Conformance | Expanded JavaScript | 6,444 | 6,445 | 654 | 519 |
+| Conformance | Expanded declarations | 6,314 | 6,342 | 757 | 519 |
+
+Diagnostic accuracy checks preserve matches and do not add false positives for
+any TS code. The five supported language-server operations preserve their
+passing cases and skip counts. The full inventory, including unsupported
+operations, is retained in the metrics snapshot.
+
+All 5,656 public Rust tests pass, with zero failures and
+37 ignored. Formatting, `make ci` and workspace Clippy pass.
+Pass rates exclude skips.
+Remaining diagnostic, emit, type, symbol and LSP failures remain visible.
+
+Measured public source: `75023f14b`. The preceding snapshot remains at
+`docs/compatibility-metrics-2026-10-13-cdcf42764.json`.
