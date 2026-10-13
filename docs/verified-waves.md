@@ -3069,3 +3069,44 @@ published snapshot; this batch does not establish full TypeScript compatibility.
 All 5,512 public Rust tests pass, with 37 ignored, and `make ci` passes.
 The measured compiler commit is `543ff7588`. The preceding
 snapshot is retained at `docs/compatibility-metrics-2026-10-13-c7c7197be.json`.
+
+## 2026-10-13: complete go-to-definition coverage
+
+Go-to-definition passes all 213 TypeScript fourslash cases, with zero failures
+and zero skips. The two previously skipped cases now execute range-based
+requests for quoted import and export names. Upstream tests and reference
+baselines are unchanged.
+
+The harness now compares every returned declaration at its exact file and
+position. Earlier measurements checked the first target and allowed nearby
+positions or same-name matches. Omitted source lines and definition metadata
+are now parsed accurately, and mixed-operation baselines stay separated.
+
+The server follows selected overloads, inherited constructors, merged symbols,
+generic and mapped property origins, contextual callbacks and module aliases.
+Keyword and JSDoc navigation also work through the editor protocol, which
+returns every definition location. Sixty-three original tests compare complete
+location spans with TypeScript 6.0.3. Two editor-protocol tests and four harness
+regressions bring the added regression coverage to 69 passing tests.
+
+| LSP operation | Passed before | Passed now | Failed now | Skipped now |
+|---|---:|---:|---:|---:|
+| QuickInfo | 311 | 311 | 218 | 10 |
+| Completions | 860 | 860 | 271 | 0 |
+| Go-to-definition | 191 | 213 | 0 | 0 |
+| Find-all-references | 329 | 329 | 18 | 0 |
+| Signature help | 123 | 123 | 22 | 7 |
+
+Every compiler and conformance baseline lane retains all previous passes.
+Cache-free reports cover JavaScript, diagnostics, symbols, Types, expanded
+JavaScript/declarations and diagnostic accuracy. All twelve public comparisons
+have zero losses or new skips; the six JavaScript, diagnostic and Types reports
+match the private manifests. No diagnostic code loses matches or gains false
+positives. Other supported LSP operations retain all previous passing cases.
+
+All 5,581 public Rust tests pass, with zero failures and 37 ignored.
+Formatting, `make ci` and workspace Clippy pass. Skips are excluded from pass
+rates; remaining failures in other compiler and LSP operations remain visible.
+
+Measured public source: `a7f80796d`. The preceding snapshot is
+retained at `docs/compatibility-metrics-2026-10-13-543ff7588.json`.
