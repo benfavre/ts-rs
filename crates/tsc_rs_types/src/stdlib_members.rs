@@ -59,6 +59,7 @@ fn library_interfaces(path: &str, strict_null_checks: bool) -> Option<Arc<Librar
         return Some(cached);
     }
     let _loading = LibraryLoadGuard::enter();
+    let _environment = crate::class_return_inference::isolated_environment();
     let text = std::fs::read_to_string(path).ok()?;
     let file = tsc_rs_parser::parse(path, &text);
     let mut checker = TypeChecker::new();
@@ -239,6 +240,7 @@ impl TypeChecker {
     ) -> Option<Vec<Type>> {
         if LOADING_LIBRARY.with(|depth| depth.get() != 0)
             || self.program_declares_library_owner(owner)
+            || self.type_parameter_in_resolution(owner)
         {
             return None;
         }
@@ -532,15 +534,52 @@ impl TypeChecker {
         if depth >= 32 {
             return None;
         }
-        if let Type::Union(members) | Type::Intersection(members) = receiver {
+        if let Type::Union(members) = receiver {
             return members
                 .iter()
                 .find_map(|member| self.library_readonly_access(member, index, depth + 1));
+        }
+        if let Type::Intersection(members) = receiver {
+            let key = match index {
+                Type::StringLiteral(key) => Some(key.clone()),
+                Type::NumberLiteral(key) => Some(Self::canonical_numeric_property_name(key)),
+                _ => None,
+            };
+            let mut readonly = None;
+            for member in members.iter() {
+                let access = self.library_readonly_access(member, index, depth + 1);
+                // createUnionOrIntersectionProperty (checker_p24.rs): a union
+                // retains any readonly property, whereas an intersection's
+                // property is writable if any declaration of it is writable.
+                // Constituents which do not declare the property are neutral.
+                if access.is_none()
+                    && key
+                        .as_ref()
+                        .is_some_and(|key| self.type_property_presence(member, key) == Some(true))
+                {
+                    return None;
+                }
+                if access.is_some() {
+                    readonly = access;
+                }
+            }
+            return readonly;
         }
         if let Some(constraint) = self.declared_type_param_constraint(receiver) {
             if constraint != *receiver {
                 return self.library_readonly_access(&constraint, index, depth + 1);
             }
+        }
+        if let Type::ObjectType(info) = receiver {
+            let key = match index {
+                Type::StringLiteral(key) => key.clone(),
+                Type::NumberLiteral(key) => Self::canonical_numeric_property_name(key),
+                _ => return None,
+            };
+            return info
+                .readonly_names
+                .contains(&key)
+                .then_some(LibraryReadonlyAccess::Property(key));
         }
         let Type::TypeReference(name, arguments) = receiver else {
             return None;

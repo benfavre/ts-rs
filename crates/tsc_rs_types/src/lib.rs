@@ -97,6 +97,20 @@ pub use inference::{infer_type_arguments, InferenceContext, InferenceInfo, Infer
 /// strips the suffix, so diagnostics still print the declared name.
 pub(crate) const OPAQUE_TYPE_PARAM_MARKER: char = '\u{1}';
 
+/// Declaration identity for nested function-expression parameters. Unlike an
+/// opaque relation parameter, this remains an ordinary inferable parameter.
+pub(crate) const DECLARED_TYPE_PARAM_MARKER: char = '\u{2}';
+
+thread_local! {
+    static RENAMING_DECLARED_PARAMETERS: Cell<bool> = const { Cell::new(false) };
+}
+struct ParameterIdentityMapping(bool);
+impl Drop for ParameterIdentityMapping {
+    fn drop(&mut self) {
+        RENAMING_DECLARED_PARAMETERS.with(|active| active.set(self.0));
+    }
+}
+
 thread_local! {
     /// Declared constraints of opaque signature type parameters, keyed by
     /// their full (suffixed) name.
@@ -122,7 +136,9 @@ pub(crate) const RELATION_TARGET_METHOD: u8 = 2;
 
 /// The declared name of a (possibly opaque) type parameter.
 pub(crate) fn opaque_type_param_display(name: &str) -> &str {
-    name.split(OPAQUE_TYPE_PARAM_MARKER).next().unwrap_or(name)
+    name.split([OPAQUE_TYPE_PARAM_MARKER, DECLARED_TYPE_PARAM_MARKER])
+        .next()
+        .unwrap_or(name)
 }
 pub use narrowing::{
     apply_cond_facts, narrow_by_discriminant, narrow_by_instanceof, narrow_by_nullish,
@@ -647,7 +663,9 @@ pub struct ObjectTypeData {
     /// Kept separate from hover spelling and excluded from structural identity.
     pub node_source: ObjectSource,
     /// Readonly property declarations, retained for display and write checks.
-    /// Like method spelling, ignored by structural equality and hashing.
+    /// Include them in arena identity so a mutable binding cannot inherit an
+    /// equal-looking readonly binding's write restrictions. Structural
+    /// assignability still compares the properties independently of this flag.
     pub readonly_names: Vec<std::string::String>,
     /// Setter-only declaration flags. Ordinary access uses the annotated type,
     /// while an object spread copies `undefined`. Include them in arena
@@ -662,6 +680,7 @@ impl PartialEq for ObjectTypeData {
             && self.construct_signatures == other.construct_signatures
             && self.index_signature == other.index_signature
             && self.index_signature_name == other.index_signature_name
+            && self.readonly_names == other.readonly_names
             && self.setter_only_names == other.setter_only_names
     }
 }
@@ -675,6 +694,7 @@ impl std::hash::Hash for ObjectTypeData {
         self.construct_signatures.hash(state);
         self.index_signature.hash(state);
         self.index_signature_name.hash(state);
+        self.readonly_names.hash(state);
         self.setter_only_names.hash(state);
     }
 }
@@ -1342,7 +1362,7 @@ impl Type {
                 if index > 0 {
                     buf.push_str(", ");
                 }
-                buf.push_str(parameter);
+                buf.push_str(opaque_type_param_display(parameter));
                 if let Some(Some(constraint)) = constructor.type_param_constraints.get(index) {
                     buf.push_str(" extends ");
                     constraint.display_into(buf);
@@ -1537,7 +1557,7 @@ impl Type {
                         if i > 0 {
                             buf.push_str(", ");
                         }
-                        buf.push_str(tp);
+                        buf.push_str(opaque_type_param_display(tp));
                         if let Some(Some(constraint)) = ft.type_param_constraints.get(i) {
                             buf.push_str(" extends ");
                             constraint.display_into(buf);
@@ -1649,7 +1669,7 @@ impl Type {
                             if i > 0 {
                                 buf.push_str(", ");
                             }
-                            buf.push_str(tp);
+                            buf.push_str(opaque_type_param_display(tp));
                             if let Some(Some(constraint)) = cs.type_param_constraints.get(i) {
                                 buf.push_str(" extends ");
                                 constraint.display_into(buf);
@@ -4259,6 +4279,21 @@ impl TypeChecker {
             TypeSpanKind::Expression
         };
         let record = TypeAtSpan::new(ty, kind, self);
+        if let ExprKind::FnExpr(declaration) = &expr.kind {
+            if let Some(name_span) = declaration.name_span {
+                let printed = type_nodes::print_function_declaration(ty, self);
+                let record = TypeAtSpan {
+                    type_string: ty.display_string(),
+                    node_text: printed.text,
+                    underline: printed.underline,
+                    kind: TypeSpanKind::Declaration,
+                };
+                self.expression_type_spans
+                    .as_mut()
+                    .unwrap()
+                    .insert((name_span.start, name_span.end), record);
+            }
+        }
         self.record_expression_member_names(expr, ty);
         self.expression_type_spans
             .as_mut()
@@ -4299,19 +4334,78 @@ impl TypeChecker {
         std::mem::take(&mut self.diagnostics)
     }
 
+    /// Resolve generic names in their lexical declaration before consulting
+    /// namespace members or global/library type registries. This follows
+    /// resolveEntityName/getTypeFromTypeReference in pingdotgg/ts-rust.
+    pub(crate) fn type_parameter_in_resolution(&self, name: &str) -> bool {
+        self.resolved_type_parameter_name(name).is_some()
+    }
+
+    pub(crate) fn resolved_type_parameter_name(&self, name: &str) -> Option<String> {
+        MAPPED_PARAMS_IN_RESOLUTION
+            .with(|stack| {
+                stack
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|identity| opaque_type_param_display(identity) == name)
+                    .cloned()
+            })
+            .or_else(|| {
+                TYPE_RESOLUTION_TYPE_PARAMS.with(|scopes| {
+                    scopes.borrow().iter().rev().find_map(|scope| {
+                        scope
+                            .iter()
+                            .find(|identity| opaque_type_param_display(identity) == name)
+                            .cloned()
+                    })
+                })
+            })
+            .or_else(|| {
+                self.active_type_param_names.iter().rev().find_map(|scope| {
+                    scope
+                        .iter()
+                        .find(|identity| opaque_type_param_display(identity) == name)
+                        .cloned()
+                })
+            })
+    }
+
+    pub(crate) fn identify_active_function_parameters(
+        &mut self,
+        identities: &HashMap<String, Type>,
+    ) {
+        if identities.is_empty() {
+            return;
+        }
+        let identity = |name: &String| match identities.get(name) {
+            Some(Type::TypeParameter(identity)) => identity.clone(),
+            _ => name.clone(),
+        };
+        if let Some(names) = self.active_type_param_names.last_mut() {
+            *names = names.iter().map(identity).collect();
+        }
+        if let Some(names) = self.unconstrained_type_param_names.last_mut() {
+            *names = names.iter().map(identity).collect();
+        }
+        if let Some(constraints) = self.type_param_constraint_stack.last_mut() {
+            *constraints = constraints
+                .iter()
+                .map(|(name, ty)| {
+                    (
+                        identity(name),
+                        Self::identify_type_parameters(ty, identities),
+                    )
+                })
+                .collect();
+        }
+    }
+
     pub(crate) fn namespace_owned_type_name(&self, name: &str) -> String {
         let Some(owner) = self.type_resolution_namespace.as_deref() else {
             return name.to_string();
         };
-        if !name.contains('.')
-            && TYPE_RESOLUTION_TYPE_PARAMS.with(|scopes| {
-                scopes
-                    .borrow()
-                    .iter()
-                    .rev()
-                    .any(|scope| scope.contains(name))
-            })
-        {
+        if !name.contains('.') && self.type_parameter_in_resolution(name) {
             return name.to_string();
         }
         let mut candidate_owner = owner;
@@ -4333,9 +4427,6 @@ impl TypeChecker {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        if self.type_resolution_namespace.is_none() {
-            return;
-        }
         TYPE_RESOLUTION_TYPE_PARAMS.with(|scopes| {
             scopes.borrow_mut().push(
                 names
@@ -4347,9 +4438,6 @@ impl TypeChecker {
     }
 
     fn exit_type_resolution_type_params(&self) {
-        if self.type_resolution_namespace.is_none() {
-            return;
-        }
         TYPE_RESOLUTION_TYPE_PARAMS.with(|scopes| {
             scopes.borrow_mut().pop();
         });
@@ -16364,6 +16452,8 @@ impl TypeChecker {
                     .insert(import_equals.name.clone());
             }
             StmtKind::TypeAlias(type_alias) => {
+                let _parameters =
+                    crate::type_params_in_resolution(type_alias.type_params.as_deref());
                 let type_params: Vec<std::string::String> = type_alias
                     .type_params
                     .as_ref()
@@ -16400,28 +16490,7 @@ impl TypeChecker {
                     // Alias hover stores the expanded body below. The name's
                     // semantic type has a separate span so consumers do not
                     // mistake that hover protocol for a TypeScript type.
-                    let declaration_type = match &resolved {
-                        Type::Union(_)
-                        | Type::Intersection(_)
-                        | Type::ObjectType(_)
-                        | Type::Array(_)
-                        | Type::Tuple(_)
-                        | Type::Function(_)
-                        | Type::Constructor(_)
-                        | Type::Mapped { .. }
-                        | Type::Conditional { .. }
-                        | Type::Readonly(_) => Type::TypeReference(
-                            type_alias.name.clone(),
-                            type_params
-                                .iter()
-                                .cloned()
-                                .map(Type::TypeParameter)
-                                .collect(),
-                        ),
-                        Type::IndexedAccess { .. } => self.simplify_type(&resolved),
-                        other => other.clone(),
-                    };
-                    self.record_expression_type_span(name_span, &declaration_type);
+                    self.record_type_alias_name(type_alias, &type_params, &resolved, name_span);
                     let displayed = if type_params.is_empty() {
                         // Non-generic alias: use display-mode simplifier
                         // (folds mapped types too) so
@@ -16446,6 +16515,37 @@ impl TypeChecker {
             },
             _ => {}
         }
+    }
+
+    fn record_type_alias_name(
+        &mut self,
+        declaration: &TypeAliasDecl,
+        type_params: &[String],
+        resolved: &Type,
+        name_span: Span,
+    ) {
+        let declaration_type = match resolved {
+            Type::Union(_)
+            | Type::Intersection(_)
+            | Type::ObjectType(_)
+            | Type::Array(_)
+            | Type::Tuple(_)
+            | Type::Function(_)
+            | Type::Constructor(_)
+            | Type::Mapped { .. }
+            | Type::Conditional { .. }
+            | Type::Readonly(_) => Type::TypeReference(
+                declaration.name.clone(),
+                type_params
+                    .iter()
+                    .cloned()
+                    .map(Type::TypeParameter)
+                    .collect(),
+            ),
+            Type::IndexedAccess { .. } => self.simplify_type(resolved),
+            other => other.clone(),
+        };
+        self.record_expression_type_span(name_span, &declaration_type);
     }
 
     /// See `scoped_type_keys`. `require_registered`: only keys the interface
@@ -20234,30 +20334,12 @@ impl TypeChecker {
     /// (walking parameter-to-parameter constraint chains). None when the
     /// type is not a constrained in-scope type parameter.
     fn typeparam_constraint_apparent(&self, ty: &Type) -> Option<Type> {
-        fn param_name(ty: &Type) -> Option<&str> {
-            match ty {
-                Type::TypeParameter(p) => Some(p.as_str()),
-                Type::TypeReference(p, a) if a.is_empty() => Some(p.as_str()),
-                _ => None,
-            }
-        }
-        let mut cur = param_name(ty)?.to_string();
+        let mut current = self.declared_type_param_constraint(ty)?;
         for _ in 0..4 {
-            let c = self
-                .type_param_constraint_stack
-                .iter()
-                .rev()
-                .find_map(|m| m.get(cur.as_str()))?;
-            match param_name(c) {
-                Some(next)
-                    if self
-                        .type_param_constraint_stack
-                        .iter()
-                        .any(|m| m.contains_key(next)) =>
-                {
-                    cur = next.to_string();
-                }
-                _ => return Some(c.clone()),
+            match self.declared_type_param_constraint(&current) {
+                Some(next) if next != current => current = next,
+                Some(_) => return None,
+                None => return Some(current),
             }
         }
         None
@@ -30405,6 +30487,20 @@ impl TypeChecker {
                     }
                 }
                 self.check_type_node_future_lib_globals(&type_alias.type_ann);
+                if let Some(span) = type_alias.name_span.filter(|span| {
+                    self.expression_type_spans
+                        .as_ref()
+                        .is_some_and(|spans| !spans.contains_key(&(span.start, span.end)))
+                }) {
+                    let resolved = self.resolve_alias_body(&type_alias.type_ann);
+                    let parameters = type_alias
+                        .type_params
+                        .iter()
+                        .flatten()
+                        .map(|parameter| parameter.name.clone())
+                        .collect::<Vec<_>>();
+                    self.record_type_alias_name(type_alias, &parameters, &resolved, span);
+                }
                 self.pop_active_type_param_names(pushed_type_params);
                 self.check_type_declaration_computed_names(std::slice::from_ref(stmt));
             }
@@ -32322,10 +32418,11 @@ impl TypeChecker {
     }
 
     pub(crate) fn type_param_name_is_active(&self, name: &str) -> bool {
-        self.active_type_param_names
-            .iter()
-            .rev()
-            .any(|frame| frame.contains(name))
+        self.active_type_param_names.iter().rev().any(|frame| {
+            frame
+                .iter()
+                .any(|identity| opaque_type_param_display(identity) == name)
+        })
     }
 
     pub(crate) fn function_parameter_name_is_active(&self, name: &str) -> bool {
@@ -32343,6 +32440,7 @@ impl TypeChecker {
                                params: &[Param],
                                return_type: Option<&TypeNode>| {
             let pushed_type_params = this.push_active_type_param_names(type_params);
+            this.record_signature_parameter_types(params);
             let pushed_parameter_names = this.push_active_function_parameter_names(params);
             for param in params {
                 if let Some(annotation) = &param.type_ann {
@@ -32418,6 +32516,7 @@ impl TypeChecker {
                                params: &[Param],
                                return_type: Option<&TypeNode>| {
             let pushed_type_params = this.push_active_type_param_names(type_params);
+            this.record_signature_parameter_types(params);
             if let Some(type_params) = type_params {
                 for type_param in type_params {
                     if let Some(constraint) = &type_param.constraint {
@@ -32481,19 +32580,36 @@ impl TypeChecker {
         if self.expression_type_spans.is_none() {
             return;
         }
-        let TypeMemberKind::PropertySig(property) = &member.kind else {
-            return;
+        let (name, annotation, optional) = match &member.kind {
+            TypeMemberKind::PropertySig(property) => (
+                &property.name,
+                property.type_ann.as_ref(),
+                property.optional,
+            ),
+            TypeMemberKind::GetAccessorSig(accessor) => {
+                (&accessor.name, accessor.return_type.as_ref(), false)
+            }
+            TypeMemberKind::SetAccessorSig(accessor) => {
+                self.record_signature_parameter_types(&accessor.params);
+                (
+                    &accessor.name,
+                    accessor
+                        .params
+                        .first()
+                        .and_then(|parameter| parameter.type_ann.as_ref()),
+                    false,
+                )
+            }
+            _ => return,
         };
-        let span = property.name.span();
+        let span = name.span();
         let after_comment = self
             .expression_type_comments
             .partition_point(|comment| comment.start <= span.start);
         if after_comment > 0 && self.expression_type_comments[after_comment - 1].end > span.start {
             return;
         }
-        let mut ty = property
-            .type_ann
-            .as_ref()
+        let mut ty = annotation
             .map(|annotation| self.resolve_type_node(annotation))
             .unwrap_or(Type::Any);
         // Qualified aliases can remain references during annotation
@@ -32525,10 +32641,10 @@ impl TypeChecker {
                 }
             }
         }
-        if property.optional && self.strict_null_checks {
+        if optional && self.strict_null_checks {
             ty = Type::flatten_union(vec![ty, Type::Undefined]);
         }
-        self.record_expression_type_span(property.name.span(), &ty);
+        self.record_expression_type_span(span, &ty);
     }
 
     fn collect_infer_names_from_type_member(
@@ -42557,7 +42673,13 @@ impl TypeChecker {
         }
         if !type_params.is_empty() {
             text.push('<');
-            text.push_str(&type_params.join(", "));
+            text.push_str(
+                &type_params
+                    .iter()
+                    .map(|name| opaque_type_param_display(name))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
             text.push('>');
         }
         text.push('(');
@@ -42600,10 +42722,11 @@ impl TypeChecker {
             Type::TypeReference(name, args) if args.is_empty() => name.as_str(),
             _ => return None,
         };
-        if self.class_info.contains_key(name)
-            || self.interface_info.contains_key(name)
-            || self.type_aliases.contains_key(name)
-            || self.enum_info.contains_key(name)
+        if !matches!(ty, Type::TypeParameter(_))
+            && (self.class_info.contains_key(name)
+                || self.interface_info.contains_key(name)
+                || self.type_aliases.contains_key(name)
+                || self.enum_info.contains_key(name))
         {
             return None;
         }
@@ -42725,7 +42848,8 @@ impl TypeChecker {
         source: &Type,
         target: &Type,
     ) -> Option<std::string::String> {
-        let name = self.active_type_parameter_name(target)?;
+        let identity = self.active_type_parameter_name(target)?;
+        let name = opaque_type_param_display(&identity);
         let source_display = source.display_string_single_line();
         if source_display == name {
             return None;
@@ -42930,7 +43054,10 @@ impl TypeChecker {
             }
             (
                 Type::ObjectType(info),
-                Type::ObjectType(_) | Type::Union(_) | Type::TypeReference(..),
+                Type::ObjectType(_)
+                | Type::Union(_)
+                | Type::TypeReference(..)
+                | Type::TypeParameter(_),
             ) if !matches!(effective, Type::Intersection(_)) => {
                 let mut widened = info.clone();
                 widened.properties = info
@@ -44286,6 +44413,18 @@ impl TypeChecker {
     // Generic type substitution and inference
     // -----------------------------------------------------------------------
 
+    /// Declaration identity is an alpha-renaming, not type instantiation.
+    /// Retain object/member metadata throughout the recursive mapping.
+    pub(crate) fn identify_type_parameters(ty: &Type, identities: &HashMap<String, Type>) -> Type {
+        if identities.is_empty() {
+            return ty.clone();
+        }
+        let _guard = ParameterIdentityMapping(
+            RENAMING_DECLARED_PARAMETERS.with(|active| active.replace(true)),
+        );
+        Self::substitute(ty, identities)
+    }
+
     /// Recursively replace type parameters with concrete types throughout a type tree.
     fn substitute(ty: &Type, map: &HashMap<std::string::String, Type>) -> Type {
         let exceeded = type_op_enter();
@@ -44802,7 +44941,7 @@ impl TypeChecker {
             };
             &renamed
         };
-        FunctionType {
+        let mut result = FunctionType {
             source: ft.source.clone(),
             type_param_constraints: ft
                 .type_param_constraints
@@ -44826,7 +44965,15 @@ impl TypeChecker {
                 target_type: Arc::new(Self::substitute(&pred.target_type, eff)),
                 is_asserts: pred.is_asserts,
             }),
+        };
+        if !RENAMING_DECLARED_PARAMETERS.with(|active| active.get())
+            && (result.params != ft.params || result.return_type != ft.return_type)
+        {
+            result.source = result
+                .source
+                .with_instantiated_parameters(ft.type_params.clone());
         }
+        result
     }
 
     fn substitute_constructor(
@@ -44924,10 +45071,21 @@ impl TypeChecker {
                     call_signatures,
                     construct_signatures,
                     index_signature,
-                    index_signature_name: None,
+                    index_signature_name: RENAMING_DECLARED_PARAMETERS
+                        .with(|active| active.get())
+                        .then(|| info.index_signature_name.clone())
+                        .flatten(),
                     setter_only_names: info.setter_only_names.clone(),
-                    readonly_names: Vec::new(),
-                    method_names: Vec::new(),
+                    readonly_names: if RENAMING_DECLARED_PARAMETERS.with(|active| active.get()) {
+                        info.readonly_names.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    method_names: if RENAMING_DECLARED_PARAMETERS.with(|active| active.get()) {
+                        info.method_names.clone()
+                    } else {
+                        Vec::new()
+                    },
                     node_source: info.node_source.clone(),
                 }))
             }

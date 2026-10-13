@@ -211,6 +211,31 @@ impl TypeChecker {
             },
             TypeNodeKind::Reference(type_ref) => {
                 let mut name = self.expr_to_name(&type_ref.name);
+                if matches!(type_ref.name.kind, ExprKind::Ident(_))
+                    && type_ref
+                        .type_args
+                        .as_ref()
+                        .is_none_or(|args| args.is_empty())
+                    && self.type_parameter_in_resolution(&name)
+                {
+                    let identity = self
+                        .resolved_type_parameter_name(&name)
+                        .unwrap_or_else(|| name.clone());
+                    // The native relation engine keeps unambiguous lexical
+                    // references deferred. Use an explicit parameter when a
+                    // global declaration or a nested symbol needs distinction.
+                    return if identity == name
+                        && !self.class_info.contains_key(&name)
+                        && !self.interface_info.contains_key(&name)
+                        && !self.type_aliases.contains_key(&name)
+                        && !self.enum_info.contains_key(&name)
+                        && !self.builtins.instance_members.contains_key(&name)
+                    {
+                        Type::TypeReference(identity, Arc::from([] as [Type; 0]))
+                    } else {
+                        Type::TypeParameter(identity)
+                    };
+                }
                 name = self.namespace_owned_type_name(&name);
                 // A named class expression has a body-local type binding even
                 // though its source name does not escape the expression. Its
@@ -322,7 +347,17 @@ impl TypeChecker {
                 Type::flatten_union(resolved)
             }
             TypeNodeKind::Intersection(types) => {
-                let resolved = types.iter().map(|t| self.resolve_type_node(t)).collect();
+                let resolved: Vec<_> = types.iter().map(|t| self.resolve_type_node(t)).collect();
+                // Separate nonempty anonymous declarations have distinct type
+                // identities even when their properties are structurally equal.
+                // Do not collapse their written intersection by shape alone.
+                if types.len() > 1
+                    && types.iter().all(|node| {
+                        matches!(&node.kind, TypeNodeKind::TypeLit(members) if !members.is_empty())
+                    })
+                {
+                    return Type::Intersection(resolved.into());
+                }
                 self.reduce_nullish_intersection(resolved)
             }
             TypeNodeKind::Function(fn_type) => {
@@ -718,6 +753,12 @@ impl TypeChecker {
                         // `set x(v: T)` declares it by its parameter type.
                         TypeMemberKind::GetAccessorSig(accessor) => {
                             let name = self.prop_name_to_string(&accessor.name);
+                            if !members.iter().any(|member| {
+                                matches!(&member.kind, TypeMemberKind::SetAccessorSig(setter)
+                                    if self.prop_name_to_string(&setter.name) == name)
+                            }) {
+                                readonly_names.push(name.clone());
+                            }
                             let ty = accessor
                                 .return_type
                                 .as_ref()
@@ -1778,9 +1819,48 @@ impl TypeChecker {
             .collect()
     }
 
+    /// Stable parameter identities let a returned generic function retain an
+    /// enclosing parameter with the same spelling. The declaration and file
+    /// distinguish symbols; display names are assigned separately by the printer.
+    pub(crate) fn function_expression_parameters(&self, fn_decl: &FnDecl) -> HashMap<String, Type> {
+        fn_decl
+            .type_params
+            .iter()
+            .flatten()
+            .map(|parameter| {
+                let identity = format!(
+                    "{}{}{}:{}",
+                    parameter.name,
+                    crate::DECLARED_TYPE_PARAM_MARKER,
+                    self.current_file_name.as_deref().unwrap_or_default(),
+                    parameter.name_span.start
+                );
+                (parameter.name.clone(), Type::TypeParameter(identity))
+            })
+            .collect()
+    }
+
     pub(crate) fn resolve_fn_type(&self, fn_decl: &FnDecl) -> FunctionType {
+        self.resolve_fn_type_with_parameters(fn_decl, &HashMap::new())
+    }
+
+    fn resolve_fn_type_with_parameters(
+        &self,
+        fn_decl: &FnDecl,
+        identities: &HashMap<String, Type>,
+    ) -> FunctionType {
         let _receiver = self.infer_function_receiver(&fn_decl.params);
         let _own_type_params = crate::type_params_in_resolution(fn_decl.type_params.as_deref());
+        if !identities.is_empty() {
+            MAPPED_PARAMS_IN_RESOLUTION.with(|stack| {
+                let mut stack = stack.borrow_mut();
+                for name in stack.iter_mut().rev().take(identities.len()) {
+                    if let Some(Type::TypeParameter(identity)) = identities.get(name) {
+                        *name = identity.clone();
+                    }
+                }
+            });
+        }
         let _constraints = self.inferred_constraint_scope(fn_decl.type_params.as_deref());
         let params: Vec<(String, Type)> = fn_decl
             .params
@@ -1818,11 +1898,17 @@ impl TypeChecker {
                                 }
                             })
                     });
-                (pname, self.declared_optional_param_type(p, pty))
+                (
+                    pname,
+                    Self::identify_type_parameters(
+                        &self.declared_optional_param_type(p, pty),
+                        identities,
+                    ),
+                )
             })
             .collect();
         let ret = if let Some(ref rt) = fn_decl.return_type {
-            self.resolve_type_node(rt)
+            Self::identify_type_parameters(&self.resolve_type_node(rt), identities)
         } else if let Some(ref body) = fn_decl.body {
             // Hoisting can resolve a signature outside its parameter scope.
             // Formal parameters, including default initializers, supply the
@@ -1862,26 +1948,48 @@ impl TypeChecker {
         } else {
             Type::Any
         };
-        let type_predicate = fn_decl
+        let mut type_predicate = fn_decl
             .return_type
             .as_ref()
             .and_then(|rt| self.extract_type_predicate(rt));
+        if let Some(predicate) = &mut type_predicate {
+            predicate.target_type = Arc::new(Self::identify_type_parameters(
+                &predicate.target_type,
+                identities,
+            ));
+        }
         let type_params = fn_decl
             .type_params
             .as_ref()
-            .map(|tps| tps.iter().map(|tp| tp.name.clone()).collect())
+            .map(|tps| {
+                tps.iter()
+                    .map(|tp| match identities.get(&tp.name) {
+                        Some(Type::TypeParameter(identity)) => identity.clone(),
+                        _ => tp.name.clone(),
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
-        let type_param_defaults = self.resolve_type_param_defaults(fn_decl.type_params.as_deref());
-        let type_param_constraints =
-            self.resolve_type_param_constraints(fn_decl.type_params.as_deref());
+        let type_param_defaults = self
+            .resolve_type_param_defaults(fn_decl.type_params.as_deref())
+            .into_iter()
+            .map(|ty| ty.map(|ty| Self::identify_type_parameters(&ty, identities)))
+            .collect();
+        let type_param_constraints = self
+            .resolve_type_param_constraints(fn_decl.type_params.as_deref())
+            .into_iter()
+            .map(|ty| ty.map(|ty| Self::identify_type_parameters(&ty, identities)))
+            .collect();
         FunctionType {
-            source: self.signature_source(
-                &fn_decl.params,
-                &params,
-                fn_decl.type_params.as_deref(),
-                fn_decl.return_type.as_ref(),
-                &ret,
-            ),
+            source: self
+                .signature_source(
+                    &fn_decl.params,
+                    &params,
+                    fn_decl.type_params.as_deref(),
+                    fn_decl.return_type.as_ref(),
+                    &ret,
+                )
+                .with_parameter_identities(identities),
             type_param_constraints,
             params,
             return_type: Arc::new(ret),
@@ -2137,7 +2245,7 @@ impl TypeChecker {
                 let mut ty = ty;
                 if matches!(expr.kind, ExprKind::FnExpr(_)) {
                     if let Type::Function(signature) = &mut ty {
-                        signature.source = signature.source.clone().with_original_this_parameter();
+                        signature.source = signature.source.clone().with_reused_parameter_nodes();
                     }
                 }
                 out.push(self.widen_fresh_return_expr_type(expr, ty));
@@ -2487,7 +2595,10 @@ impl TypeChecker {
             ExprKind::Ident(name) => crate::infer_param_binding(name)
                 .or_else(|| self.lookup_var(name).cloned())
                 .unwrap_or(Type::Any),
-            ExprKind::FnExpr(fn_decl) => Type::Function(self.resolve_fn_type(fn_decl)),
+            ExprKind::FnExpr(fn_decl) => Type::Function(self.resolve_fn_type_with_parameters(
+                fn_decl,
+                &self.function_expression_parameters(fn_decl),
+            )),
             ExprKind::ClassExpr(_) => Type::TypeReference(
                 format!("typeof __class_expression_{}", expr.span.start),
                 Arc::from([]),
@@ -3145,6 +3256,9 @@ impl TypeChecker {
                 let obj_ty = self.infer_expr_type(&mem.object);
                 let obj_ty = self.widen_fresh_array_type(&mem.object, obj_ty);
                 let obj_ty = self.fresh_index_receiver_type(&mem.object, obj_ty);
+                let obj_ty = self
+                    .declared_type_param_constraint(&obj_ty)
+                    .unwrap_or(obj_ty);
                 if let Some(value) = self.infer_receiver_member(&obj_ty, &mem.property) {
                     return value;
                 }

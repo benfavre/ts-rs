@@ -11,9 +11,37 @@ use tsc_rs_ast::*;
 #[derive(Debug, Clone, Default)]
 pub struct SignatureSource(Option<Arc<SignatureDeclaration>>);
 impl SignatureSource {
+    pub(crate) fn with_parameter_identities(
+        mut self,
+        identities: &std::collections::HashMap<String, Type>,
+    ) -> Self {
+        if let Some(source) = &mut self.0 {
+            let source = Arc::make_mut(source);
+            for (_, annotation) in &mut source.type_parameters {
+                if let Some(annotation) = annotation {
+                    annotation.ty =
+                        TypeChecker::identify_type_parameters(&annotation.ty, identities);
+                }
+            }
+            if let Some(predicate) = source
+                .return_type
+                .as_mut()
+                .and_then(|annotation| annotation.predicate.as_mut())
+            {
+                predicate.target_type = Arc::new(TypeChecker::identify_type_parameters(
+                    &predicate.target_type,
+                    identities,
+                ));
+            }
+        }
+        self
+    }
+
     pub(crate) fn with_instantiated_parameters(mut self, parameters: Vec<String>) -> Self {
         if let Some(source) = &mut self.0 {
-            Arc::make_mut(source).instantiated_parameters = parameters;
+            let source = Arc::make_mut(source);
+            source.instantiated_parameters.extend(parameters);
+            source.reused_parameter_nodes = false;
         }
         self
     }
@@ -36,9 +64,9 @@ impl SignatureSource {
         self
     }
 
-    pub(crate) fn with_original_this_parameter(mut self) -> Self {
+    pub(crate) fn with_reused_parameter_nodes(mut self) -> Self {
         if let Some(source) = &mut self.0 {
-            Arc::make_mut(source).original_this_parameter = true;
+            Arc::make_mut(source).reused_parameter_nodes = true;
         }
         self
     }
@@ -67,7 +95,7 @@ struct ParameterDeclaration {
 #[derive(Debug, Clone)]
 struct SignatureDeclaration {
     source_file: Option<String>,
-    original_this_parameter: bool,
+    reused_parameter_nodes: bool,
     instantiated_parameters: Vec<String>,
     function_type: bool,
     parameters: Vec<ParameterDeclaration>,
@@ -370,7 +398,7 @@ impl TypeChecker {
         let annotation = |node: &TypeNode, ty: &Type| self.source_annotation(node, ty);
         SignatureSource(Some(Arc::new(SignatureDeclaration {
             source_file: self.current_file_name.clone(),
-            original_this_parameter: false,
+            reused_parameter_nodes: false,
             instantiated_parameters: Vec::new(),
             function_type: false,
             parameters: parameters
@@ -423,7 +451,7 @@ impl TypeChecker {
         };
         SignatureSource(Some(Arc::new(SignatureDeclaration {
             source_file: self.current_file_name.clone(),
-            original_this_parameter: false,
+            reused_parameter_nodes: false,
             instantiated_parameters: Vec::new(),
             function_type: false,
             parameters: signature
@@ -461,6 +489,8 @@ pub(crate) struct PrintedType<'a> {
     signature_file: Option<String>,
     value_parameters: Vec<String>,
     instantiated_parameters: Vec<String>,
+    type_parameter_names: std::collections::HashMap<String, String>,
+    used_type_parameter_names: std::collections::HashSet<String>,
 }
 impl PrintedType<'_> {
     fn write(&mut self, text: &str, original: bool) {
@@ -476,20 +506,83 @@ impl PrintedType<'_> {
     fn original(&mut self, text: &str) {
         self.write(text, true);
     }
+    /// Adapted from typeParameterToName in nodebuilder_impl_p2.rs: cache by
+    /// semantic identity and allocate a fresh spelling only on collision.
+    fn type_parameter_name(&mut self, identity: &str) -> String {
+        if let Some(name) = self.type_parameter_names.get(identity) {
+            return name.clone();
+        }
+        let raw = crate::opaque_type_param_display(identity);
+        let mut name = raw.to_owned();
+        let mut suffix = 0;
+        while self.used_type_parameter_names.contains(&name) {
+            suffix += 1;
+            name = format!("{raw}_{suffix}");
+        }
+        self.used_type_parameter_names.insert(name.clone());
+        self.type_parameter_names
+            .insert(identity.to_owned(), name.clone());
+        name
+    }
+
+    fn annotation_matches(&self, ty: &Type, original: &Type) -> bool {
+        if original == ty || TypeChecker::substitute(original, &Default::default()) == *ty {
+            return true;
+        }
+        // Assigning a declaration identity changes neither the annotation nor
+        // its type. Ordinary instantiation still invalidates source reuse.
+        let identities = self
+            .type_parameter_names
+            .keys()
+            .filter(|name| name.contains(crate::DECLARED_TYPE_PARAM_MARKER))
+            .filter(|name| {
+                TypeChecker::substitute(
+                    ty,
+                    &std::collections::HashMap::from([((*name).clone(), Type::Never)]),
+                ) != TypeChecker::substitute(ty, &Default::default())
+            })
+            .map(|name| {
+                (
+                    crate::opaque_type_param_display(name).to_owned(),
+                    Type::TypeParameter(name.clone()),
+                )
+            })
+            .collect();
+        TypeChecker::identify_type_parameters(original, &identities) == *ty
+    }
+
     fn annotation(&mut self, ty: &Type, annotation: Option<&Annotation>) {
-        if let Some(annotation) = annotation.filter(|a| {
-            (a.ty == *ty || TypeChecker::substitute(&a.ty, &Default::default()) == *ty)
-                && !self.has_fresh_parameter(ty)
-        }) {
-            self.original(&annotation.text);
+        if let Type::TypeParameter(identity) = ty {
+            self.type_parameter_name(identity);
+        }
+        if let Some(annotation) = annotation
+            .filter(|a| self.annotation_matches(ty, &a.ty) && !self.has_fresh_parameter(ty))
+        {
+            let renamed = self
+                .type_parameter_names
+                .iter()
+                .filter(|(identity, name)| {
+                    crate::opaque_type_param_display(identity) != name.as_str()
+                })
+                .map(|(identity, _)| (identity.clone(), Type::Never))
+                .collect();
+            if TypeChecker::substitute(ty, &renamed)
+                != TypeChecker::substitute(ty, &Default::default())
+            {
+                let start = self.underline.len();
+                self.ty(ty);
+                // The declaration's type node is reused even when its generic
+                // references have new spellings in this signature scope.
+                self.underline
+                    .replace_range(start.., &" ".repeat(self.underline.len() - start));
+            } else {
+                self.original(&annotation.text);
+            }
         } else {
             self.ty(ty);
         }
     }
     fn has_fresh_parameter(&self, ty: &Type) -> bool {
-        if self.instantiated_parameters.is_empty() {
-            return false;
-        }
         let substitutions = self
             .instantiated_parameters
             .iter()
@@ -589,6 +682,8 @@ impl PrintedType<'_> {
         predicate: Option<&TypePredicate>,
         separator: &str,
     ) {
+        let previous_type_names = self.type_parameter_names.clone();
+        let previous_used_names = self.used_type_parameter_names.clone();
         let parameter_depth = self.value_parameters.len();
         self.value_parameters
             .extend(parameters.iter().map(|(name, _)| {
@@ -611,6 +706,9 @@ impl PrintedType<'_> {
                 .extend(source.instantiated_parameters.iter().cloned());
         }
         if !type_parameters.is_empty() {
+            for identity in type_parameters {
+                self.type_parameter_name(identity);
+            }
             self.synthetic("<");
             for (i, name) in type_parameters.iter().enumerate() {
                 if i != 0 {
@@ -618,18 +716,33 @@ impl PrintedType<'_> {
                 }
                 let declaration = source
                     .and_then(|s| s.type_parameters.get(i))
-                    .filter(|(n, _)| n == name);
-                self.write(name, declaration.is_some());
+                    .filter(|(n, _)| n == crate::opaque_type_param_display(name));
+                let printed = self.type_parameter_name(name);
+                self.write(
+                    &printed,
+                    declaration.is_some()
+                        && (printed == crate::opaque_type_param_display(name)
+                            || source.is_some_and(|s| s.reused_parameter_nodes)),
+                );
                 if let Some(Some(constraint)) = constraints.get(i) {
-                    self.synthetic(" extends ");
+                    self.write(
+                        " extends ",
+                        source.is_some_and(|s| s.reused_parameter_nodes),
+                    );
                     self.annotation(
                         constraint,
                         declaration.and_then(|(_, annotation)| annotation.as_ref()),
                     );
                 }
                 if let Some(Some(default)) = defaults.get(i) {
-                    self.synthetic(" = ");
+                    let original = source.is_some_and(|s| s.reused_parameter_nodes);
+                    self.write(" = ", original);
+                    let start = self.underline.len();
                     self.ty(default);
+                    if original {
+                        self.underline
+                            .replace_range(start.., &" ".repeat(self.underline.len() - start));
+                    }
                 }
             }
             self.synthetic(">");
@@ -649,8 +762,13 @@ impl PrintedType<'_> {
             let declaration = source
                 .and_then(|s| s.parameters.get(i))
                 .filter(|p| p.name == name || name == "_");
+            let original_parameter = source.is_some_and(|s| s.reused_parameter_nodes)
+                && declaration
+                    .and_then(|p| p.annotation.as_ref())
+                    .is_some_and(|annotation| self.annotation_matches(ty, &annotation.ty))
+                && !self.has_fresh_parameter(ty);
             if rest {
-                self.synthetic("...");
+                self.write("...", original_parameter);
             }
             if let Some(declaration) = declaration.filter(|p| !p.name.is_empty()) {
                 self.original(&declaration.name);
@@ -660,18 +778,9 @@ impl PrintedType<'_> {
             if optional {
                 self.synthetic("?");
             }
-            // Serializing an inferred returned function reuses its explicit
-            // receiver declaration; printing the function itself synthesizes it.
-            if name == "this"
-                && source.is_some_and(|s| s.original_this_parameter)
-                && declaration
-                    .and_then(|p| p.annotation.as_ref())
-                    .is_some_and(|a| a.ty == *ty)
-            {
-                self.original(": ");
-            } else {
-                self.synthetic(": ");
-            }
+            // A returned function can reuse its unchanged parameter nodes;
+            // a directly printed signature creates parameter nodes instead.
+            self.write(": ", original_parameter);
             self.annotation(ty, declaration.and_then(|p| p.annotation.as_ref()));
         }
         self.synthetic(")");
@@ -689,6 +798,8 @@ impl PrintedType<'_> {
         self.instantiated_parameters = previous_parameters;
         self.signature_file = previous_file;
         self.value_parameters.truncate(parameter_depth);
+        self.type_parameter_names = previous_type_names;
+        self.used_type_parameter_names = previous_used_names;
     }
     fn parenthesized(&mut self, ty: &Type, parens: bool) {
         if parens {
@@ -736,6 +847,24 @@ impl PrintedType<'_> {
             }
         }
         match ty {
+            Type::TypeParameter(identity) => {
+                let name = self.type_parameter_name(identity);
+                self.synthetic(&name);
+            }
+            Type::TypeReference(identity, arguments)
+                if arguments.is_empty()
+                    && (self.type_parameter_names.contains_key(identity)
+                        || self.checker.is_some_and(|checker| {
+                            checker.type_parameter_in_resolution(identity)
+                                && !checker.class_info.contains_key(identity)
+                                && !checker.interface_info.contains_key(identity)
+                                && !checker.type_aliases.contains_key(identity)
+                                && !checker.enum_info.contains_key(identity)
+                        })) =>
+            {
+                let name = self.type_parameter_name(identity);
+                self.synthetic(&name);
+            }
             Type::Namespace(namespace) => {
                 // symbolToTypeNode uses a type query for value-space symbols.
                 // Resolve its symbol chain against the native lexical scopes.
@@ -1007,11 +1136,34 @@ pub(crate) fn print_type(ty: &Type) -> PrintedType<'static> {
     result
 }
 
+pub(crate) fn print_function_declaration<'a>(
+    ty: &Type,
+    checker: &'a TypeChecker,
+) -> PrintedType<'a> {
+    let mut result = PrintedType {
+        checker: Some(checker),
+        ..Default::default()
+    };
+    result.ty(ty);
+    result
+}
+
 pub(crate) fn print_type_in_context<'a>(ty: &Type, checker: &'a TypeChecker) -> PrintedType<'a> {
     let mut result = PrintedType {
         checker: Some(checker),
         ..Default::default()
     };
+    let mut visible = std::collections::HashSet::new();
+    for identity in checker
+        .active_type_param_names
+        .iter()
+        .rev()
+        .flat_map(|frame| frame.iter())
+    {
+        if visible.insert(crate::opaque_type_param_display(identity)) {
+            result.type_parameter_name(identity);
+        }
+    }
     result.ty(ty);
     result
 }
@@ -1493,7 +1645,7 @@ mod tests {
         };
         signature.source = SignatureSource(Some(Arc::new(SignatureDeclaration {
             source_file: None,
-            original_this_parameter: false,
+            reused_parameter_nodes: false,
             instantiated_parameters: Vec::new(),
             function_type: false,
             parameters: vec![ParameterDeclaration {

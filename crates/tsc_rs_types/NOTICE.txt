@@ -117,3 +117,19 @@ index-info tables without materializing incomplete structural library shapes.
 Iterable reference displays elide matching trailing defaults following the
 backwards-compatible argument elision in nodebuilder_impl_p3.rs at that same
 revision. Native member resolution still instantiates the declaration defaults.
+
+Lexical generic reference resolution adapts resolveEntityName from
+checker_p17.rs and getTypeFromTypeReference from checker_p25.rs in that pinned
+revision. Native declaration scopes distinguish parameters from same-named
+program and library types; cached library declarations use an isolated
+resolution environment.
+
+Nested function-expression parameter identity and source-aware generic naming
+adapt typeParameterToName (checker/nodebuilder_impl_p2.rs) and the scoped
+name tables (checker/nodebuilder_scopes.rs) from the same pinned source.
+Native declaration/file identities replace donor TypeId/symbol keys; the
+native checker remains responsible for binding, inference and substitution.
+
+Readonly property combination follows createUnionOrIntersectionProperty in
+checker_p24.rs: unions retain any readonly declaration, while intersections
+allow writes when a constituent declares the same property as mutable.

@@ -41,7 +41,8 @@ impl TypeChecker {
             .iter()
             .map(|parameter| {
                 (
-                    parameter.name.clone(),
+                    self.resolved_type_parameter_name(&parameter.name)
+                        .unwrap_or_else(|| parameter.name.clone()),
                     parameter
                         .constraint
                         .as_ref()

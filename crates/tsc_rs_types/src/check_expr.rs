@@ -1759,7 +1759,37 @@ impl TypeChecker {
         let diagnostics = self.diagnostics.len();
         let receiver = self.check_expr(object);
         self.diagnostics.truncate(diagnostics);
-        let (mut class, mut args, is_static) = match &receiver {
+        self.setter_write_type_for_receiver(&receiver, property, 0)
+    }
+
+    fn setter_write_type_for_receiver(
+        &self,
+        receiver: &Type,
+        property: &str,
+        depth: usize,
+    ) -> Option<Type> {
+        if depth >= 16 {
+            return None;
+        }
+        if let Type::Intersection(members) = receiver {
+            let mut values = Vec::new();
+            let mut has_setter = false;
+            let index = Type::StringLiteral(property.to_owned());
+            for member in members.iter() {
+                if let Some(value) =
+                    self.setter_write_type_for_receiver(member, property, depth + 1)
+                {
+                    has_setter = true;
+                    values.push(value);
+                } else if let Some(value) = self.known_literal_index_read(member, &index, 0) {
+                    values.push(value);
+                } else if self.intersection_property_presence(member, property, 0) != Some(false) {
+                    return None;
+                }
+            }
+            return has_setter.then(|| type_ops::simplify_intersection(values));
+        }
+        let (mut class, mut args, is_static) = match receiver {
             Type::TypeReference(name, args) => match name.strip_prefix("typeof ") {
                 Some(class) => (class.to_string(), args.clone(), true),
                 None => (name.to_string(), args.clone(), false),
@@ -11454,6 +11484,8 @@ impl TypeChecker {
                 self.jump_function_depth += 1;
                 let pushed_type_params =
                     self.push_active_type_param_names(fn_decl.type_params.as_deref());
+                let identities = self.function_expression_parameters(fn_decl);
+                self.identify_active_function_parameters(&identities);
                 self.check_active_type_param_declarations(fn_decl.type_params.as_deref());
                 self.check_function_like_future_lib_globals(
                     &fn_decl.params,
@@ -11502,18 +11534,19 @@ impl TypeChecker {
                             .as_ref()
                             .map(|t| self.resolve_type_node(t))
                             .unwrap_or(Type::Any);
-                        self.record_pattern_types(&p.name, &pty);
-                        self.check_binding_pattern_access(&p.name, &pty);
-                        self.declare_pattern_vars(&p.name, pty.clone());
+                        let pty = Self::identify_type_parameters(&pty, &identities);
+                        let binding_type = self.declared_optional_param_type(p, pty.clone());
+                        self.record_pattern_types(&p.name, &binding_type);
+                        self.check_binding_pattern_access(&p.name, &binding_type);
+                        self.declare_pattern_vars(&p.name, binding_type);
                         self.completion_mark_parameter(p);
                         self.mark_optional_parameter(p);
                         (pname, pty)
                     })
                     .collect();
-                let expected = fn_decl
-                    .return_type
-                    .as_ref()
-                    .map(|ty| self.resolve_type_node(ty));
+                let expected = fn_decl.return_type.as_ref().map(|ty| {
+                    Self::identify_type_parameters(&self.resolve_type_node(ty), &identities)
+                });
                 self.return_type_stack
                     .push(self.unwrap_async_return(expected, fn_decl.is_async));
                 self.return_is_async_stack.push(fn_decl.is_async);
@@ -11539,42 +11572,64 @@ impl TypeChecker {
                 self.return_is_async_stack.pop();
                 self.generator_stack.pop();
                 let ret = if let Some(ref rt) = fn_decl.return_type {
-                    self.resolve_type_node(rt)
+                    Self::identify_type_parameters(&self.resolve_type_node(rt), &identities)
                 } else if let Some(ref body) = fn_decl.body {
                     self.infer_return_type_from_block(body)
                 } else {
                     Type::Any
                 };
-                let fn_tp = fn_decl
+                let mut fn_tp = fn_decl
                     .return_type
                     .as_ref()
                     .and_then(|rt| self.extract_type_predicate(rt));
+                if let Some(predicate) = &mut fn_tp {
+                    predicate.target_type = Arc::new(Self::identify_type_parameters(
+                        &predicate.target_type,
+                        &identities,
+                    ));
+                }
                 self.fn_nesting_depth -= 1;
                 self.jump_function_depth -= 1;
                 self.var_first_types = saved_var_first_types2;
-                self.pop_active_type_param_names(pushed_type_params);
-                self.pop_scope();
-                Type::Function(FunctionType {
-                    source: self.signature_source(
-                        &fn_decl.params,
-                        &params,
-                        fn_decl.type_params.as_deref(),
-                        fn_decl.return_type.as_ref(),
-                        &ret,
-                    ),
+                let result = Type::Function(FunctionType {
+                    source: self
+                        .signature_source(
+                            &fn_decl.params,
+                            &params,
+                            fn_decl.type_params.as_deref(),
+                            fn_decl.return_type.as_ref(),
+                            &ret,
+                        )
+                        .with_parameter_identities(&identities),
                     type_param_constraints: self
-                        .resolve_type_param_constraints(fn_decl.type_params.as_deref()),
+                        .resolve_type_param_constraints(fn_decl.type_params.as_deref())
+                        .into_iter()
+                        .map(|ty| ty.map(|ty| Self::identify_type_parameters(&ty, &identities)))
+                        .collect(),
                     params,
                     return_type: Arc::new(ret),
                     type_params: fn_decl
                         .type_params
                         .as_ref()
-                        .map(|tps| tps.iter().map(|tp| tp.name.clone()).collect())
+                        .map(|tps| {
+                            tps.iter()
+                                .map(|tp| match identities.get(&tp.name) {
+                                    Some(Type::TypeParameter(identity)) => identity.clone(),
+                                    _ => tp.name.clone(),
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default(),
                     type_param_defaults: self
-                        .resolve_type_param_defaults(fn_decl.type_params.as_deref()),
+                        .resolve_type_param_defaults(fn_decl.type_params.as_deref())
+                        .into_iter()
+                        .map(|ty| ty.map(|ty| Self::identify_type_parameters(&ty, &identities)))
+                        .collect(),
                     type_predicate: fn_tp,
-                })
+                });
+                self.pop_active_type_param_names(pushed_type_params);
+                self.pop_scope();
+                result
             }
             ExprKind::ClassExpr(class_decl) => {
                 if let (Some(name), Some(span)) = (&class_decl.name, class_decl.name_span) {

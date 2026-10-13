@@ -181,7 +181,8 @@ const literal: { get g(): number } = { g: 1 };
     );
     assert_eq!(
         messages(&diagnostics, 2339),
-        vec!["Property 'nope' does not exist on type '{ g: number; h: string; f(): void; }'."],
+        // TypeScript 6.0.3 prints getter-only signatures as readonly properties.
+        vec!["Property 'nope' does not exist on type '{ readonly g: number; h: string; f(): void; }'."],
         "diagnostics: {diagnostics:?}"
     );
     assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");

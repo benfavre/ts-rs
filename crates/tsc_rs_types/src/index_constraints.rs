@@ -131,6 +131,22 @@ impl TypeChecker {
             _ => return None,
         };
         match receiver {
+            Type::Intersection(members) => {
+                let mut values = Vec::new();
+                for member in members.iter() {
+                    if let Some(value) = self.known_literal_index_read(member, index, depth + 1) {
+                        values.push(value);
+                    } else if self.intersection_property_presence(member, &key, depth + 1)
+                        != Some(false)
+                    {
+                        // An unresolved constituent or index signature may
+                        // contribute another type. Leave the composite access
+                        // deferred instead of discarding that contribution.
+                        return None;
+                    }
+                }
+                (!values.is_empty()).then(|| type_ops::simplify_intersection(values))
+            }
             Type::Array(element) => {
                 if key == "length" {
                     Some(Type::Number)

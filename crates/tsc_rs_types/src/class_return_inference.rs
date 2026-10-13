@@ -48,7 +48,13 @@ impl Environment {
     }
 }
 
-struct EnvironmentGuard(Environment);
+pub(super) struct EnvironmentGuard(Environment);
+
+/// Cached library declarations are resolved in their own environment, never
+/// in the signature which first caused a library file to be loaded.
+pub(super) fn isolated_environment() -> EnvironmentGuard {
+    Environment::default().enter()
+}
 
 impl Drop for EnvironmentGuard {
     fn drop(&mut self) {
