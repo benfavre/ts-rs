@@ -1764,6 +1764,7 @@ impl TypeChecker {
     }
 
     pub(crate) fn resolve_fn_type(&self, fn_decl: &FnDecl) -> FunctionType {
+        let _receiver = self.infer_function_receiver(&fn_decl.params);
         let _own_type_params = crate::type_params_in_resolution(fn_decl.type_params.as_deref());
         let _constraints = self.inferred_constraint_scope(fn_decl.type_params.as_deref());
         let params: Vec<(String, Type)> = fn_decl
@@ -2110,6 +2111,12 @@ impl TypeChecker {
                     }
                     _ => self.infer_expr_type(expr),
                 };
+                let mut ty = ty;
+                if matches!(expr.kind, ExprKind::FnExpr(_)) {
+                    if let Type::Function(signature) = &mut ty {
+                        signature.source = signature.source.clone().with_original_this_parameter();
+                    }
+                }
                 out.push(self.widen_fresh_return_expr_type(expr, ty));
             }
             // A bare `return;` is recorded as `void` so callers can tell it
@@ -2284,8 +2291,22 @@ impl TypeChecker {
     }
 
     fn infer_expr_type_unsimplified(&self, expr: &Expr) -> Type {
+        // Resolve operands even when an operator fixes its result type. A
+        // receiver call in either operand can make this signature circular.
+        if crate::class_return_inference::active() {
+            if let ExprKind::Binary(binary) = &expr.kind {
+                if !matches!(
+                    binary.op,
+                    BinaryOp::Add | BinaryOp::LogAnd | BinaryOp::LogOr | BinaryOp::NullCoal
+                ) {
+                    self.infer_expr_type(&binary.left);
+                    self.infer_expr_type(&binary.right);
+                }
+            }
+        }
         match &expr.kind {
             ExprKind::NumLit(n) => Type::NumberLiteral(n.to_string()),
+            ExprKind::This => crate::class_return_inference::this_type().unwrap_or(Type::Any),
             ExprKind::BigIntLit(n) => Type::BigIntLiteral(n.to_string()),
             ExprKind::StrLit(s) => Type::StringLiteral(self.cooked_property_literal(s, expr.span)),
             ExprKind::BoolLit(b) => Type::BooleanLiteral(*b),
@@ -3101,6 +3122,9 @@ impl TypeChecker {
                 let obj_ty = self.infer_expr_type(&mem.object);
                 let obj_ty = self.widen_fresh_array_type(&mem.object, obj_ty);
                 let obj_ty = self.fresh_index_receiver_type(&mem.object, obj_ty);
+                if let Some(value) = self.infer_receiver_member(&obj_ty, &mem.property) {
+                    return value;
+                }
                 match &obj_ty {
                     Type::ObjectType(info) => {
                         info.properties
@@ -3196,6 +3220,11 @@ impl TypeChecker {
                 let obj_ty = self.widen_fresh_array_type(&ea.object, obj_ty);
                 let obj_ty = self.fresh_index_receiver_type(&ea.object, obj_ty);
                 let index = self.infer_expr_type(&ea.index);
+                if let Type::StringLiteral(name) | Type::NumberLiteral(name) = &index {
+                    if let Some(value) = self.infer_receiver_member(&obj_ty, name) {
+                        return value;
+                    }
+                }
                 if let Some(value) = self.array_or_tuple_type(&obj_ty, 0).and_then(|shape| {
                     crate::tuple_access::indexed_type(
                         &shape,

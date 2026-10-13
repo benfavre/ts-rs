@@ -1757,35 +1757,59 @@ impl TypeChecker {
         let diagnostics = self.diagnostics.len();
         let receiver = self.check_expr(object);
         self.diagnostics.truncate(diagnostics);
-        let (class, args, is_static) = match &receiver {
+        let (mut class, mut args, is_static) = match &receiver {
             Type::TypeReference(name, args) => match name.strip_prefix("typeof ") {
                 Some(class) => (class.to_string(), args.clone(), true),
                 None => (name.to_string(), args.clone(), false),
             },
             _ => return None,
         };
-        let info = self.class_info.get(class.as_str())?;
-        let setter = info
-            .setter_types
-            .get(&(property.to_string(), is_static))?
-            .clone();
-        if is_static || info.type_params.is_empty() || args.is_empty() {
-            return Some(setter);
+        let mut seen = HashSet::new();
+        while seen.insert(class.clone()) {
+            let info = self.class_info.get(class.as_str())?;
+            let map: HashMap<std::string::String, Type> = info
+                .type_params
+                .iter()
+                .cloned()
+                .zip(args.iter().cloned())
+                .collect();
+            let names: std::collections::HashSet<&str> = info
+                .type_params
+                .iter()
+                .map(std::string::String::as_str)
+                .collect();
+            let instantiate = |ty: &Type| {
+                if is_static || map.is_empty() {
+                    ty.clone()
+                } else {
+                    crate::inference::substitute(&Self::rewrite_type_param_refs(ty, &names), &map)
+                }
+            };
+            if let Some(setter) = info.setter_types.get(&(property.to_owned(), is_static)) {
+                return Some(instantiate(setter));
+            }
+            let (properties, methods) = if is_static {
+                (&info.static_properties, &info.static_methods)
+            } else {
+                (&info.instance_properties, &info.instance_methods)
+            };
+            // An own field, method or getter shadows the base accessor.
+            if properties.iter().any(|(name, _)| name == property)
+                || methods.iter().any(|(name, _)| name == property)
+            {
+                return None;
+            }
+            // Carry substitutions through every heritage edge, so D<number>
+            // extends C<T[]> writes to C's setter using number[].
+            class = info.extends.clone()?;
+            args = info
+                .extends_type_args
+                .iter()
+                .map(instantiate)
+                .collect::<Vec<_>>()
+                .into();
         }
-        let map: HashMap<std::string::String, Type> = info
-            .type_params
-            .iter()
-            .cloned()
-            .zip(args.iter().cloned())
-            .collect();
-        // The annotation holds the class's type parameters as references.
-        let names: std::collections::HashSet<&str> = info
-            .type_params
-            .iter()
-            .map(std::string::String::as_str)
-            .collect();
-        let setter = Self::rewrite_type_param_refs(&setter, &names);
-        Some(crate::inference::substitute(&setter, &map))
+        None
     }
 
     pub(super) fn report_readonly_property_write(&mut self, target: &Expr) -> bool {

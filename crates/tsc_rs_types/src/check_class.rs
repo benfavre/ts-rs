@@ -1268,6 +1268,7 @@ impl TypeChecker {
             type_param_defaults,
             required_type_params,
         };
+        let info = self.refine_class_returns(class_decl, info);
         self.exit_type_resolution_type_params();
         info
     }

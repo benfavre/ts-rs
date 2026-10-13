@@ -1,7 +1,7 @@
 use super::*;
 
 thread_local! {
-    static INFERRED_CONSTRAINTS: RefCell<Vec<rustc_hash::FxHashMap<String, Option<Type>>>> =
+    pub(super) static INFERRED_CONSTRAINTS: RefCell<Vec<rustc_hash::FxHashMap<String, Option<Type>>>> =
         const { RefCell::new(Vec::new()) };
 }
 

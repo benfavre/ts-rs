@@ -9,6 +9,14 @@ use tsc_rs_ast::*;
 
 #[derive(Debug, Clone, Default)]
 pub struct SignatureSource(Option<Arc<SignatureDeclaration>>);
+impl SignatureSource {
+    pub(crate) fn with_original_this_parameter(mut self) -> Self {
+        if let Some(source) = &mut self.0 {
+            Arc::make_mut(source).original_this_parameter = true;
+        }
+        self
+    }
+}
 impl PartialEq for SignatureSource {
     fn eq(&self, _: &Self) -> bool {
         true
@@ -31,6 +39,7 @@ struct ParameterDeclaration {
 }
 #[derive(Debug, Clone)]
 struct SignatureDeclaration {
+    original_this_parameter: bool,
     parameters: Vec<ParameterDeclaration>,
     type_parameters: Vec<(String, Option<Annotation>)>,
     return_type: Option<Annotation>,
@@ -329,6 +338,7 @@ impl TypeChecker {
         }
         let annotation = |node: &TypeNode, ty: &Type| self.source_annotation(node, ty);
         SignatureSource(Some(Arc::new(SignatureDeclaration {
+            original_this_parameter: false,
             parameters: parameters
                 .iter()
                 .zip(types)
@@ -377,6 +387,7 @@ impl TypeChecker {
             })
         };
         SignatureSource(Some(Arc::new(SignatureDeclaration {
+            original_this_parameter: false,
             parameters: signature
                 .params
                 .iter()
@@ -518,7 +529,18 @@ impl PrintedType {
             if optional {
                 self.synthetic("?");
             }
-            self.synthetic(": ");
+            // Serializing an inferred returned function reuses its explicit
+            // receiver declaration; printing the function itself synthesizes it.
+            if name == "this"
+                && source.is_some_and(|s| s.original_this_parameter)
+                && declaration
+                    .and_then(|p| p.annotation.as_ref())
+                    .is_some_and(|a| a.ty == *ty)
+            {
+                self.original(": ");
+            } else {
+                self.synthetic(": ");
+            }
             self.annotation(ty, declaration.and_then(|p| p.annotation.as_ref()));
         }
         self.synthetic(")");
@@ -1259,6 +1281,7 @@ mod tests {
             unreachable!()
         };
         signature.source = SignatureSource(Some(Arc::new(SignatureDeclaration {
+            original_this_parameter: false,
             parameters: vec![ParameterDeclaration {
                 name: "x".into(),
                 annotation: Some(Annotation {

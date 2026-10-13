@@ -15,6 +15,7 @@ mod check_class;
 mod check_expr;
 mod check_narrowing;
 mod check_uncalled;
+mod class_return_inference;
 mod constructor_signatures;
 mod contextual_literals;
 pub mod control_flow;
@@ -15285,6 +15286,17 @@ impl TypeChecker {
         }
     }
 
+    fn clear_class_resolution_caches(&mut self) {
+        self.ref_resolve_memo
+            .get_mut()
+            .expect("ref_resolve_memo lock poisoned")
+            .clear();
+        self.assign_memo
+            .get_mut()
+            .expect("assign_memo lock poisoned")
+            .clear();
+    }
+
     /// Build the VALUE exports of a namespace body (annotated/inferred vars
     /// with an in-order local alias env, declared function signatures,
     /// lenient implementation shapes, and class refs).
@@ -16172,17 +16184,17 @@ impl TypeChecker {
                             }
                             ClassMemberKind::GetAccessor(acc) => {
                                 let name_span = acc.name.span();
-                                let ty = acc
-                                    .return_type
-                                    .as_ref()
-                                    .map(|t| self.resolve_type_node(t))
-                                    .unwrap_or_else(|| {
-                                        if let Some(ref body) = acc.body {
-                                            self.infer_return_type_from_stmts(body)
-                                        } else {
-                                            Type::Any
-                                        }
-                                    });
+                                let name = self.prop_name_to_string(&acc.name);
+                                let properties = if acc.modifiers & MOD_STATIC != 0 {
+                                    &info.static_properties
+                                } else {
+                                    &info.instance_properties
+                                };
+                                let ty = properties
+                                    .iter()
+                                    .find(|(key, _)| key == &name)
+                                    .map(|(_, ty)| ty.clone())
+                                    .unwrap_or(Type::Any);
                                 self.record_expression_type_span(name_span, &ty);
                                 if !matches!(ty, Type::Any) {
                                     self.expression_types
@@ -29019,15 +29031,18 @@ impl TypeChecker {
                         .as_ref()
                         .map(|arguments| arguments.len())
                         .unwrap_or(0);
-                    let class_lookup_name = name
-                        .rsplit_once('.')
-                        .and_then(|(namespace, member)| {
-                            self.namespace_member_names
-                                .get(namespace)
-                                .is_some_and(|members| members.contains(member))
-                                .then_some(member)
-                        })
-                        .unwrap_or(name.as_str());
+                    let class_lookup_name = if self.class_info.contains_key(&name) {
+                        name.as_str()
+                    } else {
+                        name.rsplit_once('.')
+                            .and_then(|(namespace, member)| {
+                                self.namespace_member_names
+                                    .get(namespace)
+                                    .is_some_and(|members| members.contains(member))
+                                    .then_some(member)
+                            })
+                            .unwrap_or(name.as_str())
+                    };
                     let class_arity = self.class_info.get(class_lookup_name).and_then(|info| {
                         if info.type_params.is_empty() {
                             return None;
@@ -30654,6 +30669,16 @@ impl TypeChecker {
                 .as_deref()
                 .map(|owner| format!("{owner}.{namespace_name}"))
                 .unwrap_or_else(|| namespace_name.clone());
+            // The program-wide inventory excludes external-module locals.
+            // They still own lexical type names while checking their bodies.
+            let enclosing_type_names = Arc::clone(&self.namespace_type_names);
+            if matches!(module_decl.name, ModuleName::Ident(_)) {
+                Self::collect_namespace_type_names(
+                    module_decl,
+                    &namespace_path,
+                    Arc::make_mut(&mut self.namespace_type_names),
+                );
+            }
             let previous_type_resolution_namespace =
                 self.type_resolution_namespace.replace(namespace_path);
             self.push_scope();
@@ -30696,6 +30721,39 @@ impl TypeChecker {
             for s in body {
                 self.hoist_lexical_type_declaration(s);
                 self.hoist_namespace_value_member(s);
+            }
+            // Bare class names belong to this namespace block while its body
+            // is checked. A different namespace's same-named constructor must
+            // not supply instance members or polymorphic-this return types.
+            let enclosing_classes: Vec<_> =
+                body.iter()
+                    .filter_map(|statement| {
+                        let declaration = match &statement.kind {
+                            StmtKind::Export(export) => match &export.kind {
+                                ExportDeclKind::Decl(inner)
+                                | ExportDeclKind::DefaultDecl(inner) => inner,
+                                _ => return None,
+                            },
+                            _ => statement,
+                        };
+                        let StmtKind::ClassDecl(class) = &declaration.kind else {
+                            return None;
+                        };
+                        let name = class.name.as_ref()?;
+                        self.class_info
+                            .get(name)
+                            .cloned()
+                            .map(|info| (name.clone(), info))
+                    })
+                    .collect();
+            if !enclosing_classes.is_empty() {
+                // Cached references and relations contain the previous
+                // namespace's bare class shapes.
+                self.clear_class_resolution_caches();
+            }
+            self.refresh_current_file_class_info(body);
+            if !enclosing_classes.is_empty() {
+                self.clear_class_resolution_caches();
             }
             self.declare_dotted_namespace_members(body);
             // Namespace-local import-equals declarations are also
@@ -30742,8 +30800,17 @@ impl TypeChecker {
                 self.ambient_depth -= 1;
             }
             self.var_first_types = saved_var_first_types;
+            // Keep registrations from nested namespaces. Only the bare names
+            // shadowed by this block need their enclosing entries restored.
+            if !enclosing_classes.is_empty() {
+                self.clear_class_resolution_caches();
+            }
+            for (name, info) in enclosing_classes {
+                self.class_info.insert(name, info);
+            }
             self.pop_scope();
             self.type_resolution_namespace = previous_type_resolution_namespace;
+            self.namespace_type_names = enclosing_type_names;
         }
     }
 
@@ -43856,6 +43923,9 @@ impl TypeChecker {
     }
 
     fn resolve_member_on_type_impl(&self, ty: &Type, property: &str) -> Type {
+        if let Some(value) = self.infer_receiver_member(ty, property) {
+            return value;
+        }
         if let Some(value) = self.array_or_tuple_type(ty, 0).and_then(|shape| {
             crate::tuple_access::indexed_type(
                 &shape,

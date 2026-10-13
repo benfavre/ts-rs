@@ -52,3 +52,8 @@ Setter-only object spread reads adapt getSpreadSymbol from checker_p15.rs in
 that same ts-rust revision. The native object representation retains setter
 kind through substitutions and inheritance, then copies undefined as the
 spread value without changing the original annotated accessor type.
+
+Class return-type inference adapts getReturnTypeOfSignature's resolution stack
+from checker_p22.rs in that same ts-rust revision. Native class member shapes,
+parameter scopes and AST bodies replace symbol links and signature targets;
+lazy resolution preserves declaration-order independence and detects cycles.
