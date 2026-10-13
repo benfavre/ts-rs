@@ -41,6 +41,7 @@ mod javascript_aliases;
 mod jsdoc;
 mod jump_targets;
 mod layered_map;
+mod member_type_spans;
 mod module_augmentations;
 mod module_resolution_diagnostics;
 pub mod narrowing;
@@ -1121,6 +1122,8 @@ struct InterfaceInfo {
     index_locations: rustc_hash::FxHashMap<Type, (String, Span)>,
     /// Properties and methods resolved to an ObjectTypeInfo.
     object_type: ObjectTypeInfo,
+    /// Opt-in declaration signatures before structural overload deduplication.
+    method_declarations: Vec<member_type_spans::MethodDeclaration>,
     /// Names of optional properties (should not cause TS2420 if missing).
     optional_props: Vec<std::string::String>,
     /// First property declaration in merged interface fragments.
@@ -4054,6 +4057,7 @@ impl TypeChecker {
             "BigUint64Array",
         ] {
             interfaces.get_or_insert_with(name.to_string(), || InterfaceInfo {
+                method_declarations: Vec::new(),
                 declaration_span: Span::new(0, 0),
                 decl_file: String::new(),
                 is_global: true,
@@ -11355,6 +11359,15 @@ impl TypeChecker {
     }
 
     fn merge_interface_info(existing: &mut InterfaceInfo, incoming: InterfaceInfo) {
+        for declaration in &incoming.method_declarations {
+            // Re-injection of one declaration is not another overload. Two
+            // distinct declarations with equal signatures still both print.
+            if !existing.method_declarations.iter().any(|previous| {
+                previous.file == declaration.file && previous.span == declaration.span
+            }) {
+                existing.method_declarations.push(declaration.clone());
+            }
+        }
         existing.object_type.setter_only_names.retain(|name| {
             !incoming
                 .object_type
@@ -30169,6 +30182,17 @@ impl TypeChecker {
                     self.check_type_node_generic_arity(extends);
                 }
                 self.check_object_type_duplicate_members(&interface.members);
+                self.record_method_signature_types(
+                    &interface.members,
+                    self.interface_info.get(&interface.name).map(|info| {
+                        info.method_declarations
+                            .iter()
+                            .map(|declaration| {
+                                (declaration.name.clone(), Arc::new(declaration.ty.clone()))
+                            })
+                            .collect()
+                    }),
+                );
                 for member in &interface.members {
                     self.check_type_member_future_lib_globals(member);
                 }
@@ -32507,6 +32531,7 @@ impl TypeChecker {
             }
             TypeNodeKind::TypeLit(members) => {
                 self.check_object_type_duplicate_members(members);
+                self.record_method_signature_types(members, None);
                 for member in members {
                     self.check_type_member_future_lib_globals(member);
                 }
@@ -32679,6 +32704,7 @@ impl TypeChecker {
             }
             TypeNodeKind::TypeLit(members) => {
                 self.check_object_type_duplicate_members(members);
+                self.record_method_signature_types(members, None);
                 for member in members {
                     self.check_type_member_generic_arity(member);
                 }

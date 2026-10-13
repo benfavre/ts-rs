@@ -1310,6 +1310,7 @@ impl TypeChecker {
         let mut index_sig = None;
         let mut index_sig_name: Option<std::string::String> = None;
         let mut optional_props = Vec::new();
+        let mut method_declarations = Vec::new();
 
         for member in &iface_decl.members {
             match &member.kind {
@@ -1408,6 +1409,19 @@ impl TypeChecker {
                     self.exit_type_resolution_type_params();
                     if method.optional {
                         optional_props.push(name.clone());
+                    }
+                    if self.expression_type_spans.is_some() {
+                        method_declarations.push(crate::member_type_spans::MethodDeclaration {
+                            name: name.clone(),
+                            file: self
+                                .injected_decl_file
+                                .as_ref()
+                                .or(self.current_file_name.as_ref())
+                                .cloned()
+                                .unwrap_or_default(),
+                            span: method.name.span(),
+                            ty: Type::Function(ft.clone()),
+                        });
                     }
                     props.push((name, Arc::new(Type::Function(ft))));
                 }
@@ -1643,6 +1657,7 @@ impl TypeChecker {
         let props = merge_overloaded_function_props(props);
 
         let info = InterfaceInfo {
+            method_declarations,
             index_signatures: self.interface_index_signature_types(iface_decl),
             index_locations: self.interface_index_locations(iface_decl),
             declaration_span: iface_decl.span,
