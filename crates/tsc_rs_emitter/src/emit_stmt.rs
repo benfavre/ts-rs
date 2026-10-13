@@ -16635,6 +16635,15 @@ impl<'a> Emitter<'a> {
 
     /// Block-level using disposal scope — uses `const` for bindings.
     pub(crate) fn emit_block_using_dispose_scope(&mut self, stmts: &[Stmt]) {
+        self.emit_block_using_dispose_scope_with_binding(stmts, "const");
+    }
+
+    /// Shared disposal envelope for block scopes and lowered function bodies.
+    pub(super) fn emit_block_using_dispose_scope_with_binding(
+        &mut self,
+        stmts: &[Stmt],
+        keyword: &str,
+    ) {
         let has_await = stmts
             .iter()
             .any(|s| matches!(&s.kind, StmtKind::Var(vs) if vs.kind == VarKind::AwaitUsing));
@@ -16643,7 +16652,7 @@ impl<'a> Emitter<'a> {
         let env_num = self.next_using_env_num();
 
         self.writeln(&format!(
-            "const env_{env_num} = {{ stack: [], error: void 0, hasError: false }};"
+            "{keyword} env_{env_num} = {{ stack: [], error: void 0, hasError: false }};"
         ));
         self.writeln("try {");
         self.indent += 1;
@@ -16654,7 +16663,8 @@ impl<'a> Emitter<'a> {
                     for d in &vs.declarations {
                         if let PatKind::Ident(name) = &d.name.kind {
                             if let Some(init) = &d.init {
-                                self.write("const ");
+                                self.write(keyword);
+                                self.write(" ");
                                 self.write(name);
                                 self.write(" = ");
                                 self.write(self.helper_prefix());
@@ -16681,7 +16691,7 @@ impl<'a> Emitter<'a> {
         self.indent += 1;
         if has_await {
             self.writeln(&format!(
-                "const result_{env_num} = {}__disposeResources(env_{env_num});",
+                "{keyword} result_{env_num} = {}__disposeResources(env_{env_num});",
                 self.helper_prefix()
             ));
             self.writeln(&format!("if (result_{env_num})"));

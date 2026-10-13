@@ -19188,3 +19188,130 @@ class C {
         "{stripped}"
     );
 }
+
+#[test]
+fn test_es5_derived_constructor_resources_enclose_super_and_instance_initializers() {
+    let js = emit_ts_with(
+        r#"
+var events: string[] = [];
+function resource(name: string) {
+    events.push("acquire " + name);
+    return { [Symbol.dispose]() { events.push("dispose " + name); } };
+}
+class Base {
+    constructor() { events.push("base"); return { base: 7 }; }
+}
+class Derived extends Base {
+    value = (events.push("field " + this.parameter), this.base + 1);
+    constructor(public parameter: number) {
+        using before = resource("before");
+        events.push("before base");
+        super();
+        using after = resource("after");
+        events.push("body " + this.value);
+    }
+}
+var value = new Derived(3);
+console.log(events.join(","), value.parameter, value.value);
+"#,
+        CompilerOptions {
+            target: Some(ScriptTarget::ES5),
+            ..Default::default()
+        },
+    );
+    assert!(
+        !js.contains("class Derived") && !js.contains("using before"),
+        "{js}"
+    );
+    assert_node_syntax(&js);
+    assert_eq!(execute_with_node(&js), "acquire before,before base,base,field 3,acquire after,body 8,dispose after,dispose before 3 8");
+}
+
+#[test]
+fn test_es5_derived_constructor_resources_dispose_on_super_or_field_errors() {
+    let js = emit_ts_with(
+        r#"
+var events: string[] = [];
+function resource(name: string) {
+    return { [Symbol.dispose]() { events.push("dispose " + name); throw new Error("dispose " + name); } };
+}
+function fail() { events.push("field"); throw new Error("field"); }
+class Base { constructor(fails: boolean) { events.push("base"); if (fails) throw new Error("base"); } }
+class Derived extends Base {
+    value = fail();
+    constructor(fails: boolean) { using item = resource("item"); super(fails); }
+}
+for (var fails of [true, false]) {
+    try { new Derived(fails); }
+    catch (error) { events.push(error.name + ":" + error.error.message + ":" + error.suppressed.message); }
+}
+console.log(events.join(","));
+"#,
+        CompilerOptions {
+            target: Some(ScriptTarget::ES5),
+            ..Default::default()
+        },
+    );
+    assert!(
+        !js.contains("class Derived") && !js.contains("using item"),
+        "{js}"
+    );
+    assert_node_syntax(&js);
+    assert_eq!(execute_with_node(&js), "base,dispose item,SuppressedError:dispose item:base,base,field,dispose item,SuppressedError:dispose item:field");
+}
+
+#[test]
+fn test_es5_derived_constructor_delayed_super_without_resources_initializes_in_order() {
+    let js = emit_ts_with(
+        r#"
+var events: string[] = [];
+class Base { constructor() { events.push("base"); } }
+class Derived extends Base {
+    value = (events.push("field " + this.parameter), 1);
+    constructor(public parameter: number) { events.push("before"); super(); events.push("body"); }
+}
+new Derived(4);
+console.log(events.join(","));
+"#,
+        CompilerOptions {
+            target: Some(ScriptTarget::ES5),
+            ..Default::default()
+        },
+    );
+    assert!(!js.contains("class Derived"), "{js}");
+    assert_eq!(execute_with_node(&js), "before,base,field 4,body");
+}
+
+#[test]
+fn test_es5_derived_constructor_using_matches_reference() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests");
+    let source = std::fs::read_to_string(root.join(
+        "cases/conformance/statements/VariableStatements/usingDeclarations/usingDeclarations.11.ts",
+    ))
+    .unwrap();
+    let source = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("// @"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let js = emit_ts_with(
+        &source,
+        CompilerOptions {
+            target: Some(ScriptTarget::ES5),
+            module: Some(ModuleKind::ESNext),
+            strict: Some(false),
+            ..Default::default()
+        },
+    );
+    let reference = std::fs::read_to_string(
+        root.join("baselines/reference/usingDeclarations.11(target=es5).js"),
+    )
+    .unwrap();
+    let (_, expected) = reference
+        .split_once("//// [usingDeclarations.11.js]")
+        .unwrap();
+    assert_eq!(
+        normalize_newlines(js.trim()),
+        normalize_newlines(expected.trim())
+    );
+}

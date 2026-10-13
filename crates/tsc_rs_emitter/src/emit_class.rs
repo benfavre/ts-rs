@@ -3746,20 +3746,22 @@ impl<'a> Emitter<'a> {
         {
             return false;
         }
-        // Instance initialization follows one direct super call. Other
-        // constructor control-flow shapes need expression-level sequencing.
+        // Instance initialization follows one direct super call. Statements
+        // before that call keep their position; nested calls still need
+        // expression-level sequencing.
         let has_instance_initializers = class_decl.members.iter().any(|member| {
             matches!(&member.kind, ClassMemberKind::Property(property)
                 if property.initializer.is_some()
                     && property.modifiers & (MOD_STATIC | MOD_DECLARE) == 0)
+                || matches!(&member.kind, ClassMemberKind::Constructor(ctor)
+                    if ctor.params.iter().any(|param|
+                        param.modifiers & (MOD_PUBLIC | MOD_PRIVATE | MOD_PROTECTED | MOD_READONLY | MOD_OVERRIDE) != 0))
         });
         if class_decl.extends.is_some() && has_instance_initializers {
             for member in &class_decl.members {
                 if let ClassMemberKind::Constructor(ctor) = &member.kind {
                     let body = ctor.body.as_deref().unwrap_or(&[]);
-                    if body.first().and_then(Self::direct_super_call).is_none()
-                        || self.legacy_constructor_remaining_has_super(body)
-                    {
+                    if ctor.body.is_some() && self.legacy_constructor_super_index(body).is_none() {
                         return false;
                     }
                 }
@@ -4539,6 +4541,21 @@ impl<'a> Emitter<'a> {
         })
     }
 
+    fn legacy_constructor_super_index(&self, body: &[Stmt]) -> Option<usize> {
+        let index = body
+            .iter()
+            .position(|stmt| Self::direct_super_call(stmt).is_some())?;
+        body.iter()
+            .enumerate()
+            .all(|(other, stmt)| {
+                other == index
+                    || !self
+                        .source_between(stmt.span.start, stmt.span.end)
+                        .contains("super")
+            })
+            .then_some(index)
+    }
+
     fn emit_legacy_es5_derived_constructor_body(
         &mut self,
         body: &[Stmt],
@@ -4549,6 +4566,56 @@ impl<'a> Emitter<'a> {
     ) {
         let direct_super = body.first().and_then(Self::direct_super_call);
         let remaining_has_super = self.legacy_constructor_remaining_has_super(body);
+
+        let has_using =
+            self.needs_downlevel("using") && crate::emit_stmt::has_using_declaration(body);
+        if has_using || (!field_initializers.is_empty() && direct_super.is_none()) {
+            // The disposal try must contain the original super call and all
+            // following instance initialization. Moving super into a prologue
+            // would both reorder resource acquisition and bypass cleanup if
+            // the base constructor or a field initializer throws.
+            let mut initialized_body = body.to_vec();
+            if !field_initializers.is_empty() {
+                let super_index = self
+                    .legacy_constructor_super_index(body)
+                    .expect("field initialization requires one direct super call");
+                initialized_body.splice(
+                    super_index + 1..super_index + 1,
+                    field_initializers.iter().cloned(),
+                );
+            }
+            self.emit_scoped_body_with_param_initializers(
+                &[],
+                &initialized_body,
+                |emitter, body| {
+                    emitter.write("var ");
+                    emitter.write(this_name);
+                    emitter.writeln(" = this;");
+                    let saved_super = emitter
+                        .legacy_constructor_super
+                        .replace(super_name.to_string());
+                    let saved_this = emitter.legacy_this_alias.replace(this_name.to_string());
+                    let saved_static_this =
+                        emitter.static_this_alias.replace(this_name.to_string());
+                    if has_using {
+                        emitter.emit_block_using_dispose_scope_with_binding(body, "var");
+                    } else {
+                        for stmt in body {
+                            emitter.emit_leading_comments(stmt.span.start);
+                            emitter.emit_stmt(stmt);
+                        }
+                    }
+                    emitter.static_this_alias = saved_static_this;
+                    emitter.legacy_this_alias = saved_this;
+                    emitter.legacy_constructor_super = saved_super;
+                    emitter.write("return ");
+                    emitter.write(this_name);
+                    emitter.writeln(";");
+                },
+            );
+            self.advance_comment_pos(enclosing_span.end);
+            return;
+        }
 
         if !field_initializers.is_empty() {
             debug_assert!(direct_super.is_some() && !remaining_has_super);
