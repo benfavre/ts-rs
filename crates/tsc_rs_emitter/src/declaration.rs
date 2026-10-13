@@ -1511,6 +1511,8 @@ impl<'a> DeclarationEmitter<'a> {
                     self.write(": ");
                     self.write(&ty);
                 }
+            } else {
+                self.write(": any");
             }
         }
         self.writeln(";");

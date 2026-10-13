@@ -1024,3 +1024,26 @@ fn test_dts_leading_documentation_honors_remove_comments() {
         "export declare const value = 1;\n"
     );
 }
+
+#[test]
+fn test_dts_uninitialized_variable_declarators_have_explicit_any_types() {
+    let source = "var x, y, z = 1; let a, b: string; declare const ambient;";
+    let expected = "declare var x: any, y: any, z: number;\ndeclare let a: any, b: string;\ndeclare const ambient: any;\n";
+    for strict in [false, true] {
+        let file = tsc_rs_parser::parse("test.ts", source);
+        let options = CompilerOptions {
+            declaration: Some(true),
+            strict: Some(strict),
+            ..Default::default()
+        };
+        assert_eq!(emit(&file, &options).declaration_file.unwrap(), expected);
+    }
+}
+
+#[test]
+fn test_dts_exported_and_namespace_variables_keep_implicit_any_types() {
+    assert_eq!(
+        emit_dts("export let value; export declare const ambient; export namespace N { export var member, typed: number; }"),
+        "export declare let value: any;\nexport declare const ambient: any;\nexport declare namespace N {\n    var member: any, typed: number;\n}\n"
+    );
+}
