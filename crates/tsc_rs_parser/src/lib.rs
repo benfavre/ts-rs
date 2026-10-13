@@ -84,6 +84,7 @@ pub fn has_syntax_errors(diagnostics: &[Diagnostic]) -> bool {
                 | 1010
                 | 1109
                 | 1110
+                | 1124
                 | 1127
                 | 1128
                 | 1131
@@ -336,22 +337,22 @@ pub fn parse_with_jsx(file_name: &str, source: &str, jsx_enabled: bool) -> Sourc
     // parser diagnostics, matching TypeScript's streaming scanner.
     if diagnostics
         .iter()
-        .any(|diagnostic| matches!(diagnostic.code, 1121 | 1125))
+        .any(|diagnostic| matches!(diagnostic.code, 1121 | 1124 | 1125))
     {
         // TypeScript keeps the grammar diagnostic over TS1121 when both report
         // at the same source position. This matters for invalid negative
         // property names: TS1136 starts on `-`, which is also where the signed
-        // TS1121 span would start. A missing hexadecimal digit is different:
+        // TS1121 span would start. A missing numeric digit is different:
         // the streaming scanner owns that failure position and prevents a
-        // parser-recovery diagnostic such as TS1005 from replacing TS1125.
+        // parser-recovery diagnostic such as TS1005 from replacing it.
         let grammar_error_starts: Vec<_> = diagnostics
             .iter()
-            .filter(|diagnostic| !matches!(diagnostic.code, 1121 | 1125))
+            .filter(|diagnostic| !matches!(diagnostic.code, 1121 | 1124 | 1125))
             .filter_map(|diagnostic| diagnostic.span.map(|span| span.start))
             .collect();
-        let hexadecimal_failure_starts: Vec<_> = diagnostics
+        let numeric_failure_starts: Vec<_> = diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == 1125)
+            .filter(|diagnostic| matches!(diagnostic.code, 1124 | 1125))
             .filter_map(|diagnostic| diagnostic.span.map(|span| span.start))
             .collect();
         diagnostics.retain(|diagnostic| {
@@ -360,10 +361,10 @@ pub fn parse_with_jsx(file_name: &str, source: &str, jsx_enabled: bool) -> Sourc
                     .span
                     .is_some_and(|span| grammar_error_starts.contains(&span.start));
             }
-            diagnostic.code == 1125
+            matches!(diagnostic.code, 1124 | 1125)
                 || !diagnostic
                     .span
-                    .is_some_and(|span| hexadecimal_failure_starts.contains(&span.start))
+                    .is_some_and(|span| numeric_failure_starts.contains(&span.start))
         });
         diagnostics.sort_by_key(|diagnostic| {
             diagnostic
@@ -604,6 +605,32 @@ impl<'a> Parser<'a> {
             }
 
             let raw = &source[token.span.start as usize..token.span.end as usize];
+            // Decimal scanning consumes the exponent marker and optional sign
+            // even when no digit follows. Diagnose the insertion point after
+            // any separators, before a bigint suffix or the next token.
+            let is_radix_literal = raw.starts_with('0')
+                && matches!(
+                    raw.as_bytes().get(1),
+                    Some(b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+                );
+            if !is_radix_literal {
+                if let Some(exponent) = raw.find(['e', 'E']) {
+                    if !raw[exponent + 1..]
+                        .bytes()
+                        .any(|byte| byte.is_ascii_digit())
+                    {
+                        let failure = token.span.start + raw.trim_end_matches('n').len() as u32;
+                        diagnostics.push(Diagnostic {
+                            code: 1124,
+                            message: "Digit expected.".to_string(),
+                            category: DiagnosticCategory::Error,
+                            file_name: None,
+                            span: Some(Span::new(failure, failure)),
+                            related: None,
+                        });
+                    }
+                }
+            }
             if raw
                 .get(..2)
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("0x"))
@@ -672,7 +699,7 @@ impl<'a> Parser<'a> {
     /// diagnostics covered by that successful reinterpretation.
     pub(crate) fn suppress_eager_scanner_diagnostics_in_span(&mut self, covered_span: Span) {
         self.diagnostics.retain(|diagnostic| {
-            !(matches!(diagnostic.code, 1121 | 1125 | 1127 | 18026)
+            !(matches!(diagnostic.code, 1121 | 1124 | 1125 | 1127 | 18026)
                 || (diagnostic.code == 1002
                     && diagnostic.message == "Unterminated string literal."))
                 || !diagnostic.span.is_some_and(|span| {
@@ -1303,7 +1330,7 @@ impl<'a> Parser<'a> {
         let scanner_error = |code: u32| {
             matches!(
                 code,
-                1002 | 1010 | 1125 | 1126 | 1127 | 1160 | 1161 | 1198 | 1199 | 1351 | 1490
+                1002 | 1010 | 1124 | 1125 | 1126 | 1127 | 1160 | 1161 | 1198 | 1199 | 1351 | 1490
             )
         };
         let same_start = |diagnostic: &Diagnostic| {

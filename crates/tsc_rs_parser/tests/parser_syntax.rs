@@ -237,3 +237,123 @@ var { outer: { inner, alias: deep }, list: [nested, ...nestedRest] } = source;";
         ]
     );
 }
+
+#[test]
+fn missing_exponent_digits_report_the_end_of_the_exponent() {
+    for (literal, offset) in [
+        ("1e", 2),
+        ("1E", 2),
+        ("1e+", 3),
+        ("1E-", 3),
+        ("0.1e+", 5),
+        ("1.e-", 4),
+        (".1e+", 4),
+        ("1efoo", 2),
+        ("1e+foo", 3),
+    ] {
+        let source = format!("const n = {literal};");
+        let parsed = parse("exponent.ts", &source);
+        assert_eq!(
+            parsed.diagnostics.len(),
+            1,
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+        let diagnostic = &parsed.diagnostics[0];
+        assert_eq!(diagnostic.code, 1124, "{source}");
+        assert_eq!(diagnostic.message, "Digit expected.");
+        assert_eq!(
+            diagnostic.span,
+            Some(tsc_rs_ast::Span::new(10 + offset, 10 + offset))
+        );
+    }
+
+    // Separators and a bigint suffix can have their own diagnostics. The
+    // missing decimal digit is still located after separators, before `n`.
+    for (source, offset) in [("1e_", 3), ("1e+__n;", 5), ("1en;", 2)] {
+        let parsed = parse("exponent.ts", source);
+        let digits: Vec<_> = parsed
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == 1124)
+            .collect();
+        assert_eq!(digits.len(), 1, "{source}: {:?}", parsed.diagnostics);
+        assert_eq!(digits[0].span, Some(tsc_rs_ast::Span::new(offset, offset)));
+    }
+}
+
+#[test]
+fn missing_exponent_digits_are_checked_in_numeric_syntax_positions() {
+    for (source, offset) in [
+        ("1e", 2),
+        ("type Value = 1e;", 15),
+        ("const value = { 1e: 0 };", 18),
+        ("declare const value = 1e;", 24),
+        ("const t = `1e${2e+}3e-`;", 18),
+    ] {
+        let parsed = parse("exponent.ts", source);
+        assert_eq!(
+            parsed.diagnostics.len(),
+            1,
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+        assert_eq!(parsed.diagnostics[0].code, 1124, "{source}");
+        assert_eq!(
+            parsed.diagnostics[0].span,
+            Some(tsc_rs_ast::Span::new(offset, offset))
+        );
+    }
+
+    let parsed = parse("exponent.ts", "1e; 2E+; 3e-;");
+    let observed: Vec<_> = parsed
+        .diagnostics
+        .iter()
+        .map(|d| (d.code, d.span.unwrap()))
+        .collect();
+    assert_eq!(
+        observed,
+        [
+            (1124, tsc_rs_ast::Span::new(2, 2)),
+            (1124, tsc_rs_ast::Span::new(7, 7)),
+            (1124, tsc_rs_ast::Span::new(12, 12)),
+        ]
+    );
+}
+
+#[test]
+fn exponent_digit_checks_ignore_complete_numbers_and_literal_text() {
+    for source in [
+        "0; 1e0; 1E+2; 1e-2; 0.1e2; .1e2; 1.e2; 1e1_0;",
+        "0x1e; 0xEn; 0XdeadBEEFn; 0o17; 0b10; 12n;",
+        "const text = '1e+'; const template = `1e${value}2e-`;",
+        "// 1e+\n/* 2e- */ const value = 1;",
+        "const rx = value < /1e+ 2E- 3e/;",
+        "type T = `1e${string}2e+`;",
+    ] {
+        let parsed = parse("valid-exponent.ts", source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+
+    for source in ["01e+;", "0b1e;", "0o1e;"] {
+        let parsed = parse("other-numeric-errors.ts", source);
+        assert!(
+            parsed.diagnostics.iter().all(|d| d.code != 1124),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+
+    let source = "const view = <div title=\"1e+\">1e+ {2e+}</div>;";
+    let parsed = parse("exponent.tsx", source);
+    assert_eq!(parsed.diagnostics.len(), 1, "{:?}", parsed.diagnostics);
+    assert_eq!(parsed.diagnostics[0].code, 1124);
+    assert_eq!(
+        parsed.diagnostics[0].span,
+        Some(tsc_rs_ast::Span::new(38, 38))
+    );
+}
