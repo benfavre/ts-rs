@@ -137,11 +137,12 @@ impl<'a> DeclarationEmitter<'a> {
             .any(Self::stmt_has_explicit_boundary_export);
         let has_emitted_module_indicator = file.statements.iter().any(|stmt| {
             Self::should_emit_external_stmt(stmt, &retained_names)
+                && !Self::is_empty_binding_declaration(stmt)
                 && Self::stmt_has_module_indicator(stmt)
         });
         if external_module
             && ((retains_private_declaration && !has_explicit_export)
-                || (forced_module && !has_emitted_module_indicator))
+                || !has_emitted_module_indicator)
         {
             self.writeln("export {};");
         }
@@ -831,9 +832,28 @@ impl<'a> DeclarationEmitter<'a> {
         }
     }
 
+    /// Destructuring can evaluate an initializer without declaring any names.
+    /// Such declarations have runtime effects but no declaration-file surface.
+    fn is_empty_binding_declaration(stmt: &Stmt) -> bool {
+        match &stmt.kind {
+            StmtKind::Var(declaration) => declaration
+                .declarations
+                .iter()
+                .all(|binding| Self::binding_names(&binding.name).is_empty()),
+            StmtKind::Export(export) => match &export.kind {
+                ExportDeclKind::Decl(inner) => Self::is_empty_binding_declaration(inner),
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Emit a statement for the declaration file.
     /// `top_level` indicates whether we are at the top level of the file.
     fn emit_stmt(&mut self, stmt: &Stmt, top_level: bool) {
+        if Self::is_empty_binding_declaration(stmt) {
+            return;
+        }
         match &stmt.kind {
             StmtKind::FnDecl(fn_decl) => {
                 let is_exported = fn_decl.modifiers & MOD_EXPORT != 0;
@@ -1388,7 +1408,12 @@ impl<'a> DeclarationEmitter<'a> {
         };
         self.write(kw);
         self.write(" ");
-        for (i, decl) in var_stmt.declarations.iter().enumerate() {
+        for (i, decl) in var_stmt
+            .declarations
+            .iter()
+            .filter(|decl| !Self::binding_names(&decl.name).is_empty())
+            .enumerate()
+        {
             if i > 0 {
                 self.write(", ");
             }
@@ -1473,7 +1498,9 @@ impl<'a> DeclarationEmitter<'a> {
             !self.enum_ambient && retained.iter().any(|name| !exported.contains(name));
         let explicit_exports = has_boundary || has_private;
         for statement in statements {
-            if Self::is_function_overload_implementation(statement, statements) {
+            if Self::is_empty_binding_declaration(statement)
+                || Self::is_function_overload_implementation(statement, statements)
+            {
                 continue;
             }
             if !self.enum_ambient && !Self::should_emit_external_stmt(statement, &retained) {

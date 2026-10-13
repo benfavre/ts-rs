@@ -912,3 +912,52 @@ fn test_dts_internal_alias_used_by_exported_signature_is_retained() {
         "declare namespace Hidden {\n    interface Value {\n        name: string;\n    }\n}\nimport Alias = Hidden.Value;\nexport declare function use(value: Alias): Alias;\nexport {};\n"
     );
 }
+
+#[test]
+fn test_dts_empty_binding_patterns_preserve_external_module_identity() {
+    for source in [
+        "export let [,,[,[],,[],]] = undefined as any;",
+        "export const {} = sideEffect();",
+        "export const { item: [,{ nested: {} }] = [] } = sideEffect();",
+        "export let [...[]] = sideEffect();",
+    ] {
+        assert_eq!(emit_dts(source), "export {};\n", "{source}");
+    }
+}
+
+#[test]
+fn test_dts_empty_binding_patterns_emit_no_script_declarations() {
+    let dts = emit_dts(
+        "const {} = sideEffect(); let [,,[[]]] = sideEffect(); var { item: {} } = sideEffect();",
+    );
+    assert_eq!(dts, "");
+}
+
+#[test]
+fn test_dts_empty_bindings_do_not_leave_commas_or_export_prefixes() {
+    assert_eq!(
+        emit_dts(
+            "export const [] = [], first = 1, {} = {}, second: string = '', [,,] = [] as any;"
+        ),
+        "export declare const first = 1, second: string;\n"
+    );
+    assert_eq!(
+        emit_dts(
+            "namespace Outer { export const {} = {}; } declare namespace Ambient { const {}: {}; }"
+        ),
+        "declare namespace Outer {\n}\ndeclare namespace Ambient {\n}\n"
+    );
+}
+
+#[test]
+fn test_dts_empty_bindings_keep_existing_module_markers() {
+    assert_eq!(
+        emit_dts("import 'side-effect'; export const {} = {};"),
+        "import 'side-effect';\n"
+    );
+    assert_eq!(emit_dts("export const {} = {}; export {};"), "export {};\n");
+    assert_eq!(
+        emit_dts_named("empty.mts", "const {} = {};"),
+        "export {};\n"
+    );
+}
