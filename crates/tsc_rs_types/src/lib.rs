@@ -19607,8 +19607,22 @@ impl TypeChecker {
     /// tsc never keeps an alias name on an intrinsic result: `type T = …`
     /// resolving to `number` prints `number`.
     fn display_type_through_primitive_alias(&self, ty: &Type) -> Type {
+        if matches!(ty, Type::Conditional { .. }) {
+            if let Some(bound @ (Type::Boolean | Type::Union(_))) =
+                self.primitive_conditional_constraint(ty, 8)
+            {
+                return bound;
+            }
+        }
         if let Type::TypeReference(..) = ty {
             if let Some(resolved) = self.resolve_type_for_assignability(ty) {
+                if matches!(&resolved, Type::Conditional { .. }) {
+                    if let Some(bound @ (Type::Boolean | Type::Union(_))) =
+                        self.primitive_conditional_constraint(&resolved, 8)
+                    {
+                        return bound;
+                    }
+                }
                 if matches!(&resolved, Type::Keyof(object) if self.array_or_tuple_type(object, 0).is_some())
                 {
                     return resolved;
@@ -24049,6 +24063,214 @@ impl TypeChecker {
         )))
     }
 
+    /// Primitive destinations for which a deferred conditional's result can
+    /// be checked without solving another type-level computation.
+    fn is_primitive_conditional_bound(ty: &Type) -> bool {
+        match ty {
+            Type::String
+            | Type::Number
+            | Type::Boolean
+            | Type::BigInt
+            | Type::Symbol
+            | Type::Null
+            | Type::Undefined
+            | Type::Void
+            | Type::Never
+            | Type::StringLiteral(_)
+            | Type::NumberLiteral(_)
+            | Type::BooleanLiteral(_)
+            | Type::BigIntLiteral(_) => true,
+            Type::Union(members) => members.iter().all(Self::is_primitive_conditional_bound),
+            _ => false,
+        }
+    }
+
+    fn conditional_constraint_operand_is_resolved(ty: &Type, depth: u8) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        let resolved = |ty: &Type| Self::conditional_constraint_operand_is_resolved(ty, depth - 1);
+        let signature_resolved = |signature: &FunctionType| {
+            signature.type_params.is_empty()
+                && signature.params.iter().all(|(_, ty)| resolved(ty))
+                && resolved(&signature.return_type)
+        };
+        match ty {
+            Type::Any | Type::Unknown | Type::Object => true,
+            Type::Array(inner) | Type::Optional(inner) | Type::Readonly(inner) => resolved(inner),
+            Type::Tuple(members) | Type::Union(members) | Type::Intersection(members) => {
+                members.iter().all(resolved)
+            }
+            Type::Function(signature) => signature_resolved(signature),
+            Type::ObjectType(info) => {
+                info.properties.iter().all(|(_, ty)| resolved(ty))
+                    && info.call_signatures.iter().all(signature_resolved)
+                    && info.construct_signatures.is_empty()
+                    && info
+                        .index_signature
+                        .as_ref()
+                        .is_none_or(|(key, value)| resolved(key) && resolved(value))
+            }
+            other => Self::is_primitive_conditional_bound(other),
+        }
+    }
+
+    fn resolve_conditional_constraint_operand(&self, ty: &Type, depth: u8) -> Option<Type> {
+        if depth == 0 {
+            return None;
+        }
+        if let Type::TypeReference(name, _) = ty {
+            // Classes need their nominal relation, and inherited builtins
+            // may not have their members in the structural table. Do not
+            // mistake an incomplete shape for an empty object.
+            if self.class_info.contains_key(name)
+                || self
+                    .interface_info
+                    .get(name)
+                    .is_some_and(|info| !info.extends.is_empty())
+            {
+                return None;
+            }
+            let resolved = self.resolve_for_simplify(ty)?;
+            return self.resolve_conditional_constraint_operand(&resolved, depth - 1);
+        }
+        Self::conditional_constraint_operand_is_resolved(ty, depth).then(|| ty.clone())
+    }
+
+    fn closed_primitive_conditional_branch(&self, ty: &Type, depth: u8) -> Option<Type> {
+        if depth == 0 {
+            return None;
+        }
+        if Self::is_primitive_conditional_bound(ty) {
+            return Some(ty.clone());
+        }
+        if let Type::TypeReference(..) = ty {
+            let resolved = self.resolve_type_for_assignability(ty)?;
+            return self.closed_primitive_conditional_branch(&resolved, depth - 1);
+        }
+        // A nested conditional needs the outer branch's narrowing. Bounding
+        // it under the original constraint would lose that correlation.
+        None
+    }
+
+    /// Bound a distributive conditional with closed primitive branches. This
+    /// does not simplify the conditional itself: a parameter's constraint is
+    /// an upper bound, not the particular type used at an instantiation.
+    fn primitive_conditional_constraint(&self, ty: &Type, depth: u8) -> Option<Type> {
+        if depth == 0 {
+            return None;
+        }
+        if Self::is_primitive_conditional_bound(ty) {
+            return Some(ty.clone());
+        }
+        if let Type::TypeReference(..) = ty {
+            let resolved = self.resolve_type_for_assignability(ty)?;
+            return self.primitive_conditional_constraint(&resolved, depth - 1);
+        }
+        let Type::Conditional {
+            check,
+            extends,
+            true_type,
+            false_type,
+        } = ty
+        else {
+            return None;
+        };
+        // Only a naked, active type parameter distributes over its constraint.
+        self.active_type_parameter_name(check)?;
+        let true_bound = self.closed_primitive_conditional_branch(true_type, depth - 1)?;
+        let false_bound = self.closed_primitive_conditional_branch(false_type, depth - 1)?;
+        let default = || Type::flatten_union(vec![true_bound.clone(), false_bound.clone()]);
+        let Some(constraint) = self.declared_type_param_constraint(check) else {
+            return Some(default());
+        };
+        if matches!(constraint, Type::Never) {
+            return Some(default());
+        }
+        if matches!(extends.as_ref(), Type::Any | Type::Unknown) {
+            return Some(if matches!(true_bound, Type::Never) {
+                default()
+            } else {
+                true_bound
+            });
+        }
+        // Parsed global augmentations can change the apparent builtin shape;
+        // leave their conditional relations unresolved here.
+        if self.interface_info.contains_key("Array")
+            || self.class_info.contains_key("Array")
+            || self.type_aliases.contains_key("Array")
+            || (matches!(&constraint, Type::TypeReference(name, _) if name == "Function")
+                && self.interface_info.contains_key("Function"))
+        {
+            return None;
+        }
+        // The minimal builtins keep Function as a named leaf. Its required
+        // call/apply/bind members and an array's indexed shape are disjoint
+        // in this relation, although a subtype can of course implement both.
+        // User declarations may augment either global, so use structural
+        // resolution instead when one is present.
+        let global_function = |ty: &Type| {
+            matches!(ty, Type::TypeReference(name, args) if name == "Function" && args.is_empty())
+                && self.active_type_parameter_name(ty).is_none()
+                && !self.interface_info.contains_key("Function")
+                && !self.class_info.contains_key("Function")
+                && !self.type_aliases.contains_key("Function")
+                && !self.interface_info.contains_key("Array")
+                && stdlib::stdlib_member_availability(&self.compiler_options)
+                    .is_some_and(|library| library.declares_global_type("Function"))
+        };
+        if (global_function(&constraint)
+            && matches!(extends.as_ref(), Type::Array(_) | Type::Tuple(_)))
+            || (global_function(&extends) && matches!(constraint, Type::Array(_) | Type::Tuple(_)))
+        {
+            return Some(false_bound);
+        }
+        let extends = self.resolve_conditional_constraint_operand(extends, 8)?;
+        let constraint = self.resolve_conditional_constraint_operand(&constraint, 8)?;
+        let members = match &constraint {
+            Type::Union(members) => members.as_ref(),
+            other => std::slice::from_ref(other),
+        };
+        let mut bounds = Vec::new();
+        for member in members {
+            if matches!(member, Type::Never) {
+                continue;
+            }
+            if matches!(member, Type::Any | Type::Unknown) {
+                bounds.push(if matches!(extends, Type::Never) {
+                    false_bound.clone()
+                } else {
+                    default()
+                });
+            } else if self.is_assignable_to(member, &extends) {
+                bounds.push(true_bound.clone());
+            } else {
+                bounds.push(false_bound.clone());
+                // A failed whole-constraint comparison does not rule out the
+                // true branch: object includes arrays, and string includes
+                // the string member of an extends union such as "abc" | 42.
+                let overlaps = match &extends {
+                    Type::Union(members) => members
+                        .iter()
+                        .any(|candidate| self.is_assignable_to(candidate, member)),
+                    Type::Never => false,
+                    other => self.is_assignable_to(other, member),
+                };
+                if overlaps {
+                    bounds.push(true_bound.clone());
+                }
+            }
+        }
+        let bound = Type::flatten_union(bounds);
+        // A never constraint supplies no useful instantiation. TypeScript
+        // falls back to the conditional's default branch union in this case.
+        Some(if matches!(bound, Type::Never) {
+            default()
+        } else {
+            bound
+        })
+    }
+
     fn is_assignable_to_inner(&self, source: &Type, target: &Type) -> bool {
         if let Some(accepts) = self.array_keyof_accepts(source, target) {
             return accepts;
@@ -25618,6 +25840,13 @@ impl TypeChecker {
                 return self
                     .contextual_key_constraint(target)
                     .is_some_and(|keys| self.is_assignable_to(source, &keys));
+            }
+        }
+        if matches!(source, Type::Conditional { .. })
+            && Self::is_primitive_conditional_bound(target)
+        {
+            if let Some(bound) = self.primitive_conditional_constraint(source, 8) {
+                return self.is_assignable_to(&bound, target);
             }
         }
         // Unresolved TypeReference, IndexedAccess, Keyof, Typeof, Conditional,
@@ -33972,6 +34201,44 @@ impl TypeChecker {
     ) -> Option<(std::string::String, Option<RelatedDiagnostic>)> {
         if let Some(reason) = self.readonly_assignment_reason(source, target) {
             return Some((reason, None));
+        }
+        if Self::is_primitive_conditional_bound(target) {
+            let conditional = match source {
+                Type::Conditional { .. } => Some(source.clone()),
+                Type::TypeReference(..) => self
+                    .resolve_type_for_assignability(source)
+                    .filter(|resolved| matches!(resolved, Type::Conditional { .. })),
+                _ => None,
+            };
+            if let Some(bound) = conditional
+                .as_ref()
+                .and_then(|conditional| self.primitive_conditional_constraint(conditional, 8))
+            {
+                if !self.is_assignable_to(&bound, target) {
+                    let failing_member = match &bound {
+                        Type::Union(members) => members
+                            .iter()
+                            .find(|member| !self.is_assignable_to(member, target)),
+                        _ => None,
+                    };
+                    if failing_member.is_some()
+                        || self.display_type_through_primitive_alias(source) != bound
+                    {
+                        return Some((
+                            format!(
+                                "Type '{}' is not assignable to type '{}'.",
+                                self.elaboration_display_type(
+                                    failing_member.unwrap_or(&bound),
+                                    target
+                                )
+                                .display_string_single_line(),
+                                target.display_string_single_line(),
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
         }
         if let Type::Union(members) = target {
             if let Some(reason) = members
