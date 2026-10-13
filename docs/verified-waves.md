@@ -2648,3 +2648,61 @@ published snapshot; this batch does not establish full TypeScript compatibility.
 All 4,931 public Rust tests pass, with 37 ignored, and `make ci` passes.
 The measured compiler commit is `8d97319d6`. The preceding
 snapshot is retained at `docs/compatibility-metrics-2026-10-13-b4c0639af.json`.
+
+## 2026-10-13: namespace value types
+
+Namespace values retain their qualified declaration identity and print
+TypeScript type queries through native lexical scopes. Local aliases,
+nested namespaces and shadowing signature parameters participate in name
+selection. This adapts the donor symbolToTypeNode value-symbol path while
+keeping native types and ordinary hover output authoritative.
+Native inference resolves namespace member returns and namespace function
+exports. Import aliases and member names now contribute type entries;
+global declaration names distinguish scripts from module augmentations.
+Function declaration entries preserve their original annotations and
+overload signatures even when a variable has the same name.
+Template delimiter matching, readonly tuple spreads and suffix inference
+preserve precise generic constraints. Array-map callbacks retain the
+expected return context through both concise and block bodies.
+Namespace completions resolve lexical bindings before selecting exports;
+three server tests cover function members, declaration merging and shadowing.
+18 additional tests compare complete diagnostic codes and source spans.
+32 regression tests compare original TypeScript 6.0.3 type text and
+synthetic-node masks and assert unchanged diagnostics and hover when
+collecting spans. Donor attribution and licenses are retained. Unchanged
+upstream baselines remain the whole-case compatibility oracle.
+
+| Suite | Type passes before | After |
+|---|---:|---:|
+| Compiler | 1,248 | 1,402 |
+| Conformance | 1,078 | 1,131 |
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,977 | 4,979 |
+| Conformance | 4,048 | 4,048 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 88.42% | 88.48% | 64.74% | 64.78% |
+| Conformance | 90.17% | 90.32% | 72.79% | 72.82% |
+
+False-positive diagnostics change from 1,265 to 1,258 in compiler
+and from 2,279 to 2,244 in conformance. The accuracy report includes all option variants.
+
+QuickInfo retains 308 passes. Comparing every supported
+LSP failure set finds no newly failing cases or additional skips.
+
+Whole-case baselines gain 2 diagnostic matches and 207 type matches.
+All twelve measured baseline lanes have zero passed-to-failed cases and no
+new skips. The public JavaScript, diagnostic and type results match the six
+private verification manifests exactly.
+
+Cache-free reports cover JavaScript, diagnostics, symbols, types, expanded
+JavaScript/declarations, diagnostic accuracy and all supported LSP operations.
+Skips are excluded from pass rates. Remaining failures remain visible in the
+published snapshot; this batch does not establish full TypeScript compatibility.
+
+All 4,984 public Rust tests pass, with 37 ignored, and `make ci` passes.
+The measured compiler commit is `09f151bbc`. The preceding
+snapshot is retained at `docs/compatibility-metrics-2026-10-13-8d97319d6.json`.
