@@ -1169,6 +1169,7 @@ impl TypeChecker {
         }
 
         let info = ClassInfo {
+            expression_type_node: None,
             setter_types,
             member_locations: {
                 let mut locations = rustc_hash::FxHashMap::default();

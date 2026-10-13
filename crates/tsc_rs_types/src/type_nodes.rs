@@ -815,6 +815,23 @@ impl PrintedType<'_> {
         // Intrinsic results (including optional primitive unions) have no alias
         // symbol of their own. Keep unresolved/generic computations deferred.
         if let (Some(checker), Type::TypeReference(name, arguments)) = (self.checker, ty) {
+            if let Some(display) = name
+                .strip_prefix("typeof ")
+                .and_then(|identity| checker.class_info.get(identity))
+                .and_then(|info| info.expression_type_node.as_ref())
+                .filter(|display| *display != ty)
+            {
+                self.ty(display);
+                return;
+            }
+            if let Some(body) = checker.expand_type_alias_once(name, arguments) {
+                if matches!(&body, Type::Typeof(_))
+                    || matches!(&body, Type::TypeReference(name, _) if name.starts_with("typeof "))
+                {
+                    self.ty(&body);
+                    return;
+                }
+            }
             if let Some(body @ Type::IndexedAccess(..)) =
                 checker.expand_type_alias_once(name, arguments)
             {

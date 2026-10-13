@@ -481,7 +481,12 @@ impl TypeChecker {
         if let ExprKind::Member(member) = &entity.kind {
             self.record_type_query_entity(&member.object);
         }
-        let ty = self.infer_expr_type(entity);
+        let ty = match &entity.kind {
+            ExprKind::Ident(name) if name == "undefined" && self.lookup_var(name).is_none() => {
+                Type::Undefined
+            }
+            _ => self.infer_expr_type(entity),
+        };
         self.record_checked_expression_type(entity, &ty);
     }
 

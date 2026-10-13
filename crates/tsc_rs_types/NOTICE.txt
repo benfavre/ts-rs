@@ -133,3 +133,11 @@ native checker remains responsible for binding, inference and substitution.
 Readonly property combination follows createUnionOrIntersectionProperty in
 checker_p24.rs: unions retain any readonly declaration, while intersections
 allow writes when a constituent declares the same property as mutable.
+
+Class heritage type queries adapt getTypeOfNode (checker_p35.rs),
+resolveBaseTypesOfClass and getInstantiatedConstructorsForTypeArguments
+(checker_p21.rs), and isValidBaseType (checker_p22.rs) from the same revision.
+Native construct signatures and declaration libraries supply base instances;
+the type-query span keeps the instance while child names keep constructor
+values. Class-expression display provenance follows createAnonymousTypeNodeEx
+in nodebuilder_impl_p3.rs without replacing native nominal identities.

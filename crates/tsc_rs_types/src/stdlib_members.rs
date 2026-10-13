@@ -14,6 +14,7 @@ struct LibraryInterface {
     bases: Vec<Type>,
     properties: HashMap<String, LibraryProperty>,
     indices: Vec<LibraryIndex>,
+    constructors: Vec<ConstructorType>,
 }
 
 #[derive(Clone)]
@@ -118,6 +119,18 @@ fn library_interfaces(path: &str, strict_null_checks: bool) -> Option<Arc<Librar
         );
         for member in &declaration.members {
             match &member.kind {
+                TypeMemberKind::ConstructSig(_) => {
+                    let node = TypeNode {
+                        kind: TypeNodeKind::TypeLit(vec![member.clone()]),
+                        span: member.span,
+                    };
+                    if let Type::ObjectType(shape) = checker.resolve_type_node(&node) {
+                        interface
+                            .constructors
+                            .extend(shape.construct_signatures.iter().cloned());
+                    }
+                    continue;
+                }
                 TypeMemberKind::PropertySig(property) => {
                     let mut ty = property
                         .type_ann
@@ -193,6 +206,43 @@ fn library_interfaces(path: &str, strict_null_checks: bool) -> Option<Arc<Librar
 }
 
 impl TypeChecker {
+    pub(super) fn library_constructor_signatures(&self, owner: &str) -> Vec<ConstructorType> {
+        if LOADING_LIBRARY.with(|depth| depth.get() != 0)
+            || self.program_declares_library_owner(owner)
+        {
+            return Vec::new();
+        }
+        let Some(availability) = stdlib::stdlib_member_availability(&self.compiler_options) else {
+            return Vec::new();
+        };
+        let mut signatures = Vec::new();
+        for file in availability.owner_declaring_libraries(owner) {
+            if let Some(interfaces) = library_interfaces(&file, self.strict_null_checks) {
+                if let Some(interface) = interfaces.get(owner) {
+                    signatures.extend(interface.constructors.iter().cloned());
+                }
+            }
+        }
+        signatures
+    }
+
+    pub(super) fn library_interface_is_active(&self, owner: &str) -> bool {
+        if LOADING_LIBRARY.with(|depth| depth.get() != 0)
+            || self.program_declares_library_owner(owner)
+        {
+            return false;
+        }
+        stdlib::stdlib_member_availability(&self.compiler_options).is_some_and(|availability| {
+            availability
+                .owner_declaring_libraries(owner)
+                .iter()
+                .any(|file| {
+                    library_interfaces(file, self.strict_null_checks)
+                        .is_some_and(|interfaces| interfaces.contains_key(owner))
+                })
+        })
+    }
+
     fn library_base_reference(base: Type) -> Option<(String, Vec<Type>)> {
         match base {
             Type::TypeReference(name, args) => Some((name, args.to_vec())),

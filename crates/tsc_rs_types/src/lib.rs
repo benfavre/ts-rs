@@ -28,6 +28,7 @@ mod external_helpers;
 mod function_returns;
 mod global_access;
 mod global_import_aliases;
+mod heritage_type_queries;
 mod import_alias_conflicts;
 mod import_attributes;
 mod index_access;
@@ -1043,6 +1044,8 @@ const ARRAY_INTERFACE_MEMBERS: &[&str] = &[
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct ClassInfo {
+    /// Display provenance for class expressions; never replaces their nominal identity.
+    expression_type_node: Option<Type>,
     /// Constructor parameters: (name, type, optional, has_rest)
     constructor_params: Vec<(std::string::String, Type, bool, bool)>,
     /// Public bodyless signatures when constructor overload declarations exist.
@@ -2387,7 +2390,7 @@ fn dedup_exact_diagnostics(
 ) -> Vec<Diagnostic> {
     let mut seen: rustc_hash::FxHashSet<(u32, Option<(u32, u32)>, std::string::String)> =
         rustc_hash::FxHashSet::default();
-    diagnostics
+    let mut diagnostics: Vec<_> = diagnostics
         .into_iter()
         .map(|mut diagnostic| {
             diagnostic.message = collapse_multiline_type_displays(&diagnostic.message);
@@ -2407,7 +2410,24 @@ fn dedup_exact_diagnostics(
             );
             seen.insert(key)
         })
-        .collect()
+        .collect();
+    // TypeScript returns semantic diagnostics in source order, independently
+    // of which lazy semantic query produced them first.
+    diagnostics.sort_by(|a, b| {
+        (
+            a.file_name.as_deref().or(current_file),
+            a.span.map(|span| (span.start, span.end - span.start)),
+            a.code,
+            &a.message,
+        )
+            .cmp(&(
+                b.file_name.as_deref().or(current_file),
+                b.span.map(|span| (span.start, span.end - span.start)),
+                b.code,
+                &b.message,
+            ))
+    });
+    diagnostics
 }
 
 impl TypeCheckOutput {
@@ -3243,6 +3263,7 @@ pub struct TypeChecker {
     /// nested functions because the variable may be assigned before the
     /// callback is actually invoked.
     fn_nesting_depth: u32,
+    type_node_function_path: Vec<String>,
     /// Active loop, switch, and label targets in the statement traversal.
     jump_targets: Vec<jump_targets::JumpTarget>,
     /// Syntactic functions only; namespace lowering is not a jump boundary.
@@ -3638,6 +3659,7 @@ impl Clone for TypeChecker {
             dotted_namespace_value_names: self.dotted_namespace_value_names.clone(),
             namespace_path_exports: self.namespace_path_exports.clone(),
             fn_nesting_depth: self.fn_nesting_depth,
+            type_node_function_path: self.type_node_function_path.clone(),
             jump_targets: self.jump_targets.clone(),
             jump_function_depth: self.jump_function_depth,
             ambient_statement_starts: self.ambient_statement_starts.clone(),
@@ -3877,6 +3899,7 @@ impl TypeChecker {
             dotted_namespace_value_names: Default::default(),
             namespace_path_exports: std::collections::HashMap::new(),
             fn_nesting_depth: 0,
+            type_node_function_path: Vec::new(),
             jump_targets: Vec::new(),
             jump_function_depth: 0,
             ambient_statement_starts: rustc_hash::FxHashSet::default(),
@@ -28984,6 +29007,25 @@ impl TypeChecker {
             }
             StmtKind::FnDecl(fn_decl) => {
                 self.check_type_declaration_computed_names(std::slice::from_ref(stmt));
+                // Resolve before the body introduces its local declarations:
+                // parameter defaults cannot see those body-only bindings.
+                let class_return_signature = self
+                    .expression_type_spans
+                    .is_some()
+                    .then(|| self.resolve_fn_type(fn_decl))
+                    .filter(|signature| Self::has_class_expression_type(&signature.return_type));
+                let mut path = fn_decl
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "(Anonymous function)".into());
+                if let Some(parameters) = &fn_decl.type_params {
+                    if !parameters.is_empty() {
+                        path.push('<');
+                        path.push_str(&vec!["any"; parameters.len()].join(", "));
+                        path.push('>');
+                    }
+                }
+                self.type_node_function_path.push(path);
                 self.push_scope();
                 if let Some(type_params) = &fn_decl.type_params {
                     for type_param in type_params {
@@ -29143,8 +29185,11 @@ impl TypeChecker {
                         // annotations. A variable with the same name, or an
                         // interned equal signature, must not replace them.
                         let overloads = self.overloads.get(name).filter(|sigs| !sigs.is_empty());
+                        // Class expressions acquire display provenance while
+                        // checking the body; retain the original signature.
                         if overloads.is_some()
                             || !spans.contains_key(&(name_span.start, name_span.end))
+                            || class_return_signature.is_some()
                         {
                             let ty = if let Some(signatures) = overloads {
                                 if let [signature] = signatures.as_slice() {
@@ -29160,7 +29205,10 @@ impl TypeChecker {
                                     )
                                 }
                             } else {
-                                Type::Function(self.resolve_fn_type(fn_decl))
+                                Type::Function(
+                                    class_return_signature
+                                        .unwrap_or_else(|| self.resolve_fn_type(fn_decl)),
+                                )
                             };
                             self.record_expression_type_span(name_span, &ty);
                         }
@@ -29176,6 +29224,7 @@ impl TypeChecker {
                 self.var_first_types = saved_var_first_types;
                 self.pop_active_type_param_names(pushed_type_param_names);
                 self.pop_scope();
+                self.type_node_function_path.pop();
             }
             StmtKind::ClassDecl(class_decl) => {
                 // A `declare class` is an ambient context: its heritage may
@@ -29242,7 +29291,8 @@ impl TypeChecker {
                     }
                 }
                 if let Some(extends) = &class_decl.extends {
-                    self.check_base_constructor_expression(extends);
+                    let constructor = self.check_base_constructor_expression(extends);
+                    self.record_class_heritage_type(class_decl, &constructor);
                     let name = self.expr_to_name(extends);
                     let missing_value_member =
                         name.rsplit_once('.').is_some_and(|(namespace, member)| {
@@ -29288,7 +29338,7 @@ impl TypeChecker {
                     };
                     let class_arity = self.class_info.get(class_lookup_name).and_then(|info| {
                         if info.type_params.is_empty() {
-                            return None;
+                            return Some((0, 0));
                         }
                         let minimum = self
                             .interface_info
@@ -29307,12 +29357,22 @@ impl TypeChecker {
                         // JavaScript: omitted type arguments default to `any`.
                         let js_defaulted = provided == 0 && self.current_file_is_js();
                         if (provided < minimum || provided > maximum) && !js_defaulted {
+                            let span = self.class_heritage_span(class_decl);
                             let display = self.generic_display_name(&name, maximum);
-                            self.diagnostics.push(error_generic_type_requires_args(
-                                &display,
-                                maximum,
-                                extends.span,
-                            ));
+                            if maximum == 0 {
+                                self.diagnostics.push(Diagnostic {
+                                    code: 2315,
+                                    message: format!("Type '{name}' is not generic."),
+                                    category: DiagnosticCategory::Error,
+                                    file_name: None,
+                                    span: Some(span),
+                                    related: None,
+                                });
+                            } else {
+                                self.diagnostics.push(error_generic_type_requires_args(
+                                    &display, maximum, span,
+                                ));
+                            }
                         }
                     }
                     if let Some(arguments) = &class_decl.extends_type_args {
@@ -31949,7 +32009,18 @@ impl TypeChecker {
         // extend an interface" territory, not TS2708.
         let saved_namespaces = matches!(extends.kind, ExprKind::Member(_))
             .then(|| std::mem::take(&mut self.uninstantiated_namespace_names));
+        let before = self.diagnostics.len();
         let base = self.check_expr(extends);
+        let name = self.expr_to_name(extends);
+        if self.interface_info.contains_key(&name) && self.lookup_var(&name).is_none() {
+            for diagnostic in &mut self.diagnostics[before..] {
+                if diagnostic.code == 2693 && diagnostic.span == Some(extends.span) {
+                    diagnostic.code = 2689;
+                    diagnostic.message =
+                        format!("Cannot extend an interface '{name}'. Did you mean 'implements'?");
+                }
+            }
+        }
         if let Some(saved) = saved_namespaces {
             self.uninstantiated_namespace_names = saved;
         }
@@ -32013,7 +32084,8 @@ impl TypeChecker {
     fn base_type_is_constructor_like(&self, ty: &Type) -> bool {
         match ty {
             // Definitely not constructable.
-            Type::Undefined
+            Type::Unknown
+            | Type::Undefined
             | Type::Void
             | Type::Number
             | Type::String
@@ -33026,6 +33098,7 @@ impl TypeChecker {
             }
             TypeNodeKind::TypeQuery(expression) => {
                 self.check_type_query_future_lib_global(expression);
+                self.record_type_query_entity(expression);
             }
             TypeNodeKind::Array(inner) => self.check_type_node_generic_arity(inner),
             TypeNodeKind::Tuple(elements) => {

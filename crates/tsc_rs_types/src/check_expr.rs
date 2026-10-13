@@ -9038,7 +9038,16 @@ impl TypeChecker {
                     Type::Namespace(info) => {
                         if let Some((_, ty)) = info.exports.iter().find(|(n, _)| n == &mem.property)
                         {
-                            ty.clone()
+                            match ty {
+                                Type::TypeReference(name, args)
+                                    if args.is_empty()
+                                        && name == &format!("{}.{}", info.qualified_name, mem.property)
+                                        && self.class_constructor_signatures(name).is_some() =>
+                                {
+                                    Type::TypeReference(format!("typeof {name}"), Arc::from([]))
+                                }
+                                _ => ty.clone(),
+                            }
                         } else {
                             // TS2339: the namespace has no such export.
                             // Display matches tsc: 'typeof M'.
@@ -10956,6 +10965,7 @@ impl TypeChecker {
                             } else {
                                 self.lookup_var(name).cloned().unwrap_or(Type::Any)
                             };
+                            self.record_expression_type_span(*span, &ty);
                             properties.push((name.to_string(), Arc::new(ty)));
                         }
                         ObjLitProp::ShorthandDefault(name, default_expr, span) => {
@@ -11647,7 +11657,8 @@ impl TypeChecker {
                     }
                 }
                 if let Some(extends) = &class_decl.extends {
-                    self.check_base_constructor_expression(extends);
+                    let constructor = self.check_base_constructor_expression(extends);
+                    self.record_class_heritage_type(class_decl, &constructor);
                 }
                 let legacy_decorators = self.compiler_options.experimental_decorators == Some(true);
                 self.check_decorators_at_site(
@@ -11683,7 +11694,8 @@ impl TypeChecker {
                 self.enclosing_class_derived
                     .push(class_decl.extends.is_some());
                 self.register_class_initializer_shapes(class_decl);
-                let info = self.build_class_info(class_decl);
+                let mut info = self.build_class_info(class_decl);
+                info.expression_type_node = self.class_expression_type_node(class_decl, &info);
                 self.record_class_member_declaration_types(class_decl, &info);
                 self.insert_class_info(identity.clone(), info);
                 let class_type_param_frame = pushed_type_params
