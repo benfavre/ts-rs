@@ -414,6 +414,8 @@ pub fn load_find_all_refs_baseline(path: &Path) -> Result<Vec<FindAllRefsEntry>,
 /// A single goToDefinition baseline entry (one section per marker).
 #[derive(Debug, Clone)]
 pub struct GoToDefinitionEntry {
+    /// Every declaration target, in baseline order. Cursor ranges are excluded.
+    pub targets: Vec<(String, u32)>,
     /// The target file that the definition points to.
     pub target_file: Option<String>,
     /// The character offset of the definition target (`[|` range start) within
@@ -474,9 +476,6 @@ pub fn load_goto_definition_baseline(
 struct FileBlock {
     path: String,
     annotated: String,
-    has_angle_brackets: bool,   // contains <|...|>
-    has_square_brackets: bool,  // contains [|...|]
-    has_goto_def_comment: bool, // contains /*GOTO DEF*/
 }
 
 /// Parse a single goToDefinition section starting after the `=== goToDefinition ===` header.
@@ -496,7 +495,9 @@ fn parse_goto_definition_section(
         let trimmed = lines[i].trim();
 
         // Next section or end
-        if trimmed == "// === goToDefinition ===" || trimmed == "// === getDefinitionAtPosition ==="
+        if trimmed.starts_with("// === ")
+            && !trimmed.starts_with("// === /")
+            && trimmed != "// === Details ==="
         {
             break;
         }
@@ -516,8 +517,8 @@ fn parse_goto_definition_section(
                 // Source lines are prefixed with "// "
                 if let Some(rest) = lines[i].strip_prefix("// ") {
                     // Handle `--- (line: N) skipped ---` placeholder lines.
-                    // These indicate that lines 1 through N-1 of the source were
-                    // omitted in the baseline. Restore the actual source lines from
+                    // N is the zero-based line where the excerpt resumes.
+                    // Restore the actual source lines from
                     // the virtual file to keep offset calculations correct.
                     if rest.contains("skipped") {
                         if let Some(start) = rest.find("(line: ") {
@@ -526,8 +527,8 @@ fn parse_goto_definition_section(
                                 if let Ok(line_num) =
                                     rest[num_start..num_start + end].parse::<usize>()
                                 {
-                                    // Skipped lines 1..line_num-1. Look up the virtual
-                                    // source for this file and insert the actual lines.
+                                    // Look up the virtual source for this file and
+                                    // restore the omitted lines before this excerpt.
                                     let file_path_str = file_path;
                                     let source = virtual_sources.get(file_path_str).or_else(|| {
                                         // Try matching by filename only
@@ -544,10 +545,10 @@ fn parse_goto_definition_section(
                                     });
                                     if let Some(src) = source {
                                         let src_lines: Vec<&str> = src.lines().collect();
-                                        // Insert the skipped lines. `(line: N)` means
-                                        // lines 1..N (1-based) are omitted; we restore
-                                        // them so that character offsets align.
-                                        for li in 0..line_num.saturating_sub(1) {
+                                        // N is the zero-based line of the next
+                                        // displayed source line. Restore only the
+                                        // gap, including gaps after displayed lines.
+                                        for li in annotated_lines.len()..line_num {
                                             if li < src_lines.len() {
                                                 annotated_lines.push(src_lines[li].to_string());
                                             } else {
@@ -556,7 +557,7 @@ fn parse_goto_definition_section(
                                         }
                                     } else {
                                         // Fallback: insert empty lines
-                                        for _ in 0..line_num.saturating_sub(1) {
+                                        for _ in annotated_lines.len()..line_num {
                                             annotated_lines.push(String::new());
                                         }
                                     }
@@ -595,9 +596,6 @@ fn parse_goto_definition_section(
             let joined = annotated_lines.join("\n");
             file_blocks.push(FileBlock {
                 path: file_path.to_string(),
-                has_angle_brackets: joined.contains("<|"),
-                has_square_brackets: joined.contains("[|"),
-                has_goto_def_comment: joined.contains("GOTO DEF"),
                 annotated: joined,
             });
 
@@ -651,50 +649,14 @@ fn parse_goto_definition_section(
         i += 1;
     }
 
-    // Determine the target file and position:
-    // 1. If a file has <|...|>, it's the definition target.
-    // 2. Otherwise, the first file with [|...|] that does NOT contain /*GOTO DEF*/ is the target.
-    // 3. If only one file exists and it has [|...|], it's both cursor and target.
-    let mut target_file: Option<String> = None;
-    let mut target_position: Option<u32> = None;
-
-    // Strategy 1: file with <|
-    for block in &file_blocks {
-        if block.has_angle_brackets {
-            if let Some(pos) = find_target_position_in_annotated(&block.annotated) {
-                target_file = Some(block.path.clone());
-                target_position = Some(pos);
-            }
-            break;
-        }
-    }
-
-    // Strategy 2: first file with [| but no GOTO DEF
-    if target_file.is_none() {
-        for block in &file_blocks {
-            if block.has_square_brackets && !block.has_goto_def_comment {
-                if let Some(pos) = find_target_position_in_annotated(&block.annotated) {
-                    target_file = Some(block.path.clone());
-                    target_position = Some(pos);
-                }
-                break;
-            }
-        }
-    }
-
-    // Strategy 3: single file with [| (it's both cursor and target)
-    if target_file.is_none() && file_blocks.len() == 1 && file_blocks[0].has_square_brackets {
-        if let Some(pos) = find_target_position_in_annotated(&file_blocks[0].annotated) {
-            target_file = Some(file_blocks[0].path.clone());
-            target_position = Some(pos);
-        }
-    }
-
-    let found_any_content = !file_blocks.is_empty();
-    let expects_no_definition = !found_any_content || (target_file.is_none() && name.is_empty());
+    let targets = definition_targets(&file_blocks, virtual_sources);
+    let target_file = targets.first().map(|(file, _)| file.clone());
+    let target_position = targets.first().map(|(_, position)| *position);
+    let expects_no_definition = targets.is_empty() && name.is_empty();
 
     (
         GoToDefinitionEntry {
+            targets,
             target_file,
             target_position,
             name,
@@ -705,69 +667,185 @@ fn parse_goto_definition_section(
     )
 }
 
-/// Find the character position of the `[|` target range within annotated source text.
-///
-/// The annotated source may contain `<|...|>` (full declaration range) and
-/// `[|...|]` (definition name range). We need to strip all annotations to
-/// compute the true character offset of the `[|` target.
-fn find_target_position_in_annotated(text: &str) -> Option<u32> {
-    // We need to find the [| marker and compute its position after stripping
-    // all annotation markers: <|, |>, [|, |], /*GOTO DEF*/, /*GOTO DEF POS*/
-    let mut pos: u32 = 0;
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut found_target: Option<u32> = None;
-
-    while i < len {
-        // Check for annotation markers
-        if i + 1 < len {
-            // [| — definition name range start (this is what we want)
-            if bytes[i] == b'[' && bytes[i + 1] == b'|' {
-                if found_target.is_none() {
-                    found_target = Some(pos);
-                }
-                i += 2;
-                continue;
-            }
-            // |] — definition name range end
-            if bytes[i] == b'|' && bytes[i + 1] == b']' {
-                i += 2;
-                continue;
-            }
-            // <| — full declaration range start
-            if bytes[i] == b'<' && bytes[i + 1] == b'|' {
-                i += 2;
-                continue;
-            }
-            // |> — full declaration range end
-            if bytes[i] == b'|' && bytes[i + 1] == b'>' {
-                i += 2;
-                continue;
-            }
-        }
-
-        // Check for /*GOTO DEF*/ or /*GOTO DEF POS*/ comments
-        if i + 3 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            if let Some(close) = text[i + 2..].find("*/") {
-                let comment = &text[i + 2..i + 2 + close];
-                if comment.starts_with("GOTO DEF") {
-                    i += 2 + close + 2;
-                    continue;
-                }
-            }
-        }
-
-        pos += 1;
-        i += 1;
+/// Read all definition ranges, respecting defId metadata and excluding the
+/// cursor's textSpan. Align to the virtual source so indentation stripped by
+/// fourslash and omitted source lines cannot shift a target to another token.
+fn definition_targets(
+    blocks: &[FileBlock],
+    sources: &HashMap<String, String>,
+) -> Vec<(String, u32)> {
+    struct Range {
+        start: usize,
+        end: usize,
+        in_declaration: bool,
+        def_id: Option<usize>,
+        cursor: bool,
     }
-
-    found_target
+    let mut ranges = vec![];
+    for block in blocks {
+        let text = &block.annotated;
+        let mut plain = String::new();
+        let mut stack: Vec<Range> = vec![];
+        let mut completed = vec![];
+        let mut declaration_depth = 0usize;
+        let mut cursors = vec![];
+        let mut i = 0;
+        while i < text.len() {
+            let rest = &text[i..];
+            if rest.starts_with("<|") {
+                declaration_depth += 1;
+                i += 2;
+            } else if rest.starts_with("|>") {
+                declaration_depth = declaration_depth.saturating_sub(1);
+                i += 2;
+            } else if rest.starts_with("[|") {
+                stack.push(Range {
+                    start: plain.len(),
+                    end: plain.len(),
+                    in_declaration: declaration_depth > 0,
+                    def_id: None,
+                    cursor: false,
+                });
+                i += 2;
+            } else if rest.starts_with("|]") {
+                if let Some(mut range) = stack.pop() {
+                    range.end = plain.len();
+                    completed.push(range);
+                }
+                i += 2;
+            } else if rest.starts_with("{|") {
+                if let Some(end) = rest.find("|}") {
+                    if let Some(range) = stack.last_mut() {
+                        if let Some((_, value)) = rest[..end].split_once("defId:") {
+                            range.def_id = value
+                                .trim_start()
+                                .chars()
+                                .take_while(char::is_ascii_digit)
+                                .collect::<String>()
+                                .parse()
+                                .ok();
+                        }
+                    }
+                    i += end + 2;
+                } else {
+                    i += 2;
+                }
+            } else if rest.starts_with("/*GOTO DEF") {
+                cursors.push(plain.len());
+                if let Some(end) = rest.find("*/") {
+                    i += end + 2;
+                } else {
+                    break;
+                }
+            } else {
+                let c = rest.chars().next().unwrap();
+                plain.push(c);
+                i += c.len_utf8();
+            }
+        }
+        let source = sources.get(&block.path);
+        for mut range in completed {
+            range.cursor = cursors.iter().any(|p| range.start <= *p && *p <= range.end);
+            let position = if range.start == 0 && (range.end == 0 || range.end == plain.len()) {
+                0
+            } else if let Some(source) = source {
+                let line = plain[..range.start].bytes().filter(|b| *b == b'\n').count();
+                let column = range.start - plain[..range.start].rfind('\n').map_or(0, |p| p + 1);
+                let source_lines: Vec<_> = source.split('\n').collect();
+                let annotated_line = plain.split('\n').nth(line).unwrap_or("");
+                if let Some(source_line) = source_lines.get(line) {
+                    let indent_source = source_line.len() - source_line.trim_start().len();
+                    let indent_annotated = annotated_line.len() - annotated_line.trim_start().len();
+                    source_lines[..line]
+                        .iter()
+                        .map(|s| s.len() + 1)
+                        .sum::<usize>()
+                        + column.saturating_sub(indent_annotated)
+                        + indent_source
+                } else {
+                    range.start
+                }
+            } else {
+                range.start
+            };
+            ranges.push((block.path.clone(), position as u32, range));
+        }
+    }
+    let has_ids = ranges.iter().any(|(_, _, r)| r.def_id.is_some());
+    let has_declarations = ranges.iter().any(|(_, _, r)| r.in_declaration);
+    let single_range = ranges.len() == 1;
+    ranges.retain(|(_, _, r)| {
+        if has_ids {
+            r.def_id.is_some()
+        } else if has_declarations {
+            r.in_declaration
+        } else {
+            !r.cursor || single_range
+        }
+    });
+    if has_ids {
+        ranges.sort_by_key(|(_, _, r)| r.def_id);
+    }
+    ranges
+        .into_iter()
+        .map(|(file, pos, _)| (file, pos))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn definition_ranges_include_every_id_and_exclude_the_cursor() {
+        let sources = HashMap::from([("/a.ts".into(), "class C { static {} static {} }".into())]);
+        let blocks = vec![FileBlock { path: "/a.ts".into(), annotated: "class C { <|[|{| defId: 0 |}static|] {}|> <|/*GOTO DEF*/[|{| textSpan: true, defId: 1 |}static|] {}|> }".into() }];
+        assert_eq!(
+            definition_targets(&blocks, &sources),
+            vec![("/a.ts".into(), 10), ("/a.ts".into(), 20)]
+        );
+    }
+
+    #[test]
+    fn definition_module_start_is_zero_despite_fourslash_indentation() {
+        let sources = HashMap::from([("/a.ts".into(), " export const x = 1;".into())]);
+        let blocks = vec![
+            FileBlock {
+                path: "/a.ts".into(),
+                annotated: "[|export const x = 1;|]".into(),
+            },
+            FileBlock {
+                path: "/b.ts".into(),
+                annotated: "import /*GOTO DEF*/[|alias|] = require('./a');".into(),
+            },
+        ];
+        assert_eq!(
+            definition_targets(&blocks, &sources),
+            vec![("/a.ts".into(), 0)]
+        );
+    }
+
+    #[test]
+    fn definition_parser_restores_middle_gaps_and_stops_at_other_operations() {
+        let source = "const before = 1;\n// omitted\nconst target = 2;\ntarget;";
+        let sources = HashMap::from([("/a.ts".into(), source.into())]);
+        let lines = [
+            "// === /a.ts ===",
+            "// const before = 1;",
+            "// --- (line: 2) skipped ---",
+            "// <|const [|target|] = 2;|>",
+            "// /*GOTO DEF*/target;",
+            "// === Details ===",
+            "[{\"name\":\"target\",\"kind\":\"const\"}]",
+            "// === findReferences ===",
+            "// === /a.ts ===",
+            "// [|unrelated|]",
+        ];
+        let (entry, next) = parse_goto_definition_section(&lines, 0, &sources);
+        assert_eq!(entry.targets, vec![("/a.ts".into(), 35)]);
+        assert_eq!(next, 7);
+        assert!(!entry.expects_no_definition);
+    }
 
     #[test]
     fn test_normalize_display() {

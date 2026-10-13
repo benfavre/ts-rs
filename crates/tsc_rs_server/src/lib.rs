@@ -22,6 +22,7 @@ use tsc_rs_symbols::{
 };
 use tsc_rs_types::TypeCheckOutput;
 
+mod definition;
 mod lib_stubs;
 mod ref_aliases;
 
@@ -29,7 +30,7 @@ mod ref_aliases;
 /// going through the JSON-RPC transport layer.
 pub mod harness_api {
     pub use super::{
-        completions_at, completions_at_with_prefs, definition_at, extract_token_at,
+        completions_at, completions_at_with_prefs, definition_at, definitions_at, extract_token_at,
         find_symbol_at_offset, hover_at, is_inside_string_or_comment, references_at,
         resolve_symbol_type, signature_help_at, ProjectState, KEYWORDS,
     };
@@ -12115,6 +12116,36 @@ fn unresolved_import_equals_alias(
 }
 
 pub fn definition_at(
+    query_engine: &QueryEngine,
+    sym_table: &SymbolTable,
+    sf: &SourceFile,
+    offset: u32,
+    project: Option<&ProjectState>,
+    check_out: &TypeCheckOutput,
+) -> Option<(String, Span)> {
+    definitions_at(query_engine, sym_table, sf, offset, project, check_out)
+        .into_iter()
+        .next()
+}
+
+/// All declaration targets, including merged declarations and index signatures.
+pub fn definitions_at(
+    query_engine: &QueryEngine,
+    sym_table: &SymbolTable,
+    sf: &SourceFile,
+    offset: u32,
+    project: Option<&ProjectState>,
+    check_out: &TypeCheckOutput,
+) -> Vec<(String, Span)> {
+    if let Some(targets) = definition::resolve(query_engine, sf, offset, check_out) {
+        return targets;
+    }
+    legacy_definition_at(query_engine, sym_table, sf, offset, project, check_out)
+        .into_iter()
+        .collect()
+}
+
+fn legacy_definition_at(
     query_engine: &QueryEngine,
     sym_table: &SymbolTable,
     sf: &SourceFile,
@@ -31551,19 +31582,6 @@ pub fn run_server(input: &mut impl BufRead, output: &mut impl io::Write) -> io::
                     let offset = position_to_offset(&doc.text, line, character);
                     let token = extract_token_at(&doc.text, offset);
 
-                    // Early filter: keywords, strings, comments, numeric literals
-                    if token.is_empty()
-                        || KEYWORDS.contains(&token.as_str())
-                        || is_inside_string_or_comment(&doc.text, offset)
-                        || token
-                            .chars()
-                            .next()
-                            .map(|c| c.is_ascii_digit())
-                            .unwrap_or(false)
-                    {
-                        return None;
-                    }
-
                     let active_project = projects.project_for_file(&file_name);
                     let cached = cache.get_or_update(
                         uri,
@@ -31573,7 +31591,7 @@ pub fn run_server(input: &mut impl BufRead, output: &mut impl io::Write) -> io::
                         projects.options_for_file(&file_name),
                         projects.project_for_file(&file_name),
                     );
-                    let def = definition_at(
+                    let definitions = definitions_at(
                         &cached.query_engine,
                         &cached.sym_table,
                         &cached.source_file,
@@ -31581,41 +31599,40 @@ pub fn run_server(input: &mut impl BufRead, output: &mut impl io::Write) -> io::
                         active_project,
                         &cached.check_output,
                     );
-                    match &def {
-                        Some((f, span)) => lsp_log!(
-                            "definition: \"{}\" at {}:{}:{} -> {}:{}-{} ({:.1}ms)",
-                            token,
-                            short_uri(uri),
-                            line,
-                            character,
-                            short_path(f),
-                            span.start,
-                            span.end,
-                            req_start.elapsed().as_secs_f64() * 1000.0
-                        ),
-                        None => lsp_log!(
-                            "definition: \"{}\" at {}:{}:{} -> not found ({:.1}ms)",
-                            token,
-                            short_uri(uri),
-                            line,
-                            character,
-                            req_start.elapsed().as_secs_f64() * 1000.0
-                        ),
+                    lsp_log!(
+                        "definition: \"{}\" at {}:{}:{} -> {} target(s) ({:.1}ms)",
+                        token,
+                        short_uri(uri),
+                        line,
+                        character,
+                        definitions.len(),
+                        req_start.elapsed().as_secs_f64() * 1000.0
+                    );
+                    if definitions.is_empty() {
+                        return None;
                     }
-                    let (def_file, def_span) = def?;
-
-                    // Use the correct file's text for position conversion
-                    let def_text = text_for_file(&def_file, &file_name, &doc.text, active_project);
-                    let (sl, sc) = offset_to_position(def_text, def_span.start);
-                    let (el, ec) = offset_to_position(def_text, def_span.end);
-                    let def_uri = filename_to_uri(&def_file);
-                    Some(json!({
-                        "uri": def_uri,
-                        "range": {
-                            "start": { "line": sl, "character": sc },
-                            "end": { "line": el, "character": ec }
-                        }
-                    }))
+                    let locations: Vec<Value> = definitions
+                        .into_iter()
+                        .map(|(file, span)| {
+                            let text =
+                                cached
+                                    .query_engine
+                                    .get_source_file(&file)
+                                    .unwrap_or_else(|| {
+                                        text_for_file(&file, &file_name, &doc.text, active_project)
+                                    });
+                            let (sl, sc) = offset_to_position(text, span.start);
+                            let (el, ec) = offset_to_position(text, span.end);
+                            json!({
+                                "uri": filename_to_uri(&file),
+                                "range": {
+                                    "start": { "line": sl, "character": sc },
+                                    "end": { "line": el, "character": ec }
+                                }
+                            })
+                        })
+                        .collect();
+                    Some(Value::Array(locations))
                 })();
 
                 if let Some(id) = id {

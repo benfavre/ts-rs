@@ -194,6 +194,11 @@ pub fn classify_test_operation(source: &str) -> LspOperation {
 
 /// Parse a fourslash test file into an `LspTest`.
 pub fn parse_fourslash(test_name: &str, raw: &str) -> Result<LspTest, String> {
+    let definition_ranges = raw
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .contains("verify.baselineGoToDefinition(...test.ranges())");
     let mut options = CompilerOptions::default();
     let mut file_sections: Vec<(String, Vec<String>)> = Vec::new();
     let mut current_file = format!("/tests/cases/fourslash/{}.ts", test_name);
@@ -264,7 +269,8 @@ pub fn parse_fourslash(test_name: &str, raw: &str) -> Result<LspTest, String> {
 
     for (file_name, lines) in &file_sections {
         let raw_content = lines.join("\n");
-        let (content, file_markers) = extract_markers(&raw_content, file_name);
+        let (content, file_markers) =
+            extract_markers_with_ranges(&raw_content, file_name, definition_ranges);
         markers.extend(file_markers);
         if !content.is_empty() || lines.len() > 0 {
             files.push(LspTestFile {
@@ -285,7 +291,18 @@ pub fn parse_fourslash(test_name: &str, raw: &str) -> Result<LspTest, String> {
         .cloned()
         .collect::<Vec<_>>()
         .join("\n");
-    let verify_commands = parse_verify_commands(&verify_text);
+    let mut verify_commands = parse_verify_commands(&verify_text);
+    if definition_ranges {
+        for command in &mut verify_commands {
+            if let VerifyCommand::BaselineGoToDefinition { markers: requested } = command {
+                *requested = markers
+                    .iter()
+                    .filter(|m| m.name.starts_with("__definition_range:"))
+                    .map(|m| m.name.clone())
+                    .collect();
+            }
+        }
+    }
 
     Ok(LspTest {
         name: test_name.to_string(),
@@ -300,7 +317,16 @@ pub fn parse_fourslash(test_name: &str, raw: &str) -> Result<LspTest, String> {
 }
 
 /// Extract `/*name*/` markers from content, returning cleaned content and markers.
+#[cfg(test)]
 fn extract_markers(content: &str, file_name: &str) -> (String, Vec<Marker>) {
+    extract_markers_with_ranges(content, file_name, false)
+}
+
+fn extract_markers_with_ranges(
+    content: &str,
+    file_name: &str,
+    definition_ranges: bool,
+) -> (String, Vec<Marker>) {
     let mut result = String::with_capacity(content.len());
     let mut markers = Vec::new();
     let bytes = content.as_bytes();
@@ -311,6 +337,13 @@ fn extract_markers(content: &str, file_name: &str) -> (String, Vec<Marker>) {
     while i < len {
         // Strip definition range markers [| and |]
         if i + 1 < len && bytes[i] == b'[' && bytes[i + 1] == b'|' {
+            if definition_ranges {
+                markers.push(Marker {
+                    name: format!("__definition_range:{file_name}:{pos}"),
+                    file_name: file_name.to_string(),
+                    position: pos,
+                });
+            }
             i += 2;
             continue;
         }
@@ -412,11 +445,17 @@ fn parse_option(key: &str, val: &str, options: &mut CompilerOptions) {
         "esmoduleinterop" => {
             options.es_module_interop = Some(val.eq_ignore_ascii_case("true"));
         }
+        "experimentaldecorators" => {
+            options.experimental_decorators = Some(val.eq_ignore_ascii_case("true"));
+        }
         "allowimportingtsextensions" => {
             options.allow_importing_ts_extensions = Some(val.eq_ignore_ascii_case("true"));
         }
         "moduleresolution" => {
             options.module_resolution = Some(val.to_string());
+        }
+        "typeroots" => {
+            options.type_roots = Some(val.split(',').map(|s| s.trim().to_string()).collect());
         }
         _ => {} // ignore unknown options
     }
@@ -1689,6 +1728,29 @@ pub fn baseline_name_for_test(test_name: &str, op: LspOperation) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn definition_spread_ranges_preserve_virtual_file_positions() {
+        let raw = "// @typeRoots: src/types, vendor/types\n// @filename: /a.ts\n////export { foo as \"[|alias|]\" };\n// @filename: /b.ts\n////import { \"[|alias|]\" as bar } from './a';\nverify.baselineGoToDefinition(...test.ranges());";
+        let parsed = parse_fourslash("ranges", raw).unwrap();
+        assert_eq!(
+            parsed.options.type_roots,
+            Some(vec!["src/types".into(), "vendor/types".into()])
+        );
+        let VerifyCommand::BaselineGoToDefinition { markers } = &parsed.verify_commands[0] else {
+            panic!("missing definition command");
+        };
+        assert_eq!(markers.len(), 2);
+        let positions: Vec<_> = markers
+            .iter()
+            .map(|name| {
+                let marker = parsed.markers.iter().find(|m| &m.name == name).unwrap();
+                (marker.file_name.as_str(), marker.position)
+            })
+            .collect();
+        assert_eq!(positions, vec![("/a.ts", 17), ("/b.ts", 10)]);
+        assert_eq!(parsed.files[0].content, "export { foo as \"alias\" };");
+    }
 
     #[test]
     fn test_extract_markers() {

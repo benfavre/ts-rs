@@ -1470,100 +1470,56 @@ impl LspRunner {
         for (idx, marker_name) in requested_markers.iter().enumerate() {
             let marker = test.markers.iter().find(|m| m.name == *marker_name);
 
-            let actual = marker.and_then(|m| lsp_executor::definition_at_marker(&qe, &analyses, m));
-
-            // Get the corresponding baseline entry
+            let actual_targets = marker
+                .map(|m| lsp_executor::definitions_at_marker(&qe, &analyses, m))
+                .unwrap_or_default();
+            let actual = actual_targets.first();
             let entry = entries.get(idx);
-
-            let (passed, expected_str, actual_str) = match entry {
+            let actual_str = if actual_targets.is_empty() {
+                "(no definition)".to_string()
+            } else {
+                actual_targets
+                    .iter()
+                    .map(|(file, span)| format!("{}:{}", file, span.start))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let (passed, expected_str) = match entry {
                 Some(entry) if entry.expects_no_definition => {
-                    // Baseline expects no definition
-                    let passed = actual.is_none();
-                    let expected_str = "(no definition)".to_string();
-                    let actual_str = match &actual {
-                        Some((file, span)) => format!("{}:{}", file, span.start),
-                        None => "(no definition)".to_string(),
-                    };
-                    (passed, expected_str, actual_str)
+                    (actual_targets.is_empty(), "(no definition)".to_string())
                 }
-                Some(entry) => {
-                    let expected_file = entry.target_file.as_deref();
-                    let expected_pos = entry.target_position;
-
-                    let expected_str = match (expected_file, expected_pos) {
-                        (Some(f), Some(p)) => format!("{}:{} ({})", f, p, entry.name),
-                        (Some(f), None) => format!("{} ({})", f, entry.name),
-                        _ => format!("(unknown target) ({})", entry.name),
-                    };
-
-                    match &actual {
-                        Some((file, span)) => {
-                            let actual_str = format!("{}:{}", file, span.start);
-
-                            // Compare file: the baseline uses full paths like
-                            // /tests/cases/fourslash/Definition.ts while the
-                            // executor returns short paths like /Definition.ts.
-                            // Compare by filename (last path component).
-                            let exp_filename = expected_file
-                                .and_then(|f| f.rsplit('/').next())
-                                .unwrap_or("");
-                            let act_filename = file.rsplit('/').next().unwrap_or(file);
-                            let file_match = exp_filename == act_filename;
-
-                            // Compare position with tolerance of ±5
-                            let pos_match = match expected_pos {
-                                Some(exp_pos) => {
-                                    let diff = (span.start as i64) - (exp_pos as i64);
-                                    diff.abs() <= 5
-                                }
-                                None => true, // no position to check — file match is enough
-                            };
-
-                            // Name-based match: if the expected name appears at
-                            // the actual position in the source, consider it a
-                            // match even if the offset is off (handles baselines
-                            // with `--- skipped ---` lines where offset calculation
-                            // can be inaccurate).
-                            let name_match = if !pos_match && !entry.name.is_empty() {
-                                // Look up the source text at the actual position
-                                let src = qe.get_source_file(file);
-                                src.map_or(false, |s| {
-                                    let start = span.start as usize;
-                                    let name = &entry.name;
-                                    if start + name.len() <= s.len() {
-                                        &s[start..start + name.len()] == name
-                                    } else {
-                                        false
-                                    }
-                                })
-                            } else {
-                                false
-                            };
-
-                            let passed = file_match && (pos_match || name_match);
-                            (passed, expected_str, actual_str)
+                Some(entry) if !entry.targets.is_empty() => {
+                    let expected = entry
+                        .targets
+                        .iter()
+                        .map(|(f, p)| format!("{f}:{p}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    // Match every declaration once; file identity includes its
+                    // directory, so duplicate node_modules packages stay distinct.
+                    let mut remaining = actual_targets.iter().collect::<Vec<_>>();
+                    let matched = entry.targets.iter().all(|(file, position)| {
+                        if let Some(i) = remaining
+                            .iter()
+                            .position(|(f, span)| f == file && span.start == *position)
+                        {
+                            remaining.remove(i);
+                            true
+                        } else {
+                            false
                         }
-                        None => {
-                            let actual_str = "(no definition)".to_string();
-                            (false, expected_str, actual_str)
-                        }
-                    }
+                    });
+                    (matched && remaining.is_empty(), expected)
                 }
-                None => {
-                    // No baseline entry for this marker — can't compare
-                    let actual_str = match &actual {
-                        Some((file, span)) => format!("{}:{}", file, span.start),
-                        None => "(no definition)".to_string(),
-                    };
-                    (false, "(no baseline entry)".to_string(), actual_str)
-                }
+                Some(_) => (false, "(unreadable definition targets)".to_string()),
+                None => (false, "(no baseline entry)".to_string()),
             };
 
             if !passed {
                 all_passed = false;
                 if first_bucket.is_none() {
                     let expected_file = entry.and_then(|e| e.target_file.as_deref());
-                    let actual_info = actual.as_ref().map(|(f, span)| (f.as_str(), span.start));
+                    let actual_info = actual.map(|(f, span)| (f.as_str(), span.start));
                     first_bucket = Some(classify_goto_definition(
                         expected_file,
                         actual_info,

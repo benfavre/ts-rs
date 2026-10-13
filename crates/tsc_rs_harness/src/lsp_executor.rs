@@ -107,7 +107,20 @@ pub fn definition_at_marker(
     analyses: &HashMap<String, FileAnalysis>,
     marker: &Marker,
 ) -> Option<(String, Span)> {
-    let analysis = analyses.get(&marker.file_name)?;
+    definitions_at_marker(qe, analyses, marker)
+        .into_iter()
+        .next()
+}
+
+/// Execute the complete definition request, including multiple declarations.
+pub fn definitions_at_marker(
+    qe: &QueryEngine,
+    analyses: &HashMap<String, FileAnalysis>,
+    marker: &Marker,
+) -> Vec<(String, Span)> {
+    let Some(analysis) = analyses.get(&marker.file_name) else {
+        return vec![];
+    };
     // Build a project state from all analyzed files so cross-file
     // import definitions can be resolved.
     let project = if analyses.len() > 1 {
@@ -121,7 +134,7 @@ pub fn definition_at_marker(
     } else {
         None
     };
-    harness_api::definition_at(
+    harness_api::definitions_at(
         qe,
         &analysis.sym_table,
         &analysis.source_file,
