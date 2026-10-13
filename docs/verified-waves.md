@@ -2920,3 +2920,55 @@ published snapshot; this batch does not establish full TypeScript compatibility.
 All 5,356 public Rust tests pass, with 37 ignored, and `make ci` passes.
 The measured compiler commit is `c69bf94aa`. The preceding
 snapshot is retained at `docs/compatibility-metrics-2026-10-13-4ce09d34c.json`.
+
+## 2026-10-13: class heritage types and constructor queries
+
+Class heritage queries instantiate native constructor signatures, including
+generic arguments, dependent defaults, declaration-library constructors,
+qualified class names and aliases. The base expression displays its instance
+type while nested expression names retain their constructor types.
+Named class expressions preserve source names without changing their nominal
+identities. Anonymous mixin displays retain the generic base intersection.
+Type-query declarations and shorthand properties retain complete type spans.
+Invalid constructor return types, unknown bases and nongeneric class arguments
+receive the corresponding TypeScript diagnostics in source order.
+88 regression tests compare original TypeScript 6.0.3 type text, available
+synthetic-node masks and complete diagnostic codes and spans in strict and
+non-strict modes. Diagnostics and ordinary hover results agree with type-span
+tracking enabled and disabled. Donor attribution and licenses are retained.
+Upstream cases and reference baselines are unchanged.
+
+| Suite | Type passes before | After |
+|---|---:|---:|
+| Compiler | 1,688 | 1,862 |
+| Conformance | 1,272 | 1,390 |
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,990 | 4,994 |
+| Conformance | 4,051 | 4,053 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 88.84% | 88.89% | 65.08% | 65.11% |
+| Conformance | 90.35% | 90.37% | 72.91% | 72.93% |
+
+False-positive diagnostics change from 1,219 to 1,214 in compiler
+and from 2,237 to 2,233 in conformance. The accuracy report includes all option variants.
+
+QuickInfo retains 311 passes. Comparing every supported
+LSP failure set finds no newly failing cases or additional skips.
+
+Whole-case baselines gain 6 diagnostic matches and 292 type matches.
+All twelve measured baseline lanes have zero passed-to-failed cases and no
+new skips. The public JavaScript, diagnostic and type results match the six
+private verification manifests exactly.
+
+Cache-free reports cover JavaScript, diagnostics, symbols, types, expanded
+JavaScript/declarations, diagnostic accuracy and all supported LSP operations.
+Skips are excluded from pass rates. Remaining failures remain visible in the
+published snapshot; this batch does not establish full TypeScript compatibility.
+
+All 5,444 public Rust tests pass, with 37 ignored, and `make ci` passes.
+The measured compiler commit is `63ae6da5d`. The preceding
+snapshot is retained at `docs/compatibility-metrics-2026-10-13-c69bf94aa.json`.
