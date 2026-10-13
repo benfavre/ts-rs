@@ -107,3 +107,13 @@ retain a callable provisional shape during native overload selection.
 Contextual rest parameter typing adapts getRestTypeAtPosition from
 checker/relater_p2.rs in the same pinned ts-rust revision. Native arrays,
 tuples and rest elements preserve the remaining argument sequence.
+
+Declaration-derived library index signatures and properties adapt
+resolveObjectTypeMembers from checker_p21.rs and property-before-index lookup
+from getPropertyTypeForIndexType in checker_p30.rs at the same pinned ts-rust
+revision. Native type substitutions and inherited key domains replace donor
+index-info tables without materializing incomplete structural library shapes.
+
+Iterable reference displays elide matching trailing defaults following the
+backwards-compatible argument elision in nodebuilder_impl_p3.rs at that same
+revision. Native member resolution still instantiates the declaration defaults.

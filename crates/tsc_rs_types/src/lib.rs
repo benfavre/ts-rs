@@ -16418,6 +16418,7 @@ impl TypeChecker {
                                 .map(Type::TypeParameter)
                                 .collect(),
                         ),
+                        Type::IndexedAccess { .. } => self.simplify_type(&resolved),
                         other => other.clone(),
                     };
                     self.record_expression_type_span(name_span, &declaration_type);
@@ -22620,6 +22621,18 @@ impl TypeChecker {
                     Some(pruned) => self.simplify_type_modal(&pruned, display),
                     None => self.simplify_type_modal(obj, display),
                 };
+                // Structural mapped types must bind their key parameter before
+                // indexing. This path supplies members of nominal library types.
+                if matches!(&obj_simp, Type::TypeReference(..))
+                    && self.active_type_parameter_name(&idx_simp).is_none()
+                {
+                    if let Some(value) = self
+                        .known_literal_index_read(&obj_simp, &idx_simp, 0)
+                        .or_else(|| self.inherited_element_index_type(&obj_simp, &idx_simp))
+                    {
+                        return value;
+                    }
+                }
                 let obj_struct = self
                     .resolve_for_simplify(&obj_simp)
                     .unwrap_or_else(|| obj_simp.clone());
@@ -32367,6 +32380,7 @@ impl TypeChecker {
             // unrelated diagnostic behavior.
             TypeMemberKind::ConstructSig(_) => {}
             TypeMemberKind::IndexSig(signature) => {
+                self.record_signature_parameter_types(&signature.params);
                 self.check_index_signature_type_grammar(signature, member.span);
                 let pushed_parameter_names =
                     self.push_active_function_parameter_names(&signature.params);
@@ -32443,6 +32457,7 @@ impl TypeChecker {
                 signature.return_type.as_ref(),
             ),
             TypeMemberKind::IndexSig(signature) => {
+                self.record_signature_parameter_types(&signature.params);
                 self.check_index_signature_type_grammar(signature, member.span);
                 self.check_function_like_future_lib_globals(
                     &signature.params,
@@ -44183,6 +44198,7 @@ impl TypeChecker {
                         }
                     } else {
                         self.lookup_library_instance_method(name, args, property)
+                            .or_else(|| self.lookup_library_property(name, args, property))
                             .or_else(|| self.builtins.lookup_instance_property(name, property))
                             .unwrap_or(Type::Any)
                     }
@@ -44215,6 +44231,7 @@ impl TypeChecker {
                     self.resolve_member_on_type(&alias_ty, property)
                 } else {
                     self.lookup_library_instance_method(name, args, property)
+                        .or_else(|| self.lookup_library_property(name, args, property))
                         .or_else(|| self.builtins.lookup_instance_property(name, property))
                         .unwrap_or(Type::Any)
                 }

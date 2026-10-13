@@ -700,6 +700,41 @@ impl PrintedType<'_> {
         }
     }
     fn ty(&mut self, ty: &Type) {
+        // Indexed-access aliases inherit the selected property's type identity.
+        // Intrinsic results (including optional primitive unions) have no alias
+        // symbol of their own. Keep unresolved/generic computations deferred.
+        if let (Some(checker), Type::TypeReference(name, arguments)) = (self.checker, ty) {
+            if let Some(body @ Type::IndexedAccess(..)) =
+                checker.expand_type_alias_once(name, arguments)
+            {
+                let resolved = checker.simplify_type(&body);
+                fn intrinsic(ty: &Type) -> bool {
+                    match ty {
+                        Type::Union(members) => members.iter().all(intrinsic),
+                        Type::Any
+                        | Type::Unknown
+                        | Type::Never
+                        | Type::Void
+                        | Type::Null
+                        | Type::Undefined
+                        | Type::String
+                        | Type::Number
+                        | Type::Boolean
+                        | Type::BigInt
+                        | Type::Symbol
+                        | Type::StringLiteral(_)
+                        | Type::NumberLiteral(_)
+                        | Type::BooleanLiteral(_)
+                        | Type::BigIntLiteral(_) => true,
+                        _ => false,
+                    }
+                }
+                if intrinsic(&resolved) {
+                    self.ty(&resolved);
+                    return;
+                }
+            }
+        }
         match ty {
             Type::Namespace(namespace) => {
                 // symbolToTypeNode uses a type query for value-space symbols.
@@ -905,6 +940,13 @@ impl PrintedType<'_> {
                 if !arguments.is_empty() && name != "Array" && name != "ReadonlyArray" =>
             {
                 self.synthetic(crate::scoped_interface_display_name(name));
+                let count = self.checker.map_or(arguments.len(), |checker| {
+                    checker.library_printed_argument_count(name, arguments)
+                });
+                let arguments = &arguments[..count];
+                if arguments.is_empty() {
+                    return;
+                }
                 self.synthetic("<");
                 for (i, argument) in arguments.iter().enumerate() {
                     if i != 0 {

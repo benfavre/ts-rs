@@ -1197,7 +1197,9 @@ impl TypeChecker {
     /// a property access (TS2703); under strictNullChecks a deleted declared
     /// property must admit `undefined` (TS2790).
     fn check_delete_operand(&mut self, operand: &Expr) {
-        if self.report_readonly_sequence_write(operand, true).is_some() {
+        if self.report_readonly_sequence_write(operand, true).is_some()
+            || self.report_readonly_library_write(operand, true).is_some()
+        {
             return;
         }
         let mut inner = operand;
@@ -1814,6 +1816,9 @@ impl TypeChecker {
 
     pub(super) fn report_readonly_property_write(&mut self, target: &Expr) -> bool {
         if let Some(readonly) = self.report_readonly_sequence_write(target, false) {
+            return readonly;
+        }
+        if let Some(readonly) = self.report_readonly_library_write(target, false) {
             return readonly;
         }
         let inferred_index;
@@ -8662,6 +8667,18 @@ impl TypeChecker {
                         nullish_receiver_reported = true;
                     }
                 }
+                if self.assignment_target_span == Some(expr.span)
+                    && matches!(
+                        self.library_readonly_access(
+                            &obj_ty,
+                            &Type::StringLiteral(mem.property.to_string()),
+                            0
+                        ),
+                        Some(crate::stdlib_members::LibraryReadonlyAccess::Property(_))
+                    )
+                {
+                    return Type::Error;
+                }
                 self.check_private_member_access(&obj_ty, &mem.property, property_span);
                 self.check_protected_member_access(
                     &obj_ty,
@@ -9297,6 +9314,7 @@ impl TypeChecker {
                                     }
                                 } else if let Some(builtin) =
                                     self.lookup_library_instance_method(name, type_args, &mem.property)
+                                        .or_else(|| self.lookup_library_property(name, type_args, &mem.property))
                                         .or_else(|| self.builtins.lookup_instance_property(name, &mem.property))
                                 {
                                     builtin
@@ -9483,6 +9501,7 @@ impl TypeChecker {
                             } else {
                                 // No class info – try built-in instance members
                                 self.lookup_library_instance_method(name, type_args, &mem.property)
+                                    .or_else(|| self.lookup_library_property(name, type_args, &mem.property))
                                     .or_else(|| self.builtins.lookup_instance_property(name, &mem.property))
                                     .unwrap_or_else(|| {
                                         // A lib interface instance (`Promise<number>`) reports a
@@ -9945,7 +9964,8 @@ impl TypeChecker {
                 let unchecked = self
                     .compiler_options
                     .no_unchecked_indexed_access
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    && self.strict_null_checks;
                 let wrap_undef = |ty: Type| {
                     if unchecked {
                         Type::flatten_union(vec![ty, Type::Undefined])
@@ -9966,6 +9986,14 @@ impl TypeChecker {
                     .flatten()
                 {
                     return value;
+                }
+                if self.assignment_target_span == Some(expr.span)
+                    && matches!(
+                        self.library_readonly_access(&obj_ty, &idx_ty, 0),
+                        Some(crate::stdlib_members::LibraryReadonlyAccess::Property(_))
+                    )
+                {
+                    return Type::Error;
                 }
                 if let Some(member) = self.known_literal_index_read(&obj_ty, &idx_ty, 0) {
                     self.record_expr_type(expr.span.start, &member);

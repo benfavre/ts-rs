@@ -245,6 +245,10 @@ impl TypeChecker {
                     .as_ref()
                     .map(|args| args.iter().map(|a| self.resolve_type_node(a)).collect())
                     .unwrap_or_default();
+                let args: Arc<[Type]> = self
+                    .library_type_arguments(&name, &args)
+                    .map(Arc::from)
+                    .unwrap_or(args);
                 // Preserve container mutability when normalizing array references.
                 if matches!(name.as_str(), "Array" | "ReadonlyArray") && args.len() == 1 {
                     let array = Type::Array(Arc::new(args[0].clone()));
@@ -3217,12 +3221,18 @@ impl TypeChecker {
                                         &mem.property,
                                     )
                                     .or_else(|| {
+                                        self.lookup_library_property(name, type_args, &mem.property)
+                                    })
+                                    .or_else(|| {
                                         self.builtins.lookup_instance_property(name, &mem.property)
                                     })
                                     .unwrap_or(Type::Any)
                                 })
                         } else {
                             self.lookup_library_instance_method(name, type_args, &mem.property)
+                                .or_else(|| {
+                                    self.lookup_library_property(name, type_args, &mem.property)
+                                })
                                 .or_else(|| {
                                     self.builtins.lookup_instance_property(name, &mem.property)
                                 })
@@ -3270,11 +3280,20 @@ impl TypeChecker {
                 }) {
                     return value;
                 }
-                if let Some(value) = self
-                    .known_literal_index_read(&obj_ty, &index, 0)
-                    .or_else(|| self.inherited_element_index_type(&obj_ty, &index))
-                    .or_else(|| self.fresh_dynamic_index_type(&ea.object, &obj_ty, &index))
-                {
+                if let Some(value) = self.known_literal_index_read(&obj_ty, &index, 0) {
+                    return value;
+                }
+                if let Some(value) = self.inherited_element_index_type(&obj_ty, &index) {
+                    return if self.strict_null_checks
+                        && self.compiler_options.no_unchecked_indexed_access == Some(true)
+                        && self.assignment_target_span != Some(expr.span)
+                    {
+                        Type::flatten_union(vec![value, Type::Undefined])
+                    } else {
+                        value
+                    };
+                }
+                if let Some(value) = self.fresh_dynamic_index_type(&ea.object, &obj_ty, &index) {
                     return value;
                 }
                 match &obj_ty {

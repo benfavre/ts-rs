@@ -131,6 +131,23 @@ impl TypeChecker {
             _ => return None,
         };
         match receiver {
+            Type::Array(element) => {
+                if key == "length" {
+                    Some(Type::Number)
+                } else {
+                    self.lookup_array_method_typed(element, &key)
+                }
+            }
+            Type::Readonly(inner) if matches!(inner.as_ref(), Type::Array(_) | Type::Tuple(_)) => {
+                if self.readonly_sequence_member_missing(&key) {
+                    return None;
+                }
+                let value = self.readonly_sequence_member_type(inner, &key);
+                (!matches!(value, Type::Any | Type::Error)).then_some(value)
+            }
+            primitive if Self::primitive_library_owner(primitive).is_some() => {
+                self.lookup_primitive_member(primitive, &key)
+            }
             Type::ObjectType(info) => {
                 info.properties
                     .iter()
@@ -150,18 +167,11 @@ impl TypeChecker {
                         .find(|(name, _)| name == &key)
                         .map(|(_, ty)| ty);
                 }
-                if matches!(name.as_str(), "Array" | "ReadonlyArray")
-                    && args.len() == 1
-                    && !self.interface_info.contains_key(name)
-                    && !self.class_info.contains_key(name)
-                    && !self.type_aliases.contains_key(name)
-                    && stdlib::stdlib_member_availability(&self.compiler_options)
-                        .is_some_and(|library| library.declares_member(name, &key) == Some(true))
+                if let Some(property) = self
+                    .lookup_library_property(name, args, &key)
+                    .or_else(|| self.lookup_library_instance_method(name, args, &key))
                 {
-                    return self
-                        .builtins
-                        .lookup_array_method_typed(&args[0], &key)
-                        .or_else(|| self.builtins.lookup_instance_property("Array", &key));
+                    return Some(property);
                 }
                 let shape = self
                     .resolve_type_reference_to_object(name, args)
@@ -339,7 +349,11 @@ impl TypeChecker {
         if !seen.insert(name.clone()) || seen.len() > 64 {
             return Vec::new();
         }
-        let (parameters, own, bases) = if let Some(info) = self.interface_info.get(name) {
+        let (parameters, own, bases) = if let Some(info) = self
+            .interface_info
+            .get(name)
+            .filter(|_| self.program_declares_library_owner(name))
+        {
             let bases = info
                 .extends
                 .iter()
@@ -375,19 +389,16 @@ impl TypeChecker {
         } else {
             let result = if let Some(expanded) = self.expand_type_alias_once(name, arguments) {
                 self.inherited_index_constraints(&expanded, seen)
-            } else if matches!(name.as_str(), "Array" | "ReadonlyArray" | "ArrayLike")
-                && arguments.len() == 1
-                && stdlib::stdlib_member_availability(&self.compiler_options)
-                    .is_some_and(|library| library.declares_global_type(name))
-            {
-                vec![IndexConstraint {
-                    key: Type::Number,
-                    value: arguments[0].clone(),
-                    is_static: false,
-                    local_span: None,
-                }]
             } else {
-                Vec::new()
+                self.library_index_signatures(name, arguments)
+                    .into_iter()
+                    .map(|index| IndexConstraint {
+                        key: index.key,
+                        value: index.value,
+                        is_static: false,
+                        local_span: None,
+                    })
+                    .collect()
             };
             seen.remove(name);
             return result;
