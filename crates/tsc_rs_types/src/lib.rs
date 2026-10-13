@@ -45,6 +45,7 @@ mod layered_map;
 mod member_type_spans;
 mod module_augmentations;
 mod module_resolution_diagnostics;
+mod namespace_type_spans;
 pub mod narrowing;
 mod object_accessors;
 mod overload_compatibility;
@@ -12125,6 +12126,7 @@ impl TypeChecker {
             .collect();
         self.current_source = Some(file.text.clone());
         self.prepare_expression_type_comments(file);
+        self.record_namespace_declaration_types(file);
         self.prepare_augmentation_module_detection(file);
         self.check_strict_reserved_words(file);
         self.check_node18_resolution_mode_requirements(&file.statements);
@@ -12391,6 +12393,7 @@ impl TypeChecker {
             .collect();
         self.current_source = Some(file.text.clone());
         self.prepare_expression_type_comments(file);
+        self.record_namespace_declaration_types(file);
         self.prepare_augmentation_module_detection(file);
         self.check_strict_reserved_words(file);
         self.check_node18_resolution_mode_requirements(&file.statements);
@@ -14780,6 +14783,7 @@ impl TypeChecker {
             StmtKind::ClassDecl(class_decl) => {
                 if let Some(ref name) = class_decl.name {
                     let info = self.build_class_info(class_decl);
+                    self.record_class_member_declaration_types(class_decl, &info);
                     // The class VALUE binding is the constructor: model it as
                     // `typeof Name` (member access resolves statics through
                     // class_info; hover displays tsc's `typeof C`).
@@ -15282,6 +15286,7 @@ impl TypeChecker {
                 continue;
             };
             let info = self.build_class_info(class_decl);
+            self.record_class_member_declaration_types(class_decl, &info);
             (&mut self.class_info).insert(name.clone(), info);
         }
     }
@@ -16142,7 +16147,6 @@ impl TypeChecker {
                                 };
                                 if let Some(ft) = ft {
                                     let ty = Type::Function(ft);
-                                    self.record_expression_type_span(name_span, &ty);
                                     self.expression_types
                                         .insert(name_span.start, ty.display_string());
                                 }
@@ -16163,20 +16167,6 @@ impl TypeChecker {
                                     .find(|(name, _)| name == &property_name)
                                     .map(|(_, ty)| ty.clone())
                                     .unwrap_or(Type::Any);
-                                // The parser can recover a statement keyword as an
-                                // empty property before the following declaration
-                                // (`var x` or `function f`). It is not a name node.
-                                let recovered_keyword = prop.type_ann.is_none()
-                                    && prop.initializer.is_none()
-                                    && self
-                                        .syntax_error_starts
-                                        .binary_search(&prop_name_span.start)
-                                        .is_ok()
-                                    && matches!(&prop.name, PropName::Ident(name, _)
-                                        if tsc_rs_scanner::TokenKind::keyword_from_str(name).is_keyword());
-                                if !recovered_keyword {
-                                    self.record_expression_type_span(prop_name_span, &ty);
-                                }
                                 if !matches!(ty, Type::Any) {
                                     self.expression_types
                                         .insert(prop_name_span.start, ty.display_string());
@@ -16195,28 +16185,15 @@ impl TypeChecker {
                                     .find(|(key, _)| key == &name)
                                     .map(|(_, ty)| ty.clone())
                                     .unwrap_or(Type::Any);
-                                self.record_expression_type_span(name_span, &ty);
                                 if !matches!(ty, Type::Any) {
                                     self.expression_types
                                         .insert(name_span.start, ty.display_string());
                                 }
                             }
-                            ClassMemberKind::SetAccessor(acc) => {
-                                let name = self.prop_name_to_string(&acc.name);
-                                let properties = if acc.modifiers & MOD_STATIC != 0 {
-                                    &info.static_properties
-                                } else {
-                                    &info.instance_properties
-                                };
-                                if let Some((_, ty)) =
-                                    properties.iter().find(|(key, _)| key == &name)
-                                {
-                                    self.record_expression_type_span(acc.name.span(), ty);
-                                }
-                            }
                             _ => {}
                         }
                     }
+                    self.record_class_member_declaration_types(class_decl, &info);
                     self.insert_class_info(name.clone(), info);
                 }
             }
@@ -28960,6 +28937,10 @@ impl TypeChecker {
                             &Type::TypeReference(name.clone(), params),
                         );
                     }
+                }
+                if class_decl.name.is_none() && self.expression_type_spans.is_some() {
+                    let info = self.build_class_info(class_decl);
+                    self.record_class_member_declaration_types(class_decl, &info);
                 }
                 self.check_static_property_name_conflicts(class_decl, None);
                 let pushed_type_param_names =

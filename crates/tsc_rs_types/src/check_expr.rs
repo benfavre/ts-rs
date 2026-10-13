@@ -11454,6 +11454,9 @@ impl TypeChecker {
                 })
             }
             ExprKind::ClassExpr(class_decl) => {
+                if let (Some(name), Some(span)) = (&class_decl.name, class_decl.name_span) {
+                    self.record_expression_type_span(span, &Type::Typeof(name.clone()));
+                }
                 if let Some(name) = &class_decl.name {
                     self.check_reserved_type_name(name, class_decl.name_span, 2414, "Class");
                 }
@@ -11503,6 +11506,7 @@ impl TypeChecker {
                     .push(class_decl.extends.is_some());
                 self.register_class_initializer_shapes(class_decl);
                 let info = self.build_class_info(class_decl);
+                self.record_class_member_declaration_types(class_decl, &info);
                 self.insert_class_info(identity.clone(), info);
                 let class_type_param_frame = pushed_type_params
                     .then(|| self.active_type_param_names.len().saturating_sub(1));

@@ -57,3 +57,8 @@ Class return-type inference adapts getReturnTypeOfSignature's resolution stack
 from checker_p22.rs in that same ts-rust revision. Native class member shapes,
 parameter scopes and AST bodies replace symbol links and signature targets;
 lazy resolution preserves declaration-order independence and detects cycles.
+
+Namespace declaration meaning adapts getModuleInstanceState and export-alias
+resolution from ast/utilities_p3.rs in that same ts-rust revision. Native
+statement slices replace parent-node links and retain cycle-safe resolution
+while projecting namespace name types for the baseline writer.
