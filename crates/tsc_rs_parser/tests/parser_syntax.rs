@@ -177,6 +177,127 @@ fn variable_declarations_preserve_typescript_full_start_offsets() {
 }
 
 #[test]
+fn export_assignment_modifiers_highlight_the_first_token() {
+    use tsc_rs_ast::{ExportDeclKind, StmtKind};
+
+    for (prefix, first) in [
+        ("declare ", "declare"),
+        ("export declare ", "export"),
+        ("export\ndeclare ", "export"),
+        ("export /* comment */ declare ", "export"),
+    ] {
+        for assignment in ["export = value;", "export default value;"] {
+            let source = format!("/* leading */\n{prefix}{assignment}");
+            let parsed = parse("assignment.ts", &source);
+            assert_eq!(
+                parsed.diagnostics.len(),
+                1,
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            let diagnostic = &parsed.diagnostics[0];
+            assert_eq!(diagnostic.code, 1120, "{source}");
+            assert_eq!(
+                diagnostic.message,
+                "An export assignment cannot have modifiers."
+            );
+            let span = diagnostic.span.unwrap();
+            assert_eq!(span.start as usize, source.find(prefix).unwrap());
+            assert_eq!(&source[span.start as usize..span.end as usize], first);
+
+            // Reporting the grammar error must preserve the recovered export
+            // assignment so existing JavaScript emission remains unchanged.
+            let mut statement = &parsed.statements[0];
+            while let StmtKind::Export(export) = &statement.kind {
+                match &export.kind {
+                    ExportDeclKind::Decl(inner) => statement = inner,
+                    ExportDeclKind::Default(_) => break,
+                    _ => panic!("unexpected export in {source}"),
+                }
+            }
+            assert!(
+                matches!(statement.kind, StmtKind::ExportAssign(_))
+                    || matches!(&statement.kind, StmtKind::Export(export)
+                    if matches!(export.kind, ExportDeclKind::Default(_)))
+            );
+        }
+    }
+}
+
+#[test]
+fn export_assignment_modifiers_respect_module_context() {
+    for source in [
+        "namespace N { declare export = value; }",
+        "declare namespace N { declare export = value; }",
+        "function f() { declare export = value; }",
+        "if (true) { declare export = value; }",
+        "declare module 'pkg' { declare export = value; }",
+        "declare module 'pkg' { export declare export = value; }",
+        "declare global { declare export = value; }",
+    ] {
+        let parsed = parse("context.ts", source);
+        assert!(
+            !parsed.diagnostics.iter().any(|d| d.code == 1120),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
+fn export_assignment_modifiers_preserve_grammar_error_precedence() {
+    for source in [
+        "export export export = value;",
+        "declare declare export = value;",
+        "declare export export = value;",
+        "@decorator declare export = value;",
+        "declare\nexport = value;",
+        "export declare\nexport = value;",
+        "declare export = ;",
+        "declare export = value; const broken = ;",
+        "const broken = ; export export default value;",
+    ] {
+        let parsed = parse("recovery.ts", source);
+        assert!(
+            !parsed.diagnostics.iter().any(|d| d.code == 1120),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+
+    for source in [
+        "export = value;",
+        "export default value;",
+        "export default class C {}",
+        "export default function f() {}",
+        "export default interface I {}",
+        "export declare class C {}",
+        "declare export default class C {}",
+        "declare export default function f();",
+    ] {
+        let parsed = parse("declaration.ts", source);
+        assert!(
+            !parsed.diagnostics.iter().any(|d| d.code == 1120),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+
+    let parsed = parse("assignment.js", "declare export = value;");
+    assert_eq!(
+        parsed.diagnostics.iter().filter(|d| d.code == 1120).count(),
+        1
+    );
+
+    // An export-only prefix needs compiler options to choose TS1120 versus
+    // TS1287 in CommonJS/verbatimModuleSyntax, so the parser leaves it alone.
+    for source in ["export export = value;", "export export default value;"] {
+        let parsed = parse("options.ts", source);
+        assert!(!parsed.diagnostics.iter().any(|d| d.code == 1120));
+    }
+}
+
+#[test]
 fn destructuring_bindings_preserve_binding_element_full_starts() {
     let source = "const { alpha, /* object */ key: renamed = 1, ...rest } = source;\n\
 let [first, , /* array */ second = 2, ...tail] = values;\n\

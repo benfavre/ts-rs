@@ -57,6 +57,7 @@ pub fn is_grammar_diagnostic(code: u32) -> bool {
             | 1096
             | 1098
             | 1099
+            | 1120
             | 1123
             | 1162
             | 1171
@@ -189,6 +190,7 @@ pub fn parse_with_jsx(file_name: &str, source: &str, jsx_enabled: bool) -> Sourc
         }
     }
     let statements = p.parse_source_elements();
+    p.report_export_assignment_modifiers(&statements);
     let suppress_typescript_ts1206 = p.suppress_typescript_ts1206;
     let mut diagnostics = p.diagnostics;
     // TS1185: the scanner skips merge conflict markers as trivia.
@@ -1524,6 +1526,66 @@ impl<'a> Parser<'a> {
             }
         }
         stmts
+    }
+
+    /// Export assignments retain their expression-only AST for recovery.
+    /// Inspect the original modifier tokens without changing that structure,
+    /// and only at source-file level, where an explicit declare modifier is
+    /// not already rejected for its enclosing context.
+    fn report_export_assignment_modifiers(&mut self, statements: &[Stmt]) {
+        'statements: for statement in statements {
+            let mut declaration = statement;
+            while let StmtKind::Export(export) = &declaration.kind {
+                if let ExportDeclKind::Decl(inner) = &export.kind {
+                    declaration = inner;
+                } else {
+                    break;
+                }
+            }
+            let is_assignment = matches!(declaration.kind, StmtKind::ExportAssign(_))
+                || matches!(&declaration.kind, StmtKind::Export(export)
+                    if matches!(export.kind, ExportDeclKind::Default(_)));
+            if !is_assignment {
+                continue;
+            }
+
+            let first = self
+                .tokens
+                .partition_point(|token| token.span.start < statement.span.start);
+            let first_span = self.tokens[first].span;
+            let mut seen_export = false;
+            let mut seen_declare = false;
+            for index in first..self.tokens.len().saturating_sub(1) {
+                let token = &self.tokens[index];
+                let next = &self.tokens[index + 1];
+                if token.kind == TokenKind::Export
+                    && matches!(next.kind, TokenKind::Equals | TokenKind::Default)
+                {
+                    // A declare modifier makes this assignment ambient, so
+                    // TS1120 is independent of module compiler options. Bare
+                    // export modifiers need an option-aware checker: CommonJS
+                    // with verbatimModuleSyntax reports TS1287 instead.
+                    if seen_declare {
+                        self.grammar_error_at_span(
+                            1120,
+                            "An export assignment cannot have modifiers.".into(),
+                            first_span,
+                        );
+                    }
+                    break;
+                }
+                // Duplicate/out-of-order modifiers and decorators take
+                // precedence over TS1120. A newline after declare ends its
+                // modifier role.
+                match token.kind {
+                    TokenKind::Export if !seen_export && !seen_declare => seen_export = true,
+                    TokenKind::Declare if !seen_declare && !next.preceded_by_line_break => {
+                        seen_declare = true;
+                    }
+                    _ => continue 'statements,
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
