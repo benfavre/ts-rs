@@ -30710,6 +30710,7 @@ impl TypeChecker {
     /// namespaces) and the code-specific pairs (class + function → 2813/2814,
     /// enum + class → 2567) are left alone.
     fn check_duplicate_declarations(&mut self, statements: &[Stmt]) {
+        self.check_duplicate_function_implementations(statements);
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum Kind {
             Class,
@@ -30839,6 +30840,64 @@ impl TypeChecker {
                         diagnostics::error_cannot_redeclare_block_scoped(name, span)
                     } else {
                         error_duplicate_identifier(name, span)
+                    });
+                }
+            }
+        }
+    }
+
+    /// A function's declarations form an overload group only when at most
+    /// one has a body. Report every declaration in a conflicting group,
+    /// including its bodyless signatures, at the declaration's name.
+    fn check_duplicate_function_implementations(&mut self, statements: &[Stmt]) {
+        // JavaScript permits repeated function declarations. TypeScript
+        // checks duplicate implementations even inside ambient contexts.
+        if self.current_file_is_js() {
+            return;
+        }
+        let mut groups: HashMap<Option<&str>, Vec<(Span, bool)>> = HashMap::new();
+        for statement in statements {
+            let (inner, is_default) = match &statement.kind {
+                StmtKind::Export(export) => match &export.kind {
+                    ExportDeclKind::Decl(inner) => (inner.as_ref(), false),
+                    ExportDeclKind::DefaultDecl(inner) => (inner.as_ref(), true),
+                    _ => continue,
+                },
+                _ => (statement, false),
+            };
+            let StmtKind::FnDecl(function) = &inner.kind else {
+                continue;
+            };
+            let span = function.name_span.unwrap_or_else(|| {
+                // Anonymous default declarations are diagnosed at `export`.
+                Span::new(statement.span.start, statement.span.start + 6)
+            });
+            let declaration = (span, function.body.is_some());
+            if let Some(name) = function.name.as_deref() {
+                groups.entry(Some(name)).or_default().push(declaration);
+            }
+            if is_default {
+                // Default functions share an export symbol even when their
+                // local names differ. A named default also binds locally.
+                groups.entry(None).or_default().push(declaration);
+            }
+        }
+        for declarations in groups.values() {
+            if declarations.iter().filter(|(_, body)| *body).count() < 2 {
+                continue;
+            }
+            for &(span, _) in declarations {
+                if self
+                    .reported_duplicate_spans
+                    .insert((2393, span.start, span.end))
+                {
+                    self.diagnostics.push(Diagnostic {
+                        code: 2393,
+                        message: "Duplicate function implementation.".to_string(),
+                        category: DiagnosticCategory::Error,
+                        file_name: None,
+                        span: Some(span),
+                        related: None,
                     });
                 }
             }
