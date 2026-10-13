@@ -19808,12 +19808,16 @@ impl TypeChecker {
         // Resolve locally-declared class instances to structural form so the
         // missing-property refinement (TS2741/2739) fires for class-to-class
         // assignments (chainedAssignment1: 'Z' missing 'a' required by 'X').
+        let declared_source = source;
+        let declared_target = target;
+        let index_relation = !self.inherited_element_index_keys(source).is_empty()
+            || !self.inherited_element_index_keys(target).is_empty();
         let src_resolved;
         let source = match source {
             Type::TypeReference(n, a)
                 if a.is_empty() && self.class_info.contains_key(n.as_str()) =>
             {
-                src_resolved = self.get_class_instance_type(n);
+                src_resolved = self.class_assignability_instance_type(n);
                 &src_resolved
             }
             _ => source,
@@ -19823,7 +19827,7 @@ impl TypeChecker {
             Type::TypeReference(n, a)
                 if a.is_empty() && self.class_info.contains_key(n.as_str()) =>
             {
-                tgt_resolved = self.get_class_instance_type(n);
+                tgt_resolved = self.class_assignability_instance_type(n);
                 &tgt_resolved
             }
             _ => target,
@@ -20018,7 +20022,18 @@ impl TypeChecker {
                         )
                     });
                 diagnostic.message.push_str(&reason);
-            } else if let Some((line, related)) = self.assignability_elaboration(source, target) {
+            } else if let Some((line, related)) = self.assignability_elaboration(
+                if index_relation {
+                    declared_source
+                } else {
+                    source
+                },
+                if index_relation {
+                    declared_target
+                } else {
+                    target
+                },
+            ) {
                 diagnostic.message.push_str("\n  ");
                 diagnostic.message.push_str(&line.replace('\n', "\n  "));
                 diagnostic.related = related.map(|note| vec![note]);
@@ -21187,6 +21202,187 @@ impl TypeChecker {
         None
     }
 
+    /// Class member lookup also serves operations that do not inspect indices.
+    /// Structural assignment needs the instance's inherited index signature too.
+    fn class_assignability_instance_type(&self, name: &str) -> Type {
+        let instance = self.get_class_instance_type(name);
+        if self.type_param_name_is_active(name) {
+            return instance;
+        }
+        let Type::ObjectType(info) = instance else {
+            return instance;
+        };
+        let reference = Type::TypeReference(name.to_string(), Arc::from([]));
+        let keys = self.inherited_element_index_keys(&reference);
+        let [key] = keys.as_slice() else {
+            // The compact object representation has only one index slot.
+            // Multiple domains are checked on the original reference instead.
+            return Type::ObjectType(info);
+        };
+        let Some(value) = self.inherited_element_index_type(&reference, key) else {
+            return Type::ObjectType(info);
+        };
+        let mut data = info.into_data();
+        data.index_signature = Some((Arc::new(key.clone()), Arc::new(value)));
+        Type::ObjectType(ObjectTypeInfo::new(data))
+    }
+
+    /// An index value is compared for every possible key. A generic value
+    /// therefore supplies only the members guaranteed by its constraint.
+    fn index_value_is_assignable(&self, source: &Type, target: &Type, depth: usize) -> bool {
+        if depth >= 16 || source == target {
+            return self.is_assignable_to(source, target);
+        }
+        if self.active_type_parameter_name(source).is_some()
+            && self.active_type_parameter_name(target).is_none()
+        {
+            if let Some(constraint) = self.declared_type_param_constraint(source) {
+                if constraint != *source {
+                    return self.index_value_is_assignable(&constraint, target, depth + 1);
+                }
+            }
+        }
+        self.is_assignable_to(source, target)
+    }
+
+    fn missing_assignment_index(&self, source: &Type, target: &Type) -> Option<Type> {
+        let Type::TypeReference(name, _) = source else {
+            return None;
+        };
+        if self.active_type_parameter_name(source).is_some()
+            || self.active_type_parameter_name(target).is_some()
+            || !self.class_info.contains_key(name) && !self.interface_info.contains_key(name)
+        {
+            return None;
+        }
+        self.inherited_element_index_keys(target)
+            .into_iter()
+            .find(|key| {
+                if !matches!(key, Type::String | Type::Number | Type::Symbol) {
+                    return false;
+                }
+                let any_string = matches!(key, Type::String)
+                    && matches!(
+                        self.inherited_element_index_type(target, key),
+                        Some(Type::Any)
+                    );
+                !any_string && self.inherited_element_index_type(source, key).is_none()
+            })
+    }
+
+    fn incompatible_index_values(
+        &self,
+        source: &Type,
+        target: &Type,
+    ) -> Option<(Type, Type, Type, Type)> {
+        if self.active_type_parameter_name(source).is_some()
+            || self.active_type_parameter_name(target).is_some()
+        {
+            return None;
+        }
+        for target_key in self.inherited_element_index_keys(target) {
+            if !matches!(target_key, Type::String | Type::Number | Type::Symbol) {
+                continue;
+            }
+            let source_keys = self.inherited_element_index_keys(source);
+            let narrower_key = source_keys
+                .iter()
+                .find(|key| self.index_applies_to_property(key, &target_key));
+            let Some(source_value) = self
+                .inherited_element_index_type(source, &target_key)
+                .or_else(|| {
+                    narrower_key.and_then(|key| self.inherited_element_index_type(source, key))
+                })
+            else {
+                continue;
+            };
+            let Some(target_value) = self.inherited_element_index_type(target, &target_key) else {
+                continue;
+            };
+            if !self.index_value_is_assignable(&source_value, &target_value, 0) {
+                let source_key = source_keys
+                    .iter()
+                    .find(|key| **key == target_key)
+                    .or_else(|| {
+                        source_keys
+                            .iter()
+                            .find(|key| self.index_applies_to_property(&target_key, key))
+                    })
+                    .or(narrower_key)
+                    .cloned()
+                    .unwrap_or_else(|| target_key.clone());
+                return Some((source_key, target_key, source_value, target_value));
+            }
+        }
+        None
+    }
+
+    fn assignment_index_property_key(name: &str) -> Type {
+        if let Some(identity) = name
+            .strip_prefix("[unique:")
+            .and_then(|name| name.strip_suffix(']'))
+            .filter(|identity| identity.contains('\0'))
+        {
+            Type::UniqueSymbol(identity.to_string())
+        } else if name
+            .strip_prefix("[Symbol.")
+            .and_then(|name| name.strip_suffix(']'))
+            .is_some_and(Self::is_well_known_symbol_name)
+        {
+            Type::Symbol
+        } else {
+            Type::StringLiteral(name.to_string())
+        }
+    }
+
+    fn assignment_property_matches_index(&self, name: &str, index: &Type) -> bool {
+        let key = Self::assignment_index_property_key(name);
+        self.index_applies_to_property(&key, index)
+            // Symbol keys currently share their representation with quoted
+            // strings, including strings containing escaped NUL characters.
+            // Preserve the old string check until property identity
+            // distinguishes these declarations.
+            || matches!(key, Type::Symbol | Type::UniqueSymbol(_))
+                && self.index_applies_to_property(&Type::StringLiteral(name.to_string()), index)
+    }
+
+    fn property_index_value(&self, property: &Type, key: &Type) -> Type {
+        if let Type::Optional(inner) = property {
+            if matches!(key, Type::String | Type::Symbol) {
+                if self.compiler_options.exact_optional_property_types != Some(true) {
+                    if let Type::Union(members) = inner.as_ref() {
+                        return Type::flatten_union(
+                            members
+                                .iter()
+                                .filter(|member| !matches!(member, Type::Undefined))
+                                .cloned()
+                                .collect(),
+                        );
+                    }
+                }
+                return inner.as_ref().clone();
+            }
+        }
+        self.optional_property_type(property.clone())
+    }
+
+    fn index_value_reason(&mut self, source: &Type, target: &Type, depth: usize) -> String {
+        if depth < 16 && self.active_type_parameter_name(source).is_some() {
+            if let Some(constraint) = self.declared_type_param_constraint(source) {
+                if constraint != *source {
+                    let nested = self.index_value_reason(&constraint, target, depth + 1);
+                    return format!(
+                        "Type '{}' is not assignable to type '{}'.\n  {}",
+                        source.display_string_single_line(),
+                        target.display_string_single_line(),
+                        nested.replace('\n', "\n  ")
+                    );
+                }
+            }
+        }
+        self.leaf_reason_text(source, target)
+    }
+
     /// Resolve a TypeReference to its structural ObjectType form using class_info or interface_info.
     fn resolve_type_reference_to_object(&self, name: &str, args: &[Type]) -> Option<Type> {
         if args.is_empty() {
@@ -21417,7 +21613,7 @@ impl TypeChecker {
             }
             Some(obj_type)
         } else if self.class_info.contains_key(name) {
-            let inst = self.get_class_instance_type(name);
+            let inst = self.class_assignability_instance_type(name);
             if matches!(inst, Type::ObjectType(_)) {
                 // Substitute type args if generic
                 if !args.is_empty() {
@@ -25077,6 +25273,48 @@ impl TypeChecker {
             }
         }
 
+        // Preserve the named source until each indexed union/intersection
+        // constituent has checked its required index signatures. Expanding it
+        // first would incorrectly give interfaces and classes implicit indices.
+        if matches!(source, Type::TypeReference(name, _)
+            if self.active_type_parameter_name(source).is_none()
+                && (self.class_info.contains_key(name) || self.interface_info.contains_key(name)))
+        {
+            let compound = match target {
+                Type::Union(_) | Type::Intersection(_) => Some(target.clone()),
+                Type::TypeReference(name, _)
+                    if self.active_type_parameter_name(target).is_none()
+                        && self.type_aliases.contains_key(name) =>
+                {
+                    self.resolve_type_for_assignability(target)
+                }
+                _ => None,
+            };
+            if let Some(Type::Union(members) | Type::Intersection(members)) = &compound {
+                if members.iter().any(|member| {
+                    self.inherited_element_index_keys(member)
+                        .iter()
+                        .any(|key| matches!(key, Type::String | Type::Number | Type::Symbol))
+                }) {
+                    return if matches!(compound, Some(Type::Union(_))) {
+                        members
+                            .iter()
+                            .any(|member| self.is_assignable_to(source, member))
+                    } else {
+                        members
+                            .iter()
+                            .all(|member| self.is_assignable_to(source, member))
+                    };
+                }
+            }
+        }
+
+        if self.incompatible_index_values(source, target).is_some()
+            || self.missing_assignment_index(source, target).is_some()
+        {
+            return false;
+        }
+
         // Resolve TypeReference types to structural form (class/interface)
         let resolved_source = if let Type::TypeReference(name, args) = source {
             if self.local_type_alias_names.contains(name) {
@@ -26305,19 +26543,28 @@ impl TypeChecker {
             // If target has an index signature, check that all source properties
             // (including those not in target's named properties) are assignable
             // to the target's index signature value type
-            if let Some((_, ref tgt_idx_val_ty)) = tgt_info.index_signature {
+            if let Some((ref tgt_idx_key_ty, ref tgt_idx_val_ty)) = tgt_info.index_signature {
                 for (name, src_ty) in &src_info.properties {
+                    if !self.assignment_property_matches_index(name, tgt_idx_key_ty) {
+                        continue;
+                    }
                     // Skip properties already checked above (they matched named target props)
                     if tgt_info.properties.iter().any(|(n, _)| n == name) {
                         continue;
                     }
-                    if !self.is_assignable_to(src_ty, tgt_idx_val_ty) {
+                    let value = self.property_index_value(src_ty, tgt_idx_key_ty);
+                    if !self.index_value_is_assignable(&value, tgt_idx_val_ty, 0) {
                         return false;
                     }
                 }
                 // Source index signature must also be compatible with target index signature
-                if let Some((_, ref src_idx_val_ty)) = src_info.index_signature {
-                    if !self.is_assignable_to(src_idx_val_ty, tgt_idx_val_ty) {
+                if let Some((ref src_idx_key_ty, ref src_idx_val_ty)) = src_info.index_signature {
+                    let overlapping = self
+                        .index_applies_to_property(src_idx_key_ty, tgt_idx_key_ty)
+                        || self.index_applies_to_property(tgt_idx_key_ty, src_idx_key_ty);
+                    if overlapping
+                        && !self.index_value_is_assignable(src_idx_val_ty, tgt_idx_val_ty, 0)
+                    {
                         return false;
                     }
                 }
@@ -34069,7 +34316,7 @@ impl TypeChecker {
             }
             Type::TypeReference(name, args) => {
                 if args.is_empty() && self.class_info.contains_key(name.as_str()) {
-                    match self.get_class_instance_type(name) {
+                    match self.class_assignability_instance_type(name) {
                         Type::ObjectType(info) => return Some(info),
                         _ => {}
                     }
@@ -35182,6 +35429,85 @@ impl TypeChecker {
                     }
                 }
                 return Some((text, None));
+            }
+        }
+        if let Some(key) = self.missing_assignment_index(source, target) {
+            return Some((
+                format!(
+                    "Index signature for type '{}' is missing in type '{}'.",
+                    key.display_string_single_line(),
+                    src_disp
+                ),
+                None,
+            ));
+        }
+        if let Some((source_key, target_key, source_value, target_value)) =
+            self.incompatible_index_values(source, target)
+        {
+            self.last_leaf_related = None;
+            let reason = self.index_value_reason(&source_value, &target_value, 0);
+            let related = self.last_leaf_related.take();
+            // Equal generic references compare covariant index parameters
+            // directly; unrelated shapes explain the index signatures.
+            let same_generic_parameter = match (source, target) {
+                (Type::TypeReference(sn, sa), Type::TypeReference(tn, ta))
+                    if sn == tn && sa.len() == ta.len() =>
+                {
+                    source_info.properties.is_empty()
+                        && target_info.properties.is_empty()
+                        && sa
+                            .iter()
+                            .zip(ta.iter())
+                            .any(|(s, t)| *s == source_value && *t == target_value)
+                }
+                _ => false,
+            };
+            if same_generic_parameter {
+                return Some((reason, related));
+            }
+            let key_text = if source_key == target_key {
+                format!("'{}'", target_key.display_string_single_line())
+            } else {
+                format!(
+                    "'{}' and '{}'",
+                    source_key.display_string_single_line(),
+                    target_key.display_string_single_line()
+                )
+            };
+            return Some((
+                format!(
+                    "{key_text} index signatures are incompatible.\n  {}",
+                    reason.replace('\n', "\n  ")
+                ),
+                related,
+            ));
+        }
+        if let Some((key, value)) = &target_info.index_signature {
+            if self.inherited_element_index_type(source, key).is_none() {
+                for (name, property) in &source_info.properties {
+                    let property_key = Self::assignment_index_property_key(name);
+                    if !self.assignment_property_matches_index(name, key) {
+                        continue;
+                    }
+                    let source_value = self.property_index_value(property, key);
+                    if !self.index_value_is_assignable(&source_value, value, 0) {
+                        self.last_leaf_related = None;
+                        let reason = self.index_value_reason(&source_value, value, 0);
+                        let name = match &property_key {
+                            Type::UniqueSymbol(identity) => {
+                                format!("[{}]", Self::unique_symbol_display_name(identity))
+                            }
+                            _ => name.clone(),
+                        };
+                        return Some((
+                            format!(
+                                "Property '{name}' is incompatible with index signature.\n  {}",
+                                reason.replace('\n', "\n  ")
+                            ),
+                            self.last_leaf_related.take(),
+                        ));
+                    }
+                }
             }
         }
         // A named source (interface/class instance) has no implicit index
