@@ -160,6 +160,137 @@ async function exponentiationWithAwait() {
 }
 
 #[test]
+fn conditional_type_line_break_preserves_an_extends_property() {
+    use tsc_rs_ast::{KeywordTypeKind, PropName, StmtKind, TypeMemberKind, TypeNodeKind};
+
+    for separator in [
+        "\n",
+        "\r\n",
+        "\r",
+        "/*\n*/",
+        "// comment\n",
+        "\u{2028}",
+        "\u{2029}",
+    ] {
+        for declaration in ["interface Shape", "type Shape ="] {
+            let source = format!(
+                "{declaration} {{ value?: number{separator} extends?: string | string[] }}"
+            );
+            let parsed = parse("conditional-boundary.ts", &source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{source:?}: {:?}",
+                parsed.diagnostics
+            );
+            assert_eq!(parsed.statements.len(), 1);
+            let members = match &parsed.statements[0].kind {
+                StmtKind::InterfaceDecl(interface) => &interface.members,
+                StmtKind::TypeAlias(alias) => {
+                    let TypeNodeKind::TypeLit(members) = &alias.type_ann.kind else {
+                        panic!("expected object type for {source:?}");
+                    };
+                    members
+                }
+                _ => panic!("expected type declaration for {source:?}"),
+            };
+            assert_eq!(members.len(), 2, "{source:?}");
+            let TypeMemberKind::PropertySig(value) = &members[0].kind else {
+                panic!("expected first property for {source:?}");
+            };
+            assert!(matches!(&value.name, PropName::Ident(name, _) if name == "value"));
+            assert!(value.optional);
+            let value_type = value.type_ann.as_ref().unwrap();
+            assert!(matches!(
+                value_type.kind,
+                TypeNodeKind::Keyword(KeywordTypeKind::Number)
+            ));
+            assert_eq!(
+                &source[value_type.span.start as usize..value_type.span.end as usize],
+                "number"
+            );
+            let TypeMemberKind::PropertySig(extends) = &members[1].kind else {
+                panic!("expected extends property for {source:?}");
+            };
+            assert!(matches!(&extends.name, PropName::Ident(name, _) if name == "extends"));
+            assert!(extends.optional);
+            let TypeNodeKind::Union(types) = &extends.type_ann.as_ref().unwrap().kind else {
+                panic!("expected union for extends property in {source:?}");
+            };
+            assert_eq!(types.len(), 2);
+            assert!(matches!(
+                types[0].kind,
+                TypeNodeKind::Keyword(KeywordTypeKind::String)
+            ));
+            let TypeNodeKind::Array(element) = &types[1].kind else {
+                panic!("expected array union constituent for {source:?}");
+            };
+            assert!(matches!(
+                element.kind,
+                TypeNodeKind::Keyword(KeywordTypeKind::String)
+            ));
+        }
+    }
+}
+
+#[test]
+fn conditional_type_line_break_also_terminates_method_returns() {
+    use tsc_rs_ast::{KeywordTypeKind, StmtKind, TypeMemberKind, TypeNodeKind};
+
+    let parsed = parse(
+        "method-boundary.ts",
+        "interface Shape { get(): number\n extends?: string }",
+    );
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let StmtKind::InterfaceDecl(interface) = &parsed.statements[0].kind else {
+        panic!("expected interface");
+    };
+    assert_eq!(interface.members.len(), 2);
+    let TypeMemberKind::MethodSig(method) = &interface.members[0].kind else {
+        panic!("expected method signature");
+    };
+    assert!(matches!(
+        method.return_type.as_ref().unwrap().kind,
+        TypeNodeKind::Keyword(KeywordTypeKind::Number)
+    ));
+    assert!(matches!(
+        interface.members[1].kind,
+        TypeMemberKind::PropertySig(_)
+    ));
+}
+
+#[test]
+fn conditional_types_allow_line_breaks_after_the_extends_keyword() {
+    use tsc_rs_ast::{StmtKind, TypeNodeKind};
+
+    for source in [
+        "type Pick<T> = T extends\n string ?\n true :\n false;",
+        "type Pick<T> = T /* comment */ extends string ? true : false;",
+        "type Pick<T> = T extends string ? T extends 'a' ? 1 : 2 : 3;",
+    ] {
+        let parsed = parse("conditional.ts", source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+        let StmtKind::TypeAlias(alias) = &parsed.statements[0].kind else {
+            panic!("expected type alias for {source}");
+        };
+        assert!(
+            matches!(alias.type_ann.kind, TypeNodeKind::Conditional(_)),
+            "{source}"
+        );
+    }
+
+    let parsed = parse("constraint.ts", "type Constrained<T\n extends string> = T;");
+    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+    let StmtKind::TypeAlias(alias) = &parsed.statements[0].kind else {
+        panic!("expected constrained type alias");
+    };
+    assert!(alias.type_params.as_ref().unwrap()[0].constraint.is_some());
+}
+
+#[test]
 fn variable_declarations_preserve_typescript_full_start_offsets() {
     let parsed = parse("variables.ts", "var a,   b;");
     let tsc_rs_ast::StmtKind::Var(statement) = &parsed.statements[0].kind else {

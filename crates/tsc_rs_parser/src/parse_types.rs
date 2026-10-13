@@ -51,7 +51,12 @@ impl<'a> Parser<'a> {
         // Check for conditional type: T extends U ? V : W
         // When disallow_conditional_types is set (e.g. inside `infer T extends <constraint>`),
         // do not consume extends/? as a conditional type.
-        if !self.disallow_conditional_types && self.eat(TokenKind::Extends).is_some() {
+        // A line break before `extends` ends the preceding type, allowing it
+        // to name the next member after an automatically inserted semicolon.
+        if !self.disallow_conditional_types
+            && !self.is_on_new_line()
+            && self.eat(TokenKind::Extends).is_some()
+        {
             // The extends type disallows nested conditional types so that the
             // `?` terminator is unambiguous.
             let saved_dcl = self.disallow_conditional_types;
