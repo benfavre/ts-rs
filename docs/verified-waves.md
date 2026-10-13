@@ -3110,3 +3110,32 @@ rates; remaining failures in other compiler and LSP operations remain visible.
 
 Measured public source: `a7f80796d`. The preceding snapshot is
 retained at `docs/compatibility-metrics-2026-10-13-543ff7588.json`.
+
+## 2026-10-13: constructor references and exact reference measurement
+
+Find-all-references now compares every returned file and complete span with the
+TypeScript fourslash baseline. The old harness accepted partial counts and
+included duplicated definition displays. Its published 329/347 (94.8%) result
+was not an exact-location result and is not comparable with this snapshot.
+With the same stricter harness, the preceding server passes 143/347;
+this batch passes 151/347, with 196 failures and zero skips.
+There are 8 newly passing cases and no lost passes under this comparison.
+Repeated requests and text insertions are replayed; explanatory definition
+copies are excluded, omitted source lines are restored, and malformed or
+incomplete comparisons cannot become passes.
+
+Constructor references now distinguish constructor declarations and construction
+sites from ordinary class-name uses. Overloads, inherited constructors, access
+modifiers, shadowed classes and imports have independent TypeScript 6.0.3 oracle
+regressions. Upstream test cases and baseline files are unchanged.
+
+Go-to-definition remains 213/213 with no skips. The other supported LSP operations
+retain their previous passing cases and skip counts. All twelve public compiler
+and conformance comparisons have zero losses or new skips; the six JavaScript,
+diagnostic and Types manifests match the private measurements. Diagnostic
+accuracy retains matches without additional false positives for every code.
+
+All 5,600 public Rust tests pass, with zero failures and
+37 ignored. Formatting, `make ci` and workspace Clippy pass.
+Measured public source: `cdcf42764`. The previous snapshot remains
+at `docs/compatibility-metrics-2026-10-13-a7f80796d.json`.

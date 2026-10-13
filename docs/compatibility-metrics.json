@@ -1,6 +1,6 @@
 {
   "measured_at": "2026-10-13",
-  "source_commit": "a7f80796da2b36b09755587029d790c37ded5fbd",
+  "source_commit": "cdcf42764f74f7cd377aa73f36c1bafc79ce4ddb",
   "source_build": "Public main checkout, release profile, cache-free baseline reports; unchanged upstream cases and reference baselines.",
   "pass_rate_definition": "passed / (passed + failed); skipped cases excluded, never counted as passes.",
   "baselines": {
@@ -145,7 +145,7 @@
       "passed": 311,
       "failed": 218,
       "skipped": 10,
-      "report_sha256": "0cb9aa29e551500390ecb7880b8d45dc7dc87a5c41f535b37e873e7d6f40b24d",
+      "report_sha256": "7d3ca196005f85aa7d81e9e9ed6007ebdbd5d28e263823c42e355144e2ba9856",
       "command": "target/release/lsp-report --op quickinfo --json --top 1000 --show-samples 10000"
     },
     "completions": {
@@ -166,10 +166,10 @@
     },
     "findallrefs": {
       "total": 347,
-      "passed": 329,
-      "failed": 18,
+      "passed": 151,
+      "failed": 196,
       "skipped": 0,
-      "report_sha256": "f713031591a14e441f20a75dfa18d54cf32ee55e0b7a36b44c7dac236ad8747e",
+      "report_sha256": "d14abe771c8615d8d17d7cfed5eafb801da868726374f9f0b40c00dc0f500a13",
       "command": "target/release/lsp-report --op findallrefs --json --top 1000 --show-samples 10000"
     },
     "signaturehelp": {
@@ -183,23 +183,23 @@
   },
   "lsp_inventory": {
     "total": 6320,
-    "passed": 1836,
-    "failed": 529,
+    "passed": 1658,
+    "failed": 707,
     "skipped": 3955,
-    "report_sha256": "99b05afa6cf1e96bea1e6783c77e1b07daaa02d35e8ba66e7e7ba6e61272296d",
+    "report_sha256": "8562f521816fb344c1f4ca927289638fa02f174d3b90d47beb358a8d1edbcc31",
     "command": "target/release/lsp-report --op all --json --top 1000 --show-samples 10000"
   },
   "rust_tests": {
-    "total": 5618,
-    "passed": 5581,
+    "total": 5637,
+    "passed": 5600,
     "failed": 0,
     "skipped": 37,
-    "report_sha256": "d7293844575496c28578db280685b9a88f81f4ea4e403e7363f5e152ec91ab24",
+    "report_sha256": "776de9c936fd634c24211bf8bb37f660761eb8b1cf6891be83e774922db8ca33",
     "command": "cargo test --workspace"
   },
   "validation": {
     "make_ci": "passed",
-    "ci_log_sha256": "b6f716c3c29ea56349b7b3f2ee0e70d584e4dc6fa026013d59070de36d6e9f01"
+    "ci_log_sha256": "f2eeaa975689d4b2562f13456c496c47f85fe4bd5cbc32ba4e14c08e7e0fca5c"
   },
   "diagnostic_accuracy_definition": "Full expanded errors inventory; matches file basename, line and TS code with multiplicity, excluding configuration-deprecation codes. Does not require exact diagnostic message or column.",
   "lsp_total_definition": "The per-operation tables cover five supported operations. The full inventory includes unsupported cases and reports their skips separately; no skip is a pass."

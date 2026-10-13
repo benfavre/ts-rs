@@ -60,7 +60,7 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-All results below were measured on 2026-10-13 at `a7f80796d`, with the
+All results below were measured on 2026-10-13 at `cdcf42764`, with the
 result cache disabled. Pass rates are `passed / (passed + failed)`; skipped
 cases are never counted as passes.
 
@@ -76,7 +76,7 @@ JavaScript emit skips 497 compiler and 519 conformance cases without a `.js`
 oracle (mostly `noEmit`); diagnostics exercises all of them. Symbols and types
 skip 95 compiler and 290 conformance cases without a uniquely selected oracle.
 
-Public workspace validation: **5,581 Rust tests passed**, zero failed, and
+Public workspace validation: **5,600 Rust tests passed**, zero failed, and
 37 ignored; `make ci` passes.
 
 Language server, against the `fourslash` suite:
@@ -86,11 +86,11 @@ Language server, against the `fourslash` suite:
 | QuickInfo (hover) | 311 | 218 | 10 | 58.8% |
 | Completions | 860 | 271 | 0 | 76.0% |
 | Go-to-definition | 213 | 0 | 0 | 100.0% |
-| Find-all-references | 329 | 18 | 0 | 94.8% |
+| Find-all-references | 151 | 196 | 0 | 43.5% |
 | Signature help | 123 | 22 | 7 | 84.8% |
-| **Supported operations** | **1,836** | **529** | **17** | **77.6%** |
+| **Supported operations** | **1,658** | **707** | **17** | **70.1%** |
 
-The full inventory contains 6,320 cases: 1,836 pass, 529 fail, and 3,955 are
+The full inventory contains 6,320 cases: 1,658 pass, 707 fail, and 3,955 are
 skipped, including unsupported operations.
 
 Expanded option variants (14,819 identities, 1,016 skips per lane):
@@ -109,6 +109,9 @@ Symbol and type baselines still have substantial gaps.
 current counts, measurement commit, report hashes and reproduction commands.
 The [September 7 snapshot](docs/compatibility-metrics-2026-09-07.json) remains
 available as historical evidence.
+
+Find-all-references now requires exact file and span matches. The earlier 94.8%
+figure used a partial-count check and is not comparable with this snapshot.
 
 Reproduce any row:
 
