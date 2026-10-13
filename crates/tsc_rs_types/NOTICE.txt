@@ -94,3 +94,16 @@ src/overload_failure.rs adapts getCandidateForOverloadFailure and
 getLongestCandidateIndex from checker_p11.rs, preserving the selected failure
 result while reporting the original overload diagnostic. The copyright and
 license terms above also apply to these adaptations.
+
+Primitive member lookup adapts getApparentType's primitive-to-wrapper mapping
+from checker_p24.rs in the same pinned ts-rust revision. Native primitive and
+literal receivers share the declaration-based member resolver and retain their
+receiver identity when substituting polymorphic this types.
+
+Library overload serialization retains declaration order as in
+getSignaturesOfSymbol in checker_p22.rs. Context-sensitive function arguments
+retain a callable provisional shape during native overload selection.
+
+Contextual rest parameter typing adapts getRestTypeAtPosition from
+checker/relater_p2.rs in the same pinned ts-rust revision. Native arrays,
+tuples and rest elements preserve the remaining argument sequence.

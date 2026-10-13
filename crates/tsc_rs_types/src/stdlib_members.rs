@@ -107,6 +107,9 @@ fn library_interfaces(path: &str, strict_null_checks: bool) -> Option<Arc<Librar
                         .collect();
                     if !non_nullable.is_empty() {
                         signature.return_type = Arc::new(Type::flatten_union(non_nullable));
+                        signature.source = signature
+                            .source
+                            .with_resolved_return_type(&signature.return_type);
                     }
                 }
             }
@@ -154,13 +157,9 @@ impl TypeChecker {
         let availability = stdlib::stdlib_member_availability(&self.compiler_options)?;
         let mut signatures = Vec::new();
         let mut bases = Vec::new();
-        // Later declaration groups precede earlier groups, preserving the
-        // order within each group, just like merged interface overloads.
-        for file in availability
-            .owner_declaring_libraries(owner)
-            .into_iter()
-            .rev()
-        {
+        // getSignaturesOfSymbol (checker_p22.rs) retains declaration order.
+        // Candidate precedence during calls is separate from member type order.
+        for file in availability.owner_declaring_libraries(owner) {
             let interfaces = library_interfaces(&file, self.strict_null_checks)?;
             let Some(interface) = interfaces.get(owner) else {
                 continue;
@@ -287,6 +286,32 @@ impl TypeChecker {
                     &Type::TypeReference(owner.to_owned(), arguments.to_vec().into()),
                 )
             })
+    }
+
+    /// Primitive apparent types use their wrapper interfaces, following
+    /// getApparentType in pingdotgg/ts-rust checker_p24.rs. Keep the original
+    /// receiver when instantiating polymorphic `this` in a library signature.
+    pub(super) fn primitive_library_owner(receiver: &Type) -> Option<&'static str> {
+        match receiver {
+            Type::String | Type::StringLiteral(_) => Some("String"),
+            Type::Number | Type::NumberLiteral(_) => Some("Number"),
+            Type::Boolean | Type::BooleanLiteral(_) => Some("Boolean"),
+            Type::BigInt | Type::BigIntLiteral(_) => Some("BigInt"),
+            Type::Symbol | Type::UniqueSymbol(_) => Some("Symbol"),
+            _ => None,
+        }
+    }
+
+    pub(super) fn lookup_primitive_member(&self, receiver: &Type, name: &str) -> Option<Type> {
+        let owner = Self::primitive_library_owner(receiver)?;
+        let user_declared = self.class_info.contains_key(owner)
+            || self.interface_info.contains_key(owner)
+            || self.type_aliases.contains_key(owner);
+        (!user_declared)
+            .then(|| self.library_method_type(owner, &[], name))
+            .flatten()
+            .map(|method| Self::substitute_this(&method, receiver))
+            .or_else(|| self.builtins.lookup_instance_property(owner, name))
     }
 
     pub(crate) fn lookup_array_method_typed(&self, element: &Type, method: &str) -> Option<Type> {

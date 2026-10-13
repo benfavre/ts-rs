@@ -18,6 +18,17 @@ impl SignatureSource {
         self
     }
 
+    pub(crate) fn with_resolved_return_type(mut self, ty: &Type) -> Self {
+        if let Some(annotation) = self
+            .0
+            .as_mut()
+            .and_then(|source| Arc::make_mut(source).return_type.as_mut())
+        {
+            annotation.ty = ty.clone();
+        }
+        self
+    }
+
     pub(crate) fn with_function_type_origin(mut self) -> Self {
         if let Some(source) = &mut self.0 {
             Arc::make_mut(source).function_type = true;
@@ -466,9 +477,10 @@ impl PrintedType<'_> {
         self.write(text, true);
     }
     fn annotation(&mut self, ty: &Type, annotation: Option<&Annotation>) {
-        if let Some(annotation) =
-            annotation.filter(|a| a.ty == *ty && !self.has_fresh_parameter(ty))
-        {
+        if let Some(annotation) = annotation.filter(|a| {
+            (a.ty == *ty || TypeChecker::substitute(&a.ty, &Default::default()) == *ty)
+                && !self.has_fresh_parameter(ty)
+        }) {
             self.original(&annotation.text);
         } else {
             self.ty(ty);
@@ -699,6 +711,7 @@ impl PrintedType<'_> {
                 self.synthetic("typeof ");
                 self.synthetic(&name);
             }
+            Type::UniqueSymbol(_) => self.synthetic("unique symbol"),
             Type::Function(signature) => self.signature(signature, " => "),
             Type::Constructor(signature) => self.constructor(signature, " => "),
             Type::Array(element) if matches!(element.as_ref(), Type::UniqueSymbol(_)) => {

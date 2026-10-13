@@ -3235,13 +3235,8 @@ impl TypeChecker {
                             raw_ty
                         }
                     }
-                    Type::String | Type::StringLiteral(_) => self
-                        .builtins
-                        .lookup_instance_property("String", &mem.property)
-                        .unwrap_or(Type::Any),
-                    Type::Number | Type::NumberLiteral(_) => self
-                        .builtins
-                        .lookup_instance_property("Number", &mem.property)
+                    primitive if Self::primitive_library_owner(primitive).is_some() => self
+                        .lookup_primitive_member(primitive, &mem.property)
                         .unwrap_or(Type::Any),
                     Type::Array(elem) => self
                         .lookup_array_method_typed(elem, &mem.property)

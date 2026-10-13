@@ -44030,21 +44030,9 @@ impl TypeChecker {
                     None
                 }
             }
-            Type::String | Type::StringLiteral(_) => Some(
-                self.builtins
-                    .lookup_instance_property("String", property)
-                    .is_some(),
-            ),
-            Type::Number | Type::NumberLiteral(_) => Some(
-                self.builtins
-                    .lookup_instance_property("Number", property)
-                    .is_some(),
-            ),
-            Type::Boolean | Type::BooleanLiteral(_) => Some(
-                self.builtins
-                    .lookup_instance_property("Boolean", property)
-                    .is_some(),
-            ),
+            primitive if Self::primitive_library_owner(primitive).is_some() => {
+                Some(self.lookup_primitive_member(primitive, property).is_some())
+            }
             Type::Array(_) | Type::Tuple(_) => Some(
                 property == "length"
                     || self
@@ -44231,17 +44219,8 @@ impl TypeChecker {
                         .unwrap_or(Type::Any)
                 }
             }
-            Type::String | Type::StringLiteral(_) => self
-                .builtins
-                .lookup_instance_property("String", property)
-                .unwrap_or(Type::Any),
-            Type::Number | Type::NumberLiteral(_) => self
-                .builtins
-                .lookup_instance_property("Number", property)
-                .unwrap_or(Type::Any),
-            Type::Boolean | Type::BooleanLiteral(_) => self
-                .builtins
-                .lookup_instance_property("Boolean", property)
+            primitive if Self::primitive_library_owner(primitive).is_some() => self
+                .lookup_primitive_member(primitive, property)
                 .unwrap_or(Type::Any),
             Type::Array(ref elem) => self
                 .lookup_array_method_typed(elem, property)

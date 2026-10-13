@@ -5981,10 +5981,7 @@ impl TypeChecker {
                             // of the REMAINING contextual parameters (empty
                             // tuple when none remain), not a single positional
                             // slot.
-                            let cps = ctx_params.unwrap();
-                            let rest: Vec<Type> =
-                                cps.iter().skip(i).map(|(_, t)| t.clone()).collect();
-                            Type::Tuple(rest.into())
+                            Self::contextual_rest_type(ctx_params.unwrap(), i)
                         } else if let Some(cp) = ctx_params
                             // TypeScript skips contextual parameter typing for a
                             // function expression that declares its OWN type
@@ -6307,10 +6304,7 @@ impl TypeChecker {
                         {
                             // Rest param: tuple of remaining ctx params (see
                             // the Arrow arm).
-                            let cps = ctx_params.unwrap();
-                            let rest: Vec<Type> =
-                                cps.iter().skip(i).map(|(_, t)| t.clone()).collect();
-                            Type::Tuple(rest.into())
+                            Self::contextual_rest_type(ctx_params.unwrap(), i)
                         } else if let Some(cp) = ctx_params
                             // See the Arrow arm: a function expression with its
                             // own type parameters skips contextual param typing.
@@ -7542,7 +7536,18 @@ impl TypeChecker {
                         .iter()
                         .map(|argument| {
                             if matches!(argument.kind, ExprKind::Arrow(_) | ExprKind::FnExpr(_)) {
-                                Type::Any
+                                // Context-sensitive callbacks have a callable shape even
+                                // before their parameters and return are inferred. Using
+                                // any here also matches scalar overloads (e.g. replace).
+                                Type::Function(FunctionType {
+                                    params: Vec::new(),
+                                    return_type: Arc::new(Type::Any),
+                                    type_params: Vec::new(),
+                                    type_param_constraints: Vec::new(),
+                                    type_param_defaults: Vec::new(),
+                                    type_predicate: None,
+                                    source: Default::default(),
+                                })
                             } else {
                                 self.infer_expr_type(argument)
                             }
@@ -9510,39 +9515,11 @@ impl TypeChecker {
                             }
                         }
                     }
-                    // Resolve member access on primitive and well-known types via builtins
-                    Type::String | Type::StringLiteral(_) => self
-                        .builtins
-                        .lookup_instance_property("String", &mem.property)
+                    primitive if Self::primitive_library_owner(primitive).is_some() => self
+                        .lookup_primitive_member(primitive, &mem.property)
                         .unwrap_or_else(|| {
                             self.primitive_member_fallback(
-                                "String",
-                                &mem.object,
-                                &obj_ty,
-                                &mem.property,
-                                property_span,
-                                reported_future_lib_member,
-                            )
-                        }),
-                    Type::Number | Type::NumberLiteral(_) => self
-                        .builtins
-                        .lookup_instance_property("Number", &mem.property)
-                        .unwrap_or_else(|| {
-                            self.primitive_member_fallback(
-                                "Number",
-                                &mem.object,
-                                &obj_ty,
-                                &mem.property,
-                                property_span,
-                                reported_future_lib_member,
-                            )
-                        }),
-                    Type::Boolean | Type::BooleanLiteral(_) => self
-                        .builtins
-                        .lookup_instance_property("Boolean", &mem.property)
-                        .unwrap_or_else(|| {
-                            self.primitive_member_fallback(
-                                "Boolean",
+                                Self::primitive_library_owner(primitive).unwrap(),
                                 &mem.object,
                                 &obj_ty,
                                 &mem.property,
@@ -13304,6 +13281,43 @@ impl TypeChecker {
         }
     }
 
+    /// Adapt getRestTypeAtPosition (pingdotgg/ts-rust relater_p2.rs):
+    /// a rest parameter captures the remaining argument sequence. A contextual
+    /// array rest remains an array, rather than becoming a tuple of one array.
+    fn contextual_rest_type(params: &[(String, Type)], index: usize) -> Type {
+        if let Some((position, (_, ty))) = params
+            .iter()
+            .enumerate()
+            .find(|(position, (name, _))| *position <= index && name.starts_with("..."))
+        {
+            if position == index {
+                return ty.clone();
+            }
+            return match ty {
+                Type::Tuple(elements) => {
+                    Type::Tuple(elements.iter().skip(index - position).cloned().collect())
+                }
+                Type::Any => Type::Array(Arc::new(Type::Any)),
+                _ => ty.clone(),
+            };
+        }
+        Type::Tuple(
+            params
+                .iter()
+                .skip(index)
+                .map(|(name, ty)| {
+                    if name.starts_with("...") {
+                        Type::Rest(Arc::new(ty.clone()))
+                    } else if name.starts_with('?') {
+                        Type::Optional(Arc::new(ty.clone()))
+                    } else {
+                        ty.clone()
+                    }
+                })
+                .collect(),
+        )
+    }
+
     /// The contextual parameter at position `index` of a contextual signature:
     /// positions at or after a rest parameter (`...args: T[]`) take its
     /// element type (tsc getTypeAtPosition), not the whole array.
@@ -13443,14 +13457,19 @@ impl TypeChecker {
         expr: &Expr,
     ) -> bool {
         // TS2554: Check argument count against parameter metadata.
-        // Only check when we have stored param info (from local function decls).
-        // Skip for: builtins, imports, methods, constructors (too many false positives).
-        // Bare local functions, and methods on program-declared
-        // receivers (class / interface / type literal), have faithful
-        // parameter metadata; library receivers are skipped.
+        // Check local declarations and primitive library members whose
+        // signatures were resolved from declarations. Handwritten fallback
+        // signatures do not provide reliable arity metadata.
         let arity_checkable = match &call.callee.kind {
             ExprKind::Ident(name) => self.fn_param_info.contains_key(name.as_str()),
-            ExprKind::Member(member) => self.receiver_is_user_declared(&member.object),
+            ExprKind::Member(member) => {
+                self.receiver_is_user_declared(&member.object)
+                    || Self::primitive_library_owner(&self.infer_expr_type(&member.object))
+                        .is_some_and(|owner| {
+                            self.lookup_library_instance_method(owner, &[], &member.property)
+                                .is_some()
+                        })
+            }
             _ => false,
         };
         if arity_checkable {
