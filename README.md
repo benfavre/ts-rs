@@ -60,7 +60,7 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-All results below were measured on 2026-10-13 at `b4c0639af`, with the
+All results below were measured on 2026-10-13 at `8d97319d6`, with the
 result cache disabled. Pass rates are `passed / (passed + failed)`; skipped
 cases are never counted as passes.
 
@@ -69,14 +69,14 @@ cases are never counted as passes.
 | JavaScript emit | 6,032 / 6,032 (100.0%) | 5,388 / 5,388 (100.0%) | Byte-for-byte match with the `tsc` `.js` baseline (one configuration per case) |
 | Diagnostics | 4,977 / 6,529 (76.2%) | 4,048 / 5,907 (68.5%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
 | Symbols | 1,731 / 6,434 (26.9%) | 1,590 / 5,617 (28.3%) | Match with the `tsc` `.symbols` baseline |
-| Types | 1,127 / 6,434 (17.5%) | 1,033 / 5,617 (18.4%) | Match with the `tsc` `.types` baseline |
+| Types | 1,248 / 6,434 (19.4%) | 1,078 / 5,617 (19.2%) | Match with the `tsc` `.types` baseline |
 | Type-check recall / precision | 64.7% / 88.4% | 72.8% / 90.2% | Per-diagnostic `(file, line, code)` match over every option variant |
 
 JavaScript emit skips 497 compiler and 519 conformance cases without a `.js`
 oracle (mostly `noEmit`); diagnostics exercises all of them. Symbols and types
 skip 95 compiler and 290 conformance cases without a uniquely selected oracle.
 
-Public workspace validation: **4,864 Rust tests passed**, zero failed, and
+Public workspace validation: **4,931 Rust tests passed**, zero failed, and
 37 ignored; `make ci` passes.
 
 Language server, against the `fourslash` suite:
