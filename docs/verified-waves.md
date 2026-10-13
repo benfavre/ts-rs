@@ -2497,3 +2497,53 @@ published snapshot; this batch does not establish full TypeScript compatibility.
 All 4,800 public Rust tests pass, with 37 ignored, and `make ci` passes.
 The measured compiler commit is `afdac9284`. The preceding
 snapshot is retained at `docs/compatibility-metrics-2026-10-13-4f6150c3e.json`.
+
+## 2026-10-13: interface and type-literal method type collection
+
+Method declaration names now receive their own type-baseline entries.
+Collection reuses the native resolver and source-aware signature printer
+inside the existing scoped declaration traversal. It covers generic and
+optional methods, predicates, literal and computed names, nested type
+literals, and merged interfaces. Source annotations retain their masks.
+Overload declaration identity is retained independently of structural
+signature deduplication: two equal signatures from distinct declarations
+both print, while re-injecting the same file and span adds no overload.
+Eighteen new regression tests use original TypeScript 6.0.3 writer text
+and synthetic-node masks. Every test also checks that span collection
+preserves ordinary diagnostics and hover output. Collection remains opt-in.
+The unchanged upstream baselines remain the whole-case compatibility oracle.
+
+| Suite | Type passes before | After |
+|---|---:|---:|
+| Compiler | 1,092 | 1,120 |
+| Conformance | 1,006 | 1,027 |
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,973 | 4,973 |
+| Conformance | 4,047 | 4,047 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 88.31% | 88.31% | 64.70% | 64.70% |
+| Conformance | 90.15% | 90.15% | 72.77% | 72.77% |
+
+False-positive diagnostics change from 1,277 to 1,277 in compiler
+and from 2,284 to 2,284 in conformance. The accuracy report includes all option variants.
+
+QuickInfo retains 308 passes. Comparing every supported
+LSP failure set finds no newly failing cases or additional skips.
+
+Whole-case baselines gain 0 diagnostic matches and 49 type matches.
+All twelve measured baseline lanes have zero passed-to-failed cases and no
+new skips. The public JavaScript, diagnostic and type results match the six
+private verification manifests exactly.
+
+Cache-free reports cover JavaScript, diagnostics, symbols, types, expanded
+JavaScript/declarations, diagnostic accuracy and all supported LSP operations.
+Skips are excluded from pass rates. Remaining failures remain visible in the
+published snapshot; this batch does not establish full TypeScript compatibility.
+
+All 4,818 public Rust tests pass, with 37 ignored, and `make ci` passes.
+The measured compiler commit is `8c504ed53`. The preceding
+snapshot is retained at `docs/compatibility-metrics-2026-10-13-afdac9284.json`.
