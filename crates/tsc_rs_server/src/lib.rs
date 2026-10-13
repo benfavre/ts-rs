@@ -26641,6 +26641,11 @@ pub fn references_at(
     offset: u32,
     project: Option<&ProjectState>,
 ) -> Vec<(String, Span)> {
+    if let Some(references) =
+        definition::references::constructors(query_engine, file_name, offset, project)
+    {
+        return references;
+    }
     let source_text = query_engine.get_source_file(file_name).unwrap_or("");
 
     // `default` inside `export { default } from "./c"` / `{ foo as default }`:

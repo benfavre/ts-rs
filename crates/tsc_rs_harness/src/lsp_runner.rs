@@ -2080,8 +2080,8 @@ impl LspRunner {
             };
         }
 
-        let baseline_entries = match lsp_baseline::load_find_all_refs_baseline(&baseline_path) {
-            Ok(e) => e,
+        let requests = match crate::lsp_parser::reference_requests(test) {
+            Ok(requests) => requests,
             Err(e) => {
                 return LspTestResult {
                     name: test_name.to_string(),
@@ -2090,11 +2090,36 @@ impl LspRunner {
                     skipped: false,
                     skip_reason: None,
                     bucket: Some(LspBucket::ParseError),
-                    marker_results: Vec::new(),
+                    marker_results: vec![],
                     panic_message: Some(e),
-                };
+                }
             }
         };
+        let states = requests
+            .iter()
+            .map(|(t, _)| {
+                t.files
+                    .iter()
+                    .map(|f| (f.name.clone(), f.content.clone()))
+                    .collect()
+            })
+            .collect::<Vec<_>>();
+        let baseline_entries =
+            match lsp_baseline::load_find_all_refs_baseline(&baseline_path, &states) {
+                Ok(e) => e,
+                Err(e) => {
+                    return LspTestResult {
+                        name: test_name.to_string(),
+                        operation: LspOperation::FindAllReferences,
+                        passed: false,
+                        skipped: false,
+                        skip_reason: None,
+                        bucket: Some(LspBucket::ParseError),
+                        marker_results: Vec::new(),
+                        panic_message: Some(e),
+                    };
+                }
+            };
 
         if baseline_entries.is_empty() {
             return LspTestResult {
@@ -2109,51 +2134,39 @@ impl LspRunner {
             };
         }
 
-        let (qe, analyses) = lsp_executor::build_analysis(test);
-
         let mut marker_results = Vec::new();
-        let mut all_passed = true;
+        let mut all_passed = !requests.is_empty() && requests.len() == baseline_entries.len();
         let mut first_bucket: Option<LspBucket> = None;
-
-        // Get markers from the verify command
-        let ref_markers: Vec<&str> = test
-            .verify_commands
-            .iter()
-            .filter_map(|cmd| match cmd {
-                VerifyCommand::BaselineFindAllReferences { markers } => {
-                    Some(markers.iter().map(|s| s.as_str()).collect::<Vec<_>>())
-                }
-                _ => None,
-            })
-            .flatten()
-            .collect();
-
-        // If no explicit markers, use all test markers
-        let markers_to_check: Vec<&str> = if ref_markers.is_empty() {
-            test.markers.iter().map(|m| m.name.as_str()).collect()
-        } else {
-            ref_markers
-        };
-
-        // For each marker, find the corresponding baseline entry and compare
-        for (idx, &marker_name) in markers_to_check.iter().enumerate() {
+        let mut cached_analysis = None;
+        let mut cached_sources = Vec::new();
+        for (idx, (snapshot, marker_name)) in requests.iter().enumerate() {
+            let sources: Vec<_> = snapshot.files.iter().map(|f| f.content.clone()).collect();
+            if cached_analysis.is_none() || cached_sources != sources {
+                cached_analysis = Some(lsp_executor::build_analysis(snapshot));
+                cached_sources = sources;
+            }
+            let (qe, analyses) = cached_analysis.as_ref().unwrap();
             let entry = baseline_entries.get(idx);
-            let marker = test.markers.iter().find(|m| m.name == marker_name);
-
+            let marker = snapshot.markers.iter().find(|m| m.name == *marker_name);
             let actual_refs = marker
-                .map(|m| lsp_executor::references_at_marker(&qe, &analyses, m))
+                .map(|m| lsp_executor::references_at_marker(qe, analyses, m))
                 .unwrap_or_default();
-
-            let expected_count = entry.map(|e| e.expected_ref_count).unwrap_or(1);
-            let actual_count = actual_refs.len();
-            let entry_name = entry.map(|e| e.name.as_str()).unwrap_or("");
-
-            // Pass if we find at least as many references as expected
-            // (we may find more due to different counting methodology)
-            let passed = actual_count >= expected_count
-                || (expected_count > 0
-                    && actual_count > 0
-                    && (actual_count as f64 / expected_count as f64) >= 0.5);
+            let mut expected = entry.map(|e| e.references.clone()).unwrap_or_default();
+            let mut actual: Vec<_> = actual_refs
+                .into_iter()
+                .map(|(f, s)| (lsp_baseline::normalize_reference_path(&f), s))
+                .collect();
+            let sort = |(f, span): &(String, tsc_rs_ast::Span)| (f.clone(), span.start, span.end);
+            expected.sort_by_key(sort);
+            actual.sort_by_key(sort);
+            let passed = entry.is_some() && marker.is_some() && actual == expected;
+            let actual_count = actual.len();
+            let format = |refs: &[(String, tsc_rs_ast::Span)]| {
+                refs.iter()
+                    .map(|(f, s)| format!("{f}:{}-{}", s.start, s.end))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
 
             if !passed {
                 all_passed = false;
@@ -2170,8 +2183,8 @@ impl LspRunner {
                 marker_name: marker_name.to_string(),
                 file_name: marker.map(|m| m.file_name.clone()).unwrap_or_default(),
                 position: marker.map(|m| m.position).unwrap_or(0),
-                expected: Some(format!("{} refs ({})", expected_count, entry_name)),
-                actual: Some(format!("{} refs", actual_count)),
+                expected: Some(format(&expected)),
+                actual: Some(format(&actual)),
                 passed,
             });
         }

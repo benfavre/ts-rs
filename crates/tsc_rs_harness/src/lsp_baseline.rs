@@ -305,12 +305,9 @@ pub fn load_completions_baseline(path: &Path) -> Result<Vec<CompletionsBaselineE
 /// A single findAllReferences baseline entry.
 #[derive(Debug, Clone)]
 pub struct FindAllRefsEntry {
-    /// Number of reference locations ([|...|] ranges) in the baseline.
-    pub expected_ref_count: usize,
-    /// The symbol name from the Details section.
-    pub name: String,
-    /// The symbol kind from the Details section.
-    pub kind: String,
+    /// Reference locations in the top-level source annotation. The separate
+    /// Definitions section describes groups; it does not add reference uses.
+    pub references: Vec<(String, tsc_rs_ast::Span)>,
 }
 
 /// Resolve the baseline file path for a findAllReferences test.
@@ -330,81 +327,161 @@ fn is_operation_header(line: &str) -> bool {
     !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_alphabetic())
 }
 
-pub fn load_find_all_refs_baseline(path: &Path) -> Result<Vec<FindAllRefsEntry>, String> {
+pub fn load_find_all_refs_baseline(
+    path: &Path,
+    states: &[HashMap<String, String>],
+) -> Result<Vec<FindAllRefsEntry>, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("cannot read baseline: {e}"))?;
+    parse_reference_sections(&content, states)
+}
 
+fn parse_reference_sections(
+    content: &str,
+    states: &[HashMap<String, String>],
+) -> Result<Vec<FindAllRefsEntry>, String> {
     let mut entries = Vec::new();
-    let lines: Vec<&str> = content.lines().collect();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let trimmed = lines[i].trim();
-        if trimmed == "// === findAllReferences ===" {
-            i += 1;
-            // Count [|...|] ranges in the source annotation section
-            let mut ref_count = 0;
-            let mut name = String::new();
-            let mut kind = String::new();
-
-            while i < lines.len() {
-                let t = lines[i].trim();
-                if t == "// === findAllReferences ===" {
-                    break; // next section
+    let mut references = Vec::new();
+    let mut active = false;
+    let mut file: Option<&str> = None;
+    let mut source_line = 0usize;
+    let mut stack = Vec::new();
+    for line in content.lines() {
+        if is_operation_header(line) {
+            if active {
+                if !stack.is_empty() {
+                    return Err("unclosed reference range".into());
                 }
-                // Another operation's section (`// === findRenameLocations ===`,
-                // `// === documentHighlights ===`, ...) ends this entry; file
-                // headers (`// === /a.ts ===`) and indented sub-sections don't.
-                if is_operation_header(lines[i]) {
-                    break;
-                }
-                // Count [| occurrences in source lines
-                if t.starts_with("// ") {
-                    let line = &t[3..];
-                    ref_count += line.matches("[|").count();
-                }
-                // Parse Details JSON
-                if t == "// === Details ===" {
-                    i += 1;
-                    let mut json_lines = Vec::new();
-                    while i < lines.len() {
-                        let jt = lines[i].trim();
-                        if jt.starts_with("// === ") {
-                            break;
-                        }
-                        if jt.is_empty() {
-                            let peek = lines.get(i + 1).map(|l| l.trim()).unwrap_or("");
-                            if peek.starts_with("// === ") || peek.is_empty() {
-                                i += 1;
-                                break;
-                            }
-                        }
-                        json_lines.push(jt);
-                        i += 1;
-                    }
-                    let json_text = json_lines.join("\n");
-                    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&json_text) {
-                        if let Some(first) = arr.first() {
-                            name = first["name"].as_str().unwrap_or("").to_string();
-                            kind = first["kind"].as_str().unwrap_or("").to_string();
-                        }
-                    }
-                    continue;
-                }
-                i += 1;
+                entries.push(FindAllRefsEntry {
+                    references: std::mem::take(&mut references),
+                });
             }
+            active = line == "// === findAllReferences ===";
+            file = None;
+            continue;
+        }
+        if !active {
+            continue;
+        }
+        let sources = states
+            .get(entries.len())
+            .ok_or("more reference baselines than requests")?;
+        // Indented Definitions/Details are explanatory copies, not references.
+        if line.starts_with("  // === ") {
+            file = None;
+            continue;
+        }
+        if let Some(path) = line
+            .strip_prefix("// === ")
+            .and_then(|s| s.strip_suffix(" ==="))
+        {
+            if !stack.is_empty() {
+                return Err("reference range crosses files".into());
+            }
+            if !sources
+                .keys()
+                .any(|f| normalize_reference_path(f) == normalize_reference_path(path))
+            {
+                return Err(format!("missing virtual source: {path}"));
+            }
+            file = Some(path);
+            source_line = 0;
+            continue;
+        }
+        let Some(file) = file else {
+            continue;
+        };
+        let Some(annotated) = line.strip_prefix("// ") else {
+            continue;
+        };
+        if let Some(rest) = annotated.strip_prefix("--- (line: ") {
+            source_line = rest
+                .split(')')
+                .next()
+                .unwrap_or("")
+                .parse()
+                .map_err(|_| "invalid omitted reference line")?;
+            continue;
+        }
+        let source = sources
+            .iter()
+            .find(|(f, _)| normalize_reference_path(f) == normalize_reference_path(file))
+            .map(|(_, s)| s)
+            .ok_or("missing reference source")?;
+        let source_lines: Vec<_> = source.split('\n').collect();
+        let actual = source_lines
+            .get(source_line)
+            .ok_or_else(|| format!("reference line out of range: {file}:{source_line}"))?;
+        let line_start: usize = source_lines[..source_line]
+            .iter()
+            .map(|l| l.len() + 1)
+            .sum();
+        let mut plain = String::new();
+        let mut events = Vec::new();
+        let mut rest = annotated;
+        while !rest.is_empty() {
+            if let Some(s) = rest.strip_prefix("[|") {
+                events.push((plain.len(), true));
+                rest = s;
+            } else if let Some(s) = rest.strip_prefix("|]") {
+                events.push((plain.len(), false));
+                rest = s;
+            } else if rest.starts_with("<|") || rest.starts_with("|>") {
+                rest = &rest[2..];
+            } else if rest.starts_with("{|") {
+                let end = rest.find("|}").ok_or("unterminated reference metadata")?;
+                rest = &rest[end + 2..];
+            } else if let Some(s) = rest.strip_prefix("/*FIND ALL REFS*/") {
+                rest = s;
+            } else {
+                let c = rest.chars().next().unwrap();
+                plain.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+        if plain.trim_start() != actual.trim_start() {
+            return Err(format!(
+                "reference annotation differs from source: {file}:{}: {plain:?} != {actual:?}",
+                source_line + 1
+            ));
+        }
+        let old_indent = plain.len() - plain.trim_start().len();
+        let new_indent = actual.len() - actual.trim_start().len();
+        for (column, open) in events {
+            let position = (line_start + column.saturating_sub(old_indent) + new_indent) as u32;
+            if open {
+                stack.push(position);
+            } else {
+                let start = stack.pop().ok_or("unmatched reference range end")?;
+                references.push((
+                    normalize_reference_path(file),
+                    tsc_rs_ast::Span::new(start, position),
+                ));
+            }
+        }
+        source_line += 1;
+    }
+    if active {
+        if !stack.is_empty() {
+            return Err("unclosed reference range".into());
+        }
+        entries.push(FindAllRefsEntry { references });
+    }
+    Ok(entries)
+}
 
-            entries.push(FindAllRefsEntry {
-                expected_ref_count: ref_count,
-                name,
-                kind,
-            });
-        } else {
-            i += 1;
+pub(crate) fn normalize_reference_path(path: &str) -> String {
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
         }
     }
-
-    Ok(entries)
+    parts.join("/")
 }
 
 // ---------------------------------------------------------------------------
@@ -845,6 +922,61 @@ mod tests {
         assert_eq!(entry.targets, vec![("/a.ts".into(), 35)]);
         assert_eq!(next, 7);
         assert!(!entry.expects_no_definition);
+    }
+
+    #[test]
+    fn reference_locations_ignore_definition_copies_and_metadata() {
+        let states = vec![HashMap::from([("/a.ts".into(), "const x = 1;\nx;".into())])];
+        let entries = parse_reference_sections("// === findAllReferences ===\n// === /a.ts ===\n// const [|{| isDefinition: true |}x|] = 1;\n// /*FIND ALL REFS*/[|x|];\n  // === Definitions ===\n  // === /a.ts ===\n  // const [|x|] = 1;", &states).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].references,
+            vec![
+                ("/a.ts".into(), tsc_rs_ast::Span::new(6, 7)),
+                ("/a.ts".into(), tsc_rs_ast::Span::new(13, 14))
+            ]
+        );
+    }
+
+    #[test]
+    fn reference_locations_restore_skipped_lines_and_indentation() {
+        let states = vec![HashMap::from([(
+            "/src/./a.ts".into(),
+            "// one\n// two\n    name;".into(),
+        )])];
+        let entries = parse_reference_sections("// === findAllReferences ===\n// === /src/a.ts ===\n// --- (line: 2) skipped ---\n// [|name|];", &states).unwrap();
+        assert_eq!(
+            entries[0].references,
+            vec![("/src/a.ts".into(), tsc_rs_ast::Span::new(18, 22))]
+        );
+    }
+
+    #[test]
+    fn reference_locations_use_each_request_snapshot() {
+        let states = vec![
+            HashMap::from([("/a.ts".into(), "x;".into())]),
+            HashMap::from([("/a.ts".into(), "\nx;".into())]),
+        ];
+        let entries = parse_reference_sections("// === findAllReferences ===\n// === /a.ts ===\n// [|x|];\n// === findAllReferences ===\n// === /a.ts ===\n// \n// [|x|];", &states).unwrap();
+        assert_eq!(entries[0].references[0].1, tsc_rs_ast::Span::new(0, 1));
+        assert_eq!(entries[1].references[0].1, tsc_rs_ast::Span::new(1, 2));
+    }
+
+    #[test]
+    fn reference_locations_reject_incomplete_or_inconsistent_oracles() {
+        let states = vec![HashMap::from([("/a.ts".into(), "x;".into())])];
+        for body in ["[|x;", "y;", "x|];"] {
+            assert!(parse_reference_sections(
+                &format!("// === findAllReferences ===\n// === /a.ts ===\n// {body}"),
+                &states
+            )
+            .is_err());
+        }
+        assert!(parse_reference_sections(
+            "// === findAllReferences ===\n// === /missing.ts ===",
+            &states
+        )
+        .is_err());
     }
 
     #[test]

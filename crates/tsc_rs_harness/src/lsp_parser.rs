@@ -317,6 +317,94 @@ pub fn parse_fourslash(test_name: &str, raw: &str) -> Result<LspTest, String> {
 }
 
 /// Extract `/*name*/` markers from content, returning cleaned content and markers.
+/// Replay the state-changing commands around reference requests. Each snapshot
+/// contains the text and marker positions at that request, not at test startup.
+pub(crate) fn reference_requests(test: &LspTest) -> Result<Vec<(LspTest, String)>, String> {
+    use tsc_rs_scanner::{Scanner, TokenKind};
+    let text = &test.verify_text;
+    let tokens = Scanner::new(text).scan_all();
+    let mut current = test.clone();
+    let mut cursor = None;
+    let mut cancelled = false;
+    let mut requests = Vec::new();
+    for parts in tokens.windows(4) {
+        if parts[1].kind != TokenKind::Dot || parts[3].kind != TokenKind::OpenParen {
+            continue;
+        }
+        let name = |i: usize| &text[parts[i].span.start as usize..parts[i].span.end as usize];
+        let (object, method) = (name(0), name(2));
+        if !matches!(object, "verify" | "goTo" | "edit" | "cancellation") {
+            continue;
+        }
+        let open = parts[3].span.start as usize;
+        let end =
+            find_matching_close(text, open, b'(', b')').ok_or("unterminated reference command")?;
+        let args = &text[open + 1..end];
+        match (object, method) {
+            ("cancellation", "setCancelled") => cancelled = true,
+            ("cancellation", "resetCancelled") => cancelled = false,
+            ("goTo", "marker") => {
+                let name = if args.trim().is_empty() {
+                    String::new()
+                } else {
+                    extract_string_at(args, 0)
+                        .ok_or("unsupported reference cursor command")?
+                        .0
+                };
+                let marker = current
+                    .markers
+                    .iter()
+                    .find(|m| m.name == name)
+                    .ok_or("reference cursor marker missing")?;
+                cursor = Some((marker.file_name.clone(), marker.position));
+            }
+            ("edit", "insert") => {
+                let inserted = extract_string_at(args, 0)
+                    .map(|v| v.0)
+                    .ok_or("reference insertion must be a string")?;
+                let (file, position) = cursor.as_mut().ok_or("reference edit has no cursor")?;
+                let source = current
+                    .files
+                    .iter_mut()
+                    .find(|f| f.name == *file)
+                    .ok_or("reference edit file missing")?;
+                if !source.content.is_char_boundary(*position as usize) {
+                    return Err("reference edit is not at a character boundary".into());
+                }
+                source.content.insert_str(*position as usize, &inserted);
+                for marker in &mut current.markers {
+                    if marker.file_name == *file && marker.position >= *position {
+                        marker.position += inserted.len() as u32;
+                    }
+                }
+                *position += inserted.len() as u32;
+            }
+            ("edit", _) => return Err(format!("unsupported reference edit: {method}")),
+            ("verify", "baselineFindAllReferences") if !cancelled => {
+                let mut names = Vec::new();
+                let mut at = 0;
+                while let Some((name, end)) = extract_string_at(args, at) {
+                    names.push(name);
+                    let rest = &args[end..];
+                    let Some(comma) = rest.find(',') else { break };
+                    at = end + comma + 1;
+                }
+                if args.trim().is_empty() {
+                    names = current.markers.iter().map(|m| m.name.clone()).collect();
+                }
+                if names.is_empty() {
+                    return Err("unsupported reference marker arguments".into());
+                }
+                for name in names {
+                    requests.push((current.clone(), name));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(requests)
+}
+
 #[cfg(test)]
 fn extract_markers(content: &str, file_name: &str) -> (String, Vec<Marker>) {
     extract_markers_with_ranges(content, file_name, false)
@@ -1203,6 +1291,10 @@ fn extract_string_args(text: &str, func_name: &str) -> Vec<String> {
         return Vec::new();
     };
     let args_start = start + paren + 1;
+    let Some(args_end) = find_matching_close(text, args_start - 1, b'(', b')') else {
+        return Vec::new();
+    };
+    let text = &text[..args_end];
     let mut args = Vec::new();
     let mut offset = args_start;
     while offset < text.len() {
@@ -1750,6 +1842,46 @@ mod tests {
             .collect();
         assert_eq!(positions, vec![("/a.ts", 17), ("/b.ts", 10)]);
         assert_eq!(parsed.files[0].content, "export { foo as \"alias\" };");
+    }
+
+    #[test]
+    fn reference_arguments_stop_at_the_current_call() {
+        assert_eq!(
+            extract_string_args(
+                "verify.baselineFindAllReferences('a'); verify.rename('b', 'c');",
+                "verify.baselineFindAllReferences"
+            ),
+            vec!["a"]
+        );
+    }
+
+    #[test]
+    fn reference_requests_replay_edits_without_mutating_earlier_snapshots() {
+        let test = parse_fourslash("edit", "////const /**/x = 1;\nverify.baselineFindAllReferences('');\ngoTo.marker();\nedit.insert('\\n');\nverify.baselineFindAllReferences('');").unwrap();
+        let requests = reference_requests(&test).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0.files[0].content, "const x = 1;");
+        assert_eq!(requests[1].0.files[0].content, "const \nx = 1;");
+        assert_eq!(requests[0].0.markers[0].position, 6);
+        assert_eq!(requests[1].0.markers[0].position, 7);
+    }
+
+    #[test]
+    fn reference_requests_preserve_repetitions_and_omit_cancelled_calls() {
+        let test = parse_fourslash("cancel", "////const /*a*/x = 1;\nverify.baselineFindAllReferences('a');\ncancellation.setCancelled();\nverify.baselineFindAllReferences('a');\ncancellation.resetCancelled();\nverify.baselineFindAllReferences('a');").unwrap();
+        let requests = reference_requests(&test).unwrap();
+        assert_eq!(
+            requests.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+            vec!["a", "a"]
+        );
+    }
+
+    #[test]
+    fn reference_requests_reject_unsupported_edits() {
+        let test = parse_fourslash("edit", "////const /**/x = 1;\ngoTo.marker();\nedit.deleteAtCaret(1);\nverify.baselineFindAllReferences('');").unwrap();
+        assert!(reference_requests(&test)
+            .unwrap_err()
+            .contains("unsupported reference edit"));
     }
 
     #[test]

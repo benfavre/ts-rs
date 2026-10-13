@@ -6,6 +6,7 @@ use tsc_rs_query::QueryEngine;
 
 mod calls;
 mod properties;
+pub(super) mod references;
 
 type Target = (String, Span);
 
