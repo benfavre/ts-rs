@@ -60,37 +60,37 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-All results below were measured on 2026-10-12 at `4f6150c3e`, with the
+All results below were measured on 2026-10-13 at `afdac9284`, with the
 result cache disabled. Pass rates are `passed / (passed + failed)`; skipped
 cases are never counted as passes.
 
 | Lane | Compiler suite | Conformance suite | What it measures |
 |---|---:|---:|---|
 | JavaScript emit | 6,032 / 6,032 (100.0%) | 5,388 / 5,388 (100.0%) | Byte-for-byte match with the `tsc` `.js` baseline (one configuration per case) |
-| Diagnostics | 4,972 / 6,529 (76.2%) | 4,046 / 5,907 (68.5%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
+| Diagnostics | 4,973 / 6,529 (76.2%) | 4,047 / 5,907 (68.5%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
 | Symbols | 1,731 / 6,434 (26.9%) | 1,590 / 5,617 (28.3%) | Match with the `tsc` `.symbols` baseline |
-| Types | 1,065 / 6,434 (16.6%) | 981 / 5,617 (17.5%) | Match with the `tsc` `.types` baseline |
-| Type-check recall / precision | 64.7% / 88.3% | 72.8% / 90.1% | Per-diagnostic `(file, line, code)` match over every option variant |
+| Types | 1,092 / 6,434 (17.0%) | 1,006 / 5,617 (17.9%) | Match with the `tsc` `.types` baseline |
+| Type-check recall / precision | 64.7% / 88.3% | 72.8% / 90.2% | Per-diagnostic `(file, line, code)` match over every option variant |
 
 JavaScript emit skips 497 compiler and 519 conformance cases without a `.js`
 oracle (mostly `noEmit`); diagnostics exercises all of them. Symbols and types
 skip 95 compiler and 290 conformance cases without a uniquely selected oracle.
 
-Public workspace validation: **4,762 Rust tests passed**, zero failed, and
+Public workspace validation: **4,800 Rust tests passed**, zero failed, and
 37 ignored; `make ci` passes.
 
 Language server, against the `fourslash` suite:
 
 | Operation | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| QuickInfo (hover) | 307 | 222 | 10 | 58.0% |
+| QuickInfo (hover) | 308 | 221 | 10 | 58.2% |
 | Completions | 860 | 271 | 0 | 76.0% |
 | Go-to-definition | 191 | 20 | 2 | 90.5% |
 | Find-all-references | 329 | 18 | 0 | 94.8% |
 | Signature help | 123 | 22 | 7 | 84.8% |
-| **Supported operations** | **1,810** | **553** | **19** | **76.6%** |
+| **Supported operations** | **1,811** | **552** | **19** | **76.6%** |
 
-The full inventory contains 6,320 cases: 1,810 pass, 553 fail, and 3,957 are
+The full inventory contains 6,320 cases: 1,811 pass, 552 fail, and 3,957 are
 skipped, including unsupported operations.
 
 Expanded option variants (14,819 identities, 1,016 skips per lane):
@@ -100,7 +100,7 @@ Expanded option variants (14,819 identities, 1,016 skips per lane):
 | JavaScript | 12,938 | 865 | 93.7% |
 | Declarations | 12,158 | 1,645 | 88.1% |
 
-Remaining diagnostic mismatches: 1,557 compiler cases and 1,861 conformance
+Remaining diagnostic mismatches: 1,556 compiler cases and 1,860 conformance
 cases. Expanded emit failures include ES5 transforms and declarations;
 LSP gaps include contextual typing, generics, JSDoc and cross-file information.
 Symbol and type baselines still have substantial gaps.
