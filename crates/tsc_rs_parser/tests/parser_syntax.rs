@@ -1,6 +1,103 @@
 use tsc_rs_parser::parse;
 
 #[test]
+fn incomplete_if_statements_report_errors_without_consuming_enclosing_braces() {
+    use tsc_rs_ast::{ClassMemberKind, ExprKind, PropName, StmtKind};
+
+    for (statement, expected_code, expected_message) in [
+        ("if (", 1109, "Expression expected."),
+        ("if (ready", 1005, "')' expected."),
+        ("if (state.ready", 1005, "')' expected."),
+        ("if (ready)", 1109, "Expression expected."),
+    ] {
+        let source =
+            format!("class Example {{\n first() {{\n {statement}\n }}\n next() {{}}\n}}\n");
+        let parsed = parse("incomplete-if.ts", &source);
+        assert_eq!(
+            parsed.diagnostics.len(),
+            1,
+            "{statement}: {:?}",
+            parsed.diagnostics
+        );
+        let diagnostic = &parsed.diagnostics[0];
+        assert_eq!(diagnostic.code, expected_code, "{statement}");
+        assert_eq!(diagnostic.message, expected_message, "{statement}");
+        let span = diagnostic.span.expect("missing diagnostic span");
+        assert_eq!(
+            span.start as usize,
+            source.find('}').unwrap(),
+            "{statement}"
+        );
+        assert_eq!(&source[span.start as usize..span.end as usize], "}");
+        if expected_code == 1005 {
+            let related = diagnostic
+                .related
+                .as_ref()
+                .expect("missing opening delimiter");
+            assert_eq!(related.len(), 1);
+            assert_eq!(related[0].code, 1007);
+            let opening = related[0].span.unwrap();
+            assert_eq!(opening.start as usize, source.find("if (").unwrap() + 3);
+            assert_eq!(&source[opening.start as usize..opening.end as usize], "(");
+        } else {
+            assert!(diagnostic.related.is_none(), "{statement}");
+        }
+
+        assert_eq!(parsed.statements.len(), 1, "{statement}");
+        let StmtKind::ClassDecl(class) = &parsed.statements[0].kind else {
+            panic!("expected class after recovering {statement}");
+        };
+        assert_eq!(class.members.len(), 2, "{statement}");
+        let ClassMemberKind::Method(first) = &class.members[0].kind else {
+            panic!("expected first method after recovering {statement}");
+        };
+        let body = first.body.as_ref().unwrap();
+        assert_eq!(body.len(), 1, "{statement}");
+        let StmtKind::If(if_statement) = &body[0].kind else {
+            panic!("expected recovered if statement for {statement}");
+        };
+        if statement == "if (" {
+            assert!(matches!(if_statement.test.kind, ExprKind::Omitted));
+        }
+        assert!(matches!(if_statement.consequent.kind, StmtKind::Empty));
+        let ClassMemberKind::Method(next) = &class.members[1].kind else {
+            panic!("expected following method after recovering {statement}");
+        };
+        assert!(matches!(&next.name, PropName::Ident(name, _) if name == "next"));
+        assert!(next.body.as_ref().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn empty_if_conditions_report_the_closing_parenthesis() {
+    for (source, expected_tokens) in [
+        ("if () ;", vec![")"]),
+        ("function f() { if () }", vec![")", "}"]),
+    ] {
+        let parsed = parse("empty-if.ts", source);
+        assert_eq!(parsed.diagnostics.len(), expected_tokens.len(), "{source}");
+        for (diagnostic, expected_token) in parsed.diagnostics.iter().zip(expected_tokens) {
+            assert_eq!(diagnostic.code, 1109, "{source}");
+            let span = diagnostic.span.unwrap();
+            assert_eq!(
+                &source[span.start as usize..span.end as usize],
+                expected_token
+            );
+            assert!(diagnostic.related.is_none());
+        }
+    }
+
+    for source in ["if (true) ;", "if (true) {} else {}"] {
+        let parsed = parse("valid-if.ts", source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
 fn exponentiation_rejects_unparenthesized_unary_left_operands() {
     let source = r#"-1 ** 2;
 +1 ** 2;

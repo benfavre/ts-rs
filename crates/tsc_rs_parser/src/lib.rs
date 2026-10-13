@@ -2760,22 +2760,21 @@ impl<'a> Parser<'a> {
         // Error recovery: if the next token cannot be part of a condition
         // (e.g. `}` closing the enclosing block), produce an empty condition.
         let test = if self.at(TokenKind::CloseBrace) || self.at(TokenKind::CloseParen) {
+            self.error_code(1109, "Expression expected.".into());
             Box::new(Expr {
-                kind: ExprKind::Ident("".into()),
+                kind: ExprKind::Omitted,
                 span: self.cur_span(),
             })
         } else {
             Box::new(self.parse_expression())
         };
-        // Error recovery: if `)` is missing but `}` is present, skip the `)`.
-        if !self.at(TokenKind::CloseParen) && self.at(TokenKind::CloseBrace) {
-            // Don't consume `}` — it closes the enclosing block
-        } else {
-            self.expect_matching_delimiter(opening, TokenKind::OpenParen, TokenKind::CloseParen);
-        }
+        // Report a missing `)` without consuming an enclosing `}`. If the
+        // condition is also missing, retain its earlier error at this token.
+        self.expect_matching_delimiter(opening, TokenKind::OpenParen, TokenKind::CloseParen);
         // Error recovery: if the consequent starts with `}` (closing the
         // enclosing block), produce an empty statement without consuming `}`.
         let consequent = if self.at(TokenKind::CloseBrace) {
+            self.error_code(1109, "Expression expected.".into());
             Box::new(Stmt {
                 kind: StmtKind::Empty,
                 span: Span {
