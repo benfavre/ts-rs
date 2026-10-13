@@ -114,6 +114,7 @@ impl TypeChecker {
         let Type::TypeReference(key, _) = receiver else {
             return None;
         };
+        let key = key.strip_prefix("typeof ").unwrap_or(&key).to_string();
         // A variable holding an enum object is not the enum declaration's
         // symbol. Namespace exports retain the original declaration name.
         if key.rsplit('.').next() != Some(name) {

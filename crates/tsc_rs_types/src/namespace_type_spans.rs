@@ -451,7 +451,10 @@ impl TypeChecker {
             Span::new(span.start, alias.module_ref.span.start),
         );
         let ty = self.lookup_var(&alias.name).cloned().unwrap_or(Type::Any);
-        self.record_import_entity(&alias.module_ref, &ty);
+        let declared = self
+            .enum_object_name(&ty)
+            .map(|name| Type::TypeReference(name.to_string(), Arc::from([])));
+        self.record_import_entity(&alias.module_ref, declared.as_ref().unwrap_or(&ty));
     }
 
     fn record_import_entity(&mut self, entity: &Expr, ty: &Type) {
@@ -593,7 +596,7 @@ impl TypeChecker {
     }
 }
 
-fn namespace_file_import(file: &str) -> String {
+pub(super) fn namespace_file_import(file: &str) -> String {
     let path = file.replace('\\', "/");
     let stem = [
         ".d.ts", ".d.mts", ".d.cts", ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js",

@@ -10,7 +10,8 @@
 //!
 //! Here a clone shares the base and copies only the overlay (empty after
 //! [`LayeredMap::freeze`]); a write goes to the overlay, and changing a base
-//! entry copies that one entry. Entries are never removed.
+//! entry copies that one entry. Shared entries are never removed; a lexical
+//! declaration introduced only in the overlay can be removed on scope exit.
 
 use std::sync::Arc;
 
@@ -65,6 +66,15 @@ impl<V> LayeredMap<V> {
 
     pub(crate) fn insert(&mut self, key: String, value: V) {
         self.overlay.insert(key, value);
+    }
+
+    /// Remove a scope-local name which had no entry before scope entry.
+    pub(crate) fn remove_local(&mut self, key: &str) {
+        assert!(
+            !self.base.contains_key(key),
+            "cannot remove a shared registry entry"
+        );
+        self.overlay.remove(key);
     }
 
     /// True when both maps read the same shared base (tests).

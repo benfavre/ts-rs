@@ -825,7 +825,7 @@ impl PrintedType<'_> {
                 return;
             }
             if let Some(body) = checker.expand_type_alias_once(name, arguments) {
-                if matches!(&body, Type::Typeof(_))
+                if matches!(&body, Type::Typeof(_) | Type::EnumVariant { .. })
                     || matches!(&body, Type::TypeReference(name, _) if name.starts_with("typeof "))
                 {
                     self.ty(&body);
@@ -863,7 +863,57 @@ impl PrintedType<'_> {
                 }
             }
         }
+        if let Some(checker) = self.checker {
+            if let Some(name) = checker.enum_object_name(ty) {
+                self.synthetic("typeof ");
+                self.synthetic(&checker.enum_type_node_name(name, true, &self.value_parameters));
+                return;
+            }
+            if let Type::Union(members) = ty {
+                if let Some(name) = checker.enum_union_name(members) {
+                    self.synthetic(&checker.enum_type_node_name(
+                        &name,
+                        false,
+                        &self.value_parameters,
+                    ));
+                    return;
+                }
+            }
+            if let Type::TypeReference(name, arguments) = ty {
+                if arguments.is_empty() && checker.enum_info.contains_key(name) {
+                    self.synthetic(&checker.enum_type_node_name(
+                        name,
+                        false,
+                        &self.value_parameters,
+                    ));
+                    return;
+                }
+            }
+        }
         match ty {
+            Type::EnumVariant {
+                enum_name,
+                variant_name,
+                ..
+            } => {
+                let name = self.checker.map_or_else(
+                    || enum_name.clone(),
+                    |checker| checker.enum_type_node_name(enum_name, false, &self.value_parameters),
+                );
+                let mut characters = variant_name.chars();
+                let identifier = characters
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+                    && characters.all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+                if identifier {
+                    self.synthetic(&format!("{name}.{variant_name}"));
+                } else {
+                    self.synthetic(&format!(
+                        "(typeof {name})[{}]",
+                        Type::StringLiteral(variant_name.clone()).display_string_single_line()
+                    ));
+                }
+            }
             Type::TypeParameter(identity) => {
                 let name = self.type_parameter_name(identity);
                 self.synthetic(&name);

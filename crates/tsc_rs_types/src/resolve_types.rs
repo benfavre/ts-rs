@@ -15,6 +15,7 @@ fn widen_literal(ty: Type) -> Type {
         Type::NumberLiteral(_) => Type::Number,
         Type::BooleanLiteral(_) => Type::Boolean,
         Type::BigIntLiteral(_) => Type::BigInt,
+        Type::EnumVariant { enum_name, .. } => Type::TypeReference(enum_name, Arc::from([])),
         other => other,
     }
 }
@@ -170,6 +171,12 @@ impl TypeChecker {
         let resolved = self.resolve_type_node(operand);
         let untrusted_typeof = match &operand.kind {
             TypeNodeKind::TypeQuery(expr) => {
+                if matches!(expr.kind, ExprKind::Member(_)) {
+                    let ty = self.infer_expr_type(expr);
+                    if matches!(ty, Type::EnumVariant { .. }) {
+                        return ty;
+                    }
+                }
                 self.injected_decl_file.is_some()
                     && !matches!(&expr.kind, ExprKind::Ident(name)
                         if self.injection_typeof_bindings.contains_key(name.as_str()))
@@ -900,6 +907,12 @@ impl TypeChecker {
             }
             TypeNodeKind::Keyof(inner) => self.resolve_keyof_type_node(inner),
             TypeNodeKind::TypeQuery(expr) => {
+                if matches!(expr.kind, ExprKind::Member(_)) {
+                    let ty = self.infer_expr_type(expr);
+                    if matches!(ty, Type::EnumVariant { .. }) {
+                        return ty;
+                    }
+                }
                 let mut name = self.expr_to_name(expr);
                 // Mirror the ordinary type-reference rewrite above for
                 // `typeof C` inside a named class expression. Keeping the raw
@@ -1398,6 +1411,9 @@ impl TypeChecker {
     }
 
     pub(crate) fn qualified_property_type(&self, owner: Type, property_name: &str) -> Option<Type> {
+        if self.enum_object_name(&owner).is_some() {
+            return self.enum_object_member(&owner, property_name);
+        }
         if let Some(value) = self.array_or_tuple_type(&owner, 0).and_then(|shape| {
             crate::tuple_access::indexed_type(
                 &shape,
@@ -2136,7 +2152,7 @@ impl TypeChecker {
         // returned name falls through to whatever the program declares
         // globally under that name.
         const MAX_LOCALS: usize = 24;
-        let mut locals: Vec<(std::string::String, Type)> = Vec::new();
+        let mut locals = self.inferred_enum_bindings(stmts);
         for stmt in stmts {
             let StmtKind::Var(var_stmt) = &stmt.kind else {
                 continue;
@@ -2586,7 +2602,7 @@ impl TypeChecker {
                     properties,
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
-                    index_signature: None,
+                    index_signature: self.enum_spread_index(props),
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names,
@@ -3259,6 +3275,11 @@ impl TypeChecker {
                 let obj_ty = self
                     .declared_type_param_constraint(&obj_ty)
                     .unwrap_or(obj_ty);
+                if self.enum_object_name(&obj_ty).is_some() {
+                    return self
+                        .enum_object_member(&obj_ty, &mem.property)
+                        .unwrap_or(Type::Any);
+                }
                 if let Some(value) = self.infer_receiver_member(&obj_ty, &mem.property) {
                     return value;
                 }

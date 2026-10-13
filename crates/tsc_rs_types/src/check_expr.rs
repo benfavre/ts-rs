@@ -733,16 +733,9 @@ impl TypeChecker {
         let ExprKind::ElemAccess(access) = &argument.kind else {
             return None;
         };
-        let ExprKind::Ident(enum_name) = &access.object.kind else {
-            return None;
-        };
-        let Some(Type::TypeReference(reference, args)) = self.lookup_var(enum_name) else {
-            return None;
-        };
-        if !args.is_empty() || reference != enum_name.as_str() {
-            return None;
-        }
-        let members = self.enum_info.get(enum_name.as_str())?;
+        let object = self.infer_expr_type(&access.object);
+        let enum_name = self.enum_object_name(&object)?;
+        let members = self.enum_info.get(enum_name)?;
         // The cooked literal type wins over raw source text (`"\u{44}"`).
         let member_name = match index_type {
             Type::StringLiteral(name) => Some(name.as_str()),
@@ -752,14 +745,10 @@ impl TypeChecker {
             },
         };
         // `E["A"]` is the member's own literal type, like `E.A`.
-        if let Some((member, value)) =
+        if let Some((member, _)) =
             member_name.and_then(|name| members.iter().find(|(member, _)| member == name))
         {
-            return Some(Type::EnumVariant {
-                enum_name: enum_name.to_string(),
-                variant_name: member.clone(),
-                value: Some(Arc::new(value.clone())),
-            });
+            return self.enum_member_type(enum_name, member);
         }
 
         let has_numeric_reverse_map = members.is_empty()
@@ -988,54 +977,26 @@ impl TypeChecker {
                         (self.class_info.contains_key(name.as_str())
                             && (reference == name
                                 || reference.strip_prefix("typeof ") == Some(name.as_str())))
-                            || (self.enum_info.contains_key(name.as_str()) && reference == name)
+                            || (self.enum_info.contains_key(name.as_str())
+                                && (reference == name
+                                    || reference.strip_prefix("typeof ") == Some(name.as_str())))
                     }
                     Some(Type::Namespace(_)) | Some(Type::Module(_)) => true,
                     _ => false,
                 }
             }
             ExprKind::Member(member) => {
-                let ExprKind::Ident(enum_name) = &member.object.kind else {
-                    return false;
-                };
-                matches!(
-                    self.lookup_var(enum_name),
-                    Some(Type::TypeReference(reference, args))
-                        if args.is_empty() && reference == enum_name.as_str()
-                ) && self
-                    .enum_info
-                    .get(enum_name.as_str())
-                    .is_some_and(|members| {
-                        members
-                            .iter()
-                            .any(|(name, _)| name == member.property.as_str())
-                    })
+                let object = self.infer_expr_type(&member.object);
+                self.enum_object_name(&object)
+                    .and_then(|name| self.enum_member_type(name, &member.property))
+                    .is_some()
             }
             ExprKind::ElemAccess(access) => {
-                let ExprKind::Ident(enum_name) = &access.object.kind else {
-                    return false;
-                };
-                let is_enum_binding = matches!(
-                    self.lookup_var(enum_name),
-                    Some(Type::TypeReference(reference, args))
-                        if args.is_empty() && reference == enum_name.as_str()
-                );
-                if !is_enum_binding {
-                    return false;
-                }
-                let index_type = self.infer_expr_type(&access.index);
-                let member_name = match &index_type {
-                    Type::StringLiteral(name) => Some(name.as_str()),
-                    _ => match &access.index.kind {
-                        ExprKind::StrLit(name) if !name.contains('\\') => Some(name.as_str()),
-                        _ => None,
-                    },
-                };
-                member_name.is_some_and(|name| {
-                    self.enum_info
-                        .get(enum_name.as_str())
-                        .is_some_and(|members| members.iter().any(|(member, _)| member == name))
-                })
+                let index = self.infer_expr_type(&access.index);
+                matches!(
+                    self.enum_element_access_type(argument, &index),
+                    Some(Type::EnumVariant { .. })
+                )
             }
             _ => false,
         }
@@ -1901,19 +1862,10 @@ impl TypeChecker {
         };
         // Enum members are read-only properties of the enum object
         // (`E.A = 1`, `++E["A"]`).
-        let enum_member = match &receiver.kind {
-            ExprKind::Ident(binding) => {
-                matches!(
-                    self.lookup_var(binding),
-                    Some(Type::TypeReference(reference, args))
-                        if args.is_empty() && reference == binding.as_str()
-                ) && self
-                    .enum_info
-                    .get(binding.as_str())
-                    .is_some_and(|members| members.iter().any(|(name, _)| name == property))
-            }
-            _ => false,
-        };
+        let enum_member = self
+            .enum_object_name(&receiver_type)
+            .and_then(|name| self.enum_member_type(name, property))
+            .is_some();
         if !imported_module_export
             && !readonly_namespace_export
             && !known_virtual_export
@@ -5623,7 +5575,7 @@ impl TypeChecker {
                     properties: Self::dedup_object_props_last_wins(properties),
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
-                    index_signature: None,
+                    index_signature: self.enum_spread_index(props),
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),
@@ -9090,6 +9042,16 @@ impl TypeChecker {
                         // Constructor values (`typeof C`): members are the
                         // class STATICS.
                         if let Some(cls) = name.strip_prefix("typeof ") {
+                            if self.enum_info.contains_key(cls) {
+                                if let Some(member) = self.enum_member_type(cls, &mem.property) {
+                                    return member;
+                                }
+                                if let Some(member) = self.builtins.lookup_instance_property("Object", &mem.property) {
+                                    return member;
+                                }
+                                self.diagnostics.push(self.missing_property_diagnostic(&member_obj, &mem.property, &member_obj.display_string_single_line(), property_span));
+                                return Type::Error;
+                            }
                             if let Some(ci) = self.class_info.get(cls) {
                                 // `C.prototype` is the instance type with every
                                 // type argument `any` (tsc getTypeOfPrototypeProperty).
@@ -9654,6 +9616,9 @@ impl TypeChecker {
                     }
                     // Intersection: property must exist in at least one member
                     Type::Intersection(members) => {
+                        if let Some(member) = self.enum_object_member(&obj_ty, &mem.property) {
+                            return member;
+                        }
                         // A property declared by several constituents has the
                         // intersection of their declared types (`(X & Y).x` for
                         // `X { x: A }` and `Y { x: B }` is `A & B`).
@@ -10457,6 +10422,9 @@ impl TypeChecker {
                 // diagnostics within it), but suppresses secondary target
                 // compatibility, operator, and excess-property diagnostics.
                 if readonly_write {
+                    if matches!(left_ty, Type::EnumVariant { .. }) {
+                        self.record_checked_expression_type(&assign.left, &Type::Error);
+                    }
                     self.report_invalid_reference(&assign.left, false);
                     // The write error does not prevent control-flow narrowing
                     // of a known optional tuple slot after a compatible value.
@@ -10663,9 +10631,18 @@ impl TypeChecker {
                         self.check_object_destructuring_properties(properties, &right_ty);
                     }
                 }
+                // In JavaScript, assigning the enum's qualified declaration
+                // name is an expando declaration. An alias property (`n.E`)
+                // remains an ordinary write and must satisfy the enum object.
+                let enum_expando_declaration = self.current_file_is_js()
+                    && self.enum_object_name(&left_ty).is_some_and(|name| {
+                        name.contains('.')
+                            && Self::member_path(&assign.left).as_deref() == Some(name)
+                    });
                 if assign.op == AssignOp::Assign
                     && !object_target
                     && !empty_array_target
+                    && !enum_expando_declaration
                     && !invalid_reference
                     && !matches!(left_ty, Type::Any | Type::Error)
                 {
@@ -11295,7 +11272,7 @@ impl TypeChecker {
                     properties: Self::dedup_object_props_last_wins(properties),
                     call_signatures: Vec::new(),
                     construct_signatures: Vec::new(),
-                    index_signature: None,
+                    index_signature: self.enum_spread_index(props),
                     index_signature_name: None,
                     readonly_names: Vec::new(),
                     method_names: Vec::new(),

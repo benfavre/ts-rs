@@ -22,6 +22,7 @@ pub mod control_flow;
 mod decorator_types;
 mod diagnostics;
 mod enum_conditions;
+mod enum_type_queries;
 mod equality_conditions;
 mod equality_narrowing;
 mod external_helpers;
@@ -2568,6 +2569,7 @@ struct CheckerScope {
     /// cannot model aliases/interfaces because those names do not create
     /// values, but they still shadow missing standard-library type names.
     type_names: rustc_hash::FxHashSet<std::string::String>,
+    shadowed_enums: HashMap<String, Option<Vec<(String, Type)>>>,
     /// Narrowed types for variables in this scope (from type guards in if-branches).
     narrowed: rustc_hash::FxHashMap<std::string::String, TypeId>,
     /// Precomputed true/false facts for stable `const` condition aliases.
@@ -3728,6 +3730,7 @@ impl TypeChecker {
             vars: rustc_hash::FxHashMap::default(),
             widening_literal_bindings: rustc_hash::FxHashSet::default(),
             type_names: rustc_hash::FxHashSet::default(),
+            shadowed_enums: HashMap::new(),
             narrowed: rustc_hash::FxHashMap::default(),
             condition_aliases: rustc_hash::FxHashMap::default(),
             readonly_namespace_aliases: rustc_hash::FxHashMap::default(),
@@ -4301,6 +4304,8 @@ impl TypeChecker {
         } else {
             TypeSpanKind::Expression
         };
+        let regular = self.regular_enum_query_type(ty);
+        let ty = regular.as_ref().unwrap_or(ty);
         let record = TypeAtSpan::new(ty, kind, self);
         if let ExprKind::FnExpr(declaration) = &expr.kind {
             if let Some(name_span) = declaration.name_span {
@@ -12112,7 +12117,10 @@ impl TypeChecker {
                     );
                     self.declare_var(
                         &enum_decl.name,
-                        Type::TypeReference(enum_decl.name.clone(), Arc::from([] as [Type; 0])),
+                        Type::TypeReference(
+                            format!("typeof {}", self.namespace_owned_type_name(&enum_decl.name)),
+                            Arc::from([] as [Type; 0]),
+                        ),
                     );
                 }
             }
@@ -12301,7 +12309,7 @@ impl TypeChecker {
         // Order-independent namespace+class merge fold: registration order
         // (namespace-then-class clobbers) must not decide whether the class
         // VALUE carries the namespace's exports (augmentedTypesModule4/5).
-        self.fold_namespace_class_merges(&file.statements);
+        self.fold_namespace_nominal_merges(&file.statements);
         self.check_alias_cycles(file);
         self.resolve_top_level_import_equals_entities(&file.statements);
         self.record_import_equals_readonly_aliases(&file.statements);
@@ -12573,7 +12581,7 @@ impl TypeChecker {
         // Order-independent namespace+class merge fold: registration order
         // (namespace-then-class clobbers) must not decide whether the class
         // VALUE carries the namespace's exports (augmentedTypesModule4/5).
-        self.fold_namespace_class_merges(&file.statements);
+        self.fold_namespace_nominal_merges(&file.statements);
         self.check_alias_cycles(file);
         self.resolve_top_level_import_equals_entities(&file.statements);
         self.record_import_equals_readonly_aliases(&file.statements);
@@ -12734,6 +12742,7 @@ impl TypeChecker {
             vars: rustc_hash::FxHashMap::default(),
             widening_literal_bindings: rustc_hash::FxHashSet::default(),
             type_names: rustc_hash::FxHashSet::default(),
+            shadowed_enums: HashMap::new(),
             narrowed: rustc_hash::FxHashMap::default(),
             condition_aliases: rustc_hash::FxHashMap::default(),
             readonly_namespace_aliases: rustc_hash::FxHashMap::default(),
@@ -12748,6 +12757,15 @@ impl TypeChecker {
 
     fn pop_scope(&mut self) {
         if let Some(parent) = self.scopes[self.current_scope].parent {
+            for (name, previous) in
+                std::mem::take(&mut self.scopes[self.current_scope].shadowed_enums)
+            {
+                if let Some(previous) = previous {
+                    self.enum_info.insert(name, previous);
+                } else {
+                    self.enum_info.remove_local(&name);
+                }
+            }
             self.current_scope = parent;
         }
     }
@@ -14936,10 +14954,14 @@ impl TypeChecker {
                 }
             }
             StmtKind::EnumDecl(enum_decl) => {
+                self.hoist_scoped_enum(enum_decl);
                 self.declare_var(&Self::enum_marker_name(&enum_decl.name), Type::Never);
                 self.declare_var(
                     &enum_decl.name,
-                    Type::TypeReference(enum_decl.name.clone(), Arc::from([] as [Type; 0])),
+                    Type::TypeReference(
+                        format!("typeof {}", self.namespace_owned_type_name(&enum_decl.name)),
+                        Arc::from([] as [Type; 0]),
+                    ),
                 );
             }
             StmtKind::ModuleDecl(module_decl) => {
@@ -15626,7 +15648,10 @@ impl TypeChecker {
                 match &inner.kind {
                     StmtKind::EnumDecl(enumeration) => {
                         let ty = Type::TypeReference(
-                            self.namespace_owned_type_name(&enumeration.name),
+                            format!(
+                                "typeof {}",
+                                self.namespace_owned_type_name(&enumeration.name)
+                            ),
                             Arc::from([] as [Type; 0]),
                         );
                         ns_locals.push((enumeration.name.clone(), ty.clone()));
@@ -16125,10 +16150,10 @@ impl TypeChecker {
         Self::resolve_namespace_unique_aliases(&mut existing.exports);
     }
 
-    /// Fold namespace VALUE exports onto a merged class binding as
-    /// static-like members, retaining the nominal constructor regardless of
+    /// Fold namespace VALUE exports onto a merged class or enum binding,
+    /// retaining the nominal value-object identity regardless of
     /// declaration order.
-    fn fold_namespace_class_merges(&mut self, stmts: &[Stmt]) {
+    fn fold_namespace_nominal_merges(&mut self, stmts: &[Stmt]) {
         for stmt in stmts {
             let inner: &Stmt = match &stmt.kind {
                 StmtKind::Export(ed) => match &ed.kind {
@@ -16143,7 +16168,9 @@ impl TypeChecker {
             let ModuleName::Ident(ref name) = module_decl.name else {
                 continue;
             };
-            if !self.class_info.contains_key(name.as_str()) {
+            if !self.class_info.contains_key(name.as_str())
+                && !self.enum_info.contains_key(name.as_str())
+            {
                 continue;
             }
             let namespace = self.build_namespace_value_exports(module_decl);
@@ -16386,18 +16413,14 @@ impl TypeChecker {
             StmtKind::EnumDecl(enum_decl) => {
                 self.record_enum_member_locations(&enum_decl.name, enum_decl);
                 let members = self.enum_declaration_values(enum_decl, self.ambient_depth > 0);
-                for member in &enum_decl.members {
-                    let name = self.prop_name_to_string(&member.name);
-                    if let Some((_, value_type)) = members.iter().find(|(key, _)| *key == name) {
-                        self.expression_types
-                            .insert(member.name.span().start, value_type.display_string());
-                    }
-                }
                 self.declare_var(&Self::enum_marker_name(&enum_decl.name), Type::Never);
                 Self::merge_enum_members((&mut self.enum_info), enum_decl.name.clone(), members);
                 self.declare_var(
                     &enum_decl.name,
-                    Type::TypeReference(enum_decl.name.clone(), Arc::from([] as [Type; 0])),
+                    Type::TypeReference(
+                        format!("typeof {}", self.namespace_owned_type_name(&enum_decl.name)),
+                        Arc::from([] as [Type; 0]),
+                    ),
                 );
             }
             StmtKind::ModuleDecl(module_decl) => {
@@ -16458,7 +16481,8 @@ impl TypeChecker {
                         // to see the declaring class.
                         Some(mut existing)
                             if !namespace.exports.is_empty()
-                                && self.class_info.contains_key(name.as_str()) =>
+                                && (self.class_info.contains_key(name.as_str())
+                                    || self.enum_info.contains_key(name.as_str())) =>
                         {
                             if Self::fold_namespace_into_value(&mut existing, namespace).is_ok() {
                                 self.declare_var(name, existing);
@@ -16473,6 +16497,14 @@ impl TypeChecker {
                 self.declare_var(&import_equals.name, Type::Any);
                 self.imported_namespace_bindings
                     .insert(import_equals.name.clone());
+                // A known enum alias is already needed by signatures recorded
+                // during registration, before the main alias resolution pass.
+                if self
+                    .import_equals_namespace_target_type(&import_equals.module_ref)
+                    .is_some_and(|ty| self.enum_object_name(&ty).is_some())
+                {
+                    self.try_resolve_import_equals_entity(import_equals, false);
+                }
             }
             StmtKind::TypeAlias(type_alias) => {
                 let _parameters =
@@ -21143,6 +21175,14 @@ impl TypeChecker {
 
     /// Resolve a TypeReference to its structural ObjectType form using class_info or interface_info.
     fn resolve_type_reference_to_object(&self, name: &str, args: &[Type]) -> Option<Type> {
+        if args.is_empty() {
+            if let Some(ty) = name
+                .strip_prefix("typeof ")
+                .and_then(|name| self.enum_object_structure(name))
+            {
+                return Some(ty);
+            }
+        }
         if matches!(
             name,
             "TypedPropertyDescriptor"
@@ -24573,6 +24613,16 @@ impl TypeChecker {
             if target_args.is_empty() && self.enum_target_member_values(target_name).is_some() {
                 return false;
             }
+        }
+        if self.enum_object_name(source).is_some()
+            && matches!(target, Type::TypeReference(name, args) if args.is_empty() && self.enum_target_member_values(name).is_some())
+        {
+            return false;
+        }
+        if self.enum_object_name(target).is_some()
+            && matches!(source, Type::TypeReference(name, args) if args.is_empty() && self.enum_target_member_values(name).is_some())
+        {
+            return false;
         }
         // An enum OBJECT (`typeof E`) is neither a number nor the enum type,
         // and the enum type is not its object.
@@ -30392,6 +30442,7 @@ impl TypeChecker {
                 }
             }
             StmtKind::EnumDecl(enumeration) => {
+                self.record_enum_declaration_types(enumeration);
                 self.check_reserved_type_name(
                     &enumeration.name,
                     enumeration.name_span,
@@ -30464,13 +30515,19 @@ impl TypeChecker {
                         .map(|members| members.iter().map(|(n, _)| n.clone()).collect())
                         .unwrap_or_default();
                     for member_name in &merged {
-                        self.declare_var(member_name, enum_ty.clone());
+                        let ty = self
+                            .enum_member_type(&enumeration.name, member_name)
+                            .unwrap_or_else(|| enum_ty.clone());
+                        self.declare_var(member_name, ty);
                     }
                     for member in &enumeration.members {
                         if let PropName::Ident(member_name, _) | PropName::String(member_name, _) =
                             &member.name
                         {
-                            self.declare_var(member_name, enum_ty.clone());
+                            let ty = self
+                                .enum_member_type(&enumeration.name, member_name)
+                                .unwrap_or_else(|| enum_ty.clone());
+                            self.declare_var(member_name, ty);
                         }
                     }
                     for member in &enumeration.members {
@@ -31566,7 +31623,16 @@ impl TypeChecker {
             return true;
         }
         if let Some(ty) = self.import_equals_namespace_target_type(&ie.module_ref) {
-            if self.is_global_object_type(&ty) {
+            if self.is_global_object_type(&ty) || self.enum_object_name(&ty).is_some() {
+                if self.enum_object_name(&ty).is_some()
+                    && !self.scopes[self.current_scope]
+                        .namespace_alias_order
+                        .contains(&ie.name)
+                {
+                    self.scopes[self.current_scope]
+                        .namespace_alias_order
+                        .push(ie.name.clone());
+                }
                 self.declare_var(&ie.name, ty);
                 return true;
             }
@@ -33043,6 +33109,7 @@ impl TypeChecker {
     fn check_type_node_generic_arity(&mut self, node: &TypeNode) {
         match &node.kind {
             TypeNodeKind::Reference(type_ref) => {
+                self.record_type_reference_qualifiers(&type_ref.name);
                 let name = self.expr_to_name(&type_ref.name);
                 if matches!(type_ref.name.kind, ExprKind::Ident(_)) {
                     self.static_member_forbids_type_param(&name, type_ref.name.span);
@@ -43754,14 +43821,14 @@ impl TypeChecker {
                 _ => None,
             })
             .collect();
-        // getSpreadSymbol returns a regular undefined type for setter-only
-        // members. It is not a fresh `undefined` initializer to widen to any.
+        // getSpreadSymbol returns regular types for copied members: setter-only
+        // undefined and enum members are not fresh initializers to widen.
         if before
             .properties
             .iter()
-            .any(|(_, ty)| matches!(ty.as_ref(), Type::Undefined))
+            .any(|(_, ty)| matches!(ty.as_ref(), Type::Undefined | Type::EnumVariant { .. }))
         {
-            let mut copied_undefined = rustc_hash::FxHashSet::default();
+            let mut copied_regular = rustc_hash::FxHashSet::default();
             for property in props {
                 let name = match property {
                     ObjLitProp::Property(property) => self.prop_name_to_string(&property.key),
@@ -43779,18 +43846,18 @@ impl TypeChecker {
                             &mut copied,
                         );
                         for (name, ty) in copied {
-                            if matches!(ty.as_ref(), Type::Undefined) {
-                                copied_undefined.insert(name);
+                            if matches!(ty.as_ref(), Type::Undefined | Type::EnumVariant { .. }) {
+                                copied_regular.insert(name);
                             } else {
-                                copied_undefined.remove(&name);
+                                copied_regular.remove(&name);
                             }
                         }
                         continue;
                     }
                 };
-                copied_undefined.remove(&name);
+                copied_regular.remove(&name);
             }
-            asserted.extend(copied_undefined);
+            asserted.extend(copied_regular);
         }
         if asserted.is_empty() {
             return widened;
@@ -44281,6 +44348,9 @@ impl TypeChecker {
     /// on large projects, so sharing it would silently turn ordinary nested
     /// member access into `Any`.
     fn resolve_member_on_type(&self, ty: &Type, property: &str) -> Type {
+        if let Some(member) = self.enum_object_member(ty, property) {
+            return member;
+        }
         thread_local! {
             static MEMBER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
         }
