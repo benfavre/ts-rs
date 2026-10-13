@@ -24,7 +24,7 @@ test suites (`compiler`, `conformance`, `fourslash`), with the real `tsc`
 baselines as the oracle.
 
 - **Emit matches `tsc` byte for byte** on all 11,420 JavaScript baselines.
-- **Diagnostics reproduce `tsc`'s messages, positions and codes**; 72.6%
+- **Diagnostics reproduce `tsc`'s messages, positions and codes**; 72.7%
   of the upstream cases match in full, and the rest is the active front.
 - **Language server and VS Code extension**: hover, go-to-definition,
   references, completions, signature help, rename, formatting.
@@ -60,37 +60,37 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-All results below were measured on 2026-10-13 at `09f151bbc`, with the
+All results below were measured on 2026-10-13 at `3849422e2`, with the
 result cache disabled. Pass rates are `passed / (passed + failed)`; skipped
 cases are never counted as passes.
 
 | Lane | Compiler suite | Conformance suite | What it measures |
 |---|---:|---:|---|
 | JavaScript emit | 6,032 / 6,032 (100.0%) | 5,388 / 5,388 (100.0%) | Byte-for-byte match with the `tsc` `.js` baseline (one configuration per case) |
-| Diagnostics | 4,979 / 6,529 (76.3%) | 4,048 / 5,907 (68.5%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
+| Diagnostics | 4,987 / 6,529 (76.4%) | 4,050 / 5,907 (68.6%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
 | Symbols | 1,731 / 6,434 (26.9%) | 1,590 / 5,617 (28.3%) | Match with the `tsc` `.symbols` baseline |
-| Types | 1,402 / 6,434 (21.8%) | 1,131 / 5,617 (20.1%) | Match with the `tsc` `.types` baseline |
-| Type-check recall / precision | 64.8% / 88.5% | 72.8% / 90.3% | Per-diagnostic `(file, line, code)` match over every option variant |
+| Types | 1,485 / 6,434 (23.1%) | 1,169 / 5,617 (20.8%) | Match with the `tsc` `.types` baseline |
+| Type-check recall / precision | 65.0% / 88.7% | 72.9% / 90.3% | Per-diagnostic `(file, line, code)` match over every option variant |
 
 JavaScript emit skips 497 compiler and 519 conformance cases without a `.js`
 oracle (mostly `noEmit`); diagnostics exercises all of them. Symbols and types
 skip 95 compiler and 290 conformance cases without a uniquely selected oracle.
 
-Public workspace validation: **4,984 Rust tests passed**, zero failed, and
+Public workspace validation: **5,054 Rust tests passed**, zero failed, and
 37 ignored; `make ci` passes.
 
 Language server, against the `fourslash` suite:
 
 | Operation | Passed | Failed | Skipped | Pass rate |
 |---|---:|---:|---:|---:|
-| QuickInfo (hover) | 308 | 221 | 10 | 58.2% |
+| QuickInfo (hover) | 311 | 218 | 10 | 58.8% |
 | Completions | 860 | 271 | 0 | 76.0% |
 | Go-to-definition | 191 | 20 | 2 | 90.5% |
 | Find-all-references | 329 | 18 | 0 | 94.8% |
 | Signature help | 123 | 22 | 7 | 84.8% |
-| **Supported operations** | **1,811** | **552** | **19** | **76.6%** |
+| **Supported operations** | **1,814** | **549** | **19** | **76.8%** |
 
-The full inventory contains 6,320 cases: 1,811 pass, 552 fail, and 3,957 are
+The full inventory contains 6,320 cases: 1,814 pass, 549 fail, and 3,957 are
 skipped, including unsupported operations.
 
 Expanded option variants (14,819 identities, 1,016 skips per lane):
@@ -100,7 +100,7 @@ Expanded option variants (14,819 identities, 1,016 skips per lane):
 | JavaScript | 12,938 | 865 | 93.7% |
 | Declarations | 12,158 | 1,645 | 88.1% |
 
-Remaining diagnostic mismatches: 1,550 compiler cases and 1,859 conformance
+Remaining diagnostic mismatches: 1,542 compiler cases and 1,857 conformance
 cases. Expanded emit failures include ES5 transforms and declarations;
 LSP gaps include contextual typing, generics, JSDoc and cross-file information.
 Symbol and type baselines still have substantial gaps.
