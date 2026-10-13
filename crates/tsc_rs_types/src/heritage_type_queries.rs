@@ -281,6 +281,7 @@ impl TypeChecker {
                     || {
                         self.class_info.contains_key(name)
                             || self.interface_info.contains_key(name)
+                            || self.builtins.instance_members.contains_key(name)
                             || self.library_interface_is_active(name)
                     },
                     |resolved| self.valid_heritage_instance(&resolved, depth + 1),
