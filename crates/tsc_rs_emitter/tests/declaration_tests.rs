@@ -961,3 +961,66 @@ fn test_dts_empty_bindings_keep_existing_module_markers() {
         "export {};\n"
     );
 }
+
+#[test]
+fn test_dts_leading_documentation_on_exported_declarations() {
+    assert_eq!(
+        emit_dts("// ordinary\n/** Public value */\n/* ordinary between */\nexport const value = 1;\n/** Public type */\nexport type Value = number;"),
+        "/** Public value */\nexport declare const value = 1;\n/** Public type */\nexport type Value = number;\n"
+    );
+    assert_eq!(
+        emit_dts("/** Default class */\nexport default class C {}"),
+        "/** Default class */\nexport default class C {\n}\n"
+    );
+}
+
+#[test]
+fn test_dts_documentation_preserves_inline_layout_and_relative_indent() {
+    assert_eq!(
+        emit_dts("/** first */ /** second */ const x = 1;"),
+        "/** first */ /** second */ declare const x = 1;\n"
+    );
+    assert_eq!(
+        emit_dts("/** namespace */\nnamespace N {\n      /** value\n       * explanation\n       */\n      export const value = 1;\n}"),
+        "/** namespace */\ndeclare namespace N {\n    /** value\n     * explanation\n     */\n    const value = 1;\n}\n"
+    );
+    assert_eq!(
+        emit_dts("/** windows\r\n * lines\r\n */\r\nconst x = 1;"),
+        "/** windows\n * lines\n */\ndeclare const x = 1;\n"
+    );
+}
+
+#[test]
+fn test_dts_documentation_is_not_collected_from_erased_statements() {
+    assert_eq!(
+        emit_dts("/** hidden */\nconst hidden = 0;\n/** expression */\nvoid hidden;\n/** visible */\nexport function visible(): void { /** body */ void hidden; }"),
+        "/** visible */\nexport declare function visible(): void;\n"
+    );
+    assert_eq!(emit_dts("/** expression */\nvoid 0;"), "");
+    assert_eq!(
+        emit_dts("/**/\nconst value = 1;"),
+        "declare const value = 1;\n"
+    );
+}
+
+#[test]
+fn test_dts_documentation_respects_overload_elision() {
+    assert_eq!(
+        emit_dts("/** number input */\nfunction f(value: number): void;\n/** string input */\nfunction f(value: string): void;\n/** implementation only */\nfunction f(value: any): void {}"),
+        "/** number input */\ndeclare function f(value: number): void;\n/** string input */\ndeclare function f(value: string): void;\n"
+    );
+}
+
+#[test]
+fn test_dts_leading_documentation_honors_remove_comments() {
+    let file = tsc_rs_parser::parse("test.ts", "/** public */\nexport const value = 1;");
+    let options = CompilerOptions {
+        declaration: Some(true),
+        remove_comments: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(
+        emit(&file, &options).declaration_file.unwrap(),
+        "export declare const value = 1;\n"
+    );
+}

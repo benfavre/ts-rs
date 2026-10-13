@@ -26,6 +26,8 @@ pub struct DeclarationEmitter<'a> {
     enum_scope: Vec<String>,
     enum_ambient: bool,
     strict_null_checks: bool,
+    comments: Vec<Comment>,
+    remove_comments: bool,
 }
 
 impl<'a> DeclarationEmitter<'a> {
@@ -41,6 +43,8 @@ impl<'a> DeclarationEmitter<'a> {
             enum_scope: Vec::new(),
             enum_ambient: false,
             strict_null_checks: false,
+            comments: Vec::new(),
+            remove_comments: false,
         }
     }
 
@@ -49,6 +53,7 @@ impl<'a> DeclarationEmitter<'a> {
         emitter.strict_null_checks = options
             .strict_null_checks
             .unwrap_or(options.strict.unwrap_or(false));
+        emitter.remove_comments = options.remove_comments == Some(true);
         emitter
     }
 
@@ -112,6 +117,7 @@ impl<'a> DeclarationEmitter<'a> {
     }
 
     pub fn emit_source_file(&mut self, file: &SourceFile) {
+        self.comments.clone_from(&file.comments);
         self.collect_inferred_types(file);
         let forced_module = Self::has_module_file_identity(file);
         let external_module = forced_module || Self::has_syntactic_module_indicator(file);
@@ -124,7 +130,15 @@ impl<'a> DeclarationEmitter<'a> {
                 continue;
             }
             if !external_module || Self::should_emit_external_stmt(stmt, &retained_names) {
+                let output_start = self.output.len();
+                let saved_line_start = self.at_line_start;
+                self.emit_leading_jsdoc(stmt.span.start);
+                let declaration_start = self.output.len();
                 self.emit_stmt(stmt, true);
+                if self.output.len() == declaration_start {
+                    self.output.truncate(output_start);
+                    self.at_line_start = saved_line_start;
+                }
             }
         }
 
@@ -145,6 +159,70 @@ impl<'a> DeclarationEmitter<'a> {
                 || !has_emitted_module_indicator)
         {
             self.writeln("export {};");
+        }
+    }
+
+    /// Preserve documentation attached to retained declarations, without
+    /// collecting ordinary comments or documentation inside erased statements.
+    fn emit_leading_jsdoc(&mut self, before: u32) {
+        if self.remove_comments {
+            return;
+        }
+        let end = self
+            .comments
+            .partition_point(|comment| comment.end <= before);
+        let mut start = end;
+        let mut boundary = before as usize;
+        while start > 0 {
+            let comment = &self.comments[start - 1];
+            if !self.source[comment.end as usize..boundary]
+                .chars()
+                .all(char::is_whitespace)
+            {
+                break;
+            }
+            boundary = comment.pos as usize;
+            start -= 1;
+        }
+        let mut docs = Vec::new();
+        let mut leading = false;
+        let mut previous_end = boundary;
+        for comment in &self.comments[start..end] {
+            let pos = comment.pos as usize;
+            let line_start = self.source[..pos]
+                .rfind(['\r', '\n'])
+                .map_or(0, |index| index + 1);
+            if line_start >= previous_end || pos == boundary {
+                leading = self.source[line_start..pos].trim().is_empty();
+            }
+            let text = &self.source[pos..comment.end as usize];
+            if leading && text.starts_with("/**") && !text.starts_with("/**/") {
+                docs.push((comment.clone(), pos - line_start));
+            }
+            previous_end = comment.end as usize;
+        }
+        for (index, (comment, source_indent)) in docs.iter().enumerate() {
+            let text = &self.source[comment.pos as usize..comment.end as usize];
+            for (line_index, line) in text.lines().enumerate() {
+                if line_index > 0 {
+                    self.newline();
+                }
+                let trim = if line_index == 0 {
+                    0
+                } else {
+                    line.bytes()
+                        .take(*source_indent)
+                        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                        .count()
+                };
+                self.write(&line[trim..]);
+            }
+            let next = docs.get(index + 1).map_or(before, |(next, _)| next.pos);
+            if self.source[comment.end as usize..next as usize].contains(['\r', '\n']) {
+                self.newline();
+            } else {
+                self.write(" ");
+            }
         }
     }
 
@@ -1506,6 +1584,10 @@ impl<'a> DeclarationEmitter<'a> {
             if !self.enum_ambient && !Self::should_emit_external_stmt(statement, &retained) {
                 continue;
             }
+            let output_start = self.output.len();
+            let saved_line_start = self.at_line_start;
+            self.emit_leading_jsdoc(statement.span.start);
+            let declaration_start = self.output.len();
             if let StmtKind::Export(export) = &statement.kind {
                 if let ExportDeclKind::Decl(inner) = &export.kind {
                     if explicit_exports || matches!(inner.kind, StmtKind::ImportEquals(_)) {
@@ -1522,6 +1604,10 @@ impl<'a> DeclarationEmitter<'a> {
                 self.write("export ");
             }
             self.emit_stmt(statement, false);
+            if self.output.len() == declaration_start {
+                self.output.truncate(output_start);
+                self.at_line_start = saved_line_start;
+            }
         }
         if has_private && !has_boundary {
             self.writeln("export {};");
