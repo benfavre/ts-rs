@@ -2865,3 +2865,58 @@ published snapshot; this batch does not establish full TypeScript compatibility.
 All 5,252 public Rust tests pass, with 37 ignored, and `make ci` passes.
 The measured compiler commit is `4ce09d34c`. The preceding
 snapshot is retained at `docs/compatibility-metrics-2026-10-13-973f8c8d8.json`.
+
+## 2026-10-13: lexical generic scopes and nested parameter identities
+
+The native checker resolves generic parameters before same-named library
+types and namespace members. Cached library declarations enter their own
+resolution environment. Nested generic function expressions retain distinct
+declaration identities, so captured outer parameters survive inference and
+call-site substitution even when an inner parameter has the same name.
+Source-aware printing uses scoped names and annotation reuse adapted from
+ts-rust. Optional function-expression parameters include undefined under
+strict null checking, and signature/alias declarations receive type spans.
+104 regression tests compare original TypeScript 6.0.3 type text, available
+synthetic-node masks and complete diagnostic codes and spans. They cover
+nested constraints, defaults, captures, instantiation, invalid returns and
+Unicode offsets, and verify diagnostics and hover parity with span tracking.
+Readonly checks distinguish union and intersection property mutability,
+including getter-only and paired getter/setter declarations. Class accessor
+writes through intersections combine setter input types separately from reads.
+Donor attribution and licenses are retained. Upstream cases and reference
+baselines are unchanged.
+
+| Suite | Type passes before | After |
+|---|---:|---:|
+| Compiler | 1,540 | 1,688 |
+| Conformance | 1,199 | 1,272 |
+
+| Suite | Diagnostic passes before | After |
+|---|---:|---:|
+| Compiler | 4,988 | 4,990 |
+| Conformance | 4,051 | 4,051 |
+
+| Diagnostic accuracy | Precision before | After | Recall before | After |
+|---|---:|---:|---:|---:|
+| Compiler | 88.77% | 88.84% | 65.00% | 65.08% |
+| Conformance | 90.34% | 90.35% | 72.91% | 72.91% |
+
+False-positive diagnostics change from 1,226 to 1,219 in compiler
+and from 2,239 to 2,237 in conformance. The accuracy report includes all option variants.
+
+QuickInfo retains 311 passes. Comparing every supported
+LSP failure set finds no newly failing cases or additional skips.
+
+Whole-case baselines gain 2 diagnostic matches and 221 type matches.
+All twelve measured baseline lanes have zero passed-to-failed cases and no
+new skips. The public JavaScript, diagnostic and type results match the six
+private verification manifests exactly.
+
+Cache-free reports cover JavaScript, diagnostics, symbols, types, expanded
+JavaScript/declarations, diagnostic accuracy and all supported LSP operations.
+Skips are excluded from pass rates. Remaining failures remain visible in the
+published snapshot; this batch does not establish full TypeScript compatibility.
+
+All 5,356 public Rust tests pass, with 37 ignored, and `make ci` passes.
+The measured compiler commit is `c69bf94aa`. The preceding
+snapshot is retained at `docs/compatibility-metrics-2026-10-13-4ce09d34c.json`.
