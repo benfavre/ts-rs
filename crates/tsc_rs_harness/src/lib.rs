@@ -4404,8 +4404,10 @@ impl BaselineRunner {
                 output.push_str(&bundled_dts);
             }
         } else {
-            for (dts_name, dts_content, _) in dts_sections {
+            if !dts_sections.is_empty() {
                 output.push('\n');
+            }
+            for (dts_name, dts_content, _) in dts_sections {
                 output.push_str(&format!("//// [{dts_name}]\n"));
                 output.push_str(&dts_content);
             }
@@ -11227,6 +11229,106 @@ export const value = 1;
                 "//// [g.js]\n//// [h.mjs]\n//// [i.cjs]\n//// [dummy.js]\n//// [value.js]\nexport const value = 1;\n"
             ),
             "empty sections must add no payload while non-empty output keeps one trailing newline: {baseline}"
+        );
+    }
+
+    #[test]
+    fn generate_js_baseline_separates_declaration_group_once() {
+        for declaration_only in [false, true] {
+            let source = format!(
+                "// @target: esnext\n// @declaration: true\n// @emitDeclarationOnly: {declaration_only}\n\
+                 // @filename: first.ts\ninterface First {{ value: number; }}\n\
+                 // @filename: second.ts\ntype Second = string;\n\
+                 // @filename: third.ts\nconst value = 1;\n"
+            );
+            let tc = parse_test_case("test.ts", &source);
+            let baseline = BaselineRunner::new(".").generate_js_baseline(
+                &tc,
+                "tests/cases/compiler/test.ts",
+                &source,
+            );
+            let (prefix, declarations) = baseline.split_once("//// [first.d.ts]\n").unwrap();
+            assert!(prefix.ends_with("const value = 1;\n\n"), "{baseline}");
+            assert_eq!(
+                declarations,
+                "interface First {\n    value: number;\n}\n\
+                 //// [second.d.ts]\ntype Second = string;\n\
+                 //// [third.d.ts]\ndeclare const value = 1;\n"
+            );
+            assert_eq!(baseline.contains("//// [third.js]"), !declaration_only);
+        }
+    }
+
+    #[test]
+    fn generate_js_baseline_preserves_empty_declaration_payloads() {
+        let source = "// @declaration: true\n\
+                      // @filename: first.ts\nvoid 0;\n\
+                      // @filename: second.ts\nvoid 0;\n\
+                      // @filename: third.ts\nvar value: number;\n";
+        let tc = parse_test_case("test.ts", source);
+        let baseline = BaselineRunner::new(".").generate_js_baseline(
+            &tc,
+            "tests/cases/compiler/test.ts",
+            source,
+        );
+        let (prefix, declarations) = baseline.split_once("//// [first.d.ts]\n").unwrap();
+        assert!(prefix.ends_with("var value;\n\n"), "{baseline}");
+        // Empty emitted declarations retain the collected payload's newline;
+        // constructing a section must not add another separator to that payload.
+        assert_eq!(
+            declarations,
+            "\n//// [second.d.ts]\n\n//// [third.d.ts]\ndeclare var value: number;\n"
+        );
+    }
+
+    #[test]
+    fn generate_js_baseline_preserves_single_declaration_group_spacing() {
+        let source = "// @target: esnext\n// @declaration: true\n\
+                      // @filename: value.ts\nconst value = 1;\n";
+        let tc = parse_test_case("test.ts", source);
+        let baseline = BaselineRunner::new(".").generate_js_baseline(
+            &tc,
+            "tests/cases/compiler/test.ts",
+            source,
+        );
+        assert!(baseline.ends_with(
+            "//// [value.js]\n\"use strict\";\nconst value = 1;\n\n//// [value.d.ts]\ndeclare const value = 1;\n"
+        ), "{baseline}");
+    }
+
+    #[test]
+    fn generate_js_baseline_preserves_bundled_declaration_group_spacing() {
+        let source = "// @target: esnext\n// @module: none\n// @declaration: true\n\
+                      // @outFile: bundle.js\n\
+                      // @filename: first.ts\nconst first = 1;\n\
+                      // @filename: second.ts\nconst second = 2;\n";
+        let tc = parse_test_case("test.ts", source);
+        let baseline = BaselineRunner::new(".").generate_js_baseline(
+            &tc,
+            "tests/cases/compiler/test.ts",
+            source,
+        );
+        assert!(
+            baseline.ends_with(
+                "//// [bundle.js]\n\"use strict\";\nconst first = 1;\nconst second = 2;\n\n\
+             //// [bundle.d.ts]\ndeclare const first = 1;\ndeclare const second = 2;\n"
+            ),
+            "{baseline}"
+        );
+    }
+
+    #[test]
+    fn generate_js_baseline_omits_separator_for_absent_declaration_group() {
+        let source = "// @target: esnext\n// @filename: value.ts\nconst value = 1;\n";
+        let tc = parse_test_case("test.ts", source);
+        let baseline = BaselineRunner::new(".").generate_js_baseline(
+            &tc,
+            "tests/cases/compiler/test.ts",
+            source,
+        );
+        assert!(
+            baseline.ends_with("//// [value.js]\n\"use strict\";\nconst value = 1;\n"),
+            "{baseline}"
         );
     }
 
