@@ -1,6 +1,6 @@
 {
   "measured_at": "2026-10-13",
-  "source_commit": "63ae6da5d7c600d2a0207fb50cdc6b5a7aebf6bb",
+  "source_commit": "c7c7197befa0df0c06e99dccd3d29a586b79f68a",
   "source_build": "Public main checkout, release profile, cache-free baseline reports; unchanged upstream cases and reference baselines.",
   "pass_rate_definition": "passed / (passed + failed); skipped cases excluded, never counted as passes.",
   "baselines": {
@@ -145,7 +145,7 @@
       "passed": 311,
       "failed": 218,
       "skipped": 10,
-      "report_sha256": "769617cba8f5f842578e73bc6280609f18342e04154b475e66ad26f3cd970575",
+      "report_sha256": "4110ca0a563f960670f1b1a846226ddfd1802aaf01b269c744732f3c21bcb149",
       "command": "target/release/lsp-report --op quickinfo --json --top 1000 --show-samples 10000"
     },
     "completions": {
@@ -186,20 +186,20 @@
     "passed": 1814,
     "failed": 549,
     "skipped": 3957,
-    "report_sha256": "cf91c05b17c58f548007709e82003d844dca74d69bf631383c47b13e9611d712",
+    "report_sha256": "8d90543c87011dcee17dcf9c16a23d7115173d817697d01f3cf5643bc2d98140",
     "command": "target/release/lsp-report --op all --json --top 1000 --show-samples 10000"
   },
   "rust_tests": {
-    "total": 5481,
-    "passed": 5444,
+    "total": 5482,
+    "passed": 5445,
     "failed": 0,
     "skipped": 37,
-    "report_sha256": "e3548c12e5168a2d4f6c9658c9c5d72bb894b1936c5afee1eea243d2226cf827",
+    "report_sha256": "291e12e7ceeb23810d4aadb3a1d0df876c7f2fea0f1d07261aaaa6c0c787c8ee",
     "command": "cargo test --workspace"
   },
   "validation": {
     "make_ci": "passed",
-    "ci_log_sha256": "83f1aa8acc1540fb108efcd8131d0f572075d5b96b8238aa64997af17e0c9fe3"
+    "ci_log_sha256": "4b1b4aeaa7e043bf98caf52feb18dcf4e76ff7f63288c04996f9dcc9ea5ad762"
   },
   "diagnostic_accuracy_definition": "Full expanded errors inventory; matches file basename, line and TS code with multiplicity, excluding configuration-deprecation codes. Does not require exact diagnostic message or column.",
   "lsp_total_definition": "The per-operation tables cover five supported operations. The full inventory includes unsupported cases and reports their skips separately; no skip is a pass."

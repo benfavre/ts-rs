@@ -60,7 +60,7 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-All results below were measured on 2026-10-13 at `63ae6da5d`, with the
+All results below were measured on 2026-10-13 at `c7c7197be`, with the
 result cache disabled. Pass rates are `passed / (passed + failed)`; skipped
 cases are never counted as passes.
 
@@ -76,7 +76,7 @@ JavaScript emit skips 497 compiler and 519 conformance cases without a `.js`
 oracle (mostly `noEmit`); diagnostics exercises all of them. Symbols and types
 skip 95 compiler and 290 conformance cases without a uniquely selected oracle.
 
-Public workspace validation: **5,444 Rust tests passed**, zero failed, and
+Public workspace validation: **5,445 Rust tests passed**, zero failed, and
 37 ignored; `make ci` passes.
 
 Language server, against the `fourslash` suite:
