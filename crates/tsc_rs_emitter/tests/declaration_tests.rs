@@ -868,3 +868,47 @@ fn test_dts_optional_parameter_returns_preserve_undefined() {
     };
     assert_eq!(emit(&file, &opts).declaration_file.unwrap(), "declare function f(x?: string): string | undefined;\ndeclare class C {\n    method(x?: number | undefined): number | undefined;\n}\n");
 }
+
+#[test]
+fn test_dts_namespace_alias_retains_private_dependency_chain() {
+    let dts = emit_dts(
+        "namespace Outer { namespace Inner { class Hidden {} } import Middle = Inner; export import Public = Middle; import Unused = Inner; }",
+    );
+    assert_eq!(
+        dts,
+        "declare namespace Outer {\n    namespace Inner {\n    }\n    import Middle = Inner;\n    export import Public = Middle;\n    export {};\n}\n"
+    );
+}
+
+#[test]
+fn test_dts_namespace_alias_keeps_explicit_export() {
+    let dts = emit_dts(
+        "namespace Outer { export namespace Inner { export interface Value { name: string } } export import Public = Inner; }",
+    );
+    assert_eq!(
+        dts,
+        "declare namespace Outer {\n    namespace Inner {\n        interface Value {\n            name: string;\n        }\n    }\n    export import Public = Inner;\n}\n"
+    );
+}
+
+#[test]
+fn test_dts_exported_qualified_alias_preserves_module_boundary() {
+    let dts = emit_dts(
+        "namespace Hidden { export namespace Inner { export interface Value { name: string } } } import Unused = Hidden.Inner; export import Public = Hidden.Inner;",
+    );
+    assert_eq!(
+        dts,
+        "declare namespace Hidden {\n    namespace Inner {\n        interface Value {\n            name: string;\n        }\n    }\n}\nexport import Public = Hidden.Inner;\nexport {};\n"
+    );
+}
+
+#[test]
+fn test_dts_internal_alias_used_by_exported_signature_is_retained() {
+    let dts = emit_dts(
+        "namespace Hidden { export interface Value { name: string } } import Alias = Hidden.Value; export function use(value: Alias): Alias { return value; }",
+    );
+    assert_eq!(
+        dts,
+        "declare namespace Hidden {\n    interface Value {\n        name: string;\n    }\n}\nimport Alias = Hidden.Value;\nexport declare function use(value: Alias): Alias;\nexport {};\n"
+    );
+}

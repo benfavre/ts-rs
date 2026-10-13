@@ -180,6 +180,7 @@ impl<'a> DeclarationEmitter<'a> {
             StmtKind::EnumDecl(decl) => decl.modifiers & MOD_EXPORT != 0,
             StmtKind::Var(decl) => decl.modifiers & MOD_EXPORT != 0,
             StmtKind::ModuleDecl(decl) => decl.modifiers & MOD_EXPORT != 0,
+            StmtKind::ImportEquals(decl) => decl.modifiers & MOD_EXPORT != 0,
             _ => false,
         }
     }
@@ -375,6 +376,9 @@ impl<'a> DeclarationEmitter<'a> {
                         }
                     }
                 }
+            }
+            StmtKind::ImportEquals(decl) => {
+                Self::collect_entity_name_dependencies(&decl.module_ref, &bound, &mut dependencies);
             }
             StmtKind::Export(export_decl) => match &export_decl.kind {
                 ExportDeclKind::Decl(inner) | ExportDeclKind::DefaultDecl(inner) => {
@@ -748,6 +752,7 @@ impl<'a> DeclarationEmitter<'a> {
             StmtKind::EnumDecl(decl) => decl.modifiers & MOD_EXPORT != 0,
             StmtKind::Var(decl) => decl.modifiers & MOD_EXPORT != 0,
             StmtKind::ModuleDecl(decl) => decl.modifiers & MOD_EXPORT != 0,
+            StmtKind::ImportEquals(decl) => decl.modifiers & MOD_EXPORT != 0,
             _ => false,
         }
     }
@@ -764,6 +769,7 @@ impl<'a> DeclarationEmitter<'a> {
             | StmtKind::TypeAlias(_)
             | StmtKind::EnumDecl(_)
             | StmtKind::Var(_)
+            | StmtKind::ImportEquals(_)
             | StmtKind::ModuleDecl(_) => Self::stmt_declared_names(stmt)
                 .iter()
                 .any(|name| retained_names.contains(name)),
@@ -778,6 +784,7 @@ impl<'a> DeclarationEmitter<'a> {
             StmtKind::InterfaceDecl(decl) => vec![decl.name.clone()],
             StmtKind::TypeAlias(decl) => vec![decl.name.clone()],
             StmtKind::EnumDecl(decl) => vec![decl.name.clone()],
+            StmtKind::ImportEquals(decl) => vec![decl.name.clone()],
             StmtKind::Var(decl) => decl
                 .declarations
                 .iter()
@@ -902,6 +909,18 @@ impl<'a> DeclarationEmitter<'a> {
             }
             StmtKind::Import(import_decl) => {
                 self.emit_import_decl(import_decl);
+            }
+            StmtKind::ImportEquals(decl) => {
+                // Alias exports keep their explicit modifier even in a
+                // namespace whose other declarations are implicitly exported.
+                if decl.modifiers & MOD_EXPORT != 0 {
+                    self.write("export ");
+                }
+                self.write("import ");
+                self.write(&decl.name);
+                self.write(" = ");
+                self.copy_span(decl.module_ref.span);
+                self.writeln(";");
             }
             StmtKind::Export(export_decl) => {
                 self.emit_export_decl(export_decl);
@@ -1462,14 +1481,17 @@ impl<'a> DeclarationEmitter<'a> {
             }
             if let StmtKind::Export(export) = &statement.kind {
                 if let ExportDeclKind::Decl(inner) = &export.kind {
-                    if explicit_exports {
+                    if explicit_exports || matches!(inner.kind, StmtKind::ImportEquals(_)) {
                         self.write("export ");
                     }
                     self.emit_stmt(inner, false);
                     continue;
                 }
             }
-            if explicit_exports && Self::stmt_has_direct_export_modifier(statement) {
+            if explicit_exports
+                && Self::stmt_has_direct_export_modifier(statement)
+                && !matches!(statement.kind, StmtKind::ImportEquals(_))
+            {
                 self.write("export ");
             }
             self.emit_stmt(statement, false);
