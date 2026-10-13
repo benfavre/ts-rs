@@ -11,6 +11,27 @@ pub(super) struct MethodDeclaration {
 }
 
 impl TypeChecker {
+    pub(crate) fn record_signature_parameter_types(&mut self, params: &[Param]) {
+        if self.expression_type_spans.is_none() {
+            return;
+        }
+        for param in params {
+            if matches!(param.name.kind, PatKind::Ident(_)) {
+                let ty = param
+                    .type_ann
+                    .as_ref()
+                    .map(|node| self.resolve_type_node(node))
+                    .unwrap_or(Type::Any);
+                let ty = if param.optional && self.strict_null_checks {
+                    Type::flatten_union(vec![ty, Type::Undefined])
+                } else {
+                    ty
+                };
+                self.record_expression_type_span(param.name.span, &ty);
+            }
+        }
+    }
+
     pub(crate) fn record_class_member_declaration_types(
         &mut self,
         declaration: &ClassDecl,

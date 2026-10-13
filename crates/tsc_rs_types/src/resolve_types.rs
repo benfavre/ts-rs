@@ -359,13 +359,15 @@ impl TypeChecker {
                 let ret = self.resolve_type_node(&fn_type.return_type);
                 let fn_type_pred = self.extract_type_predicate(&fn_type.return_type);
                 let function = Type::Function(FunctionType {
-                    source: self.signature_source(
-                        &fn_type.params,
-                        &params,
-                        fn_type.type_params.as_deref(),
-                        Some(&fn_type.return_type),
-                        &ret,
-                    ),
+                    source: self
+                        .signature_source(
+                            &fn_type.params,
+                            &params,
+                            fn_type.type_params.as_deref(),
+                            Some(&fn_type.return_type),
+                            &ret,
+                        )
+                        .with_function_type_origin(),
                     type_param_constraints: self
                         .resolve_type_param_constraints(fn_type.type_params.as_deref()),
                     params,
@@ -3209,13 +3211,21 @@ impl TypeChecker {
                                 .find(|(n, _)| n == &mem.property)
                                 .map(|(_, t)| Self::member_read_type(t))
                                 .unwrap_or_else(|| {
-                                    self.builtins
-                                        .lookup_instance_property(name, &mem.property)
-                                        .unwrap_or(Type::Any)
+                                    self.lookup_library_instance_method(
+                                        name,
+                                        type_args,
+                                        &mem.property,
+                                    )
+                                    .or_else(|| {
+                                        self.builtins.lookup_instance_property(name, &mem.property)
+                                    })
+                                    .unwrap_or(Type::Any)
                                 })
                         } else {
-                            self.builtins
-                                .lookup_instance_property(name, &mem.property)
+                            self.lookup_library_instance_method(name, type_args, &mem.property)
+                                .or_else(|| {
+                                    self.builtins.lookup_instance_property(name, &mem.property)
+                                })
                                 .unwrap_or(Type::Any)
                         };
                         // Substitute class type parameters if available
@@ -3234,7 +3244,6 @@ impl TypeChecker {
                         .lookup_instance_property("Number", &mem.property)
                         .unwrap_or(Type::Any),
                     Type::Array(elem) => self
-                        .builtins
                         .lookup_array_method_typed(elem, &mem.property)
                         .or_else(|| {
                             self.builtins

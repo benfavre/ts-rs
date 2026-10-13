@@ -268,6 +268,19 @@ impl StdLibMemberAvailability {
             .map(|file| file.to_string_lossy().into_owned())
     }
 
+    pub(crate) fn owner_declaring_libraries(&self, owner: &str) -> Vec<String> {
+        self.active_files
+            .iter()
+            .filter(|file| {
+                self.metadata
+                    .declarations_by_file
+                    .get(file.as_str())
+                    .is_some_and(|declarations| declarations.owners.contains(owner))
+            })
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn constructor_instance(&self, path: &str) -> Option<&str> {
         self.metadata
             .constructor_instances

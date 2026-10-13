@@ -49,6 +49,7 @@ mod namespace_type_spans;
 pub mod narrowing;
 mod object_accessors;
 mod overload_compatibility;
+mod overload_failure;
 mod private_names;
 mod property_suggestions;
 mod protected_access;
@@ -57,6 +58,7 @@ mod reserved_type_names;
 mod resolve_types;
 mod static_overrides;
 mod stdlib;
+mod stdlib_members;
 mod strict_reserved;
 mod template_relations;
 mod tuple_access;
@@ -3368,8 +3370,9 @@ pub struct TypeChecker {
     /// Maps function name -> (min_required_params, max_total_params, has_rest_param).
     fn_param_info: rustc_hash::FxHashMap<String, (usize, usize, bool)>,
     /// First `var` declaration types per name, used for TS2403 checking.
-    /// Maps `name -> (type_display, span, file_name, has_explicit_type_ann, has_init)`.
-    var_first_types: rustc_hash::FxHashMap<String, (String, Span, Option<String>, bool, bool)>,
+    /// Maps `name -> (type_display, span, file_name, has_explicit_type_ann, has_init, exported)`.
+    var_first_types:
+        rustc_hash::FxHashMap<String, (String, Span, Option<String>, bool, bool, bool)>,
     /// Checked type of each first `var` declaration, keyed by its name span
     /// start, for identity comparison behind the display-string check.
     var_first_type_values: rustc_hash::FxHashMap<u32, Type>,
@@ -12278,6 +12281,7 @@ impl TypeChecker {
                         Some(file_name.clone()),
                         *has_ann,
                         *has_init,
+                        false,
                     ),
                 );
             }
@@ -27972,6 +27976,7 @@ impl TypeChecker {
                                 first_file,
                                 first_has_ann,
                                 first_has_init,
+                                _,
                             )) = self.var_first_types.get(&name_str).cloned()
                             {
                                 // Compare the widened type display strings.
@@ -28014,8 +28019,40 @@ impl TypeChecker {
                                         .get(&first_span.start)
                                         .cloned()
                                         .is_some_and(|first_ty| {
-                                            self.is_assignable_to(&widened_ty, &first_ty)
-                                                && self.is_assignable_to(&first_ty, &widened_ty)
+                                            // Object unions retain constituent identity even
+                                            // when a base and derived shape are mutually
+                                            // assignable. Deferred parameters, enum unions
+                                            // and literal reductions still use the relation
+                                            // until their canonical identities are resolved.
+                                            let object = |ty: &Type| {
+                                                matches!(ty, Type::ObjectType(_))
+                                                    || matches!(ty, Type::TypeReference(name, args)
+                                                        if args.is_empty()
+                                                            && self.active_type_parameter_name(ty).is_none()
+                                                            && (self.class_info.contains_key(name)
+                                                                || self.interface_info.contains_key(name)))
+                                            };
+                                            let object_or_union = |ty: &Type| {
+                                                object(ty) || matches!(ty, Type::Union(members)
+                                                    if members.iter().all(&object))
+                                            };
+                                            if (matches!(widened_ty, Type::Union(_)) || matches!(first_ty, Type::Union(_)))
+                                                && object_or_union(&widened_ty) && object_or_union(&first_ty)
+                                            {
+                                                let left = self.deep_expand_for_conditional(&widened_ty);
+                                                let right = self.deep_expand_for_conditional(&first_ty);
+                                                match (&left, &right) {
+                                                    (Type::Union(left), Type::Union(right)) => {
+                                                        left.len() == right.len()
+                                                            && left.iter().all(|ty| right.contains(ty))
+                                                    }
+                                                    (Type::Union(_), _) | (_, Type::Union(_)) => false,
+                                                    _ => left == right,
+                                                }
+                                            } else {
+                                                self.is_assignable_to(&widened_ty, &first_ty)
+                                                    && self.is_assignable_to(&first_ty, &widened_ty)
+                                            }
                                         });
                                 if ty_display != first_display
                                     && !cur_any_from_failed_inference
@@ -28044,6 +28081,7 @@ impl TypeChecker {
                                         self.current_file_name.clone(),
                                         has_ann,
                                         decl.init.is_some(),
+                                        var_stmt.modifiers & MOD_EXPORT != 0,
                                     ),
                                 );
                             }
@@ -28115,6 +28153,32 @@ impl TypeChecker {
                         var_stmt.kind == VarKind::Const,
                         has_annotation,
                     );
+                    // All declarations of a var symbol expose its first
+                    // declaration type, including an invalid redeclaration.
+                    // Reuse its recorded node to retain annotation provenance.
+                    if var_stmt.kind == VarKind::Var {
+                        if let (Some(spans), PatKind::Ident(name)) =
+                            (&mut self.expression_type_spans, &decl.name.kind)
+                        {
+                            if let Some((_, first_span, first_file, _, _, first_exported)) =
+                                self.var_first_types.get(name.as_str())
+                            {
+                                if first_span.start != decl.name.span.start
+                                    && first_file == &self.current_file_name
+                                    && *first_exported == (var_stmt.modifiers & MOD_EXPORT != 0)
+                                {
+                                    if let Some(first) =
+                                        spans.get(&(first_span.start, first_span.end)).cloned()
+                                    {
+                                        spans.insert(
+                                            (decl.name.span.start, decl.name.span.end),
+                                            first,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Boolean is a union of two literals. Its declaration
                     // widens, but a checked initializer still establishes the
                     // current flow constituent until a subsequent write.
@@ -32687,6 +32751,7 @@ impl TypeChecker {
                         }
                     }
                 }
+                self.record_signature_parameter_types(&function.params);
                 self.check_function_like_future_lib_globals(
                     &function.params,
                     Some(&function.return_type),
@@ -32857,6 +32922,7 @@ impl TypeChecker {
                         }
                     }
                 }
+                self.record_signature_parameter_types(&fn_type.params);
                 for p in &fn_type.params {
                     if let Some(ref ann) = p.type_ann {
                         self.check_type_node_generic_arity(ann);
@@ -43909,7 +43975,10 @@ impl TypeChecker {
                 if let Some(members) = self.enum_info.get(name.as_str()) {
                     return Some(members.iter().any(|(member, _)| *member == property));
                 }
-                if let Some(builtin) = self.builtins.lookup_instance_property(name, property) {
+                if let Some(builtin) = self
+                    .lookup_library_instance_method(name, args, property)
+                    .or_else(|| self.builtins.lookup_instance_property(name, property))
+                {
                     return Some(!matches!(builtin, Type::Error));
                 }
                 let instance_ty = if !args.is_empty() {
@@ -44125,8 +44194,8 @@ impl TypeChecker {
                             _ => Type::clone(&prop_ty),
                         }
                     } else {
-                        self.builtins
-                            .lookup_instance_property(name, property)
+                        self.lookup_library_instance_method(name, args, property)
+                            .or_else(|| self.builtins.lookup_instance_property(name, property))
                             .unwrap_or(Type::Any)
                     }
                 } else if let Some(alias_ty) = self
@@ -44157,8 +44226,8 @@ impl TypeChecker {
                     // `ZodSafeParseResult<T> = Success<T> | Error<T>`.
                     self.resolve_member_on_type(&alias_ty, property)
                 } else {
-                    self.builtins
-                        .lookup_instance_property(name, property)
+                    self.lookup_library_instance_method(name, args, property)
+                        .or_else(|| self.builtins.lookup_instance_property(name, property))
                         .unwrap_or(Type::Any)
                 }
             }
@@ -44175,7 +44244,6 @@ impl TypeChecker {
                 .lookup_instance_property("Boolean", property)
                 .unwrap_or(Type::Any),
             Type::Array(ref elem) => self
-                .builtins
                 .lookup_array_method_typed(elem, property)
                 .or_else(|| self.builtins.lookup_instance_property("Array", property))
                 .unwrap_or(Type::Any),
@@ -44203,8 +44271,7 @@ impl TypeChecker {
                     Type::NumberLiteral(elems.len().to_string())
                 } else {
                     let elem_union = Type::flatten_union(elems.iter().cloned().collect());
-                    self.builtins
-                        .lookup_array_method_typed(&elem_union, property)
+                    self.lookup_array_method_typed(&elem_union, property)
                         .or_else(|| self.builtins.lookup_instance_property("Array", property))
                         .unwrap_or(Type::Any)
                 }
@@ -45056,8 +45123,24 @@ impl TypeChecker {
         param_types: &[(std::string::String, Type)],
         type_params: &[std::string::String],
     ) -> HashMap<std::string::String, Type> {
+        self.infer_type_arguments_for_call_with_callback_returns(
+            call_arg_types,
+            param_types,
+            type_params,
+            false,
+        )
+    }
+
+    fn infer_type_arguments_for_call_with_callback_returns(
+        &self,
+        call_arg_types: &[Type],
+        param_types: &[(std::string::String, Type)],
+        type_params: &[std::string::String],
+        callback_returns: bool,
+    ) -> HashMap<std::string::String, Type> {
         let resolved_params: Vec<_> = param_types
             .iter()
+            .filter(|(name, _)| name != "this")
             .map(|(name, ty)| {
                 let resolved = match ty {
                     Type::TypeReference(reference, _)
@@ -45112,8 +45195,12 @@ impl TypeChecker {
                 }
             })
             .collect::<Vec<_>>();
-        let mut inferred =
-            self.infer_with_common_supertype(&sources, &resolved_params, type_params);
+        let mut inferred = self.infer_with_common_supertype(
+            &sources,
+            &resolved_params,
+            type_params,
+            callback_returns,
+        );
         let unsolved: Vec<_> = type_params
             .iter()
             .filter(|name| !inferred.contains_key(*name))
@@ -45127,7 +45214,12 @@ impl TypeChecker {
                 sources.push(source);
                 targets.push((name.clone(), target));
             }
-            inferred.extend(self.infer_with_common_supertype(&sources, &targets, &unsolved));
+            inferred.extend(self.infer_with_common_supertype(
+                &sources,
+                &targets,
+                &unsolved,
+                callback_returns,
+            ));
         }
         inferred
     }
@@ -45137,6 +45229,7 @@ impl TypeChecker {
         sources: &[Type],
         targets: &[(String, Type)],
         parameters: &[String],
+        callback_returns: bool,
     ) -> HashMap<String, Type> {
         let previous_strict =
             INFER_STRICT_CONSTRUCTORS.with(|flag| flag.replace(self.strict_function_types));
@@ -45223,9 +45316,14 @@ impl TypeChecker {
         let independent_candidates = |candidates: &[Type]| {
             candidates.iter().all(|candidate| {
                 matches!(candidate, Type::Null | Type::Undefined)
-                    || sources
-                        .iter()
-                        .any(|source| supplies_candidate(source, candidate))
+                    || sources.iter().any(|source| {
+                        supplies_candidate(source, candidate)
+                                // Overload candidates are retried after their callbacks
+                                // have been contextually checked. Their return types
+                                // now provide independent covariant candidates.
+                                || (callback_returns && matches!(source, Type::Function(function)
+                                    if supplies_candidate(&function.return_type, candidate)))
+                    })
             })
         };
         for (name, candidates) in &covariant {

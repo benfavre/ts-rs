@@ -4,13 +4,27 @@
 //! a declaration's annotation is reusable only while its resolved type survives
 //! instantiation. Source provenance never participates in type identity.
 
-use crate::{ConstructorType, FunctionType, Type, TypeChecker};
+use crate::{ConstructorType, FunctionType, Type, TypeChecker, TypePredicate};
 use std::sync::Arc;
 use tsc_rs_ast::*;
 
 #[derive(Debug, Clone, Default)]
 pub struct SignatureSource(Option<Arc<SignatureDeclaration>>);
 impl SignatureSource {
+    pub(crate) fn with_instantiated_parameters(mut self, parameters: Vec<String>) -> Self {
+        if let Some(source) = &mut self.0 {
+            Arc::make_mut(source).instantiated_parameters = parameters;
+        }
+        self
+    }
+
+    pub(crate) fn with_function_type_origin(mut self) -> Self {
+        if let Some(source) = &mut self.0 {
+            Arc::make_mut(source).function_type = true;
+        }
+        self
+    }
+
     pub(crate) fn with_original_this_parameter(mut self) -> Self {
         if let Some(source) = &mut self.0 {
             Arc::make_mut(source).original_this_parameter = true;
@@ -32,6 +46,7 @@ impl std::hash::Hash for SignatureSource {
 struct Annotation {
     ty: Type,
     text: String,
+    predicate: Option<TypePredicate>,
 }
 #[derive(Debug, Clone)]
 struct ParameterDeclaration {
@@ -40,7 +55,10 @@ struct ParameterDeclaration {
 }
 #[derive(Debug, Clone)]
 struct SignatureDeclaration {
+    source_file: Option<String>,
     original_this_parameter: bool,
+    instantiated_parameters: Vec<String>,
+    function_type: bool,
     parameters: Vec<ParameterDeclaration>,
     type_parameters: Vec<(String, Option<Annotation>)>,
     return_type: Option<Annotation>,
@@ -107,6 +125,7 @@ impl TypeChecker {
         Some(Annotation {
             ty: ty.clone(),
             text: print_annotation(node, self.current_source.as_deref().unwrap_or_default())?,
+            predicate: self.extract_type_predicate(node),
         })
     }
 
@@ -339,7 +358,10 @@ impl TypeChecker {
         }
         let annotation = |node: &TypeNode, ty: &Type| self.source_annotation(node, ty);
         SignatureSource(Some(Arc::new(SignatureDeclaration {
+            source_file: self.current_file_name.clone(),
             original_this_parameter: false,
+            instantiated_parameters: Vec::new(),
+            function_type: false,
             parameters: parameters
                 .iter()
                 .zip(types)
@@ -385,10 +407,14 @@ impl TypeChecker {
             Some(Annotation {
                 ty: ty.clone(),
                 text: print_annotation(node, self.current_source.as_deref().unwrap_or_default())?,
+                predicate: self.extract_type_predicate(node),
             })
         };
         SignatureSource(Some(Arc::new(SignatureDeclaration {
+            source_file: self.current_file_name.clone(),
             original_this_parameter: false,
+            instantiated_parameters: Vec::new(),
+            function_type: false,
             parameters: signature
                 .params
                 .iter()
@@ -421,7 +447,9 @@ pub(crate) struct PrintedType<'a> {
     pub text: String,
     pub underline: String,
     checker: Option<&'a TypeChecker>,
+    signature_file: Option<String>,
     value_parameters: Vec<String>,
+    instantiated_parameters: Vec<String>,
 }
 impl PrintedType<'_> {
     fn write(&mut self, text: &str, original: bool) {
@@ -438,10 +466,75 @@ impl PrintedType<'_> {
         self.write(text, true);
     }
     fn annotation(&mut self, ty: &Type, annotation: Option<&Annotation>) {
-        if let Some(annotation) = annotation.filter(|a| a.ty == *ty) {
+        if let Some(annotation) =
+            annotation.filter(|a| a.ty == *ty && !self.has_fresh_parameter(ty))
+        {
             self.original(&annotation.text);
         } else {
             self.ty(ty);
+        }
+    }
+    fn has_fresh_parameter(&self, ty: &Type) -> bool {
+        if self.instantiated_parameters.is_empty() {
+            return false;
+        }
+        let substitutions = self
+            .instantiated_parameters
+            .iter()
+            .map(|name| (name.clone(), Type::Never))
+            .collect();
+        TypeChecker::substitute(ty, &substitutions)
+            != TypeChecker::substitute(ty, &Default::default())
+    }
+
+    fn predicate_target(&mut self, ty: &Type, original: &Type) {
+        match (ty, original) {
+            (Type::Readonly(inner), Type::Readonly(original)) => {
+                self.original("readonly ");
+                self.predicate_target(inner, original);
+            }
+            (Type::Array(element), Type::Array(original)) => {
+                self.predicate_target(element, original);
+                self.original("[]");
+            }
+            _ if ty == original && !self.has_fresh_parameter(ty) => {
+                self.original(&original.display_string_single_line());
+            }
+            _ => self.ty(ty),
+        }
+    }
+
+    fn predicate(
+        &mut self,
+        predicate: &TypePredicate,
+        annotation: Option<&Annotation>,
+        function_type: bool,
+    ) {
+        let original = annotation
+            .and_then(|a| a.predicate.as_ref())
+            .filter(|original| {
+                original.param_name == predicate.param_name
+                    && original.is_asserts == predicate.is_asserts
+            });
+        if !function_type {
+            if let (Some(annotation), Some(original)) = (annotation, original) {
+                if original == predicate && !self.has_fresh_parameter(&predicate.target_type) {
+                    self.original(&annotation.text);
+                    return;
+                }
+                let prefix = if predicate.is_asserts { "asserts " } else { "" };
+                self.original(&format!("{prefix}{} is ", predicate.param_name));
+                self.predicate_target(&predicate.target_type, &original.target_type);
+                return;
+            }
+        }
+        if predicate.is_asserts {
+            self.synthetic("asserts ");
+        }
+        self.synthetic(&predicate.param_name);
+        if !predicate.is_asserts || !matches!(predicate.target_type.as_ref(), Type::Any) {
+            self.synthetic(" is ");
+            self.ty(&predicate.target_type);
         }
     }
     fn signature(&mut self, signature: &FunctionType, separator: &str) {
@@ -452,6 +545,7 @@ impl PrintedType<'_> {
             &signature.type_param_constraints,
             &signature.type_param_defaults,
             &signature.source,
+            signature.type_predicate.as_ref(),
             separator,
         );
     }
@@ -467,6 +561,7 @@ impl PrintedType<'_> {
             &signature.type_param_constraints,
             &signature.type_param_defaults,
             &signature.source,
+            None,
             separator,
         );
     }
@@ -479,6 +574,7 @@ impl PrintedType<'_> {
         constraints: &[Option<Type>],
         defaults: &[Option<Type>],
         source: &SignatureSource,
+        predicate: Option<&TypePredicate>,
         separator: &str,
     ) {
         let parameter_depth = self.value_parameters.len();
@@ -489,6 +585,19 @@ impl PrintedType<'_> {
                     .to_owned()
             }));
         let source = source.0.as_deref();
+        let previous_file = self.signature_file.take();
+        self.signature_file = source.and_then(|source| source.source_file.clone());
+        let previous_parameters = std::mem::take(&mut self.instantiated_parameters);
+        // A substituted function may retain a declaration in the caller's
+        // file. Its T is a different symbol from the library receiver's T.
+        // Only nested declarations from the same file inherit that mapper.
+        if self.signature_file == previous_file {
+            self.instantiated_parameters = previous_parameters.clone();
+        }
+        if let Some(source) = source {
+            self.instantiated_parameters
+                .extend(source.instantiated_parameters.iter().cloned());
+        }
         if !type_parameters.is_empty() {
             self.synthetic("<");
             for (i, name) in type_parameters.iter().enumerate() {
@@ -555,7 +664,18 @@ impl PrintedType<'_> {
         }
         self.synthetic(")");
         self.synthetic(separator);
-        self.annotation(return_type, source.and_then(|s| s.return_type.as_ref()));
+        let annotation = source.and_then(|s| s.return_type.as_ref());
+        if let Some(predicate) = predicate {
+            self.predicate(
+                predicate,
+                annotation,
+                source.is_some_and(|s| s.function_type),
+            );
+        } else {
+            self.annotation(return_type, annotation);
+        }
+        self.instantiated_parameters = previous_parameters;
+        self.signature_file = previous_file;
         self.value_parameters.truncate(parameter_depth);
     }
     fn parenthesized(&mut self, ty: &Type, parens: bool) {
@@ -1242,6 +1362,7 @@ mod tests {
                     annotation: Some(Annotation {
                         ty,
                         text: text.into(),
+                        predicate: None,
                     }),
                     ..Default::default()
                 },
@@ -1275,6 +1396,7 @@ mod tests {
                 annotation: Some(Annotation {
                     ty: Type::Number,
                     text: "number".into(),
+                    predicate: None,
                 }),
                 ..Default::default()
             },
@@ -1315,12 +1437,16 @@ mod tests {
             unreachable!()
         };
         signature.source = SignatureSource(Some(Arc::new(SignatureDeclaration {
+            source_file: None,
             original_this_parameter: false,
+            instantiated_parameters: Vec::new(),
+            function_type: false,
             parameters: vec![ParameterDeclaration {
                 name: "x".into(),
                 annotation: Some(Annotation {
                     ty: Type::Number,
                     text: "number".into(),
+                    predicate: None,
                 }),
             }],
             type_parameters: Vec::new(),

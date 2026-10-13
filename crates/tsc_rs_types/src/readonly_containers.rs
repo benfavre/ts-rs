@@ -214,6 +214,11 @@ impl TypeChecker {
     }
 
     pub(super) fn readonly_sequence_member_type(&self, inner: &Type, property: &str) -> Type {
+        if let Some(element) = self.iterated_element_type(inner) {
+            if let Some(method) = self.library_method_type("ReadonlyArray", &[element], property) {
+                return Self::substitute_this(&method, &Type::Readonly(Arc::new(inner.clone())));
+            }
+        }
         let mut ty = self.resolve_member_on_type(inner, property);
         // Array callbacks receive the original readonly array. Array-producing
         // methods (slice/map/filter) still return a new mutable array.

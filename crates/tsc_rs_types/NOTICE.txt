@@ -78,3 +78,19 @@ same pinned pingdotgg/ts-rust revision. Native text segments and Type values
 replace arena IDs and donor string storage. Fixed delimiters determine each
 captured placeholder, which is checked using the native type relation.
 The copyright and license terms above also apply to this adaptation.
+
+Declaration-based standard-library member instantiation
+
+src/stdlib_members.rs adapts resolveTypeReferenceMembers and
+resolveObjectTypeMembers from checker_p21.rs in the same pinned ts-rust
+revision. Native library AST declarations, option-aware caches and type
+substitution replace donor symbol tables and arena mappers. Method type
+parameters retain their own scope; original annotations are reused only
+when their type-parameter identity survives instantiation.
+
+Predicate type-node serialization follows typePredicateToTypePredicateNodeHelper
+and serializeInferredReturnTypeForSignature in nodebuilder_impl_p2.rs.
+src/overload_failure.rs adapts getCandidateForOverloadFailure and
+getLongestCandidateIndex from checker_p11.rs, preserving the selected failure
+result while reporting the original overload diagnostic. The copyright and
+license terms above also apply to these adaptations.

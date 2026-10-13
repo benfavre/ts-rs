@@ -1995,13 +1995,25 @@ impl TypeChecker {
                         }
                     }
                 }
-                let resolved = self.resolve_type_for_assignability(ctx)?;
+                let resolved = self
+                    .resolve_type_for_assignability(ctx)
+                    .or_else(|| self.resolve_type_reference_to_object(name, args))
+                    .or_else(|| {
+                        self.library_numeric_index(name, args)
+                            .map(|element| Type::Array(Arc::new(element)))
+                    })?;
                 if resolved == *ctx {
                     return None;
                 }
                 self.tuple_like_context(&resolved, depth + 1)
             }
-            Type::ObjectType(info) => Self::tuple_from_indexed_members(&info.properties),
+            Type::ObjectType(info) => {
+                Self::tuple_from_indexed_members(&info.properties).or_else(|| {
+                    info.index_signature.as_ref().and_then(|(key, value)| {
+                        matches!(key.as_ref(), Type::Number).then(|| Type::Array(value.clone()))
+                    })
+                })
+            }
             Type::Union(members) => members
                 .iter()
                 .find(|m| matches!(m, Type::Tuple(_)))
@@ -5614,7 +5626,12 @@ impl TypeChecker {
                         let spread_element = if matches!(inner_ty, Type::Union(_)) {
                             self.for_of_binding_element_type(&inner_ty, false)
                         } else {
-                            Self::lib_iterable_element_type(&inner_ty)
+                            Self::lib_iterable_element_type(&inner_ty).or_else(|| {
+                                self.array_or_tuple_type(&inner_ty, 0)
+                                    .is_none()
+                                    .then(|| self.iterator_protocol_element_type(&inner_ty))
+                                    .flatten()
+                            })
                         };
                         if let Some(element) = spread_element {
                             checked_types.push(if tuple_ctx.is_some() {
@@ -6063,10 +6080,10 @@ impl TypeChecker {
                             self.check_expr(e)
                         };
                         // The contextual return type decides literal widening here.
-                        let inferred = if ctx_ret_type
-                            .as_ref()
-                            .is_some_and(|ret| self.contextual_type_keeps_literals(ret, 3))
-                        {
+                        let inferred = if ctx_ret_type.as_ref().is_some_and(|ret| {
+                            self.contextual_type_keeps_literals(ret, 3)
+                                || self.literal_of_contextual_type(&inferred, ret)
+                        }) {
                             inferred
                         } else {
                             self.widen_fresh_return_expr_type(e, inferred)
@@ -7520,7 +7537,25 @@ impl TypeChecker {
                     }
 
                     // Determine parameter types for contextual typing of callback args
-                    let mut param_types: Vec<(Type, bool)> = match &callee_ty {
+                    let provisional_arguments: Vec<_> = call
+                        .args
+                        .iter()
+                        .map(|argument| {
+                            if matches!(argument.kind, ExprKind::Arrow(_) | ExprKind::FnExpr(_)) {
+                                Type::Any
+                            } else {
+                                self.infer_expr_type(argument)
+                            }
+                        })
+                        .collect();
+                    let contextual_signature = match &callee_ty {
+                        Type::Intersection(members) => members.iter().find(|member| {
+                            matches!(member, Type::Function(signature) if self.overload_matches(signature, &provisional_arguments))
+                        }).or_else(|| members.iter().find(|member| matches!(member, Type::Function(_))))
+                          .unwrap_or(&callee_ty),
+                        _ => &callee_ty,
+                    };
+                    let mut param_types: Vec<(Type, bool)> = match contextual_signature {
                         Type::Function(ft) => {
                             if !ft.type_params.is_empty() {
                                 // Apply declared constraints before provisional inference:
@@ -7788,7 +7823,7 @@ impl TypeChecker {
                                 let diagnostic =
                                     self.no_overload_diagnostic(sigs, &arg_types, call, expr);
                                 self.diagnostics.push(diagnostic);
-                                Type::Error
+                                self.failed_overload_return_type(sigs, &arg_types)
                             }
                         } else if let Some(sig) = sigs.first() {
                             // A lone bodyless signature is a plain call in
@@ -9256,7 +9291,8 @@ impl TypeChecker {
                                         _ => Type::clone(&prop_ty),
                                     }
                                 } else if let Some(builtin) =
-                                    self.builtins.lookup_instance_property(name, &mem.property)
+                                    self.lookup_library_instance_method(name, type_args, &mem.property)
+                                        .or_else(|| self.builtins.lookup_instance_property(name, &mem.property))
                                 {
                                     builtin
                                 } else {
@@ -9441,8 +9477,8 @@ impl TypeChecker {
                                 }
                             } else {
                                 // No class info – try built-in instance members
-                                self.builtins
-                                    .lookup_instance_property(name, &mem.property)
+                                self.lookup_library_instance_method(name, type_args, &mem.property)
+                                    .or_else(|| self.builtins.lookup_instance_property(name, &mem.property))
                                     .unwrap_or_else(|| {
                                         // A lib interface instance (`Promise<number>`) reports a
                                         // member that no active lib declaration provides.
@@ -9514,9 +9550,7 @@ impl TypeChecker {
                                 reported_future_lib_member,
                             )
                         }),
-                    Type::Array(ref elem) => self
-                        .builtins
-                        .lookup_array_method_typed(elem, &mem.property)
+                    Type::Array(ref elem) => self.lookup_array_method_typed(elem, &mem.property)
                         .or_else(|| {
                             self.builtins
                                 .lookup_instance_property("Array", &mem.property)
@@ -9612,8 +9646,7 @@ impl TypeChecker {
                         } else {
                             // Tuple member access for array methods
                             let elem_union = Type::flatten_union(elems.iter().cloned().collect());
-                            self.builtins
-                                .lookup_array_method_typed(&elem_union, &mem.property)
+                            self.lookup_array_method_typed(&elem_union, &mem.property)
                                 .or_else(|| {
                                     self.builtins
                                         .lookup_instance_property("Array", &mem.property)
@@ -12504,7 +12537,7 @@ impl TypeChecker {
                 }
                 let diagnostic = self.no_overload_diagnostic(&sigs, arg_types, call, expr);
                 self.diagnostics.push(diagnostic);
-                return Type::Error;
+                return self.failed_overload_return_type(&sigs, arg_types);
             }
         }
         match callee_ty {
@@ -12650,6 +12683,23 @@ impl TypeChecker {
                     // only when its parameter remains unsolved, substituting
                     // earlier solutions/defaults so `<D, R = D>` makes R use
                     // the inferred D.
+                    if let (Some((name, receiver_type)), ExprKind::Member(member)) =
+                        (ft.params.first(), &call.callee.kind)
+                    {
+                        if name == "this" {
+                            let receiver = self.infer_expr_type(&member.object);
+                            let from_receiver = self.infer_type_arguments_for_call(
+                                &[receiver],
+                                &[("receiver".into(), receiver_type.clone())],
+                                &ft.type_params,
+                            );
+                            for (name, ty) in from_receiver {
+                                if !matches!(ty, Type::Unknown) {
+                                    type_param_map.insert(name, ty);
+                                }
+                            }
+                        }
+                    }
                     Self::apply_type_param_defaults(ft, &mut type_param_map);
 
                     // Substitute type params in parameter and return types.
@@ -13033,7 +13083,8 @@ impl TypeChecker {
                                 expr,
                             );
                             self.diagnostics.push(diagnostic);
-                            return Type::Error;
+                            return self
+                                .failed_overload_return_type(&info.call_signatures, arg_types);
                         }
                         // A lone signature is a plain call: per-argument checks.
                         if let Some(sig) = info.call_signatures.first() {
@@ -14051,8 +14102,13 @@ impl TypeChecker {
                         .iter()
                         .map(|t| self.widen_argument_for_inference(t))
                         .collect();
-                    let mut type_param_map =
-                        self.infer_type_arguments_for_call(&widened, &sig.params, &sig.type_params);
+                    let mut type_param_map = self
+                        .infer_type_arguments_for_call_with_callback_returns(
+                            &widened,
+                            &sig.params,
+                            &sig.type_params,
+                            true,
+                        );
                     Self::apply_type_param_defaults(sig, &mut type_param_map);
                     let ret = Self::substitute(&sig.return_type, &type_param_map);
                     Self::default_unsolved_to_never_in_return(
@@ -14189,12 +14245,26 @@ impl TypeChecker {
             if arg_types.len() < required || (!has_rest && arg_types.len() > sig.params.len()) {
                 return error_no_overload_match(sigs.len(), expression_span);
             }
+            let parameters = if sig.type_params.is_empty() {
+                sig.params.clone()
+            } else {
+                let mut inferred = self.infer_type_arguments_for_call_with_callback_returns(
+                    arg_types,
+                    &sig.params,
+                    &sig.type_params,
+                    true,
+                );
+                Self::apply_type_param_defaults(sig, &mut inferred);
+                sig.params
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), Self::substitute(ty, &inferred)))
+                    .collect()
+            };
             let mut failure = None;
             for (index, arg_ty) in arg_types.iter().enumerate() {
-                let Some((param_name, param_ty)) = sig
-                    .params
+                let Some((param_name, param_ty)) = parameters
                     .get(index)
-                    .or_else(|| has_rest.then(|| sig.params.last()).flatten())
+                    .or_else(|| has_rest.then(|| parameters.last()).flatten())
                 else {
                     break;
                 };
@@ -14403,8 +14473,12 @@ impl TypeChecker {
                 .iter()
                 .map(|t| self.widen_argument_for_inference(t))
                 .collect();
-            let mut inferred =
-                self.infer_type_arguments_for_call(&widened, &sig.params, &sig.type_params);
+            let mut inferred = self.infer_type_arguments_for_call_with_callback_returns(
+                &widened,
+                &sig.params,
+                &sig.type_params,
+                true,
+            );
             Self::apply_type_param_defaults(sig, &mut inferred);
             sig.params
                 .iter()
@@ -14443,7 +14517,20 @@ impl TypeChecker {
             {
                 continue;
             }
-            if !self.is_assignable_to(arg_ty, &effective_param_ty) {
+            // An in-scope type parameter is not an arbitrary function or
+            // object. Select overloads using what its declared constraint
+            // guarantees; otherwise a reduce accumulator T selects the
+            // element-function overload instead of the generic accumulator.
+            let argument_constraint = (arg_ty != &effective_param_ty
+                && self.active_type_parameter_name(arg_ty).is_some())
+            .then(|| {
+                self.declared_type_param_constraint(arg_ty)
+                    .unwrap_or(Type::Unknown)
+            });
+            if !self.is_assignable_to(
+                argument_constraint.as_ref().unwrap_or(arg_ty),
+                &effective_param_ty,
+            ) {
                 return false;
             }
         }
