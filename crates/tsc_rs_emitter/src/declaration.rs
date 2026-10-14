@@ -33,6 +33,7 @@ pub struct DeclarationEmitter<'a> {
     comments: Vec<Comment>,
     remove_comments: bool,
     widen_fresh_null_initializers: bool,
+    callable_namespace_scopes: Vec<HashSet<String>>,
 }
 
 impl<'a> DeclarationEmitter<'a> {
@@ -55,6 +56,7 @@ impl<'a> DeclarationEmitter<'a> {
             comments: Vec::new(),
             remove_comments: false,
             widen_fresh_null_initializers: false,
+            callable_namespace_scopes: Vec::new(),
         }
     }
 
@@ -459,6 +461,18 @@ impl<'a> DeclarationEmitter<'a> {
                 for declarator in &decl.declarations {
                     if let Some(type_ann) = &declarator.type_ann {
                         Self::collect_type_dependencies(type_ann, &bound, &mut dependencies);
+                    } else if let Some(signature) =
+                        matches!(declarator.name.kind, PatKind::Ident(_))
+                            .then(|| {
+                                declarator
+                                    .init
+                                    .as_deref()
+                                    .and_then(Self::typed_callable_initializer)
+                            })
+                            .flatten()
+                            .filter(|signature| self.callable_dependencies_are_visible(signature))
+                    {
+                        Self::collect_type_dependencies(&signature, &bound, &mut dependencies);
                     } else if let PatKind::Ident(name) = &declarator.name.kind {
                         if let Some(inferred_type) = self.inferred_var_types.get(name.as_str()) {
                             self.collect_inferred_type_dependencies(
@@ -1530,6 +1544,13 @@ impl<'a> DeclarationEmitter<'a> {
                 if let Some(literal) = literal {
                     self.write(" = ");
                     self.write(&literal);
+                } else if let Some(signature) = matches!(decl.name.kind, PatKind::Ident(_))
+                    .then(|| Self::typed_callable_initializer(init))
+                    .flatten()
+                    .filter(|signature| self.callable_dependencies_are_visible(signature))
+                {
+                    self.write(": ");
+                    self.emit_type_node(&signature);
                 } else if let Some(ty) = self.infer_var_type_text(init) {
                     self.write(": ");
                     self.write(&ty);
@@ -1539,6 +1560,176 @@ impl<'a> DeclarationEmitter<'a> {
             }
         }
         self.writeln(";");
+    }
+
+    // A directly initialized callable can expose its annotated signature without
+    // resolving its body. Preserve binding patterns: aliases can affect both
+    // duplicate parameter names and the meaning of `typeof` in the signature.
+    fn typed_callable_initializer(mut expr: &Expr) -> Option<TypeNode> {
+        while let ExprKind::Paren(inner) = &expr.kind {
+            expr = inner;
+        }
+        let (type_params, params, return_type, empty_body, local_name) = match &expr.kind {
+            ExprKind::Arrow(arrow) if !arrow.is_async => (
+                &arrow.type_params,
+                &arrow.params,
+                &arrow.return_type,
+                matches!(&arrow.body, ArrowBody::Block(body) if body.is_empty()),
+                None,
+            ),
+            ExprKind::FnExpr(function) if !function.is_async && !function.is_generator => (
+                &function.type_params,
+                &function.params,
+                &function.return_type,
+                function.body.as_ref().is_some_and(Vec::is_empty),
+                function.name.as_deref(),
+            ),
+            _ => return None,
+        };
+        // Defaults and untyped parameters need contextual inference. Leave those
+        // to the existing inference path until their types are available.
+        if params
+            .iter()
+            .any(|p| p.type_ann.is_none() || p.initializer.is_some())
+        {
+            return None;
+        }
+        let return_type = match return_type {
+            Some(ty) => ty.clone(),
+            None if empty_body => TypeNode {
+                kind: TypeNodeKind::Keyword(KeywordTypeKind::Void),
+                span: expr.span,
+            },
+            None => return None,
+        };
+        let mut local_values: HashSet<String> = params
+            .iter()
+            .flat_map(|p| Self::binding_names(&p.name))
+            .collect();
+        local_values.extend(local_name.map(str::to_string));
+        // The collector currently shares a bound-name set between value and
+        // type references. A typeof query matching a type parameter therefore
+        // also needs scope resolution before its dependency can be retained.
+        local_values.extend(type_params.iter().flatten().map(|p| p.name.clone()));
+        let needs_scope = |ty: &TypeNode| Self::callable_type_needs_scope(ty, &local_values);
+        if params
+            .iter()
+            .filter_map(|p| p.type_ann.as_ref())
+            .any(needs_scope)
+            || needs_scope(&return_type)
+            || type_params.iter().flatten().any(|p| {
+                p.constraint.as_deref().is_some_and(needs_scope)
+                    || p.default.as_deref().is_some_and(needs_scope)
+                    || p.modifiers & MOD_CONST != 0
+            })
+        {
+            return None;
+        }
+        let signature = TypeNode {
+            kind: TypeNodeKind::Function(Box::new(FnTypeNode {
+                is_abstract: false,
+                type_params: type_params.clone(),
+                params: params.clone(),
+                return_type: Box::new(return_type),
+            })),
+            span: expr.span,
+        };
+        Some(signature)
+    }
+
+    // Do not infer signatures whose dependency collection needs additional
+    // callable value scopes. This preserves the existing fallback for those
+    // cases instead of binding a local typeof query to an outer declaration.
+    fn callable_type_needs_scope(ty: &TypeNode, locals: &HashSet<String>) -> bool {
+        let check = |ty: &TypeNode| Self::callable_type_needs_scope(ty, locals);
+        match &ty.kind {
+            TypeNodeKind::Function(_)
+            | TypeNodeKind::Constructor(_)
+            | TypeNodeKind::Infer(_, _) => true,
+            TypeNodeKind::Reference(reference) => reference.type_args.iter().flatten().any(check),
+            TypeNodeKind::Array(inner)
+            | TypeNodeKind::Keyof(inner)
+            | TypeNodeKind::Unique(inner)
+            | TypeNodeKind::Readonly(inner)
+            | TypeNodeKind::Paren(inner)
+            | TypeNodeKind::Rest(inner)
+            | TypeNodeKind::Optional(inner)
+            | TypeNodeKind::TypeOperator(_, inner) => check(inner),
+            TypeNodeKind::Tuple(elements) => elements.iter().any(|e| check(&e.type_node)),
+            TypeNodeKind::Union(types) | TypeNodeKind::Intersection(types) => {
+                types.iter().any(check)
+            }
+            TypeNodeKind::TypeLit(members) => members.iter().any(|m| match &m.kind {
+                TypeMemberKind::PropertySig(property) => {
+                    property.type_ann.as_ref().is_some_and(check)
+                }
+                _ => true,
+            }),
+            TypeNodeKind::Conditional(conditional) => [
+                &conditional.check,
+                &conditional.extends,
+                &conditional.true_type,
+                &conditional.false_type,
+            ]
+            .into_iter()
+            .any(|ty| check(ty)),
+            TypeNodeKind::Mapped(mapped) => {
+                let mut scoped = locals.clone();
+                scoped.insert(mapped.type_param.name.clone());
+                let check = |ty: &TypeNode| Self::callable_type_needs_scope(ty, &scoped);
+                mapped.type_param.constraint.as_deref().is_some_and(check)
+                    || mapped.type_param.default.as_deref().is_some_and(check)
+                    || mapped.name_type.as_deref().is_some_and(check)
+                    || mapped.type_ann.as_deref().is_some_and(check)
+            }
+            TypeNodeKind::IndexedAccess(object, index) => check(object) || check(index),
+            TypeNodeKind::JSDocNullable(constraint) => constraint.as_deref().is_some_and(check),
+            TypeNodeKind::TemplateLit(template) => template.types.iter().any(check),
+            TypeNodeKind::ImportType(import) => import.type_args.iter().flatten().any(check),
+            TypeNodeKind::Predicate(predicate) => predicate.type_ann.as_deref().is_some_and(check),
+            TypeNodeKind::NamedTupleMember(member) => check(&member.type_node),
+            TypeNodeKind::TypeQuery(expression) => {
+                let mut names = HashSet::new();
+                Self::collect_entity_name_dependencies(expression, &HashSet::new(), &mut names);
+                names.iter().any(|name| locals.contains(name))
+            }
+            TypeNodeKind::Keyword(_) | TypeNodeKind::This | TypeNodeKind::Literal(_) => false,
+        }
+    }
+
+    fn callable_dependencies_are_visible(&self, signature: &TypeNode) -> bool {
+        if self.callable_namespace_scopes.is_empty() {
+            return true;
+        }
+        let mut dependencies = HashSet::new();
+        Self::collect_type_dependencies(signature, &HashSet::new(), &mut dependencies);
+        let TypeNodeKind::Function(function) = &signature.kind else {
+            return false;
+        };
+        // Namespace retained names do not distinguish values from types. A
+        // named typeof query may refer past a same-named local type alias.
+        let has_value_query = |ty: &TypeNode| Self::callable_type_needs_scope(ty, &dependencies);
+        if has_value_query(&function.return_type)
+            || function
+                .params
+                .iter()
+                .filter_map(|p| p.type_ann.as_ref())
+                .any(has_value_query)
+            || function.type_params.iter().flatten().any(|p| {
+                p.constraint.as_deref().is_some_and(has_value_query)
+                    || p.default.as_deref().is_some_and(has_value_query)
+            })
+        {
+            return false;
+        }
+        // Namespace dependencies are not propagated to outer declarations yet.
+        // Only use the new signature when its names are already retained in a
+        // visible namespace; global callable declarations use the normal pass.
+        dependencies.iter().all(|name| {
+            self.callable_namespace_scopes
+                .iter()
+                .any(|scope| scope.contains(name))
+        })
     }
 
     fn emit_module_decl(&mut self, module_decl: &ModuleDecl) {
@@ -1591,6 +1782,12 @@ impl<'a> DeclarationEmitter<'a> {
     }
 
     fn emit_namespace_body(&mut self, statements: &[Stmt]) {
+        self.callable_namespace_scopes.push(
+            statements
+                .iter()
+                .flat_map(Self::stmt_declared_names)
+                .collect(),
+        );
         let named_exports = Self::named_local_exports(statements);
         let (retained, exported) =
             self.collect_retained_declaration_names(statements, &named_exports);
@@ -1600,6 +1797,7 @@ impl<'a> DeclarationEmitter<'a> {
         let has_private =
             !self.enum_ambient && retained.iter().any(|name| !exported.contains(name));
         let explicit_exports = has_boundary || has_private;
+        *self.callable_namespace_scopes.last_mut().unwrap() = retained.clone();
         for statement in statements {
             if Self::is_empty_binding_declaration(statement)
                 || Self::is_function_overload_implementation(statement, statements)
@@ -1634,6 +1832,7 @@ impl<'a> DeclarationEmitter<'a> {
                 self.at_line_start = saved_line_start;
             }
         }
+        self.callable_namespace_scopes.pop();
         if has_private && !has_boundary {
             self.writeln("export {};");
         }

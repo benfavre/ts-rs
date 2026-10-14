@@ -1356,3 +1356,60 @@ fn test_dts_omitted_strict_options_preserve_fresh_null() {
     let source = "let l9=0,l10:string=\"\",l11=null;for(let l11 in {}){} const c=null;var v=null;namespace N{export const value=null;}class C{value=null;readonly immutable=null;}";
     assert_eq!(emit_dts(source), "declare let l9: number, l10: string, l11: null;\ndeclare const c: null;\ndeclare var v: null;\ndeclare namespace N {\n    const value: null;\n}\ndeclare class C {\n    value: null;\n    readonly immutable: null;\n}\n");
 }
+
+#[test]
+fn test_dts_typed_callable_initializers_keep_signatures_and_dependencies() {
+    // Complete declaration outputs checked against TypeScript 6.0.3.
+    for (source, expected) in [
+        ("const f=()=>{};", "declare const f: () => void;\n"),
+        ("const f=(x:string)=>{};", "declare const f: (x: string) => void;\n"),
+        ("const f=function(x:string){};", "declare const f: (x: string) => void;\n"),
+        ("export const f=(((x:string):number=>1));", "export declare const f: (x: string) => number;\n"),
+        ("type Named={name:string};let f=({name:alias}:Named)=>{};", "type Named = {\n    name: string;\n};\ndeclare let f: ({ name: alias }: Named) => void;\n"),
+        ("type Named={name:string};const f=({name:a,name:b}:Named)=>{};", "type Named = {\n    name: string;\n};\ndeclare const f: ({ name: a, name: b }: Named) => void;\n"),
+        ("let value=\"\";const f=({value:alias}:{value:string}):typeof value=>value;", "declare let value: string;\ndeclare const f: ({ value: alias }: {\n    value: string;\n}) => typeof value;\n"),
+        ("type Hidden={x:number};export const f=(x:Hidden)=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (x: Hidden) => void;\nexport {};\n"),
+        ("type Hidden={x:number};export const f=(x:string):Hidden=>({x:1});", "type Hidden = {\n    x: number;\n};\nexport declare const f: (x: string) => Hidden;\nexport {};\n"),
+        ("type A={x:number};type B={y:number};export const f=(x:A):B=>({y:1});", "type A = {\n    x: number;\n};\ntype B = {\n    y: number;\n};\nexport declare const f: (x: A) => B;\nexport {};\n"),
+        ("const hidden=\"\";export const f=(x:string):typeof hidden=>hidden;", "declare const hidden = \"\";\nexport declare const f: (x: string) => typeof hidden;\nexport {};\n"),
+        ("type T={unused:string};export const f=<T>(x:T):T=>x;", "export declare const f: <T>(x: T) => T;\n"),
+        ("type Hidden={x:number};export const f=<T extends Hidden>(x:T):T=>x;", "type Hidden = {\n    x: number;\n};\nexport declare const f: <T extends Hidden>(x: T) => T;\nexport {};\n"),
+        ("type Hidden={x:number};export const f=<T=Hidden>(x:T):T=>x;", "type Hidden = {\n    x: number;\n};\nexport declare const f: <T = Hidden>(x: T) => T;\nexport {};\n"),
+        ("type T={outer:number};export namespace N{type T={inner:string};export const f=(x:T):T=>x;}", "export declare namespace N {\n    type T = {\n        inner: string;\n    };\n    export const f: (x: T) => T;\n    export {};\n}\n"),
+        ("export const f=(x?:string):number=>1;", "export declare const f: (x?: string) => number;\n"),
+        ("export const f=(...x:string[]):number=>x.length;", "export declare const f: (...x: string[]) => number;\n"),
+        ("export const f=([a,b]:string[]):void=>{};", "export declare const f: ([a, b]: string[]) => void;\n"),
+        ("type N={p:{x:string}};export const f=({p:{x:alias}}:N):void=>{};", "type N = {\n    p: {\n        x: string;\n    };\n};\nexport declare const f: ({ p: { x: alias } }: N) => void;\nexport {};\n"),
+        ("export const f=({x=\"\"}:{x?:string}):void=>{};", "export declare const f: ({ x }: {\n    x?: string;\n}) => void;\n"),
+        ("export const f=({default:alias}:{default:string}):void=>{};", "export declare const f: ({ default: alias }: {\n    default: string;\n}) => void;\n"),
+        ("export const f=(x:unknown):x is string=>true;", "export declare const f: (x: unknown) => x is string;\n"),
+        ("export const f=(x:unknown):asserts x=>{};", "export declare const f: (x: unknown) => asserts x;\n"),
+        ("export const f=function internal(x:string):string{return x;};", "export declare const f: (x: string) => string;\n"),
+        ("export const f=function(this:{x:number}):void{};", "export declare const f: (this: {\n    x: number;\n}) => void;\n"),
+        ("export const f=(x:string):null=>null;", "export declare const f: (x: string) => null;\n"),
+        ("export const f=(x:string):string|undefined=>x;", "export declare const f: (x: string) => string | undefined;\n"),
+        ("const f=(x:string):void=>{}, n=1, g=():number=>1;", "declare const f: (x: string) => void, n = 1, g: () => number;\n"),
+        ("type Hidden={x:number};export const f:(x:Hidden)=>void=(x)=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (x: Hidden) => void;\nexport {};\n"),
+        ("export const f:<T>(x:T)=>T=<T>(x:T):T=>x;", "export declare const f: <T>(x: T) => T;\n"),
+        ("export const f=1;export const s=\"hello\";", "export declare const f = 1;\nexport declare const s = \"hello\";\n"),
+        ("export const f:any=(x:string):void=>{};", "export declare const f: any;\n"),
+        ("export declare const f:(x:string)=>void;", "export declare const f: (x: string) => void;\n"),
+        ("type X={x:number};export const f=(X:X):X=>X;", "type X = {\n    x: number;\n};\nexport declare const f: (X: X) => X;\nexport {};\n"),
+        ("type Hidden={x:number};interface Wrap<T>{x:T};export const f=(x:Wrap<Hidden>):Hidden=>x.x;", "type Hidden = {\n    x: number;\n};\ninterface Wrap<T> {\n    x: T;\n}\nexport declare const f: (x: Wrap<Hidden>) => Hidden;\nexport {};\n"),
+        ("const Hidden=1;export const f=(x:typeof Hidden):void=>{};", "declare const Hidden = 1;\nexport declare const f: (x: typeof Hidden) => void;\nexport {};\n"),
+        ("const Hidden=1;export const f=<T>(x:T):typeof Hidden=>Hidden;", "declare const Hidden = 1;\nexport declare const f: <T>(x: T) => typeof Hidden;\nexport {};\n"),
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        for (strict, strict_null_checks) in [
+            (None, None), (Some(false), None), (Some(true), None),
+            (Some(true), Some(false)), (Some(false), Some(true)),
+            (None, Some(false)), (None, Some(true)),
+        ] {
+            let options = CompilerOptions {
+                declaration: Some(true), strict, strict_null_checks, ..Default::default()
+            };
+            assert_eq!(emit(&file, &options).declaration_file.unwrap(), expected,
+                "{source}; strict={strict:?}; strict_null_checks={strict_null_checks:?}");
+        }
+    }
+}
