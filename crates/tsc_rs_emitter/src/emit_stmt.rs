@@ -16219,7 +16219,10 @@ impl<'a> Emitter<'a> {
                 "const result_{env_num} = {}__disposeResources(env_{env_num});",
                 self.helper_prefix()
             ));
-            self.writeln(&format!("if (result_{env_num}) await result_{env_num};"));
+            self.writeln(&format!("if (result_{env_num})"));
+            self.indent += 1;
+            self.writeln(&format!("await result_{env_num};"));
+            self.indent -= 1;
         } else {
             self.writeln(&format!(
                 "{}__disposeResources(env_{env_num});",
