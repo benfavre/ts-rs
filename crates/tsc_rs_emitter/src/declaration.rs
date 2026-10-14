@@ -22,6 +22,12 @@ enum ConstructorPropertyType {
     Unavailable,
 }
 
+enum GetterReturnType {
+    Primitive(&'static str),
+    Object(Vec<(String, GetterReturnType)>),
+    Annotation(TypeNode),
+}
+
 pub struct DeclarationEmitter<'a> {
     source: &'a str,
     pub output: String,
@@ -51,6 +57,7 @@ pub struct DeclarationEmitter<'a> {
     constructor_property_scopes: Vec<HashMap<String, ConstructorPropertyType>>,
     constructor_property_namespace_counts: HashMap<Vec<String>, usize>,
     can_emit_const_literal_objects: bool,
+    infer_literal_getter_returns: bool,
 }
 
 impl<'a> DeclarationEmitter<'a> {
@@ -84,6 +91,7 @@ impl<'a> DeclarationEmitter<'a> {
             constructor_property_scopes: Vec::new(),
             constructor_property_namespace_counts: HashMap::new(),
             can_emit_const_literal_objects: false,
+            infer_literal_getter_returns: false,
         }
     }
 
@@ -180,6 +188,12 @@ impl<'a> DeclarationEmitter<'a> {
     pub fn emit_source_file(&mut self, file: &SourceFile) {
         self.comments.clone_from(&file.comments);
         self.prepare_js_arguments_functions(file);
+        // JavaScript accessors also depend on JSDoc and program-level context.
+        // Recovered syntax cannot establish accessor ownership reliably.
+        self.infer_literal_getter_returns = file.diagnostics.is_empty()
+            && [".ts", ".tsx", ".mts", ".cts"]
+                .iter()
+                .any(|extension| file.file_name.ends_with(extension));
         // The batch scanner does not distinguish JSX text from identifiers.
         // Preserve the existing path when source-level naming needs that context.
         self.default_export_names_ambiguous = (file.file_name.ends_with(".tsx")
@@ -1697,7 +1711,7 @@ impl<'a> DeclarationEmitter<'a> {
                     continue;
                 }
             }
-            self.emit_class_member(member);
+            self.emit_class_member(member, &class_decl.members);
         }
         self.indent -= 1;
         self.writeln("}");
@@ -2234,7 +2248,161 @@ impl<'a> DeclarationEmitter<'a> {
         self.emit_parameter_list(params, true);
     }
 
-    fn emit_class_member(&mut self, member: &ClassMember) {
+    fn getter_member_identity(name: &PropName) -> Option<String> {
+        match name {
+            PropName::Ident(name, _) => {
+                if !name.contains('\\') {
+                    return Some(name.to_string());
+                }
+                let mut scanner = tsc_rs_scanner::TsScanner::new(name);
+                if scanner.scan() != tsc_rs_scanner::TokenKind::Identifier
+                    || scanner.text_pos() != name.len()
+                {
+                    return None;
+                }
+                Some(scanner.token_value().to_owned())
+            }
+            PropName::String(name, _) => Some(crate::emit_class::decode_js_string_content(name)),
+            PropName::Computed(expression, _) => match &expression.kind {
+                ExprKind::StrLit(name) => Some(crate::emit_class::decode_js_string_content(name)),
+                _ => None,
+            },
+            // Inferred getters below have identifier names, so numeric and
+            // private members cannot own the same property.
+            PropName::Number(_, _) | PropName::Private(_, _) => Some(String::new()),
+        }
+    }
+
+    fn infer_getter_return(
+        &self,
+        accessor: &ClassAccessor,
+        siblings: &[ClassMember],
+    ) -> Option<GetterReturnType> {
+        if !self.infer_literal_getter_returns
+            || !matches!(accessor.name, PropName::Ident(_, _))
+            || accessor.modifiers & (MOD_PRIVATE | MOD_ABSTRACT | MOD_DECLARE) != 0
+            || !accessor.params.is_empty()
+            || accessor.type_params.is_some()
+            || !accessor.decorators.is_empty()
+        {
+            return None;
+        }
+        let identity = Self::getter_member_identity(&accessor.name)?;
+        let mut setter = None;
+        for member in siblings {
+            let (name, modifiers) = match &member.kind {
+                ClassMemberKind::GetAccessor(other) if std::ptr::eq(other, accessor) => continue,
+                ClassMemberKind::GetAccessor(other) | ClassMemberKind::SetAccessor(other) => {
+                    (&other.name, other.modifiers)
+                }
+                ClassMemberKind::Property(other) => (&other.name, other.modifiers),
+                ClassMemberKind::Method(other) => (&other.name, other.modifiers),
+                _ => continue,
+            };
+            if modifiers & MOD_STATIC != accessor.modifiers & MOD_STATIC {
+                continue;
+            }
+            if Self::getter_member_identity(name)? != identity {
+                continue;
+            }
+            let ClassMemberKind::SetAccessor(other) = &member.kind else {
+                // Duplicate declarations require the checker's symbol ownership.
+                return None;
+            };
+            if setter.replace(other).is_some() {
+                return None;
+            }
+        }
+        if let Some(setter) = setter {
+            let [parameter] = setter.params.as_slice() else {
+                return None;
+            };
+            if let Some(annotation) = &parameter.type_ann {
+                // A paired setter's annotation takes precedence over the body.
+                // Named and compound types need dependency/retention context.
+                return matches!(annotation.kind, TypeNodeKind::Keyword(kind) if kind != KeywordTypeKind::Intrinsic)
+                    .then(|| GetterReturnType::Annotation(annotation.clone()));
+            }
+        }
+        let [statement] = accessor.body.as_deref()? else {
+            return None;
+        };
+        let StmtKind::Return(Some(expression)) = &statement.kind else {
+            return None;
+        };
+        Self::literal_getter_type(expression, 0)
+    }
+
+    fn literal_getter_type(expression: &Expr, depth: usize) -> Option<GetterReturnType> {
+        if depth >= 32 {
+            return None;
+        }
+        let primitive = match &expression.kind {
+            ExprKind::Paren(inner) => return Self::literal_getter_type(inner, depth + 1),
+            ExprKind::NumLit(_) => "number",
+            ExprKind::BigIntLit(_) => "bigint",
+            ExprKind::StrLit(_) | ExprKind::NoSubstTemplate(_) => "string",
+            ExprKind::BoolLit(_) => "boolean",
+            ExprKind::Unary(unary) => match (&unary.op, &unary.argument.kind) {
+                (UnaryOp::Pos | UnaryOp::Neg, ExprKind::NumLit(_)) => "number",
+                (UnaryOp::Neg, ExprKind::BigIntLit(_)) => "bigint",
+                _ => return None,
+            },
+            ExprKind::ObjectLit(properties) => {
+                let mut names = HashSet::new();
+                let mut members = Vec::new();
+                for property in properties {
+                    let ObjLitProp::Property(property) = property else {
+                        return None;
+                    };
+                    let PropName::Ident(name, _) = &property.key else {
+                        return None;
+                    };
+                    // Preserve only plain, unique source identifiers; escaped,
+                    // computed and duplicate keys require canonical key emit.
+                    if property.computed
+                        || property.question_token
+                        || !name.is_ascii()
+                        || name.contains('\\')
+                        || !names.insert(name.as_str())
+                    {
+                        return None;
+                    }
+                    members.push((
+                        name.to_string(),
+                        Self::literal_getter_type(&property.value, depth + 1)?,
+                    ));
+                }
+                return Some(GetterReturnType::Object(members));
+            }
+            // Nullish values, contextual expressions and assertions have
+            // option-dependent or semantic inference rules.
+            _ => return None,
+        };
+        Some(GetterReturnType::Primitive(primitive))
+    }
+
+    fn emit_getter_return(&mut self, inferred: &GetterReturnType) {
+        match inferred {
+            GetterReturnType::Primitive(name) => self.write(name),
+            GetterReturnType::Annotation(annotation) => self.emit_type_node(annotation),
+            GetterReturnType::Object(members) if members.is_empty() => self.write("{}"),
+            GetterReturnType::Object(members) => {
+                self.writeln("{");
+                self.indent += 1;
+                for (name, member) in members {
+                    self.write(name);
+                    self.write(": ");
+                    self.emit_getter_return(member);
+                    self.writeln(";");
+                }
+                self.indent -= 1;
+                self.write("}");
+            }
+        }
+    }
+
+    fn emit_class_member(&mut self, member: &ClassMember, siblings: &[ClassMember]) {
         match &member.kind {
             ClassMemberKind::Property(prop) => {
                 if matches!(prop.name, PropName::Private(_, _)) {
@@ -2346,6 +2514,9 @@ impl<'a> DeclarationEmitter<'a> {
                     if let Some(ref ret) = acc.return_type {
                         self.write(": ");
                         self.emit_type_node(ret);
+                    } else if let Some(inferred) = self.infer_getter_return(acc, siblings) {
+                        self.write(": ");
+                        self.emit_getter_return(&inferred);
                     }
                 }
                 self.writeln(";");

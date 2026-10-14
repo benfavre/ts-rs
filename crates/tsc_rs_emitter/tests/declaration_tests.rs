@@ -2374,3 +2374,110 @@ fn test_dts_js_arguments_respects_module_detection_boundaries() {
         }
     }
 }
+
+#[test]
+fn getter_declarations_widen_independent_literal_returns() {
+    assert_eq!(
+        emit_dts("class C { get number(){return -1;} get bigint(){return -1n;} get string(){return `hello`;} get boolean(){return true;} get parenthesized(){return (1);} }"),
+        "declare class C {\n    get number(): number;\n    get bigint(): bigint;\n    get string(): string;\n    get boolean(): boolean;\n    get parenthesized(): number;\n}\n"
+    );
+}
+
+#[test]
+fn getter_declarations_emit_nested_literal_object_shapes() {
+    assert_eq!(
+        emit_dts("namespace N { export class C { protected get point(){return {x:1,y:{label:'a',enabled:true}};} static get empty(){return {};} } }"),
+        "declare namespace N {\n    class C {\n        protected get point(): {\n            x: number;\n            y: {\n                label: string;\n                enabled: boolean;\n            };\n        };\n        static get empty(): {};\n    }\n}\n"
+    );
+}
+
+#[test]
+fn getter_declarations_use_paired_setter_annotations_in_both_orders() {
+    for annotation in [
+        "number",
+        "string",
+        "any",
+        "unknown",
+        "never",
+        "void",
+        "undefined",
+        "null",
+        "object",
+        "symbol",
+        "bigint",
+        "boolean",
+    ] {
+        for setter_first in [false, true] {
+            let getter = "get value(){return 1;}";
+            let setter = format!("set value(v:{annotation}){{}}");
+            let members = if setter_first {
+                format!("{setter}{getter}")
+            } else {
+                format!("{getter}{setter}")
+            };
+            let getter = format!("    get value(): {annotation};\n");
+            let setter = format!("    set value(v: {annotation});\n");
+            let members_expected = if setter_first {
+                format!("{setter}{getter}")
+            } else {
+                format!("{getter}{setter}")
+            };
+            assert_eq!(
+                emit_dts(&format!("class C {{{members}}}")),
+                format!("declare class C {{\n{members_expected}}}\n")
+            );
+        }
+    }
+}
+
+#[test]
+fn getter_declarations_pair_cooked_identifier_and_string_keys() {
+    for setter_name in [r"\u0076alue", "\"value\"", "[\"value\"]"] {
+        assert_eq!(
+            emit_dts(&format!("class C {{get value(){{return 1;}} set {setter_name}(v:string){{}}}}")),
+            format!("declare class C {{\n    get value(): string;\n    set {setter_name}(v: string);\n}}\n")
+        );
+    }
+    assert_eq!(
+        emit_dts(r"class C {get \u0076alue(){return 1;} set value(v:string){}}"),
+        "declare class C {\n    get \\u0076alue(): string;\n    set value(v: string);\n}\n"
+    );
+}
+
+#[test]
+fn getter_declarations_keep_static_and_instance_setters_separate() {
+    assert_eq!(
+        emit_dts("class C {get value(){return 1;} static set value(v:string){} static get other(){return true;} set other(v:number){}}"),
+        "declare class C {\n    get value(): number;\n    static set value(v: string);\n    static get other(): boolean;\n    set other(v: number);\n}\n"
+    );
+}
+
+#[test]
+fn getter_declarations_preserve_private_and_explicit_return_signatures() {
+    assert_eq!(
+        emit_dts("class C {private get hidden(){return {x:1};} get explicit():1{return 1;} get exposed(){return {x:1};}}"),
+        "declare class C {\n    private get hidden();\n    get explicit(): 1;\n    get exposed(): {\n        x: number;\n    };\n}\n"
+    );
+}
+
+#[test]
+fn getter_declarations_infer_independently_of_base_and_merged_members() {
+    assert_eq!(
+        emit_dts("class B {get value():string{return '';}} interface C {value:1;} class C extends B {get value(){return 1;}}"),
+        "declare class B {\n    get value(): string;\n}\ninterface C {\n    value: 1;\n}\ndeclare class C extends B {\n    get value(): number;\n}\n"
+    );
+}
+
+#[test]
+fn getter_declarations_reset_source_language_eligibility() {
+    let source = "class C {/** @returns {string} */ get value(){return 1;}}";
+    let typed = tsc_rs_parser::parse("typed.ts", source);
+    let javascript = tsc_rs_parser::parse("script.js", source);
+    let mut reused = tsc_rs_emitter::declaration::DeclarationEmitter::new(source);
+    reused.emit_source_file(&typed);
+    reused.output.clear();
+    reused.emit_source_file(&javascript);
+    let mut fresh = tsc_rs_emitter::declaration::DeclarationEmitter::new(source);
+    fresh.emit_source_file(&javascript);
+    assert_eq!(reused.output, fresh.output);
+}
