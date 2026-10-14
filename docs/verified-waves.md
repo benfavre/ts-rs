@@ -3294,3 +3294,52 @@ Remaining diagnostic, emit, type, symbol and LSP failures remain visible.
 
 Measured public source: `01614c3f1`. The preceding snapshot remains at
 `docs/compatibility-metrics-2026-10-14-2638bbade.json`.
+
+## 2026-10-14: compatibility rounds 31-40
+
+Ten verified rounds improve compiler compatibility. Each round preserves
+previous passes, oracle identities and skip counts across all twelve compiler
+and conformance matrices. Public measurements match the private results.
+
+| Round | Change | Newly passing comparisons |
+|---|---|---:|
+| 31 | [use var for ES5 resource environments](https://github.com/benfavre/ts-rs/commit/500c41b58caddd9d49597c554aa4be3b324f21b6) | 8 |
+| 32 | [refine named interface missing-property diagnostics](https://github.com/benfavre/ts-rs/commit/01ad3b0678b5fc7094ade1bd8bfc8a02738a66d1) | 3 |
+| 33 | [preserve named function types in shorthand declarations](https://github.com/benfavre/ts-rs/commit/873fc3505467b49b9372269ba92ec62e089773a9) | 1 |
+| 34 | [omit complete parenthesized interface heritage](https://github.com/benfavre/ts-rs/commit/2c14bcee8d9e891468448c9b09d8c53f7638e666) | 1 |
+| 35 | [preserve literal const object property types](https://github.com/benfavre/ts-rs/commit/86c19aa55d32222381f9101cfcfac24c5eda2aa6) | 1 |
+| 36 | [preserve scoped nested callable signatures](https://github.com/benfavre/ts-rs/commit/a1e669bc95a1e9345621448bb6f8f0c2985803b4) | 3 |
+| 37 | [Infer JavaScript declaration rest parameters for implicit arguments](https://github.com/benfavre/ts-rs/commit/ca8a5dde65eb8c5bd5726755e6a47cd05987b79a) | 1 |
+| 38 | [fix: infer independent literal getter declaration types](https://github.com/benfavre/ts-rs/commit/f174e4895f34402c7b27ca70cc907ee5d5a62621) | 4 |
+| 39 | [fix: omit imports used only by private module implementation](https://github.com/benfavre/ts-rs/commit/ac820c216502f18db423c648f70b44f467d89846) | 93 |
+| 40 | [fix: preserve documentation on retained class members](https://github.com/benfavre/ts-rs/commit/9133631d94da842b1eda9f439e699949d13c1c48) | 1 |
+
+Variant comparisons are not counts of distinct source programs.
+
+| Suite | Baseline | Before | After | Failed | Skipped |
+|---|---|---:|---:|---:|---:|
+| Compiler | Diagnostics | 5,013 | 5,014 | 1,515 | 0 |
+| Compiler | JavaScript | 6,032 | 6,032 | 0 | 497 |
+| Compiler | Types | 1,972 | 1,972 | 4,462 | 95 |
+| Compiler | Symbols | 1,765 | 1,765 | 4,669 | 95 |
+| Compiler | Expanded JavaScript | 6,494 | 6,494 | 210 | 497 |
+| Compiler | Expanded declarations | 5,938 | 5,986 | 718 | 497 |
+| Conformance | Diagnostics | 4,078 | 4,080 | 1,827 | 0 |
+| Conformance | JavaScript | 5,388 | 5,388 | 0 | 519 |
+| Conformance | Types | 1,471 | 1,471 | 4,146 | 290 |
+| Conformance | Symbols | 1,594 | 1,594 | 4,023 | 290 |
+| Conformance | Expanded JavaScript | 6,477 | 6,485 | 614 | 519 |
+| Conformance | Expanded declarations | 6,356 | 6,413 | 686 | 519 |
+
+Diagnostic accuracy checks preserve matches and do not add false positives for
+any TS code. The five supported language-server operations preserve their
+passing cases and skip counts. The full inventory, including unsupported
+operations, is retained in the metrics snapshot.
+
+All 5,845 public Rust tests pass, with zero failures and
+37 ignored. Formatting, `make ci` and workspace Clippy pass.
+Pass rates exclude skips.
+Remaining diagnostic, emit, type, symbol and LSP failures remain visible.
+
+Measured public source: `9133631d9`. The preceding snapshot remains at
+`docs/compatibility-metrics-2026-10-14-01614c3f1.json`.

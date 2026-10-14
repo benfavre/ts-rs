@@ -60,14 +60,14 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-All results below were measured on 2026-10-14 at `01614c3f1`, with the
+All results below were measured on 2026-10-14 at `9133631d9`, with the
 result cache disabled. Pass rates are `passed / (passed + failed)`; skipped
 cases are never counted as passes.
 
 | Lane | Compiler suite | Conformance suite | What it measures |
 |---|---:|---:|---|
 | JavaScript emit | 6,032 / 6,032 (100.0%) | 5,388 / 5,388 (100.0%) | Byte-for-byte match with the `tsc` `.js` baseline (one configuration per case) |
-| Diagnostics | 5,013 / 6,529 (76.8%) | 4,078 / 5,907 (69.0%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
+| Diagnostics | 5,014 / 6,529 (76.8%) | 4,080 / 5,907 (69.1%) | Whole-case match with the `tsc` `.errors.txt` baseline (message, position, code) |
 | Symbols | 1,765 / 6,434 (27.4%) | 1,594 / 5,617 (28.4%) | Match with the `tsc` `.symbols` baseline |
 | Types | 1,972 / 6,434 (30.6%) | 1,471 / 5,617 (26.2%) | Match with the `tsc` `.types` baseline |
 | Type-check recall / precision | 65.6% / 89.1% | 73.2% / 90.5% | Per-diagnostic `(file, line, code)` match over every option variant |
@@ -76,7 +76,7 @@ JavaScript emit skips 497 compiler and 519 conformance cases without a `.js`
 oracle (mostly `noEmit`); diagnostics exercises all of them. Symbols and types
 skip 95 compiler and 290 conformance cases without a uniquely selected oracle.
 
-Public workspace validation: **5,792 Rust tests passed**, zero failed, and
+Public workspace validation: **5,845 Rust tests passed**, zero failed, and
 37 ignored; `make ci` passes.
 
 Language server, against the `fourslash` suite:
@@ -97,10 +97,10 @@ Expanded option variants (14,819 identities, 1,016 skips per lane):
 
 | Lane | Passed | Failed | Pass rate |
 |---|---:|---:|---:|
-| JavaScript | 12,971 | 832 | 94.0% |
-| Declarations | 12,294 | 1,509 | 89.1% |
+| JavaScript | 12,979 | 824 | 94.0% |
+| Declarations | 12,399 | 1,404 | 89.8% |
 
-Remaining diagnostic mismatches: 1,516 compiler cases and 1,829 conformance
+Remaining diagnostic mismatches: 1,515 compiler cases and 1,827 conformance
 cases. Expanded emit failures include ES5 transforms and declarations;
 LSP gaps include contextual typing, generics, JSDoc and cross-file information.
 Symbol and type baselines still have substantial gaps.
