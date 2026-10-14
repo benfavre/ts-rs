@@ -1644,3 +1644,173 @@ fn test_dts_default_export_lexical_names_and_signed_zero() {
         }
     }
 }
+
+// TypeScript 6.0.3 still emits declarations for invalid binding-pattern
+// parameter properties (TS1187). These expectations include that recovery.
+fn assert_constructor_pattern_declarations(cases: &[(&str, &str)]) {
+    for (source, expected) in cases {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        for (strict, strict_null_checks) in [
+            (None, None),
+            (Some(false), None),
+            (Some(true), None),
+            (Some(true), Some(false)),
+            (Some(false), Some(true)),
+            (None, Some(false)),
+            (None, Some(true)),
+        ] {
+            let options = CompilerOptions {
+                declaration: Some(true),
+                strict,
+                strict_null_checks,
+                ..Default::default()
+            };
+            assert_eq!(
+                emit(&file, &options).declaration_file.as_deref(),
+                Some(*expected),
+                "{source}; strict={strict:?}, strictNullChecks={strict_null_checks:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_dts_constructor_patterns_structural() {
+    assert_constructor_pattern_declarations(&[
+        ("class C { constructor(public [x,y]: string[]) {} }", "declare class C {\n    x: string;\n    y: string;\n    constructor([x, y]: string[]);\n}\n"),
+        ("class C { constructor(public {x,y}: {x:number;y:string}) {} }", "declare class C {\n    x: number;\n    y: string;\n    constructor({ x, y }: {\n        x: number;\n        y: string;\n    });\n}\n"),
+        ("class C { constructor(public [,x,,y]:[boolean,string,object,number]) {} }", "declare class C {\n    x: string;\n    y: number;\n    constructor([, x, , y]: [boolean, string, object, number]);\n}\n"),
+        ("class C { constructor(public {x:[a,b],y:{z}}:{x:[string,number];y:{z:boolean}}) {} }", "declare class C {\n    a: string;\n    b: number;\n    z: boolean;\n    constructor({ x: [a, b], y: { z } }: {\n        x: [string, number];\n        y: {\n            z: boolean;\n        };\n    });\n}\n"),
+        ("class C{constructor(public {\"a-b\":x}:{\"a-b\":number}){}}", "declare class C {\n    x: number;\n    constructor({ \"a-b\": x }: {\n        \"a-b\": number;\n    });\n}\n"),
+        ("class C{constructor(public {1:x}:{1:number}){}}", "declare class C {\n    x: number;\n    constructor({ 1: x }: {\n        1: number;\n    });\n}\n"),
+        ("class C{constructor(public[x]:{a:number}[]){}}", "declare class C {\n    x: {\n        a: number;\n    };\n    constructor([x]: {\n        a: number;\n    }[]);\n}\n"),
+        ("class C{constructor(public[x]:[number,string][]){}}", "declare class C {\n    x: [number, string];\n    constructor([x]: [number, string][]);\n}\n"),
+        ("class C { constructor(public {x,y}:{x:1;y:\"a\"}) {} }", "declare class C {\n    x: 1;\n    y: \"a\";\n    constructor({ x, y }: {\n        x: 1;\n        y: \"a\";\n    });\n}\n"),
+        ("class C { constructor(public {x,y}:{x:null;y:undefined}) {} }", "declare class C {\n    x: null;\n    y: undefined;\n    constructor({ x, y }: {\n        x: null;\n        y: undefined;\n    });\n}\n"),
+    ]);
+}
+
+#[test]
+fn test_dts_constructor_patterns_aliases() {
+    assert_constructor_pattern_declarations(&[
+        ("type A=string[]; class C { constructor(public [x,y]: A) {} }", "type A = string[];\ndeclare class C {\n    x: string;\n    y: string;\n    constructor([x, y]: A);\n}\n"),
+        ("type B=A; type A=[string,number]; class C { constructor(public [x,y]: B) {} }", "type B = A;\ntype A = [string, number];\ndeclare class C {\n    x: string;\n    y: number;\n    constructor([x, y]: B);\n}\n"),
+        ("class C { constructor(public [x,y]: A) {} } type A=[string,number];", "declare class C {\n    x: string;\n    y: number;\n    constructor([x, y]: A);\n}\ntype A = [string, number];\n"),
+        ("namespace N { type A=[string,number]; export class C { constructor(public [x,y]: A) {} } }", "declare namespace N {\n    type A = [string, number];\n    export class C {\n        x: string;\n        y: number;\n        constructor([x, y]: A);\n    }\n    export {};\n}\n"),
+        ("type A=[string,number]; namespace N { type A=[boolean,bigint]; export class C { constructor(public [x,y]: A) {} } }", "type A = [string, number];\ndeclare namespace N {\n    type A = [boolean, bigint];\n    export class C {\n        x: boolean;\n        y: bigint;\n        constructor([x, y]: A);\n    }\n    export {};\n}\n"),
+        ("namespace A{type T=[number];export class C{constructor(public[x]:T){}}} namespace B{type T=[string];export class C{constructor(public[x]:T){}}}", "declare namespace A {\n    type T = [number];\n    export class C {\n        x: number;\n        constructor([x]: T);\n    }\n    export {};\n}\ndeclare namespace B {\n    type T = [string];\n    export class C {\n        x: string;\n        constructor([x]: T);\n    }\n    export {};\n}\n"),
+        ("type A=[number];const A=1;class C{constructor(public[x]:A){}}", "type A = [number];\ndeclare const A = 1;\ndeclare class C {\n    x: number;\n    constructor([x]: A);\n}\n"),
+        ("type P=number; type A={x:P}; class C { constructor(public {x}:A) {} }", "type P = number;\ntype A = {\n    x: P;\n};\ndeclare class C {\n    x: number;\n    constructor({ x }: A);\n}\n"),
+    ]);
+}
+
+#[test]
+fn test_dts_constructor_patterns_generic_scope() {
+    assert_constructor_pattern_declarations(&[
+        ("class C<T> { constructor(public [x,y]: T[]) {} }", "declare class C<T> {\n    x: T;\n    y: T;\n    constructor([x, y]: T[]);\n}\n"),
+        ("type T=number; type A={x:T}; class C<T> { constructor(public {x}:A) {} }", "type T = number;\ntype A = {\n    x: T;\n};\ndeclare class C<T> {\n    x: number;\n    constructor({ x }: A);\n}\n"),
+        ("class H{};class C<H>{constructor(public[x]:H[]){}}", "declare class H {\n}\ndeclare class C<H> {\n    x: H;\n    constructor([x]: H[]);\n}\n"),
+        ("class Hidden{};namespace N{class Hidden{};type A={x:Hidden};export class C{constructor(public{x}:A){}}}", "declare class Hidden {\n}\ndeclare namespace N {\n    class Hidden {\n    }\n    type A = {\n        x: Hidden;\n    };\n    export class C {\n        x: Hidden;\n        constructor({ x }: A);\n    }\n    export {};\n}\n"),
+        ("type T=number;type A=T[];class C<T>{constructor(public[x]:A){}}", "type T = number;\ntype A = T[];\ndeclare class C<T> {\n    x: number;\n    constructor([x]: A);\n}\n"),
+    ]);
+}
+
+#[test]
+fn test_dts_constructor_patterns_dependencies() {
+    assert_constructor_pattern_declarations(&[
+        ("class Hidden{}; type A={x:Hidden}; export class C { constructor(public {x}:A) {} }", "declare class Hidden {\n}\ntype A = {\n    x: Hidden;\n};\nexport declare class C {\n    x: Hidden;\n    constructor({ x }: A);\n}\nexport {};\n"),
+        ("interface Hidden{x:number}; type A={x:Hidden}; export class C { constructor(public {x}:A) {} }", "interface Hidden {\n    x: number;\n}\ntype A = {\n    x: Hidden;\n};\nexport declare class C {\n    x: Hidden;\n    constructor({ x }: A);\n}\nexport {};\n"),
+        ("import {Hidden} from \"./other\"; type A={x:Hidden}; export class C { constructor(public {x}:A) {} }", "import { Hidden } from \"./other\";\ntype A = {\n    x: Hidden;\n};\nexport declare class C {\n    x: Hidden;\n    constructor({ x }: A);\n}\nexport {};\n"),
+        ("class Hidden{}; type A={x:{y:Hidden}}; export class C { constructor(public {x}:A) {} }", "declare class Hidden {\n}\ntype A = {\n    x: {\n        y: Hidden;\n    };\n};\nexport declare class C {\n    x: {\n        y: Hidden;\n    };\n    constructor({ x }: A);\n}\nexport {};\n"),
+        ("export namespace N { class Hidden{}; type A={x:Hidden}; export class C { constructor(public {x}:A) {} } }", "export declare namespace N {\n    class Hidden {\n    }\n    type A = {\n        x: Hidden;\n    };\n    export class C {\n        x: Hidden;\n        constructor({ x }: A);\n    }\n    export {};\n}\n"),
+        ("class H{};type A={x:H};export class C{constructor(private{x}:A){}}", "declare class H {\n}\ntype A = {\n    x: H;\n};\nexport declare class C {\n    private x: H;\n    constructor({ x }: A);\n}\nexport {};\n"),
+    ]);
+}
+
+#[test]
+fn test_dts_constructor_patterns_rest_and_defaults() {
+    assert_constructor_pattern_declarations(&[
+        ("class C { constructor(public [x,...rest]:string[]) {} }", "declare class C {\n    x: string;\n    rest: string[];\n    constructor([x, ...rest]: string[]);\n}\n"),
+        ("class C { constructor(public [x,...rest]:[string,number,boolean]) {} }", "declare class C {\n    x: string;\n    rest: [number, boolean];\n    constructor([x, ...rest]: [string, number, boolean]);\n}\n"),
+        ("class C { constructor(public {x,...rest}:{x:number;y:string}) {} }", "declare class C {\n    x: number;\n    rest: {\n        y: string;\n    };\n    constructor({ x, ...rest }: {\n        x: number;\n        y: string;\n    });\n}\n"),
+        ("class C { constructor(public [x,...rest]:readonly string[]) {} }", "declare class C {\n    x: string;\n    rest: string[];\n    constructor([x, ...rest]: readonly string[]);\n}\n"),
+        ("class C { constructor(public {x,...rest}:{readonly x:number;readonly y:string}) {} }", "declare class C {\n    x: number;\n    rest: {\n        y: string;\n    };\n    constructor({ x, ...rest }: {\n        readonly x: number;\n        readonly y: string;\n    });\n}\n"),
+        ("class C{constructor(public[x,...rest]:[number]){}}", "declare class C {\n    x: number;\n    rest: [];\n    constructor([x, ...rest]: [number]);\n}\n"),
+        ("class C{constructor(public{x,...rest}:{x:number}){}}", "declare class C {\n    x: number;\n    rest: {};\n    constructor({ x, ...rest }: {\n        x: number;\n    });\n}\n"),
+        ("class C{constructor(public{...rest,x}:{x:number;y:string}){}}", "declare class C {\n    rest: {\n        y: string;\n    };\n    x: number;\n    constructor({ ...rest, x }: {\n        x: number;\n        y: string;\n    });\n}\n"),
+        ("class C{constructor(public[...rest,x]:number[]){}}", "declare class C {\n    rest: number[];\n    x: number;\n    constructor([...rest, x]: number[]);\n}\n"),
+        ("class C { constructor(public {x=1,y=\"a\"}:{x:number;y:string}) {} }", "declare class C {\n    x: number;\n    y: string;\n    constructor({ x, y }: {\n        x: number;\n        y: string;\n    });\n}\n"),
+        ("class C { constructor(public {x}:{x:number}={x:1}) {} }", "declare class C {\n    x: number;\n    constructor({ x }?: {\n        x: number;\n    });\n}\n"),
+        ("class C{constructor(public ...[x,y]:number[]){}}", "declare class C {\n    x: number;\n    y: number;\n    constructor(...[x, y]: number[]);\n}\n"),
+    ]);
+}
+
+#[test]
+fn test_dts_constructor_patterns_duplicates() {
+    assert_constructor_pattern_declarations(&[
+        ("class C { constructor(private [x,y]: string[]) {} }", "declare class C {\n    private x: string;\n    private y: string;\n    constructor([x, y]: string[]);\n}\n"),
+        ("class C { constructor(public [x,x]:[string,number]) {} }", "declare class C {\n    x: string;\n    x: number;\n    constructor([x, x]: [string, number]);\n}\n"),
+        ("class C { constructor(public {x:a,x:b}:{x:number}) {} }", "declare class C {\n    a: number;\n    b: number;\n    constructor({ x: a, x: b }: {\n        x: number;\n    });\n}\n"),
+        ("class C { x:string; constructor(public [x]:number[]) {} }", "declare class C {\n    x: number;\n    x: string;\n    constructor([x]: number[]);\n}\n"),
+        ("class C { constructor(public x:number,public [x,y]:string[]) {} }", "declare class C {\n    x: number;\n    x: string;\n    y: string;\n    constructor(x: number, [x, y]: string[]);\n}\n"),
+    ]);
+}
+
+#[test]
+fn test_dts_constructor_patterns_ordinary_controls() {
+    assert_constructor_pattern_declarations(&[
+        ("class C { constructor(public x:number, private y:string,readonly z:boolean) {} }", "declare class C {\n    x: number;\n    private y;\n    readonly z: boolean;\n    constructor(x: number, y: string, z: boolean);\n}\n"),
+        ("type T=number; export namespace N{type T=string;export class C{constructor(public x:T,private y:T){}}}", "export declare namespace N {\n    type T = string;\n    export class C {\n        x: T;\n        private y;\n        constructor(x: T, y: T);\n    }\n    export {};\n}\n"),
+        ("class Hidden{}; export class C{constructor(public x:Hidden,private y:Hidden){}}", "declare class Hidden {\n}\nexport declare class C {\n    x: Hidden;\n    private y;\n    constructor(x: Hidden, y: Hidden);\n}\nexport {};\n"),
+        ("type T=number; export class C<T>{constructor(public x:T){}}", "export declare class C<T> {\n    x: T;\n    constructor(x: T);\n}\n"),
+        ("class C{constructor(public []:number[]){}}", "declare class C {\n    constructor([]: number[]);\n}\n"),
+        ("export function f({x}:{x:number}):number{return x;}", "export declare function f({ x }: {\n    x: number;\n}): number;\n"),
+        ("class C{constructor([x,y]:[string,number]){}}", "declare class C {\n    constructor([x, y]: [string, number]);\n}\n"),
+    ]);
+}
+
+#[test]
+fn test_dts_constructor_patterns_do_not_emit_partial_unsupported_types() {
+    for source in [
+        "class C{constructor(public{x,y}:{x:number;y:number|string}){}}",
+        "type A<T>=[T,T]; class C<T>{constructor(public[x,y]:A<T>){}}",
+        "class C{constructor(public{x=1}:{x:undefined}){}}",
+        "class C{constructor(public{x:y=1}:{x:void}){}}",
+        "type U=unknown;class C{constructor(public[x=1]:U[]){}}",
+        "class C<T extends number|undefined>{constructor(public{x=1}:{x:T}){}}",
+    ] {
+        let output = emit_dts(source);
+        assert!(output.contains("class C"), "{output}");
+        assert!(!output.contains("\n    x:"), "{output}");
+        assert!(!output.contains("\n    y:"), "{output}");
+    }
+    let aliases = (0..36)
+        .map(|i| format!("type A{i}=A{};", i + 1))
+        .collect::<String>();
+    let source = format!(
+        "{aliases}type A36=number;class C{{constructor(public{{x,y}}:{{x:number;y:A0}}){{}}}}"
+    );
+    let output = emit_dts(&source);
+    assert!(!output.contains("\n    x:"), "{output}");
+    assert!(!output.contains("\n    y:"), "{output}");
+}
+
+#[test]
+fn test_dts_constructor_patterns_defer_ambiguous_declarations() {
+    let output =
+        emit_dts("class C{constructor(public[x]:number[]){} constructor(public[x]:string[]){}}");
+    assert!(!output.contains("\n    x: string;"), "{output}");
+    let output = emit_dts("namespace N{export type A=[number];} namespace N{export type A=[string];export class C{constructor(public[x]:A){}}}");
+    assert!(!output.contains("\n        x: string;"), "{output}");
+}
+
+#[test]
+fn test_dts_constructor_patterns_defaults_without_semantic_narrowing() {
+    assert_constructor_pattern_declarations(&[
+        ("class C{constructor(public {x=1}:{x:any}){}}", "declare class C {\n    x: any;\n    constructor({ x }: {\n        x: any;\n    });\n}\n"),
+        ("class C{constructor(public {x:y=1}:{x:number}){}}", "declare class C {\n    y: number;\n    constructor({ x: y }: {\n        x: number;\n    });\n}\n"),
+        ("class C{constructor(public [x=1]:null[]){}}", "declare class C {\n    x: null;\n    constructor([x]: null[]);\n}\n"),
+        ("class C{constructor(public[{x}={x:1}]:{x:number}[]){}}", "declare class C {\n    x: number;\n    constructor([{ x }]: {\n        x: number;\n    }[]);\n}\n"),
+        ("class C{constructor(public[[x]=[1]]:number[][]){}}", "declare class C {\n    x: number;\n    constructor([[x]]: number[][]);\n}\n"),
+    ]);
+}

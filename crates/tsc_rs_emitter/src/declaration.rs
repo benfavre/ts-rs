@@ -15,6 +15,13 @@ mod parameters;
 mod returns;
 use enums::EnumValue;
 
+#[derive(Clone)]
+enum ConstructorPropertyType {
+    Alias(TypeNode),
+    Nominal,
+    Unavailable,
+}
+
 pub struct DeclarationEmitter<'a> {
     source: &'a str,
     pub output: String,
@@ -36,6 +43,8 @@ pub struct DeclarationEmitter<'a> {
     callable_namespace_scopes: Vec<HashSet<String>>,
     default_export_names: Option<(HashSet<String>, HashSet<String>)>,
     default_export_names_ambiguous: bool,
+    constructor_property_scopes: Vec<HashMap<String, ConstructorPropertyType>>,
+    constructor_property_namespace_counts: HashMap<Vec<String>, usize>,
 }
 
 impl<'a> DeclarationEmitter<'a> {
@@ -61,6 +70,8 @@ impl<'a> DeclarationEmitter<'a> {
             callable_namespace_scopes: Vec::new(),
             default_export_names: None,
             default_export_names_ambiguous: false,
+            constructor_property_scopes: Vec::new(),
+            constructor_property_namespace_counts: HashMap::new(),
         }
     }
 
@@ -146,6 +157,14 @@ impl<'a> DeclarationEmitter<'a> {
                 .scan_all()
                 .iter()
                 .any(|token| token.kind == tsc_rs_scanner::TokenKind::LessThan);
+        self.constructor_property_namespace_counts.clear();
+        Self::count_constructor_property_namespaces(
+            &file.statements,
+            &mut Vec::new(),
+            &mut self.constructor_property_namespace_counts,
+        );
+        self.constructor_property_scopes
+            .push(Self::constructor_property_scope(&file.statements));
         self.collect_inferred_types(file);
         let forced_module = Self::has_module_file_identity(file);
         let external_module = forced_module || Self::has_syntactic_module_indicator(file);
@@ -188,6 +207,7 @@ impl<'a> DeclarationEmitter<'a> {
         {
             self.writeln("export {};");
         }
+        self.constructor_property_scopes.pop();
     }
 
     /// Preserve documentation attached to retained declarations, without
@@ -1196,8 +1216,455 @@ impl<'a> DeclarationEmitter<'a> {
         self.writeln("}");
     }
 
+    fn count_constructor_property_namespaces(
+        statements: &[Stmt],
+        path: &mut Vec<String>,
+        counts: &mut HashMap<Vec<String>, usize>,
+    ) {
+        for statement in statements {
+            let statement = match &statement.kind {
+                StmtKind::Export(export) => match &export.kind {
+                    ExportDeclKind::Decl(inner) | ExportDeclKind::DefaultDecl(inner) => inner,
+                    _ => continue,
+                },
+                _ => statement,
+            };
+            let StmtKind::ModuleDecl(module) = &statement.kind else {
+                continue;
+            };
+            Self::count_constructor_property_namespace(module, path, counts);
+        }
+    }
+
+    fn count_constructor_property_namespace(
+        module: &ModuleDecl,
+        path: &mut Vec<String>,
+        counts: &mut HashMap<Vec<String>, usize>,
+    ) {
+        path.push(match &module.name {
+            ModuleName::Ident(name) => name.to_string(),
+            ModuleName::String(name) => format!("\"{name}\""),
+        });
+        *counts.entry(path.clone()).or_default() += 1;
+        match &module.body {
+            Some(ModuleBody::Block(statements)) => {
+                Self::count_constructor_property_namespaces(statements, path, counts);
+            }
+            Some(ModuleBody::Module(inner)) => {
+                Self::count_constructor_property_namespace(inner, path, counts);
+            }
+            None => {}
+        }
+        path.pop();
+    }
+
+    fn constructor_property_scope(statements: &[Stmt]) -> HashMap<String, ConstructorPropertyType> {
+        let mut bindings = HashMap::new();
+        for statement in statements {
+            let statement = match &statement.kind {
+                StmtKind::Export(export) => match &export.kind {
+                    ExportDeclKind::Decl(inner) | ExportDeclKind::DefaultDecl(inner) => inner,
+                    _ => continue,
+                },
+                _ => statement,
+            };
+            let (names, binding) = match &statement.kind {
+                StmtKind::TypeAlias(alias) => (
+                    vec![alias.name.clone()],
+                    if alias.type_params.as_ref().is_none_or(Vec::is_empty) {
+                        ConstructorPropertyType::Alias(alias.type_ann.clone())
+                    } else {
+                        ConstructorPropertyType::Unavailable
+                    },
+                ),
+                StmtKind::ClassDecl(_) | StmtKind::InterfaceDecl(_) | StmtKind::EnumDecl(_) => (
+                    Self::stmt_declared_names(statement),
+                    ConstructorPropertyType::Nominal,
+                ),
+                StmtKind::Import(import) => match &import.specifiers {
+                    ImportClause::Named {
+                        default,
+                        named,
+                        namespace,
+                    } => (
+                        default
+                            .iter()
+                            .cloned()
+                            .chain(namespace.iter().cloned())
+                            .chain(named.iter().map(|specifier| specifier.local.clone()))
+                            .collect(),
+                        ConstructorPropertyType::Nominal,
+                    ),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            for name in names {
+                bindings
+                    .entry(name)
+                    .and_modify(|binding| *binding = ConstructorPropertyType::Unavailable)
+                    .or_insert_with(|| binding.clone());
+            }
+        }
+        bindings
+    }
+
+    fn constructor_property_binding(&self, name: &str) -> Option<&ConstructorPropertyType> {
+        // A copied alias body must keep its lexical meaning. Do not look past
+        // this namespace until references can be qualified for the use site.
+        if (1..=self.enum_scope.len()).any(|length| {
+            self.constructor_property_namespace_counts
+                .get(&self.enum_scope[..length])
+                .is_some_and(|count| *count > 1)
+        }) {
+            // Merged exports require a shared namespace symbol table. Keep
+            // alias-derived properties on the existing path until available.
+            return None;
+        }
+        self.constructor_property_scopes.last()?.get(name)
+    }
+
+    fn constructor_property_leaf_type(
+        &self,
+        ty: &TypeNode,
+        bound: &HashSet<String>,
+        alias_body: bool,
+        depth: u32,
+    ) -> Option<TypeNode> {
+        if depth > 32 {
+            return None;
+        }
+        let mut result = ty.clone();
+        result.kind = match &ty.kind {
+            TypeNodeKind::Keyword(_) | TypeNodeKind::Literal(_) => return Some(result),
+            TypeNodeKind::Paren(inner) => {
+                return self.constructor_property_leaf_type(inner, bound, alias_body, depth + 1)
+            }
+            TypeNodeKind::Reference(reference)
+                if reference.type_args.as_ref().is_none_or(Vec::is_empty) =>
+            {
+                let ExprKind::Ident(name) = &reference.name.kind else {
+                    return None;
+                };
+                if !alias_body && bound.contains(name.as_str()) {
+                    return Some(result);
+                }
+                match self.constructor_property_binding(name) {
+                    Some(ConstructorPropertyType::Alias(body)) => {
+                        // Primitive aliases are normalized in inferred property
+                        // types. Composite aliases need semantic preservation.
+                        let leaf =
+                            self.constructor_property_leaf_type(body, bound, true, depth + 1)?;
+                        return matches!(
+                            leaf.kind,
+                            TypeNodeKind::Keyword(_) | TypeNodeKind::Literal(_)
+                        )
+                        .then_some(leaf);
+                    }
+                    Some(ConstructorPropertyType::Nominal)
+                        if !alias_body || !bound.contains(name.as_str()) =>
+                    {
+                        return Some(result)
+                    }
+                    _ => return None,
+                }
+            }
+            TypeNodeKind::Array(inner) => TypeNodeKind::Array(Box::new(
+                self.constructor_property_leaf_type(inner, bound, alias_body, depth + 1)?,
+            )),
+            TypeNodeKind::Tuple(elements)
+                if elements
+                    .iter()
+                    .all(|element| !element.optional && !element.dotdotdot) =>
+            {
+                let elements = elements
+                    .iter()
+                    .map(|element| {
+                        let mut element = element.clone();
+                        element.type_node = self.constructor_property_leaf_type(
+                            &element.type_node,
+                            bound,
+                            alias_body,
+                            depth + 1,
+                        )?;
+                        Some(element)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                TypeNodeKind::Tuple(elements)
+            }
+            TypeNodeKind::TypeLit(members) => {
+                let members = members
+                    .iter()
+                    .map(|member| {
+                        let TypeMemberKind::PropertySig(property) = &member.kind else {
+                            return None;
+                        };
+                        if property.optional {
+                            return None;
+                        }
+                        let mut property = property.clone();
+                        property.type_ann = Some(self.constructor_property_leaf_type(
+                            property.type_ann.as_ref()?,
+                            bound,
+                            alias_body,
+                            depth + 1,
+                        )?);
+                        let mut member = member.clone();
+                        member.kind = TypeMemberKind::PropertySig(property);
+                        Some(member)
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                TypeNodeKind::TypeLit(members)
+            }
+            _ => return None,
+        };
+        Some(result)
+    }
+
+    fn constructor_default_preserves_type(
+        &self,
+        ty: &TypeNode,
+        bound: &HashSet<String>,
+        alias_body: bool,
+        depth: u32,
+    ) -> bool {
+        let Some(ty) = self.constructor_property_leaf_type(ty, bound, alias_body, depth) else {
+            return false;
+        };
+        // Binding defaults remove undefined. Types that require semantic
+        // narrowing (including type parameters and imported aliases) defer.
+        !matches!(
+            ty.kind,
+            TypeNodeKind::Reference(_)
+                | TypeNodeKind::Keyword(
+                    KeywordTypeKind::Undefined | KeywordTypeKind::Void | KeywordTypeKind::Unknown
+                )
+        )
+    }
+
+    fn constructor_pattern_properties(
+        &self,
+        pattern: &Pat,
+        ty: &TypeNode,
+        bound: &HashSet<String>,
+        alias_body: bool,
+        depth: u32,
+        properties: &mut Vec<(String, TypeNode)>,
+    ) -> Option<()> {
+        if depth > 32 {
+            return None;
+        }
+        if let PatKind::Assign(inner, _) = &pattern.kind {
+            if !self.constructor_default_preserves_type(ty, bound, alias_body, depth + 1) {
+                return None;
+            }
+            return self.constructor_pattern_properties(
+                inner,
+                ty,
+                bound,
+                alias_body,
+                depth + 1,
+                properties,
+            );
+        }
+        if let PatKind::Ident(name) = &pattern.kind {
+            properties.push((
+                name.to_string(),
+                self.constructor_property_leaf_type(ty, bound, alias_body, depth + 1)?,
+            ));
+            return Some(());
+        }
+        match &ty.kind {
+            TypeNodeKind::Paren(inner) | TypeNodeKind::Readonly(inner) => {
+                return self.constructor_pattern_properties(
+                    pattern,
+                    inner,
+                    bound,
+                    alias_body,
+                    depth + 1,
+                    properties,
+                )
+            }
+            TypeNodeKind::Reference(reference)
+                if reference.type_args.as_ref().is_none_or(Vec::is_empty) =>
+            {
+                let ExprKind::Ident(name) = &reference.name.kind else {
+                    return None;
+                };
+                if !alias_body && bound.contains(name.as_str()) {
+                    return None;
+                }
+                let ConstructorPropertyType::Alias(body) =
+                    self.constructor_property_binding(name)?
+                else {
+                    return None;
+                };
+                return self.constructor_pattern_properties(
+                    pattern,
+                    body,
+                    bound,
+                    true,
+                    depth + 1,
+                    properties,
+                );
+            }
+            _ => {}
+        }
+        match (&pattern.kind, &ty.kind) {
+            (PatKind::Array(elements), TypeNodeKind::Array(_) | TypeNodeKind::Tuple(_)) => {
+                if matches!(&ty.kind, TypeNodeKind::Tuple(slots) if slots.iter().any(|slot| slot.optional || slot.dotdotdot))
+                {
+                    return None;
+                }
+                for (index, element) in elements.iter().enumerate() {
+                    let Some(element) = element else {
+                        continue;
+                    };
+                    let (pattern, rest) = match element {
+                        ArrayPatElem::Pat(pattern) => (pattern, false),
+                        ArrayPatElem::Rest(pattern) => (pattern, true),
+                    };
+                    let element_type = match &ty.kind {
+                        TypeNodeKind::Array(inner) if !rest => TypeNode::clone(inner),
+                        TypeNodeKind::Array(_) => ty.clone(),
+                        TypeNodeKind::Tuple(slots) if rest => TypeNode {
+                            kind: TypeNodeKind::Tuple(slots.get(index..)?.to_vec()),
+                            span: ty.span,
+                        },
+                        TypeNodeKind::Tuple(slots) => slots.get(index)?.type_node.clone(),
+                        _ => return None,
+                    };
+                    self.constructor_pattern_properties(
+                        pattern,
+                        &element_type,
+                        bound,
+                        alias_body,
+                        depth + 1,
+                        properties,
+                    )?;
+                }
+            }
+            (PatKind::Object(bindings), TypeNodeKind::TypeLit(members)) => {
+                let mut types = HashMap::new();
+                for member in members {
+                    let TypeMemberKind::PropertySig(property) = &member.kind else {
+                        return None;
+                    };
+                    if property.optional {
+                        return None;
+                    }
+                    let key = Self::constructor_pattern_key(&property.name)?;
+                    if types.insert(key, property.type_ann.as_ref()?).is_some() {
+                        return None;
+                    }
+                }
+                // Rest excludes every named binding, even for invalid syntax
+                // where a later property follows the rest binding.
+                let mut used = HashSet::new();
+                for binding in bindings {
+                    match binding {
+                        ObjPatProp::KeyValue(key, _) => {
+                            used.insert(Self::constructor_pattern_key(key)?);
+                        }
+                        ObjPatProp::Shorthand(name, _)
+                        | ObjPatProp::ShorthandAssign(name, _, _) => {
+                            used.insert(name.to_string());
+                        }
+                        ObjPatProp::Rest(_) => {}
+                    }
+                }
+                for binding in bindings {
+                    match binding {
+                        ObjPatProp::KeyValue(key, pattern) => {
+                            let key = Self::constructor_pattern_key(key)?;
+                            self.constructor_pattern_properties(
+                                pattern,
+                                types.get(&key)?,
+                                bound,
+                                alias_body,
+                                depth + 1,
+                                properties,
+                            )?;
+                        }
+                        ObjPatProp::Shorthand(name, _)
+                        | ObjPatProp::ShorthandAssign(name, _, _) => {
+                            if matches!(binding, ObjPatProp::ShorthandAssign(..))
+                                && !self.constructor_default_preserves_type(
+                                    types.get(name.as_str())?,
+                                    bound,
+                                    alias_body,
+                                    depth + 1,
+                                )
+                            {
+                                return None;
+                            }
+                            properties.push((
+                                name.to_string(),
+                                self.constructor_property_leaf_type(
+                                    types.get(name.as_str())?,
+                                    bound,
+                                    alias_body,
+                                    depth + 1,
+                                )?,
+                            ));
+                        }
+                        ObjPatProp::Rest(pattern) => {
+                            let rest = members
+                                .iter()
+                                .filter_map(|member| {
+                                    let TypeMemberKind::PropertySig(property) = &member.kind else {
+                                        return None;
+                                    };
+                                    (!used
+                                        .contains(&Self::constructor_pattern_key(&property.name)?))
+                                    .then(|| {
+                                        let mut member = member.clone();
+                                        if let TypeMemberKind::PropertySig(property) =
+                                            &mut member.kind
+                                        {
+                                            property.readonly = false;
+                                        }
+                                        member
+                                    })
+                                })
+                                .collect();
+                            let rest_type = TypeNode {
+                                kind: TypeNodeKind::TypeLit(rest),
+                                span: ty.span,
+                            };
+                            self.constructor_pattern_properties(
+                                pattern,
+                                &rest_type,
+                                bound,
+                                alias_body,
+                                depth + 1,
+                                properties,
+                            )?;
+                        }
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    fn constructor_pattern_key(name: &PropName) -> Option<String> {
+        match name {
+            PropName::Ident(name, _) => Some(name.to_string()),
+            PropName::String(name, _) => Some(crate::emit_class::decode_js_string_content(name)),
+            PropName::Number(name, _) => Some(crate::enum_eval::normalize_js_number(name)),
+            _ => None,
+        }
+    }
+
     fn emit_constructor_properties(&mut self, class: &ClassDecl) {
         let mut emitted = HashSet::new();
+        let constructor_count = class
+            .members
+            .iter()
+            .filter(|member| matches!(member.kind, ClassMemberKind::Constructor(_)))
+            .count();
         for member in &class.members {
             let ClassMemberKind::Constructor(constructor) = &member.kind else {
                 continue;
@@ -1208,6 +1675,44 @@ impl<'a> DeclarationEmitter<'a> {
                     continue;
                 }
                 let PatKind::Ident(name) = &param.name.kind else {
+                    if param.optional || constructor_count != 1 {
+                        continue;
+                    }
+                    let Some(annotation) = &param.type_ann else {
+                        continue;
+                    };
+                    let bound = class
+                        .type_params
+                        .iter()
+                        .flatten()
+                        .map(|parameter| parameter.name.clone())
+                        .collect();
+                    let mut properties = Vec::new();
+                    if self
+                        .constructor_pattern_properties(
+                            &param.name,
+                            annotation,
+                            &bound,
+                            false,
+                            0,
+                            &mut properties,
+                        )
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    // Binding-pattern parameter properties retain their types,
+                    // including private and duplicate bindings, in TS output.
+                    for (name, ty) in properties {
+                        self.emit_accessibility(param.modifiers);
+                        if param.modifiers & MOD_READONLY != 0 {
+                            self.write("readonly ");
+                        }
+                        self.write(&name);
+                        self.write(": ");
+                        self.emit_type_node(&ty);
+                        self.writeln(";");
+                    }
                     continue;
                 };
                 if !emitted.insert(name.clone()) {
@@ -1848,6 +2353,8 @@ impl<'a> DeclarationEmitter<'a> {
                 .flat_map(Self::stmt_declared_names)
                 .collect(),
         );
+        self.constructor_property_scopes
+            .push(Self::constructor_property_scope(statements));
         let named_exports = Self::named_local_exports(statements);
         let (retained, exported) =
             self.collect_retained_declaration_names(statements, &named_exports);
@@ -1896,6 +2403,7 @@ impl<'a> DeclarationEmitter<'a> {
         if has_private && !has_boundary {
             self.writeln("export {};");
         }
+        self.constructor_property_scopes.pop();
     }
 
     fn emit_import_decl(&mut self, import_decl: &ImportDecl) {
