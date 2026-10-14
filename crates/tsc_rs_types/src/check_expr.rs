@@ -15502,6 +15502,38 @@ impl TypeChecker {
                 self.fn_nesting_depth += 1;
                 self.jump_function_depth += 1;
                 self.class_init_ctx = Some(self.fn_nesting_depth);
+                let saved_constructor_return = self.constructor_return_context.take();
+                self.constructor_return_context =
+                    self.enclosing_class_names.last().and_then(|name| {
+                        // Function-local classes currently share bare registry
+                        // names, including classes in sibling functions. Their
+                        // instance identity is not reliable here. Class
+                        // expressions also need a separate display identity.
+                        if class_is_expression
+                            || self.fn_nesting_depth != 1
+                            || self.jump_function_depth != 1
+                            || !self.static_block_fn_depths.is_empty()
+                            || self.duplicate_type_names.contains(name)
+                            || self
+                                .enclosing_class_names
+                                .iter()
+                                .filter(|owner| *owner == name)
+                                .count()
+                                > 1
+                        {
+                            return None;
+                        }
+                        let info = self.class_info.get(name.as_str())?;
+                        let arguments = info
+                            .type_params
+                            .iter()
+                            .map(|parameter| Type::TypeReference(parameter.clone(), Arc::from([])))
+                            .collect();
+                        Some((
+                            self.jump_function_depth,
+                            Type::TypeReference(name.clone(), arguments),
+                        ))
+                    });
                 // TS17009: in a DERIVED class, `this` may not be touched
                 // until `super()` runs (marker declared into the ctor scope
                 // just after it is pushed below).
@@ -15591,6 +15623,7 @@ impl TypeChecker {
                 self.pop_scope();
                 self.return_is_async_stack.pop();
                 self.generator_stack.pop();
+                self.constructor_return_context = saved_constructor_return;
                 self.fn_nesting_depth -= 1;
                 self.jump_function_depth -= 1;
                 self.in_constructor = saved_in_ctor;

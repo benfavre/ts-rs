@@ -1001,3 +1001,207 @@ fn index_assignment_quoted_unique_identity() {
     let source = r###"declare let s:{"[unique:sym\u0000probe.ts\u000014]":string}; let t:{[key:string]:number}=s;"###;
     check_index_assignment_spans(source, &[(2322, 65, 66)]);
 }
+
+fn constructor_return_diagnostics(
+    source: &str,
+    filename: &str,
+    mut options: CompilerOptions,
+) -> Vec<Diagnostic> {
+    options.target = Some(ScriptTarget::ES2015);
+    let file = tsc_rs_parser::parse(filename, source);
+    let symbols = tsc_rs_symbols::bind(&file);
+    TypeChecker::new()
+        .check_with_options(&file, &symbols, &options)
+        .diagnostics
+}
+
+fn constructor_return_assert_pair(
+    source: &str,
+    options: CompilerOptions,
+    code: u32,
+    message: &str,
+) {
+    let mut actual = constructor_return_diagnostics(source, "probe.ts", options)
+        .into_iter()
+        .map(|d| {
+            (
+                d.code,
+                d.span.unwrap().start,
+                d.span.unwrap().end,
+                d.message,
+            )
+        })
+        .collect::<Vec<_>>();
+    actual.sort();
+    let start = source.find("return").unwrap() as u32;
+    let mut expected = vec![
+        (code, start, start + 6, message.to_string()),
+        (2409, start, start + 6, "Return type of constructor signature must be assignable to the instance type of the class.".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(actual, expected, "{source}");
+}
+
+#[test]
+fn constructor_return_reports_primitive_and_generic_instance_mismatches() {
+    for (source, message) in [
+        (
+            "class X{foo(){}constructor(){return 1;}}",
+            "Type 'number' is not assignable to type 'X'.",
+        ),
+        (
+            "class X<T>{constructor(x:T){return x;}}",
+            "Type 'T' is not assignable to type 'X<T>'.",
+        ),
+        (
+            "class X{constructor(x:unknown){return x;}}",
+            "Type 'unknown' is not assignable to type 'X'.",
+        ),
+        (
+            "declare function f():void;class X{constructor(){return f();}}",
+            "Type 'void' is not assignable to type 'X'.",
+        ),
+    ] {
+        constructor_return_assert_pair(
+            source,
+            CompilerOptions {
+                strict: Some(true),
+                ..Default::default()
+            },
+            2322,
+            message,
+        );
+    }
+}
+
+#[test]
+fn constructor_return_preserves_weak_target_literal_diagnostics() {
+    for (value, printed) in [("0", "0"), ("\"\"", "\"\""), ("true", "true")] {
+        let source = format!("class X<T>{{foo?:number;constructor(){{return {value};}}}}");
+        constructor_return_assert_pair(
+            &source,
+            CompilerOptions {
+                strict: Some(true),
+                ..Default::default()
+            },
+            2559,
+            &format!("Type '{printed}' has no properties in common with type 'X<T>'."),
+        );
+    }
+    constructor_return_assert_pair(
+        "class B{foo?:number;}class C extends B{constructor(){super();return 0;}}",
+        CompilerOptions {
+            strict: Some(true),
+            ..Default::default()
+        },
+        2559,
+        "Type '0' has no properties in common with type 'C'.",
+    );
+}
+
+#[test]
+fn constructor_return_nullish_checks_follow_effective_strict_options() {
+    for value in ["null", "undefined"] {
+        let source = format!("class X{{foo=1;constructor(){{return {value};}}}}");
+        for strict in [Some(true), None] {
+            constructor_return_assert_pair(
+                &source,
+                CompilerOptions {
+                    strict,
+                    ..Default::default()
+                },
+                2322,
+                &format!("Type '{value}' is not assignable to type 'X'."),
+            );
+        }
+        for options in [
+            CompilerOptions {
+                strict: Some(false),
+                ..Default::default()
+            },
+            CompilerOptions {
+                strict: Some(true),
+                strict_null_checks: Some(false),
+                ..Default::default()
+            },
+        ] {
+            assert!(constructor_return_diagnostics(&source, "probe.ts", options).is_empty());
+        }
+    }
+}
+
+#[test]
+fn constructor_return_accepts_unknown_weak_targets_without_strict_null_checks() {
+    let source = "class C{foo?:number;constructor(){return 1 as unknown;}}";
+    for options in [
+        CompilerOptions {
+            strict: Some(false),
+            ..Default::default()
+        },
+        CompilerOptions {
+            strict: Some(true),
+            strict_null_checks: Some(false),
+            ..Default::default()
+        },
+    ] {
+        assert!(constructor_return_diagnostics(source, "probe.ts", options).is_empty());
+    }
+}
+
+#[test]
+fn constructor_return_accepts_compatible_values_and_nested_function_returns() {
+    for source in [
+        "class X{constructor(){return 1;}}",
+        "class X<X>{constructor(){return 1;}}",
+        "class X<T extends number>{constructor(x:T){return x;}}",
+        "class X{foo=1;constructor(x:any){return x;}}",
+        "class X{foo=1;constructor(x:never){return x;}}",
+        "class X{foo=1;constructor(){return;}}",
+        "class X{foo=1;constructor(){return this;}}",
+        "class X{foo=1;constructor(){return {foo:1};}}",
+        "class X{foo=1;constructor(){function f(){return \"\";}let g=()=>{return 1;};return this;}}",
+        "class X{toFixed?:(n?:number)=>string;constructor(){return 1;}}",
+        "class X{toFixed(n?:number){return \"\";}constructor(){return 1;}}",
+        "class X{foo=1;constructor(){const o={get x(){return 1;}};}}",
+        "class X{foo=1;constructor(){const o:{x:number}={get x(){return 1;}};}}",
+    ] {
+        assert!(constructor_return_diagnostics(source, "probe.ts", CompilerOptions { strict: Some(true), ..Default::default() }).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn constructor_return_does_not_confuse_sibling_function_class_names() {
+    let source = "function f(){class X{constructor(){return 1;}}return X;}function g(){class X{foo=1;}return X;}";
+    assert!(constructor_return_diagnostics(
+        source,
+        "probe.ts",
+        CompilerOptions {
+            strict: Some(true),
+            ..Default::default()
+        }
+    )
+    .is_empty());
+}
+
+#[test]
+fn constructor_return_checks_javascript_independently_of_no_implicit_any() {
+    let source = "class X { foo = 1; constructor() { return 0; } }";
+    // The project/harness chooses whether to check a JS file. This direct
+    // checker test exercises the checked-file path for each inference option.
+    for no_implicit_any in [Some(true), Some(false), None] {
+        let actual = constructor_return_diagnostics(
+            source,
+            "probe.js",
+            CompilerOptions {
+                allow_js: Some(true),
+                check_js: Some(true),
+                strict: Some(true),
+                no_implicit_any,
+                ..Default::default()
+            },
+        );
+        let mut codes = actual.into_iter().map(|d| d.code).collect::<Vec<_>>();
+        codes.sort();
+        assert_eq!(codes, vec![2322, 2409]);
+    }
+}

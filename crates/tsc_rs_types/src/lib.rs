@@ -3395,6 +3395,10 @@ pub struct TypeChecker {
     /// `Some(ty)` when the function has an explicit return type annotation;
     /// `None` when there is no annotation (return type is inferred).
     return_type_stack: Vec<Option<Type>>,
+    /// Constructors have an implicit instance return type. Pair its context
+    /// with jump-function depth, which includes object-literal accessors as
+    /// well as ordinary functions, so nested returns keep their own context.
+    constructor_return_context: Option<(u32, Type)>,
     /// Parallel stack tracking whether the enclosing function is `async`.
     /// Used at the return-statement check site to permit `return
     /// Promise<X>` against an async-unwrapped target `X` (TypeScript
@@ -3702,6 +3706,7 @@ impl Clone for TypeChecker {
             check_expression_grammar: self.check_expression_grammar,
             check_index_grammar: self.check_index_grammar,
             return_type_stack: self.return_type_stack.clone(),
+            constructor_return_context: self.constructor_return_context.clone(),
             return_is_async_stack: self.return_is_async_stack.clone(),
             generator_stack: self.generator_stack.clone(),
             allow_unreachable_code: self.allow_unreachable_code,
@@ -3943,6 +3948,7 @@ impl TypeChecker {
             check_expression_grammar: false,
             check_index_grammar: false,
             return_type_stack: Vec::new(),
+            constructor_return_context: None,
             return_is_async_stack: Vec::new(),
             generator_stack: Vec::new(),
             allow_unreachable_code: None,
@@ -28229,6 +28235,39 @@ impl TypeChecker {
         result
     }
 
+    fn constructor_return_type_is_supported(&self, ty: &Type) -> bool {
+        // Aggregate and callable returns need more precise contextual member
+        // types and diagnostic elaboration than the current relation retains.
+        // Primitive/nullish values and active generic parameters can already
+        // be compared against the constructor's instance type reliably.
+        match ty {
+            Type::String
+            | Type::StringLiteral(_)
+            | Type::Number
+            | Type::NumberLiteral(_)
+            | Type::BigInt
+            | Type::BigIntLiteral(_)
+            | Type::Boolean
+            | Type::BooleanLiteral(_)
+            | Type::Symbol
+            | Type::UniqueSymbol(_)
+            | Type::Null
+            | Type::Undefined
+            | Type::Void
+            | Type::Any
+            | Type::Never
+            | Type::Error => true,
+            // Without strict null checks, `unknown` uses an apparent empty
+            // object type. Its weak-target relation and missing-property
+            // diagnostics need separate handling; preserve prior behavior.
+            Type::Unknown => self.strict_null_checks,
+            Type::TypeReference(..) | Type::TypeParameter(_) => {
+                self.active_type_parameter_name(ty).is_some()
+            }
+            _ => false,
+        }
+    }
+
     fn check_stmt(&mut self, stmt: &Stmt) {
         let pushed = self.enter_jump_target(stmt);
         self.check_stmt_inner(stmt);
@@ -28966,6 +29005,12 @@ impl TypeChecker {
                 }
             }
             StmtKind::Return(Some(ref e)) => {
+                let constructor_return = self
+                    .constructor_return_context
+                    .as_ref()
+                    .filter(|(depth, _)| *depth == self.jump_function_depth)
+                    .filter(|_| !self.static_block_fn_depths.contains(&self.fn_nesting_depth))
+                    .map(|(_, ty)| ty.clone());
                 // Pass declared return type as contextual type for function/object expressions
                 let expected_ret = self
                     .return_type_stack
@@ -29018,7 +29063,60 @@ impl TypeChecker {
                         returns.insert(e.span.start, ret_ty.clone());
                     }
                 }
-                if let Some(Some(expected_ret)) = self.return_type_stack.last().cloned() {
+                if let Some(expected_ret) = constructor_return {
+                    let primitive_target = if crate::assign::is_primitive_source(&ret_ty) {
+                        match &expected_ret {
+                            Type::TypeReference(name, _) => {
+                                match self.get_class_instance_type(name) {
+                                    Type::ObjectType(info) => Some(info),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    // Primitive boxing against library methods still
+                    // has incomplete signature relations. Retain prior behavior
+                    // for targets with a shared primitive member.
+                    let has_primitive_common_member =
+                        primitive_target.as_ref().is_some_and(|info| {
+                            info.properties.iter().any(|(name, _)| {
+                                self.lookup_primitive_member(&ret_ty, name).is_some()
+                            })
+                        });
+                    if self.constructor_return_type_is_supported(&ret_ty)
+                        && !has_primitive_common_member
+                        && !self.is_assignable_to(&ret_ty, &expected_ret)
+                        && !matches!(ret_ty, Type::Any | Type::Error)
+                    {
+                        let return_span = Span::new(stmt.span.start, stmt.span.start + 6);
+                        if primitive_target.as_ref().is_some_and(|info| {
+                            crate::assign::is_weak_object(&Type::ObjectType(info.clone()))
+                        }) {
+                            // Weak-type diagnostics preserve the literal type,
+                            // unlike the ordinary primitive assignment error.
+                            self.diagnostics
+                                .push(diagnostics::error_no_properties_in_common(
+                                    &ret_ty.display_string(),
+                                    &expected_ret.display_string(),
+                                    return_span,
+                                ));
+                        } else {
+                            let widened = self.widen_for_message(Some(e), &ret_ty, &expected_ret);
+                            self.push_not_assignable(&widened, &expected_ret, return_span);
+                        }
+                        self.diagnostics.push(Diagnostic {
+                            code: 2409,
+                            message: "Return type of constructor signature must be assignable to the instance type of the class.".to_string(),
+                            category: DiagnosticCategory::Error,
+                            file_name: None,
+                            span: Some(return_span),
+                            related: None,
+                        });
+                    }
+                } else if let Some(Some(expected_ret)) = self.return_type_stack.last().cloned() {
                     // Inside an async function `return` automatically
                     // flattens a `Promise<X>` to `X`. The declared return
                     // type on `return_type_stack` was already unwrapped
