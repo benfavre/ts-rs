@@ -1864,3 +1864,72 @@ fn shorthand_objects_do_not_expose_uncertain_private_return_inference() {
         "declare function f(): 1;\nexport declare const utility: {\n    f: typeof f;\n};\nexport {};\n"
     );
 }
+
+#[test]
+fn interface_declarations_omit_parenthesized_heritage_expressions() {
+    assert_eq!(
+        emit_dts("class A {} interface I extends (typeof A) { value: number; } interface J extends (A) {}"),
+        "declare class A {\n}\ninterface I {\n    value: number;\n}\ninterface J {\n}\n"
+    );
+    assert_eq!(
+        emit_dts("interface I extends (Ignored), Valid<string>, Namespace.Base<number>, (typeof Missing) {}"),
+        "interface I extends Valid<string>, Namespace.Base<number> {\n}\n"
+    );
+}
+
+#[test]
+fn omitted_interface_heritage_does_not_retain_private_dependencies() {
+    assert_eq!(
+        emit_dts(
+            "class Hidden {} class Kept {} export interface I extends (Hidden) { value: Kept; }"
+        ),
+        "declare class Kept {\n}\nexport interface I {\n    value: Kept;\n}\nexport {};\n"
+    );
+    assert_eq!(
+        emit_dts("namespace N { class Hidden {} export interface I extends (typeof Hidden) {} }"),
+        "declare namespace N {\n    interface I {\n    }\n}\n"
+    );
+}
+
+#[test]
+fn interface_heritage_keeps_keyword_names_and_default_export_spelling() {
+    assert_eq!(
+        emit_dts("export default interface Named extends (Missing), any, string {}"),
+        "export default interface Named extends any, string {\n}\n"
+    );
+}
+
+#[test]
+fn interface_heritage_defers_incomplete_parenthesized_recovery() {
+    // A recovered type node has no closing delimiter. Keep its existing emit
+    // behavior and parser diagnostic until recovery is modeled independently.
+    let source = "interface I extends (A { value: number; }";
+    let file = tsc_rs_parser::parse("test.ts", source);
+    assert!(file
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == 1005));
+    assert_eq!(
+        emit_dts(source),
+        "interface I extends (A) {\n    value: number;\n}\n"
+    );
+    for source in [
+        "interface I extends ((A) { x?: number; }",
+        "interface I extends (((A)) { x?: number; }",
+    ] {
+        let file = tsc_rs_parser::parse("test.ts", source);
+        assert!(file
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == 1005));
+        let parentheses = if source.contains("(((A)") {
+            "(((A)))"
+        } else {
+            "((A))"
+        };
+        assert_eq!(
+            emit_dts(source),
+            format!("interface I extends {parentheses} {{\n    x?: number;\n}}\n")
+        );
+    }
+}

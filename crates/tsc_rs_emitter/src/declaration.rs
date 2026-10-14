@@ -472,7 +472,13 @@ impl<'a> DeclarationEmitter<'a> {
             StmtKind::InterfaceDecl(decl) => {
                 let scoped =
                     Self::collect_type_params(&decl.type_params, &bound, &mut dependencies);
-                Self::collect_types(&decl.extends, &scoped, &mut dependencies);
+                for heritage in decl
+                    .extends
+                    .iter()
+                    .filter(|ty| self.should_emit_interface_heritage(ty))
+                {
+                    Self::collect_type_dependencies(heritage, &scoped, &mut dependencies);
+                }
                 Self::collect_type_members(&decl.members, &scoped, &mut dependencies);
             }
             StmtKind::TypeAlias(decl) => {
@@ -1913,13 +1919,34 @@ impl<'a> DeclarationEmitter<'a> {
         }
     }
 
+    fn should_emit_interface_heritage(&self, heritage: &TypeNode) -> bool {
+        // Parenthesized expressions are not entity names in an interface's
+        // extends clause. Only omit complete nodes: an absent closing delimiter
+        // indicates parser recovery, whose declaration shape is still deferred.
+        let TypeNodeKind::Paren(inner) = &heritage.kind else {
+            return true;
+        };
+        // Recovery can end at an inner node's real closing parenthesis. The
+        // outer node must include its own token beyond the inner node's span.
+        heritage.span.end <= inner.span.end
+            || !self
+                .source
+                .get(heritage.span.start as usize..heritage.span.end as usize)
+                .is_some_and(|text| text.starts_with('(') && text.ends_with(')'))
+    }
+
     fn emit_interface_decl(&mut self, iface: &InterfaceDecl) {
         self.write("interface ");
         self.write(&iface.name);
         self.emit_type_params(&iface.type_params);
-        if !iface.extends.is_empty() {
+        let heritage: Vec<_> = iface
+            .extends
+            .iter()
+            .filter(|ty| self.should_emit_interface_heritage(ty))
+            .collect();
+        if !heritage.is_empty() {
             self.write(" extends ");
-            for (i, ext) in iface.extends.iter().enumerate() {
+            for (i, ext) in heritage.iter().enumerate() {
                 if i > 0 {
                     self.write(", ");
                 }
