@@ -3333,6 +3333,13 @@ pub struct TypeChecker {
     /// in `available_files`. Extension substitution must only resolve to a
     /// real program file, never to an alias derived from another file name.
     available_source_files: Arc<HashSet<String>>,
+    /// JavaScript JSDoc references can reach TypeScript consumers after
+    /// desugaring has erased their option-sensitive source meaning.
+    program_has_js_sources: bool,
+    /// A user binding can change Array/ReadonlyArray's meaning before their
+    /// references are normalized into anonymous containers. Preserve this
+    /// uncertainty across the same program graph and clones as its types.
+    program_has_shadowed_array_types: bool,
     /// Ambient string-literal modules supplied by referenced declaration
     /// libraries (for example `declare module "react"`).
     available_modules: Arc<HashSet<String>>,
@@ -3687,6 +3694,8 @@ impl Clone for TypeChecker {
             class_init_ctx: self.class_init_ctx,
             available_files: Arc::clone(&self.available_files),
             available_source_files: Arc::clone(&self.available_source_files),
+            program_has_js_sources: self.program_has_js_sources,
+            program_has_shadowed_array_types: self.program_has_shadowed_array_types,
             available_modules: Arc::clone(&self.available_modules),
             resolvable_specifiers: Arc::clone(&self.resolvable_specifiers),
             virtual_module_paths: Arc::clone(&self.virtual_module_paths),
@@ -3929,6 +3938,8 @@ impl TypeChecker {
             class_init_ctx: None,
             available_files: Arc::new(HashSet::new()),
             available_source_files: Arc::new(HashSet::new()),
+            program_has_js_sources: false,
+            program_has_shadowed_array_types: false,
             available_modules: Arc::new(HashSet::new()),
             resolvable_specifiers: Arc::new(std::collections::HashMap::new()),
             virtual_module_paths: Arc::new(std::collections::HashMap::new()),
@@ -4579,6 +4590,15 @@ impl TypeChecker {
     /// external files (lib stubs, imported modules). This enables cross-file
     /// type resolution for member access, function calls, etc.
     pub fn inject_external_types(&mut self, files: &[&SourceFile]) {
+        self.program_has_js_sources |= files
+            .iter()
+            .any(|file| Self::object_check_source_is_js(&file.file_name));
+        if !self.program_has_shadowed_array_types {
+            self.program_has_shadowed_array_types = files.iter().any(|file| {
+                !stdlib::is_typescript_standard_library_file(&file.file_name)
+                    && Self::object_check_symbols_shadow_array(&tsc_rs_symbols::bind(file))
+            });
+        }
         fn collect_global_type_declarations(
             statements: &[Stmt],
             names: &mut rustc_hash::FxHashSet<std::string::String>,
@@ -12228,6 +12248,10 @@ impl TypeChecker {
         if source_file_has_ts_nocheck(file) {
             return TypeCheckOutput::semantic_checks_skipped();
         }
+        self.program_has_js_sources |= Self::object_check_source_is_js(&file.file_name);
+        self.program_has_shadowed_array_types |=
+            !stdlib::is_typescript_standard_library_file(&file.file_name)
+                && Self::object_check_symbols_shadow_array(symbols);
         if self.current_file_name.is_none() {
             self.set_current_file_name(&file.file_name);
         }
@@ -12429,8 +12453,21 @@ impl TypeChecker {
             let is_js = [".js", ".jsx", ".mjs", ".cjs"]
                 .iter()
                 .any(|extension| lower.ends_with(extension));
+            self.program_has_js_sources |= is_js;
+            self.program_has_shadowed_array_types |=
+                !stdlib::is_typescript_standard_library_file(&file.file_name)
+                    && Self::object_check_symbols_shadow_array(symbols);
             match is_js.then(|| jsdoc::desugar(file)).flatten() {
                 Some(file_with_types) => {
+                    // The caller's symbols precede JSDoc desugaring. Bind the
+                    // resulting declarations too so typedef aliases carry the
+                    // same container uncertainty as ordinary TypeScript.
+                    if !self.program_has_shadowed_array_types {
+                        self.program_has_shadowed_array_types =
+                            Self::object_check_symbols_shadow_array(&tsc_rs_symbols::bind(
+                                &file_with_types,
+                            ));
+                    }
                     desugared = file_with_types;
                     &desugared
                 }
@@ -18560,7 +18597,12 @@ impl TypeChecker {
                 }),
             Type::TypeReference(name_ref, args) => self
                 .resolve_type_reference_to_object(name_ref, args)
-                .and_then(|resolved| self.display_target_property_type(&resolved, name)),
+                .and_then(|resolved| self.display_target_property_type(&resolved, name))
+                .or_else(|| {
+                    self.is_global_object_target(target)
+                        .then(|| self.global_object_member_type(name).map(|(ty, _)| ty))
+                        .flatten()
+                }),
             Type::Union(members) | Type::Intersection(members) => {
                 let found: Vec<Type> = members
                     .iter()
@@ -18800,7 +18842,7 @@ impl TypeChecker {
                     };
                     let target_is_optional = matches!(target_prop, Type::Optional(_));
                     let target_prop = Self::unwrap_optional_type(target_prop);
-                    if self.contains_unresolved_type_param(&target_prop) {
+                    if self.contains_unresolved_object_elaboration_type(&target_prop) {
                         continue;
                     }
                     let source_prop = source_props
@@ -18812,6 +18854,11 @@ impl TypeChecker {
                     let Some(source_prop) = source_prop else {
                         continue;
                     };
+                    if self.is_global_object_target(&resolved_target)
+                        && !Self::global_object_override_is_supported(&source_prop)
+                    {
+                        continue;
+                    }
                     if matches!(source_prop, Type::Any | Type::Error)
                         || (target_is_optional && matches!(source_prop, Type::Undefined))
                         || self.is_assignable_to(&source_prop, &target_prop)
@@ -18832,6 +18879,7 @@ impl TypeChecker {
                 let resolved_target = self
                     .resolve_type_for_assignability(target)
                     .unwrap_or_else(|| target.clone());
+                let resolved_target = self.object_elaboration_array_target(resolved_target);
                 for (index, item) in items.iter().enumerate() {
                     let Some(item) = item else {
                         continue;
@@ -18850,7 +18898,7 @@ impl TypeChecker {
                         },
                         _ => continue,
                     };
-                    if self.contains_unresolved_type_param(&target_elem) {
+                    if self.contains_unresolved_object_elaboration_type(&target_elem) {
                         continue;
                     }
                     let source_elem = self.infer_expr_type(item);
@@ -19279,7 +19327,7 @@ impl TypeChecker {
             } else {
                 self.optional_property_type(target_prop)
             };
-            if self.contains_unresolved_type_param(&target_prop) {
+            if self.contains_unresolved_object_elaboration_type(&target_prop) {
                 continue;
             }
             let source_prop = source_props
@@ -19290,6 +19338,11 @@ impl TypeChecker {
             let Some(source_prop) = source_prop.map(Self::unwrap_optional_type) else {
                 continue;
             };
+            if self.is_global_object_target(&resolved_target)
+                && !Self::global_object_override_is_supported(&source_prop)
+            {
+                continue;
+            }
             if matches!(source_prop, Type::Any | Type::Error)
                 || (target_is_optional && matches!(source_prop, Type::Undefined))
                 || self.is_assignable_to(&source_prop, &target_prop)
@@ -19367,6 +19420,7 @@ impl TypeChecker {
             ),
             other => other.clone(),
         };
+        let resolved_target = self.object_elaboration_array_target(resolved_target);
         let element_target = |index: usize| -> Option<Type> {
             fn slot(ty: &Type, index: usize) -> Option<Type> {
                 match ty {
@@ -19411,7 +19465,7 @@ impl TypeChecker {
             // deferred indexed accesses here, not every generic constituent.
             let parameter_target = self.active_type_parameter_name(&target_elem).is_some()
                 || matches!(&target_elem, Type::Keyof(owner) if self.active_type_parameter_name(owner).is_some());
-            if self.contains_unresolved_type_param(&target_elem) && !parameter_target {
+            if self.contains_unresolved_object_elaboration_type(&target_elem) && !parameter_target {
                 continue;
             }
             // The `undefined` identifier is the undefined type here.
@@ -24473,6 +24527,227 @@ impl TypeChecker {
         })
     }
 
+    // The ordinary unresolved-type classifier does not load library names.
+    // Diagnostic traversal can nevertheless recognize the exact Object type
+    // validated by the new relation, including through existing containers.
+    // Other unresolved parameters still stop elaboration.
+    fn contains_unresolved_object_elaboration_type(&self, ty: &Type) -> bool {
+        if self.is_global_object_target(ty) {
+            return false;
+        }
+        match ty {
+            Type::TypeReference(_, arguments) if !arguments.is_empty() => arguments
+                .iter()
+                .any(|argument| self.contains_unresolved_object_elaboration_type(argument)),
+            Type::Union(members) | Type::Intersection(members) => members
+                .iter()
+                .any(|member| self.contains_unresolved_object_elaboration_type(member)),
+            Type::Array(inner) | Type::Optional(inner) => {
+                self.contains_unresolved_object_elaboration_type(inner)
+            }
+            _ => self.contains_unresolved_type_param(ty),
+        }
+    }
+
+    fn contains_global_object_target(&self, ty: &Type, depth: u32) -> bool {
+        if depth > 50 {
+            return false;
+        }
+        if self.is_global_object_target(ty) {
+            return true;
+        }
+        match ty {
+            Type::Array(inner)
+            | Type::Readonly(inner)
+            | Type::Optional(inner)
+            | Type::Rest(inner) => self.contains_global_object_target(inner, depth + 1),
+            Type::Tuple(members) | Type::Union(members) | Type::Intersection(members) => members
+                .iter()
+                .any(|member| self.contains_global_object_target(member, depth + 1)),
+            Type::TypeReference(..) => self
+                .resolve_type_for_assignability(ty)
+                .filter(|resolved| resolved != ty)
+                .is_some_and(|resolved| self.contains_global_object_target(&resolved, depth + 1)),
+            _ => false,
+        }
+    }
+
+    fn object_elaboration_array_target(&self, target: Type) -> Type {
+        match target {
+            // Mutability does not affect the location of a bad element. Keep
+            // this normalization restricted to the new global Object checks.
+            Type::Readonly(inner) if self.contains_global_object_target(&inner, 0) => {
+                Type::clone(&inner)
+            }
+            Type::Union(members)
+                if self.contains_global_object_target(&Type::Union(members.clone()), 0) =>
+            {
+                Type::Union(
+                    members
+                        .iter()
+                        .map(|member| self.object_elaboration_array_target(member.clone()))
+                        .collect(),
+                )
+            }
+            other => other,
+        }
+    }
+
+    fn object_check_source_is_js(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        [".js", ".jsx", ".mjs", ".cjs"]
+            .iter()
+            .any(|extension| lower.ends_with(extension))
+    }
+
+    fn object_check_symbols_shadow_array(symbols: &SymbolTable) -> bool {
+        use tsc_rs_symbols::{
+            SYM_CLASS, SYM_ENUM, SYM_IMPORT, SYM_INTERFACE, SYM_TYPE_ALIAS, SYM_TYPE_PARAMETER,
+        };
+        symbols.symbols.iter().any(|symbol| {
+            matches!(symbol.name.as_str(), "Array" | "ReadonlyArray")
+                && symbol.flags
+                    & (SYM_CLASS
+                        | SYM_ENUM
+                        | SYM_IMPORT
+                        | SYM_INTERFACE
+                        | SYM_TYPE_ALIAS
+                        | SYM_TYPE_PARAMETER)
+                    != 0
+        })
+    }
+
+    fn is_global_object_target(&self, target: &Type) -> bool {
+        // Bare JSDoc Object means any when noImplicitAny is disabled. JSDoc
+        // desugaring currently erases the distinction from qualified/imported
+        // Object references, including types imported by TypeScript callers.
+        // Defer the new check for such mixed programs in this option mode;
+        // TypeScript-only programs keep their ordinary Object meaning.
+        matches!(target, Type::TypeReference(name, args) if name == "Object" && args.is_empty())
+            && (!self.program_has_js_sources || self.no_implicit_any)
+            && self.active_type_parameter_name(target).is_none()
+            // Array normalization currently discards the reference's origin.
+            // A user Array/ReadonlyArray alias may therefore leave a builtin
+            // Object argument in a container with a different intended shape.
+            // Until that identity is retained, defer even direct Object checks
+            // in scopes with a potentially shadowed array constructor.
+            && !self.program_has_shadowed_array_types
+            && !self.type_param_name_is_active("Array")
+            && !self.type_param_name_is_active("ReadonlyArray")
+            && !self.program_declares_library_owner("Object")
+            && !self.enum_info.contains_key("Object")
+            && stdlib::stdlib_member_availability(&self.compiler_options)
+                .is_some_and(|library| library.declares_global_type("Object"))
+    }
+
+    fn global_object_member_type(&self, name: &str) -> Option<(Type, bool)> {
+        self.lookup_library_instance_method("Object", &[], name)
+            .map(|ty| (ty, true))
+            .or_else(|| {
+                self.lookup_library_property("Object", &[], name)
+                    .map(|ty| (ty, false))
+            })
+            .filter(|(ty, _)| self.global_object_member_references_are_unshadowed(ty))
+    }
+
+    fn global_object_member_references_are_unshadowed(&self, ty: &Type) -> bool {
+        // Library references currently carry names rather than global symbol
+        // identities. A local Function or PropertyKey must not change the
+        // meaning of Object's declarations in the library.
+        match ty {
+            Type::TypeReference(name, args) => {
+                !self.type_param_name_is_active(name)
+                    && !self.program_declares_library_owner(name)
+                    && !self.enum_info.contains_key(name.as_str())
+                    && args
+                        .iter()
+                        .all(|arg| self.global_object_member_references_are_unshadowed(arg))
+            }
+            Type::Function(signature) => {
+                signature.params.iter().all(|(_, parameter)| {
+                    self.global_object_member_references_are_unshadowed(parameter)
+                }) && self.global_object_member_references_are_unshadowed(&signature.return_type)
+            }
+            Type::Union(members) | Type::Intersection(members) | Type::Tuple(members) => members
+                .iter()
+                .all(|member| self.global_object_member_references_are_unshadowed(member)),
+            Type::Array(inner)
+            | Type::Optional(inner)
+            | Type::Rest(inner)
+            | Type::Readonly(inner) => self.global_object_member_references_are_unshadowed(inner),
+            _ => true,
+        }
+    }
+
+    fn global_object_override_source(source: &ObjectTypeInfo) -> ObjectTypeInfo {
+        let mut result = source.clone();
+        result.properties.clear();
+        for (name, ty) in &source.properties {
+            if source.method_names.contains(name) {
+                if let Some((_, previous)) = result.properties.iter_mut().find(|(n, _)| n == name) {
+                    // Type literals retain each method declaration separately;
+                    // all overloads contribute to the effective member type.
+                    let mut overloads = match previous.as_ref() {
+                        Type::Intersection(members) => members.to_vec(),
+                        other => vec![other.clone()],
+                    };
+                    overloads.push(Type::clone(ty));
+                    *previous = Arc::new(Type::Intersection(overloads.into()));
+                    continue;
+                }
+            }
+            result.properties.push((name.clone(), ty.clone()));
+        }
+        result
+    }
+
+    /// Object's prototype supplies absent members. Only explicit overrides
+    /// need to agree with the selected library's Object interface.
+    fn global_object_override_target(&self, source: &ObjectTypeInfo) -> ObjectTypeInfo {
+        let mut target = ObjectTypeData::default();
+        for (name, source_type) in &source.properties {
+            if !Self::global_object_override_is_supported(source_type) {
+                continue;
+            }
+            if let Some((ty, method)) = self.global_object_member_type(name) {
+                target.properties.push((name.clone(), Arc::new(ty)));
+                if method {
+                    target.method_names.push(name.clone());
+                }
+            }
+        }
+        target.into()
+    }
+
+    fn global_object_override_is_supported(ty: &Type) -> bool {
+        // Contextual methods do not yet retain complete parameter arity, and
+        // the signature relation does not model every variadic tuple shape.
+        // Keep those members unresolved here until that relation is complete;
+        // non-callable overrides and parameter-free signatures are decidable.
+        match ty {
+            Type::Function(signature) => signature.params.is_empty(),
+            Type::ObjectType(info) => info
+                .call_signatures
+                .iter()
+                .all(|signature| signature.params.is_empty()),
+            Type::Union(members) | Type::Intersection(members) => members
+                .iter()
+                .all(Self::global_object_override_is_supported),
+            Type::Optional(inner) | Type::Readonly(inner) => {
+                Self::global_object_override_is_supported(inner)
+            }
+            Type::TypeReference(..)
+            | Type::TypeParameter(_)
+            | Type::Typeof(_)
+            | Type::IndexedAccess(..)
+            | Type::Keyof(_)
+            | Type::Conditional { .. }
+            | Type::Mapped { .. }
+            | Type::Infer(_) => false,
+            _ => true,
+        }
+    }
+
     fn is_assignable_to_inner(&self, source: &Type, target: &Type) -> bool {
         if let Some(accepts) = self.array_keyof_accepts(source, target) {
             return accepts;
@@ -26091,6 +26366,21 @@ impl TypeChecker {
         {
             if let Some(bound) = self.primitive_conditional_constraint(source, 8) {
                 return self.is_assignable_to(&bound, target);
+            }
+        }
+        if self.is_global_object_target(target) {
+            match source {
+                Type::ObjectType(info) => {
+                    let info = Self::global_object_override_source(info);
+                    let target = Type::ObjectType(self.global_object_override_target(&info));
+                    return self.is_assignable_to(&Type::ObjectType(info), &target);
+                }
+                Type::Union(members) => {
+                    return members
+                        .iter()
+                        .all(|member| self.is_assignable_to(member, target));
+                }
+                _ => {}
             }
         }
         // Unresolved TypeReference, IndexedAccess, Keyof, Typeof, Conditional,
@@ -31835,6 +32125,9 @@ impl TypeChecker {
 
     /// Register available file names for module resolution (TS2307 checking).
     pub fn register_available_files(&mut self, file_names: &[String]) {
+        self.program_has_js_sources |= file_names
+            .iter()
+            .any(|name| Self::object_check_source_is_js(name));
         let files = Arc::make_mut(&mut self.available_files);
         let source_files = Arc::make_mut(&mut self.available_source_files);
         for name in file_names {
@@ -35330,7 +35623,16 @@ impl TypeChecker {
             }
         }
         let source_info = self.structural_object_info(source)?;
-        let target_info = self.structural_object_info(target)?;
+        let source_info = if self.is_global_object_target(target) {
+            Self::global_object_override_source(&source_info)
+        } else {
+            source_info
+        };
+        let target_info = if self.is_global_object_target(target) {
+            self.global_object_override_target(&source_info)
+        } else {
+            self.structural_object_info(target)?
+        };
         let strip = |name: &str| -> std::string::String {
             name.strip_prefix('?')
                 .or_else(|| name.strip_prefix("..."))

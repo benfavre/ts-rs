@@ -1,5 +1,5 @@
 // Diagnostic expectations checked against TypeScript 6.0.3.
-use tsc_rs_ast::{CompilerOptions, Diagnostic, ScriptTarget};
+use tsc_rs_ast::{CompilerOptions, Diagnostic, ModuleKind, ScriptTarget, Span};
 use tsc_rs_types::TypeChecker;
 
 fn check(source: &str, expected: &[(u32, &str, u32, u32)]) {
@@ -1203,5 +1203,548 @@ fn constructor_return_checks_javascript_independently_of_no_implicit_any() {
         let mut codes = actual.into_iter().map(|d| d.code).collect::<Vec<_>>();
         codes.sort();
         assert_eq!(codes, vec![2322, 2409]);
+    }
+}
+
+fn object_assignment_diagnostics(source: &str, options: CompilerOptions) -> Vec<Diagnostic> {
+    object_assignment_file_diagnostics(source, "probe.ts", options)
+}
+
+fn object_assignment_file_diagnostics(
+    source: &str,
+    filename: &str,
+    options: CompilerOptions,
+) -> Vec<Diagnostic> {
+    let file = tsc_rs_parser::parse(filename, source);
+    assert!(file.diagnostics.is_empty(), "{:?}", file.diagnostics);
+    let symbols = tsc_rs_symbols::bind(&file);
+    TypeChecker::new()
+        .check_with_options(&file, &symbols, &options)
+        .diagnostics
+}
+
+fn object_assignment_options() -> CompilerOptions {
+    CompilerOptions {
+        strict: Some(true),
+        target: Some(ScriptTarget::ES2015),
+        module: Some(ModuleKind::ES2015),
+        ..Default::default()
+    }
+}
+
+// Exact diagnostic messages and ranges checked against TypeScript 6.0.3.
+#[test]
+fn global_object_explicit_overrides_report_library_member_mismatches() {
+    for (source, start, end, message) in [
+        (
+            r#"declare let source:{toString:number}; let target:Object=source;"#,
+            42,
+            48,
+            r#"Type '{ toString: number; }' is not assignable to type 'Object'.
+  Types of property 'toString' are incompatible.
+    Type 'number' is not assignable to type '() => string'."#,
+        ),
+        (
+            r#"declare let source:{constructor:number}; let target:Object=source;"#,
+            45,
+            51,
+            r#"Type '{ constructor: number; }' is not assignable to type 'Object'.
+  Types of property 'constructor' are incompatible.
+    Type 'number' is not assignable to type 'Function'."#,
+        ),
+        (
+            r#"declare let source:{hasOwnProperty:number}; let target:Object=source;"#,
+            48,
+            54,
+            r#"Type '{ hasOwnProperty: number; }' is not assignable to type 'Object'.
+  Types of property 'hasOwnProperty' are incompatible.
+    Type 'number' is not assignable to type '(v: PropertyKey) => boolean'."#,
+        ),
+        (
+            r#"declare let source:{propertyIsEnumerable:()=>string}; let target:Object=source;"#,
+            58,
+            64,
+            r#"Type '{ propertyIsEnumerable: () => string; }' is not assignable to type 'Object'.
+  The types returned by 'propertyIsEnumerable(...)' are incompatible between these types.
+    Type 'string' is not assignable to type 'boolean'."#,
+        ),
+        (
+            r#"declare let source:{readonly toString:number};let target:Object=source;"#,
+            50,
+            56,
+            r#"Type '{ readonly toString: number; }' is not assignable to type 'Object'.
+  Types of property 'toString' are incompatible.
+    Type 'number' is not assignable to type '() => string'."#,
+        ),
+        (
+            r#"declare let source:{toString():number};let target:Object=source;"#,
+            43,
+            49,
+            r#"Type '{ toString(): number; }' is not assignable to type 'Object'.
+  The types returned by 'toString()' are incompatible between these types.
+    Type 'number' is not assignable to type 'string'."#,
+        ),
+        (
+            r#"interface Source{toString:number}declare let source:Source;let target:Object=source;"#,
+            63,
+            69,
+            r#"Type 'Source' is not assignable to type 'Object'.
+  Types of property 'toString' are incompatible.
+    Type 'number' is not assignable to type '() => string'."#,
+        ),
+        (
+            r#"declare class Source{toString:number}declare let source:Source;let target:Object=source;"#,
+            67,
+            73,
+            r#"Type 'Source' is not assignable to type 'Object'.
+  Types of property 'toString' are incompatible.
+    Type 'number' is not assignable to type '() => string'."#,
+        ),
+        (
+            r#"interface Base{toString:number}interface Source extends Base{}declare let source:Source;let target:Object=source;"#,
+            92,
+            98,
+            r#"Type 'Source' is not assignable to type 'Object'.
+  Types of property 'toString' are incompatible.
+    Type 'number' is not assignable to type '() => string'."#,
+        ),
+        (
+            r#"interface Source<T>{toString:T}declare let source:Source<number>;let target:Object=source;"#,
+            69,
+            75,
+            r#"Type 'Source<number>' is not assignable to type 'Object'.
+  Types of property 'toString' are incompatible.
+    Type 'number' is not assignable to type '() => string'."#,
+        ),
+        (
+            r#"let target:Object={toString:0};"#,
+            19,
+            27,
+            r#"Type 'number' is not assignable to type '() => string'."#,
+        ),
+        (
+            r#"let target:Object={toString(){return 0;}};"#,
+            19,
+            27,
+            r#"Type '() => number' is not assignable to type '() => string'.
+  Type 'number' is not assignable to type 'string'."#,
+        ),
+        (
+            r#"declare function f(source:Object):void;f({toString:0});"#,
+            42,
+            50,
+            r#"Type 'number' is not assignable to type '() => string'."#,
+        ),
+        (
+            r#"declare function f(source:Object):void;let source={toString:0};f(source);"#,
+            65,
+            71,
+            r#"Argument of type '{ toString: number; }' is not assignable to parameter of type 'Object'.
+  Types of property 'toString' are incompatible.
+    Type 'number' is not assignable to type '() => string'."#,
+        ),
+        (
+            r#"function f():Object{return {toString:0};}"#,
+            28,
+            36,
+            r#"Type 'number' is not assignable to type '() => string'."#,
+        ),
+        (
+            r#"declare let source:{toString?:number}; let target:Object=source;"#,
+            43,
+            49,
+            r#"Type '{ toString?: number | undefined; }' is not assignable to type 'Object'.
+  Types of property 'toString' are incompatible.
+    Type 'number | undefined' is not assignable to type '() => string'.
+      Type 'undefined' is not assignable to type '() => string'."#,
+        ),
+    ] {
+        let diagnostics = object_assignment_diagnostics(source, object_assignment_options());
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].code,
+            if source.contains("f(source)") {
+                2345
+            } else {
+                2322
+            }
+        );
+        assert_eq!(diagnostics[0].span, Some(Span::new(start, end)), "{source}");
+        assert_eq!(diagnostics[0].message, message, "{source}");
+    }
+}
+
+#[test]
+fn global_object_preserves_implicit_members_valid_overrides_and_shadowing() {
+    for source in [
+        r#"declare let source:{toString:()=>string}; let target:Object=source;"#,
+        r#"declare let source:{toString:any}; let target:Object=source;"#,
+        r#"declare let source:{toString:never}; let target:Object=source;"#,
+        r#"declare let source:{valueOf:()=>number}; let target:Object=source;"#,
+        r#"declare let source:{constructor:()=>string}; let target:Object=source;"#,
+        r#"declare let source:{hasOwnProperty:(v:string)=>boolean}; let target:Object=source;"#,
+        r#"let target:Object={toString(x?:number){return "";}};"#,
+        r#"let target:Object={extra:0};"#,
+        r#"let target:Object={};"#,
+        r#"let target:Object=[];"#,
+        r#"let target:Object=()=>0;"#,
+        r#"let a:Object="";let b:Object=0;let c:Object=true;let d:Object=Symbol();"#,
+        r#"declare let source:{toString:()=>string}|number;let target:Object=source;"#,
+        r#"declare let source:{toString:number}&{toString:()=>string};let target:Object=source;"#,
+        r#"interface Source{toString():string}declare let source:Source;let target:Object=source;"#,
+        r#"declare class Source{toString():string}declare let source:Source;let target:Object=source;"#,
+        r#"type Object={toString:number};let target:Object={toString:0};export {};"#,
+        r#"class Object{toString=0;}let target:Object={toString:0};export {};"#,
+        r#"interface Object{toString:number}let target:Object={toString:0};export {};"#,
+        r#"function f<Object extends {toString:number}>(source:Object){let target:Object=source;}"#,
+        r#"interface Object{custom:number}declare let source:{custom:number};let target:Object=source;"#,
+        r#"declare let source:{toString:number};let target:object=source;let empty:{}=source;"#,
+        r#"declare let other:any;let target:Object={toString:0,...other};"#,
+        r#"declare let other:any;let target:Object={...other,toString:0};"#,
+        r#"let target:Object={toString(x=0){return "";}};"#,
+        r#"let target:Object={toString(...args:number[]){return "";}};"#,
+        r#"let target:Object={toString(this:{x:number}){return "";}};"#,
+        r#"let target:Object={toString:function(x?:number){return "";}};"#,
+        r#"let target:Object={toString:(x?:number)=>""};"#,
+        r#"declare let source:{toString:()=>number}&{toString:()=>string};let target:Object=source;"#,
+        r#"declare let source:{toString<T>():T};let target:Object=source;"#,
+        r#"declare let source:{toString<T extends string>():T};let target:Object=source;"#,
+        r#"declare let source:{toString():number;toString():string};let target:Object=source;"#,
+        r#"interface R{valueOf():R}declare let source:R;let target:Object=source;"#,
+        r#"declare let source:{toString:(radix?:number)=>string};let target:Object=source;"#,
+        r#"export {};declare let source:(...xs:[...number[],number])=>string;let target:()=>string=source;"#,
+        r#"export {};declare let source:(...xs:[void])=>string;let target:()=>string=source;"#,
+        r#"export {};declare let source:(...xs:[number,void])=>string;let target:(x:number)=>string=source;"#,
+        r#"export {};declare let source:(...xs:[number|void])=>string;let target:()=>string=source;"#,
+        r#"export {};declare let source:(...xs:[void,void])=>string;let target:()=>string=source;"#,
+        r#"export {};type Function=number;let target:Object={constructor:()=>0};"#,
+        r#"export {};type PropertyKey=number;declare let source:{hasOwnProperty(v:string):boolean};let target:Object=source;"#,
+    ] {
+        let diagnostics = object_assignment_diagnostics(source, object_assignment_options());
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+    }
+}
+
+#[test]
+fn contextual_method_arity_retains_required_positions_and_tuple_rest_elements() {
+    for (source, start, end) in [
+        (r#"let x:{f(x:number):void}={f(a=0,b:number){}};"#, 26, 27),
+        (r#"let x:{f():void}={f(...a:[number]){}};"#, 18, 19),
+    ] {
+        let diagnostics = object_assignment_diagnostics(source, object_assignment_options());
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+        assert_eq!(diagnostics[0].code, 2322, "{source}");
+        assert_eq!(diagnostics[0].span, Some(Span::new(start, end)), "{source}");
+        assert!(diagnostics[0]
+            .message
+            .contains("Target signature provides too few arguments."));
+    }
+}
+
+#[test]
+fn contextual_variadic_method_compares_its_required_tuple_suffix() {
+    let source =
+        "export {};let target:{f(x:number):void}={f(...xs:[number,...number[],number]){}};";
+    let diagnostics = object_assignment_diagnostics(source, object_assignment_options());
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code, 2322);
+    assert_eq!(diagnostics[0].span, Some(Span::new(41, 42)));
+    assert!(diagnostics[0].message.contains("Types of parameters"));
+}
+
+#[test]
+fn unsupported_object_method_parameters_do_not_hide_other_member_errors() {
+    let source = "let target:Object={toString(x?:number){return \"\";},valueOf:0};";
+    let diagnostics = object_assignment_diagnostics(source, object_assignment_options());
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code, 2322);
+    let span = diagnostics[0].span.unwrap();
+    assert_eq!(&source[span.start as usize..span.end as usize], "valueOf");
+    assert_eq!(
+        diagnostics[0].message,
+        "Type 'number' is not assignable to type '() => Object'."
+    );
+}
+
+#[test]
+fn object_member_checks_follow_library_selection_and_nullability() {
+    let source = "declare let source:{toString:number}; let target:Object=source;";
+    let mut options = object_assignment_options();
+    options.lib = vec!["es5".into()];
+    let diagnostics = object_assignment_diagnostics(source, options);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code, 2322);
+    let mut options = object_assignment_options();
+    options.no_lib = Some(true);
+    let diagnostics = object_assignment_diagnostics(
+        "interface Array<T> {} interface Boolean {} interface CallableFunction {} \
+         interface Function {} interface IArguments {} interface NewableFunction {} \
+         interface Number {} interface RegExp {} interface String {} \
+         interface Object { toString:number } declare let source:Object; let target:Object=source;",
+        options,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let mut options = object_assignment_options();
+    options.strict = Some(false);
+    let diagnostics = object_assignment_diagnostics(
+        "declare let source:{toString(x?:number):string};let target:Object=source;",
+        options,
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn global_object_jsdoc_follows_effective_no_implicit_any() {
+    for source in [
+        "/** @type {Object} */ var x={valueOf:1};",
+        "/** @param {Object} x */ function f(x){} f({valueOf:1});",
+        "/** @returns {Object} */ function f(){return {valueOf:1};}",
+        "/** @typedef {Object} Alias */ /** @type {Alias} */ var x={valueOf:1};",
+    ] {
+        for strict in [Some(true), Some(false), None] {
+            for no_implicit_any in [Some(true), Some(false), None] {
+                let options = CompilerOptions {
+                    strict,
+                    no_implicit_any,
+                    allow_js: Some(true),
+                    check_js: Some(true),
+                    ..object_assignment_options()
+                };
+                let diagnostics = object_assignment_file_diagnostics(source, "probe.js", options);
+                let codes = diagnostics.iter().map(|d| d.code).collect::<Vec<_>>();
+                if no_implicit_any.unwrap_or(strict.unwrap_or(true)) {
+                    assert_eq!(
+                        codes,
+                        vec![2322],
+                        "{source}: {strict:?}, {no_implicit_any:?}"
+                    );
+                    let start = source.find("valueOf").unwrap() as u32;
+                    assert_eq!(diagnostics[0].span, Some(Span::new(start, start + 7)));
+                } else {
+                    assert!(
+                        diagnostics.is_empty(),
+                        "{source}: {strict:?}, {no_implicit_any:?}: {diagnostics:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn global_object_typescript_override_check_is_independent_of_no_implicit_any() {
+    let source = "let x:Object={valueOf:1};";
+    for strict in [Some(true), Some(false), None] {
+        let options = CompilerOptions {
+            strict,
+            no_implicit_any: Some(false),
+            ..object_assignment_options()
+        };
+        let diagnostics = object_assignment_diagnostics(source, options);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, 2322);
+        assert_eq!(diagnostics[0].span, Some(Span::new(14, 21)));
+    }
+}
+
+#[test]
+fn global_object_jsdoc_preserves_valid_dictionary_and_shadowed_types() {
+    for source in [
+        "/** @type {object} */ var x={valueOf:1};",
+        "/** @type {Object<string,number>} */ var x={valueOf:1};",
+        "export {};class Object{valueOf=1;} /** @type {Object} */ var x={valueOf:1};",
+        "/** @type {Object} */ var x={valueOf(){return {};}};",
+    ] {
+        for no_implicit_any in [Some(true), Some(false), None] {
+            let options = CompilerOptions {
+                no_implicit_any,
+                allow_js: Some(true),
+                check_js: Some(true),
+                ..object_assignment_options()
+            };
+            let diagnostics = object_assignment_file_diagnostics(source, "probe.js", options);
+            assert!(
+                diagnostics.is_empty(),
+                "{source}: {no_implicit_any:?}: {diagnostics:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn global_object_array_errors_point_to_incompatible_property() {
+    for (filename, source) in [
+        (
+            "probe.js",
+            "/** @type {Object[]} */ const x=[{toString:1}];",
+        ),
+        ("probe.ts", "let x:Object[]=[{toString:1}];"),
+        ("probe.ts", "const x:Object[][]=[[{toString:1}]];"),
+        ("probe.ts", "const x:ReadonlyArray<Object>=[{toString:1}];"),
+        ("probe.ts", "const x:readonly Object[]=[{toString:1}];"),
+        ("probe.ts", "const x:[Object[]]=[[{toString:1}]];"),
+        (
+            "probe.ts",
+            "const x:{field:Object}[]=[{field:{toString:1}}];",
+        ),
+        (
+            "probe.ts",
+            "const x:{field:Object[]}={field:[{toString:1}]};",
+        ),
+        ("probe.ts", "const x:(Object|string)[]=[{toString:1}];"),
+        (
+            "probe.ts",
+            "declare function f(x:Object[]):void;f([{toString:1}]);",
+        ),
+        ("probe.ts", "function f():Object[]{return [{toString:1}];}"),
+    ] {
+        let diagnostics = object_assignment_file_diagnostics(
+            source,
+            filename,
+            CompilerOptions {
+                allow_js: Some(true),
+                check_js: Some(true),
+                ..object_assignment_options()
+            },
+        );
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+        assert_eq!(diagnostics[0].code, 2322);
+        let start = source.find("toString").unwrap() as u32;
+        assert_eq!(
+            diagnostics[0].span,
+            Some(Span::new(start, start + 8)),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn global_object_js_uncertainty_follows_injected_program_and_clones() {
+    let js = tsc_rs_parser::parse("library.js", "/** @param {Object} x */ function f(x){}");
+    let js = tsc_rs_types::desugar_jsdoc(&js).unwrap();
+    let consumer = tsc_rs_parser::parse("consumer.ts", "f({toString:1});");
+    let symbols = tsc_rs_symbols::bind(&consumer);
+    for consumer_first in [true, false] {
+        let files = if consumer_first {
+            vec![&consumer, &js]
+        } else {
+            vec![&js, &consumer]
+        };
+        let mut donor = TypeChecker::new();
+        donor.inject_external_types(&files);
+        // Checking a clone must retain the donor's injected JS membership,
+        // even without the separate module-resolution registration API.
+        let diagnostics = donor
+            .clone()
+            .check_with_options(
+                &consumer,
+                &symbols,
+                &CompilerOptions {
+                    no_implicit_any: Some(false),
+                    ..object_assignment_options()
+                },
+            )
+            .diagnostics;
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+}
+
+#[test]
+fn global_object_checking_js_clone_does_not_change_unrelated_ts_clone() {
+    let donor = TypeChecker::new();
+    let js = tsc_rs_parser::parse("probe.js", "/** @type {Object} */ var x={valueOf:1};");
+    let js_symbols = tsc_rs_symbols::bind(&js);
+    let options = CompilerOptions {
+        no_implicit_any: Some(false),
+        ..object_assignment_options()
+    };
+    assert!(donor
+        .clone()
+        .check_with_options(&js, &js_symbols, &options)
+        .diagnostics
+        .is_empty());
+    let ts = tsc_rs_parser::parse("probe.ts", "let x:Object={valueOf:1};");
+    let ts_symbols = tsc_rs_symbols::bind(&ts);
+    let diagnostics = donor
+        .check_with_options(&ts, &ts_symbols, &options)
+        .diagnostics;
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code, 2322);
+}
+
+#[test]
+fn global_object_preserves_shadowed_array_aliases_before_normalization() {
+    for name in ["Array", "ReadonlyArray"] {
+        let alias = format!("type {name}<T>={{toString:number}}[];");
+        let assignment = format!("let x:{name}<Object>=[{{toString:1}}];");
+        for source in [
+            format!("export {{}};{alias}{assignment}"),
+            format!("export {alias}{assignment}"),
+            format!("function f(){{{alias}{assignment}}}"),
+            format!("{{{alias}{assignment}}}"),
+            format!("const f=()=>{{{assignment}{alias}}};"),
+            format!("const f=function(){{{alias}{assignment}}};"),
+            format!("const o={{f(){{{alias}{assignment}}}}};"),
+            format!("namespace N{{export {alias}export {assignment}}}"),
+        ] {
+            let diagnostics = object_assignment_diagnostics(&source, object_assignment_options());
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn global_object_shadowed_array_uncertainty_survives_injection_and_clone() {
+    for name in ["Array", "ReadonlyArray"] {
+        // The namespace and lexical aliases can have different registry keys;
+        // the binder still records their original declaration names.
+        for source in [
+            format!("namespace N{{export type {name}<T>={{toString:number}}[];}}"),
+            format!("import type {{Other as {name}}} from './definition';"),
+            format!("const f=()=>{{type {name}<T>={{toString:number}}[];}};"),
+        ] {
+            let donor_file = tsc_rs_parser::parse("donor.ts", &source);
+            let consumer = tsc_rs_parser::parse("consumer.ts", "let x:Object={toString:1};");
+            let symbols = tsc_rs_symbols::bind(&consumer);
+            let mut donor = TypeChecker::new();
+            donor.inject_external_types(&[&consumer, &donor_file]);
+            let diagnostics = donor
+                .clone()
+                .check_with_options(&consumer, &symbols, &object_assignment_options())
+                .diagnostics;
+            // Until the erased container identity is retained, direct Object
+            // assignments in these ambiguous programs remain deferred too.
+            assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        }
+    }
+}
+
+#[test]
+fn global_object_array_shadow_does_not_disable_other_assignment_errors() {
+    let source = "export {};type Array<T>={toString:number}[];let x:number='bad';";
+    let diagnostics = object_assignment_diagnostics(source, object_assignment_options());
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code, 2322);
+    let start = source.find("x:number").unwrap() as u32;
+    assert_eq!(diagnostics[0].span, Some(Span::new(start, start + 1)));
+}
+
+#[test]
+fn global_object_jsdoc_array_typedefs_use_desugared_binding_metadata() {
+    for name in ["Array", "ReadonlyArray"] {
+        let source = format!(
+            "export {{}};/** @template T @typedef {{{{toString:number}}[]}} {name} */ \
+             /** @type {{{name}<Object>}} */ const x=[{{toString:1}}];"
+        );
+        let diagnostics = object_assignment_file_diagnostics(
+            &source,
+            "probe.js",
+            CompilerOptions {
+                allow_js: Some(true),
+                check_js: Some(true),
+                ..object_assignment_options()
+            },
+        );
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
     }
 }
