@@ -225,9 +225,35 @@ impl<'a> DeclarationEmitter<'a> {
         let named_exports = Self::named_local_exports(&file.statements);
         let (retained_names, exported_names) =
             self.collect_retained_declaration_names(&file.statements, &named_exports);
+        // An external TypeScript file with no exported declarations or module
+        // augmentations has no declaration surface that can reference an
+        // imported binding. Side-effect imports still belong in its output.
+        // JavaScript needs separate CommonJS/JSDoc export analysis.
+        let erase_private_imports = external_module
+            && file.diagnostics.is_empty()
+            && [".ts", ".tsx", ".mts", ".cts"]
+                .iter()
+                .any(|extension| file.file_name.ends_with(extension))
+            && retained_names.is_empty()
+            && !file.statements.iter().any(|statement| {
+                Self::stmt_has_direct_export_modifier(statement)
+                    || matches!(
+                        statement.kind,
+                        StmtKind::Export(_)
+                            | StmtKind::ExportAssign(_)
+                            | StmtKind::ModuleDecl(_)
+                            | StmtKind::ImportEquals(_)
+                    )
+            });
+        let omitted_import = |statement: &Stmt| {
+            erase_private_imports
+                && matches!(&statement.kind, StmtKind::Import(import) if !import.is_side_effect)
+        };
 
         for stmt in &file.statements {
-            if Self::is_function_overload_implementation(stmt, &file.statements) {
+            if omitted_import(stmt)
+                || Self::is_function_overload_implementation(stmt, &file.statements)
+            {
                 continue;
             }
             if !external_module || Self::should_emit_external_stmt(stmt, &retained_names) {
@@ -251,7 +277,8 @@ impl<'a> DeclarationEmitter<'a> {
             .iter()
             .any(Self::stmt_has_explicit_boundary_export);
         let has_emitted_module_indicator = file.statements.iter().any(|stmt| {
-            Self::should_emit_external_stmt(stmt, &retained_names)
+            !omitted_import(stmt)
+                && Self::should_emit_external_stmt(stmt, &retained_names)
                 && !Self::is_empty_binding_declaration(stmt)
                 && Self::stmt_has_module_indicator(stmt)
         });

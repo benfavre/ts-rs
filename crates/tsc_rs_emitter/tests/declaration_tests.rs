@@ -297,8 +297,11 @@ import { Component } from "react";
 import type { Props } from "./types";
 "#,
     );
-    assert!(dts.contains("import { Component } from \"react\";"));
-    assert!(dts.contains("import type { Props } from \"./types\";"));
+    assert_eq!(dts, "export {};\n");
+    assert_eq!(
+        emit_dts("import { Component } from \"react\"; import type { Props } from \"./types\"; export { Component }; export type { Props };"),
+        "import { Component } from \"react\";\nimport type { Props } from \"./types\";\nexport { Component };\nexport type { Props };\n"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -704,7 +707,11 @@ fn test_dts_optional_and_rest_params() {
 #[test]
 fn test_dts_import_namespace() {
     let dts = emit_dts("import * as path from 'path';");
-    assert!(dts.contains("import * as path from 'path';"));
+    assert_eq!(dts, "export {};\n");
+    assert_eq!(
+        emit_dts("import * as path from 'path'; export { path };"),
+        "import * as path from 'path';\nexport { path };\n"
+    );
 }
 
 // ---------------------------------------------------------------
@@ -2480,4 +2487,79 @@ fn getter_declarations_reset_source_language_eligibility() {
     let mut fresh = tsc_rs_emitter::declaration::DeclarationEmitter::new(source);
     fresh.emit_source_file(&javascript);
     assert_eq!(reused.output, fresh.output);
+}
+
+#[test]
+fn declaration_only_private_import_bindings_are_erased() {
+    for import in [
+        "import { Foo } from './dep';",
+        "import Foo from './dep';",
+        "import * as Foo from './dep';",
+        "import type { Foo } from './dep';",
+        "import { type Foo } from './dep';",
+        "import {} from './dep';",
+    ] {
+        for body in [
+            "",
+            "Foo();",
+            "const local = Foo;",
+            "function local(value: Foo) {}",
+            "class Local { value!: Foo; }",
+            "type Local = Foo;",
+        ] {
+            assert_eq!(emit_dts(&format!("{import}{body}")), "export {};\n");
+        }
+    }
+}
+
+#[test]
+fn declaration_import_erasure_preserves_side_effects_and_module_identity() {
+    assert_eq!(
+        emit_dts("import {Foo} from './dep'; import './side'; Foo();"),
+        "import './side';\n"
+    );
+    assert_eq!(
+        emit_dts("import {Foo} from './dep'; import type {} from './types'; Foo();"),
+        "export {};\n"
+    );
+    for filename in ["module.ts", "module.tsx", "module.mts", "module.cts"] {
+        assert_eq!(
+            emit_dts_named(filename, "import {Foo} from './dep'; Foo();"),
+            "export {};\n"
+        );
+    }
+}
+
+#[test]
+fn declaration_import_erasure_keeps_public_type_dependencies() {
+    assert_eq!(
+        emit_dts("import {Foo} from './dep'; export function f(): Foo {return null!;}"),
+        "import { Foo } from './dep';\nexport declare function f(): Foo;\n"
+    );
+    assert_eq!(
+        emit_dts("import {Foo} from './dep'; export {Foo};"),
+        "import { Foo } from './dep';\nexport { Foo };\n"
+    );
+    assert_eq!(
+        emit_dts("import {Foo} from './dep'; export type {Foo};"),
+        "import { Foo } from './dep';\nexport type { Foo };\n"
+    );
+}
+
+#[test]
+fn declaration_import_erasure_keeps_global_augmentation_dependencies() {
+    assert_eq!(
+        emit_dts("import {Foo} from './dep'; declare global {interface Window {foo:Foo;}}"),
+        "import { Foo } from './dep';\ndeclare global {\n    interface Window {\n        foo: Foo;\n    }\n}\n"
+    );
+}
+
+#[test]
+fn declaration_import_erasure_removes_documentation_with_erased_imports() {
+    for comment in ["/** docs */", "/*! license */", "// ordinary"] {
+        assert_eq!(
+            emit_dts(&format!("{comment}\nimport {{Foo}} from './dep'; Foo();")),
+            "export {};\n"
+        );
+    }
 }
