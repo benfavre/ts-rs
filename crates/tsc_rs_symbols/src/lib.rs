@@ -1205,6 +1205,12 @@ impl Binder {
             StmtKind::Expr(expr) => {
                 self.bind_expr(expr, file_name);
             }
+            // A bare export-assignment operand is a reference in the current
+            // scope. Complex operands require their own expression scopes.
+            StmtKind::ExportAssign(expr) if matches!(&expr.kind, ExprKind::Ident(name) if !name.contains('\\')) =>
+            {
+                self.bind_expr(expr, file_name);
+            }
             StmtKind::Return(Some(expr)) => {
                 self.bind_expr(expr, file_name);
             }

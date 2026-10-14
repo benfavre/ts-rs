@@ -92,3 +92,93 @@ fn class_members_do_not_shadow_lexical_names() {
         );
     }
 }
+
+#[test]
+fn export_assignments_reference_forward_values_types_and_merged_symbols() {
+    // TS6 getSymbolAtLocation returns the declared symbol for a bare export
+    // operand, including type-only and merged namespace declarations.
+    for declaration in [
+        "const item = 1;",
+        "class item {}",
+        "interface item {}",
+        "type item = number;",
+        "function item() {} namespace item { export const value = 1; }",
+    ] {
+        for before in [false, true] {
+            let source = if before {
+                format!("export = item;\n{declaration}")
+            } else {
+                format!("{declaration}\nexport = item;")
+            };
+            let file = tsc_rs_parser::parse("export.ts", &source);
+            assert!(file.diagnostics.is_empty(), "{source}");
+            let table = bind(&file);
+            assert!(table.diagnostics.is_empty(), "{source}");
+            let declaration_start =
+                source.find(declaration).unwrap() + declaration.find("item").unwrap();
+            let usage = source.find("export = item").unwrap() + "export = ".len();
+            let reference = table.scope_graph.reference_at(usage as u32).unwrap();
+            assert_eq!(
+                reference.symbol_id,
+                table.position_to_symbol[&(declaration_start as u32)]
+            );
+            assert_eq!(reference.span.start, usage as u32);
+            assert_eq!(reference.span.end, (usage + 4) as u32);
+            assert_eq!(
+                table.position_to_symbol[&(usage as u32)],
+                reference.symbol_id
+            );
+            if declaration.starts_with("function") {
+                assert_eq!(
+                    table
+                        .get_symbol(reference.symbol_id)
+                        .unwrap()
+                        .declarations
+                        .len(),
+                    2
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn export_assignment_references_obey_module_scope_and_do_not_create_bindings() {
+    let source = "const item = 0; declare module \"pkg\" { export = item; const item: number; } export = missing;";
+    let file = tsc_rs_parser::parse("export.ts", source);
+    let table = bind(&file);
+    let outer = table.position_to_symbol[&6];
+    let inner = table.position_to_symbol[&(source.find("item: number").unwrap() as u32)];
+    let usage = source.find("export = item").unwrap() + "export = ".len();
+    assert_ne!(outer, inner);
+    assert_eq!(
+        table
+            .scope_graph
+            .reference_at(usage as u32)
+            .unwrap()
+            .symbol_id,
+        inner
+    );
+    let missing = source.find("missing").unwrap() as u32;
+    assert!(table.scope_graph.reference_at(missing).is_none());
+    assert!(!table.position_to_symbol.contains_key(&missing));
+    assert!(table.symbols.iter().all(|symbol| symbol.name != "missing"));
+}
+
+#[test]
+fn export_assignment_function_names_do_not_conflict_with_local_bindings() {
+    for source in [
+        "export = function f() { let f = 1; return f; };",
+        "export = function f() { const f = 1; return f; };",
+        "export = function f(f: number) { return f; };",
+    ] {
+        let file = tsc_rs_parser::parse("export.ts", source);
+        assert!(file.diagnostics.is_empty(), "{source}");
+        let table = bind(&file);
+        assert!(
+            table.diagnostics.is_empty(),
+            "{source}: {:?}",
+            table.diagnostics
+        );
+    }
+}
