@@ -1933,3 +1933,119 @@ fn interface_heritage_defers_incomplete_parenthesized_recovery() {
         );
     }
 }
+
+#[test]
+fn const_asserted_object_declarations_preserve_readonly_literal_types() {
+    assert_eq!(
+        emit_dts("export const Color = { Red: 'Red', Green: 'Green', Blue: 'Blue' } as const; export type Color = typeof Color;"),
+        "export declare const Color: {\n    readonly Red: \"Red\";\n    readonly Green: \"Green\";\n    readonly Blue: \"Blue\";\n};\nexport type Color = typeof Color;\n"
+    );
+    assert_eq!(
+        emit_dts("const values = { zero: -0, radix: 0x10, large: -0x10n, truth: true } as const;"),
+        "declare const values: {\n    readonly zero: 0;\n    readonly radix: 16;\n    readonly large: -16n;\n    readonly truth: true;\n};\n"
+    );
+}
+
+#[test]
+fn const_asserted_object_declarations_preserve_scope_and_explicit_annotations() {
+    assert_eq!(
+        emit_dts("namespace N { export const x = ({ value: 1 } as const); } export const x: { value: number } = { value: 1 } as const;"),
+        "export declare const x: {\n    value: number;\n};\n"
+    );
+    assert_eq!(
+        emit_dts("export namespace N { export const x = (({ value: 1 }) as const); export const empty = <const>{}; }"),
+        "export declare namespace N {\n    const x: {\n        readonly value: 1;\n    };\n    const empty: {};\n}\n"
+    );
+    assert_eq!(
+        emit_dts("const x = { value: false } as const; export interface I { value: typeof x; }"),
+        "declare const x: {\n    readonly value: false;\n};\nexport interface I {\n    value: typeof x;\n}\nexport {};\n"
+    );
+}
+
+#[test]
+fn const_asserted_object_declarations_defer_unsupported_shapes_wholesale() {
+    for initializer in [
+        "{ x: 1, x: 2 } as const",
+        "{ x: 1, 'quoted': 2 } as const",
+        "{ x: 1, [key]: 2 } as const",
+        "{ x: 1, ...other } as const",
+        "{ x: 1, method() {} } as const",
+        "{ x: 1, get value() { return 2; } } as const",
+        "{ x: 1, value: other } as const",
+        "{ x: 1, value: null } as const",
+        "{ x: 1, value: undefined } as const",
+        r#"{ x: 1, value: '\u0041' } as const"#,
+        "({ x: 1 } as const) satisfies any",
+        "({ x: 1 } as any) as const",
+    ] {
+        assert_eq!(
+            emit_dts(&format!("const value = {initializer};")),
+            "declare const value;\n",
+            "{initializer}"
+        );
+    }
+    for keyword in ["var", "let"] {
+        assert_eq!(
+            emit_dts(&format!("{keyword} value = {{ x: 1 }} as const;")),
+            format!("declare {keyword} value;\n")
+        );
+    }
+}
+
+#[test]
+fn const_asserted_object_declarations_keep_javascript_behavior() {
+    for extension in ["js", "jsx", "mjs", "cjs"] {
+        let file = tsc_rs_parser::parse(
+            &format!("test.{extension}"),
+            "export const value = { x: 1 } as const;",
+        );
+        let options = CompilerOptions {
+            declaration: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            emit(&file, &options).declaration_file.unwrap(),
+            "export declare const value;\n",
+            "{extension}"
+        );
+    }
+}
+
+#[test]
+fn const_asserted_object_declarations_defer_unproven_literal_serialization() {
+    for initializer in [
+        "{ value: 1e400 } as const",
+        "{ value: -1e400 } as const",
+        "{ value: 'é' } as const",
+        "{ value: '😀' } as const",
+        "{ value: 1 } as const[]",
+    ] {
+        assert_eq!(
+            emit_dts(&format!("const value = {initializer};")),
+            "declare const value;\n",
+            "{initializer}"
+        );
+    }
+}
+
+#[test]
+fn const_asserted_object_declarations_reset_file_eligibility() {
+    let source = "export const value = { item: 1 } as const;";
+    let mut emitter = tsc_rs_emitter::declaration::DeclarationEmitter::new(source);
+    for (file_name, expected) in [
+        (
+            "test.ts",
+            "export declare const value: {\n    readonly item: 1;\n};\n",
+        ),
+        ("test.js", "export declare const value;\n"),
+        (
+            "test.ts",
+            "export declare const value: {\n    readonly item: 1;\n};\n",
+        ),
+    ] {
+        emitter.output.clear();
+        let file = tsc_rs_parser::parse(file_name, source);
+        emitter.emit_source_file(&file);
+        assert_eq!(emitter.output, expected, "{file_name}");
+    }
+}

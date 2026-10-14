@@ -46,6 +46,7 @@ pub struct DeclarationEmitter<'a> {
     default_export_names_ambiguous: bool,
     constructor_property_scopes: Vec<HashMap<String, ConstructorPropertyType>>,
     constructor_property_namespace_counts: HashMap<Vec<String>, usize>,
+    can_emit_const_literal_objects: bool,
 }
 
 impl<'a> DeclarationEmitter<'a> {
@@ -74,6 +75,7 @@ impl<'a> DeclarationEmitter<'a> {
             default_export_names_ambiguous: false,
             constructor_property_scopes: Vec::new(),
             constructor_property_namespace_counts: HashMap::new(),
+            can_emit_const_literal_objects: false,
         }
     }
 
@@ -167,6 +169,13 @@ impl<'a> DeclarationEmitter<'a> {
         );
         self.constructor_property_scopes
             .push(Self::constructor_property_scope(&file.statements));
+        let file_name = file.file_name.to_ascii_lowercase();
+        let is_javascript = [".js", ".jsx", ".mjs", ".cjs"]
+            .iter()
+            .any(|extension| file_name.ends_with(extension));
+        // Recovery can misrepresent assertion types such as `as const[]`.
+        // Preserve existing output when the syntax is not reliably available.
+        self.can_emit_const_literal_objects = !is_javascript && file.diagnostics.is_empty();
         self.collect_inferred_types(file);
         self.collect_shorthand_function_objects(file);
         let forced_module = Self::has_module_file_identity(file);
@@ -2131,6 +2140,26 @@ impl<'a> DeclarationEmitter<'a> {
                     }
                     self.indent -= 1;
                     self.write("}");
+                } else if let Some(properties) = (var_stmt.kind == VarKind::Const
+                    && matches!(decl.name.kind, PatKind::Ident(_))
+                    && self.can_emit_const_literal_objects)
+                    .then(|| Self::const_asserted_literal_properties(init))
+                    .flatten()
+                {
+                    self.write(": {");
+                    if !properties.is_empty() {
+                        self.newline();
+                        self.indent += 1;
+                        for (name, literal) in properties {
+                            self.write("readonly ");
+                            self.write(name);
+                            self.write(": ");
+                            self.write(&literal);
+                            self.writeln(";");
+                        }
+                        self.indent -= 1;
+                    }
+                    self.write("}");
                 } else if let Some(ty) = self.infer_var_type_text(init) {
                     self.write(": ");
                     self.write(&ty);
@@ -2344,6 +2373,64 @@ impl<'a> DeclarationEmitter<'a> {
                 .iter()
                 .any(|scope| scope.contains(name))
         })
+    }
+
+    fn const_asserted_literal_properties(expr: &Expr) -> Option<Vec<(&str, String)>> {
+        fn unparenthesized(mut expr: &Expr) -> &Expr {
+            while let ExprKind::Paren(inner) = &expr.kind {
+                expr = inner;
+            }
+            expr
+        }
+
+        let (expression, assertion) = match &unparenthesized(expr).kind {
+            ExprKind::As(assertion) => (&assertion.expr, &assertion.type_node),
+            ExprKind::TypeAssertion(assertion) => (&assertion.expr, &assertion.type_node),
+            _ => return None,
+        };
+        let TypeNodeKind::Reference(reference) = &assertion.kind else {
+            return None;
+        };
+        if !matches!(&reference.name.kind, ExprKind::Ident(name) if name == "const")
+            || reference.type_args.is_some()
+        {
+            return None;
+        }
+        let ExprKind::ObjectLit(properties) = &unparenthesized(expression).kind else {
+            return None;
+        };
+        let mut names = HashSet::new();
+        let mut result = Vec::with_capacity(properties.len());
+        for property in properties {
+            let ObjLitProp::Property(property) = property else {
+                return None;
+            };
+            let PropName::Ident(name, _) = &property.key else {
+                return None;
+            };
+            if property.computed
+                || property.question_token
+                || name.contains('\\')
+                || !names.insert(name.as_str())
+            {
+                return None;
+            }
+            // Keep this syntax-only path independent of binding and widening.
+            // Other property shapes, nullish values, and string escapes need
+            // broader inference or decoding before their types can be emitted.
+            if matches!(&unparenthesized(&property.value).kind,
+                ExprKind::StrLit(text) | ExprKind::NoSubstTemplate(text)
+                    if !text.is_ascii() || text.contains('\\') || text.contains('\r'))
+            {
+                return None;
+            }
+            let literal = Self::const_initializer_text(&property.value)?;
+            if literal.parse::<f64>().is_ok_and(|value| !value.is_finite()) {
+                return None;
+            }
+            result.push((name.as_str(), literal));
+        }
+        Some(result)
     }
 
     fn emit_module_decl(&mut self, module_decl: &ModuleDecl) {
