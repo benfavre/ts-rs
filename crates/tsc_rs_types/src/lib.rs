@@ -19309,8 +19309,8 @@ impl TypeChecker {
         None
     }
 
-    /// Attach `note` to the diagnostic just pushed (if any, and if it has no
-    /// related information yet).
+    /// Attach the expected-origin note to the diagnostic just pushed. A
+    /// missing-member declaration note comes first and does not replace it.
     fn attach_note_to_last(&mut self, before: usize, note: Option<RelatedDiagnostic>) {
         if self.diagnostics.len() <= before {
             return;
@@ -19319,8 +19319,14 @@ impl TypeChecker {
             return;
         };
         if let Some(last) = self.diagnostics.last_mut() {
-            if last.related.is_none() {
-                last.related = Some(vec![note]);
+            if last.related.is_none()
+                || last.code == 2741
+                    && last
+                        .related
+                        .as_ref()
+                        .is_some_and(|related| related.iter().all(|item| item.code == 2728))
+            {
+                last.related.get_or_insert_with(Vec::new).push(note);
             }
         }
     }
@@ -19928,6 +19934,7 @@ impl TypeChecker {
                 }
             }
         }
+        let named_target = target;
         // Resolve locally-declared class instances to structural form so the
         // missing-property refinement (TS2741/2739) fires for class-to-class
         // assignments (chainedAssignment1: 'Z' missing 'a' required by 'X').
@@ -20043,18 +20050,83 @@ impl TypeChecker {
                 }
             }
         }
-        if let Some(missing) = crate::assign::pure_missing_properties(target, source)
-            .filter(|_| !self.unmatched_property_error_suppressed(source, target))
-        {
+        // A named interface has the same missing required members as its
+        // inherited instance shape. Keep the original type for all other
+        // elaboration, and only use this expansion for the missing-only test.
+        // Generic and memberless inherited interfaces retain their existing
+        // path until their inferred arguments/base display are modeled here.
+        // These registries do not retain lexical ownership for a local
+        // same-name declaration. Preserve the existing diagnostic when a
+        // source or target name can refer to a nested type binding.
+        let nested_reference = |ty: &Type| match ty {
+            Type::TypeReference(name, _) => name
+                .split('.')
+                .any(|part| self.nested_scope_declares_type_name(part)),
+            _ => false,
+        };
+        let missing_source = match source {
+            Type::TypeReference(name, args)
+                if args.is_empty()
+                    && !nested_reference(source)
+                    && !nested_reference(named_target)
+                    && self.interface_info.get(name.as_str()).is_some_and(|info| {
+                        info.type_params.is_empty()
+                            && (info.extends.is_empty() || !info.member_locations.is_empty())
+                    })
+                    && self.active_type_parameter_name(source).is_none() =>
+            {
+                self.resolve_type_reference_to_object(name, args)
+            }
+            _ => None,
+        };
+        let missing_target = if missing_source.is_some() {
+            named_target
+        } else {
+            target
+        };
+        if let Some(missing) = crate::assign::pure_missing_properties(
+            target,
+            missing_source.as_ref().unwrap_or(source),
+        )
+        .filter(|_| !self.unmatched_property_error_suppressed(source, target))
+        .filter(|missing| {
+            missing_source.is_none()
+                || missing.iter().all(|name| {
+                    // Class metadata does not retain quoted/computed name
+                    // spelling. Only refine when the existing printer or
+                    // declaration-name span establishes the spelling exactly.
+                    self.member_name_as_written(named_target, name) != *name
+                        || self.named_member_location(named_target, name).is_some_and(
+                            |(file, span)| {
+                                // Parameter-property notes need the full
+                                // parameter span, not the stored name span.
+                                !self.class_info.iter().any(|(_, class)| {
+                                    class.member_locations.get(name).is_some_and(
+                                        |(decl_file, decl_span)| {
+                                            decl_file == &file && *decl_span == span
+                                        },
+                                    ) && class
+                                        .constructor_params
+                                        .iter()
+                                        .any(|(param, ..)| param == name)
+                                }) && self.current_file_name.as_deref() == Some(file.as_str())
+                                    && self.current_source.as_deref().and_then(|source| {
+                                        source.get(span.start as usize..span.end as usize)
+                                    }) == Some(name.as_str())
+                            },
+                        )
+                })
+        }) {
             if missing.len() == 1 {
                 {
                     let mut diagnostic = diagnostics::error_property_missing_single(
-                        &self.member_name_as_written(target, &missing[0]),
+                        &self.member_name_as_written(missing_target, &missing[0]),
                         &missing_src_disp,
                         &tgt_disp,
                         span,
                     );
-                    diagnostic.related = self.missing_member_note(target, &tgt_disp, &missing[0]);
+                    diagnostic.related =
+                        self.missing_member_note(missing_target, &tgt_disp, &missing[0]);
                     self.diagnostics.push(diagnostic);
                 }
             } else {

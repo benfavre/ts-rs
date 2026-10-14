@@ -1875,3 +1875,593 @@ fn overload_arity_retains_uniform_exports_and_module_local_library_names() {
         assert_eq!(diagnostics[0].related, None);
     }
 }
+
+// TypeScript 6.0.3 controls for missing-property diagnostic refinement.
+type Note<'a> = (u32, &'a str, u32, u32, &'a str);
+type Expected<'a> = (u32, u32, u32, &'a str, &'a [Note<'a>]);
+
+const STRICT_OPTIONS: [(Option<bool>, Option<bool>); 5] = [
+    (None, None),
+    (Some(true), None),
+    (Some(false), None),
+    (Some(true), Some(false)),
+    (Some(false), Some(true)),
+];
+
+fn assert_missing_property_diagnostics(
+    source: &str,
+    strict: Option<bool>,
+    strict_null_checks: Option<bool>,
+    expected: &[Expected<'_>],
+) {
+    let file = tsc_rs_parser::parse("probe.ts", source);
+    assert!(file.diagnostics.is_empty(), "{source}");
+    let symbols = tsc_rs_symbols::bind(&file);
+    let result = TypeChecker::new().check_with_options(
+        &file,
+        &symbols,
+        &CompilerOptions {
+            strict,
+            strict_null_checks,
+            target: Some(tsc_rs_ast::ScriptTarget::ES2015),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        result.diagnostics.len(),
+        expected.len(),
+        "{source}: {:?}",
+        result.diagnostics
+    );
+    for (diagnostic, &(code, start, end, message, notes)) in result.diagnostics.iter().zip(expected)
+    {
+        assert_eq!(diagnostic.code, code, "{source}");
+        let span = diagnostic.span.expect("diagnostic span");
+        assert_eq!((span.start, span.end), (start, end), "{source}");
+        assert_eq!(diagnostic.message, message, "{source}");
+        assert_eq!(
+            diagnostic.file_name.as_deref().unwrap_or("probe.ts"),
+            "probe.ts"
+        );
+        let related = diagnostic.related.as_deref().unwrap_or_default();
+        assert_eq!(related.len(), notes.len(), "{source}: {related:?}");
+        for (actual, &(code, file, start, end, message)) in related.iter().zip(notes) {
+            assert_eq!(actual.code, code, "{source}");
+            assert_eq!(actual.file_name.as_deref(), Some(file), "{source}");
+            let span = actual.span.expect("related diagnostic span");
+            assert_eq!((span.start, span.end), (start, end), "{source}");
+            assert_eq!(actual.message, message, "{source}");
+        }
+    }
+}
+
+#[test]
+fn interface_missing_properties_retain_named_targets_and_declarations() {
+    // inherited_private
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"class C { private x=1; foo(x:any){return x;} } interface I extends C {other(x:any):any;} class D extends C implements I {other(x:any){return x;} bar(){} } declare let i:I; declare let d:D; d=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                189,
+                190,
+                r#"Property 'bar' is missing in type 'I' but required in type 'D'."#,
+                &[(2728, r#"probe.ts"#, 145, 148, r#"'bar' is declared here."#)],
+            )],
+        );
+    }
+    // simple_interface_class
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                64,
+                65,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[(2728, r#"probe.ts"#, 37, 38, r#"'b' is declared here."#)],
+            )],
+        );
+    }
+    // simple_interface_shape
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} declare let i:I; let c:{a:number;b:number}=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                45,
+                46,
+                r#"Property 'b' is missing in type 'I' but required in type '{ a: number; b: number; }'."#,
+                &[(2728, r#"probe.ts"#, 57, 58, r#"'b' is declared here."#)],
+            )],
+        );
+    }
+    // optional_source
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a?:number;} class C {a=1;b=2;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                65,
+                66,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[(2728, r#"probe.ts"#, 38, 39, r#"'b' is declared here."#)],
+            )],
+        );
+    }
+    // readonly_source
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {readonly a:number;} class C {a=1;b=2;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                73,
+                74,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[(2728, r#"probe.ts"#, 46, 47, r#"'b' is declared here."#)],
+            )],
+        );
+    }
+    // readonly_target
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;readonly b=2;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                73,
+                74,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[(2728, r#"probe.ts"#, 46, 47, r#"'b' is declared here."#)],
+            )],
+        );
+    }
+    // multiple_missing
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;c=3;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2739,
+                68,
+                69,
+                r#"Type 'I' is missing the following properties from type 'C': b, c"#,
+                &[],
+            )],
+        );
+    }
+    // many_missing
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;c=3;d=4;e=5;f=6;g=7;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2740,
+                84,
+                85,
+                r#"Type 'I' is missing the following properties from type 'C': b, c, d, e, and 2 more."#,
+                &[],
+            )],
+        );
+    }
+    // interface_inheritance
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface B {a:number;} interface I extends B {b:string;} class C {a=1;b="";c=true;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                106,
+                107,
+                r#"Property 'c' is missing in type 'I' but required in type 'C'."#,
+                &[(2728, r#"probe.ts"#, 76, 77, r#"'c' is declared here."#)],
+            )],
+        );
+    }
+    // namespace_external
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"namespace N {export interface I {a:number;} export class C {a=1;b=2;}} declare let i:N.I; let c:N.C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                94,
+                95,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[(2728, r#"probe.ts"#, 64, 65, r#"'b' is declared here."#)],
+            )],
+        );
+    }
+    // merged_interface
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} interface I {b:string;} class C {a=1;b="";c=2;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                93,
+                94,
+                r#"Property 'c' is missing in type 'I' but required in type 'C'."#,
+                &[(2728, r#"probe.ts"#, 66, 67, r#"'c' is declared here."#)],
+            )],
+        );
+    }
+}
+
+#[test]
+fn missing_property_notes_include_expected_property_origins() {
+    // nested_property
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;} declare let i:I; let c:{x:C}={x:i};"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                73,
+                74,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[
+                    (2728, r#"probe.ts"#, 37, 38, r#"'b' is declared here."#),
+                    (
+                        6500,
+                        r#"probe.ts"#,
+                        67,
+                        68,
+                        r#"The expected type comes from property 'x' which is declared here on type '{ x: C; }'"#,
+                    ),
+                ],
+            )],
+        );
+    }
+    // nested_shape
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"class C {a=1;b=2;} declare let i:{a:number}; let c:{x:C}={x:i};"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                58,
+                59,
+                r#"Property 'b' is missing in type '{ a: number; }' but required in type 'C'."#,
+                &[
+                    (2728, r#"probe.ts"#, 13, 14, r#"'b' is declared here."#),
+                    (
+                        6500,
+                        r#"probe.ts"#,
+                        52,
+                        53,
+                        r#"The expected type comes from property 'x' which is declared here on type '{ x: C; }'"#,
+                    ),
+                ],
+            )],
+        );
+    }
+    // nested_class
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"class A {a=1;} class C {a=1;b=2;} declare let i:A; let c:{x:C}={x:i};"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                64,
+                65,
+                r#"Property 'b' is missing in type 'A' but required in type 'C'."#,
+                &[
+                    (2728, r#"probe.ts"#, 28, 29, r#"'b' is declared here."#),
+                    (
+                        6500,
+                        r#"probe.ts"#,
+                        58,
+                        59,
+                        r#"The expected type comes from property 'x' which is declared here on type '{ x: C; }'"#,
+                    ),
+                ],
+            )],
+        );
+    }
+    // nested_interface_target
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} interface C {a:number;b:number;} declare let i:I; let c:{x:C}={x:i};"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                87,
+                88,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[
+                    (2728, r#"probe.ts"#, 46, 47, r#"'b' is declared here."#),
+                    (
+                        6500,
+                        r#"probe.ts"#,
+                        81,
+                        82,
+                        r#"The expected type comes from property 'x' which is declared here on type '{ x: C; }'"#,
+                    ),
+                ],
+            )],
+        );
+    }
+    // nested_deep
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;} declare let i:I; let c:{x:{y:C}}={x:{y:i}};"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                80,
+                81,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[
+                    (2728, r#"probe.ts"#, 37, 38, r#"'b' is declared here."#),
+                    (
+                        6500,
+                        r#"probe.ts"#,
+                        70,
+                        71,
+                        r#"The expected type comes from property 'y' which is declared here on type '{ y: C; }'"#,
+                    ),
+                ],
+            )],
+        );
+    }
+    // nested_named_outer
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;} interface O {x:C;} declare let i:I; let c:O={x:i};"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                88,
+                89,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[
+                    (2728, r#"probe.ts"#, 37, 38, r#"'b' is declared here."#),
+                    (
+                        6500,
+                        r#"probe.ts"#,
+                        56,
+                        57,
+                        r#"The expected type comes from property 'x' which is declared here on type 'O'"#,
+                    ),
+                ],
+            )],
+        );
+    }
+    // nested_index_outer
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;} declare let i:I; let c:{[x:string]:C}={x:i};"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                82,
+                83,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[
+                    (2728, r#"probe.ts"#, 37, 38, r#"'b' is declared here."#),
+                    (
+                        6501,
+                        r#"probe.ts"#,
+                        67,
+                        79,
+                        r#"The expected type comes from this index signature."#,
+                    ),
+                ],
+            )],
+        );
+    }
+    // nested_optional_outer
+    for (strict, strict_null_checks) in
+        [(None, None), (Some(true), None), (Some(false), Some(true))]
+    {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;} declare let i:I; let c:{x?:C}={x:i};"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                74,
+                75,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[
+                    (2728, r#"probe.ts"#, 37, 38, r#"'b' is declared here."#),
+                    (
+                        6500,
+                        r#"probe.ts"#,
+                        67,
+                        68,
+                        r#"The expected type comes from property 'x' which is declared here on type '{ x?: C | undefined; }'"#,
+                    ),
+                ],
+            )],
+        );
+    }
+    for (strict, strict_null_checks) in [(Some(false), None), (Some(true), Some(false))] {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;} declare let i:I; let c:{x?:C}={x:i};"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                74,
+                75,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[
+                    (2728, r#"probe.ts"#, 37, 38, r#"'b' is declared here."#),
+                    (
+                        6500,
+                        r#"probe.ts"#,
+                        67,
+                        68,
+                        r#"The expected type comes from property 'x' which is declared here on type '{ x?: C; }'"#,
+                    ),
+                ],
+            )],
+        );
+    }
+    // nested_readonly_outer
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;} declare let i:I; let c:{readonly x:C}={x:i};"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2741,
+                82,
+                83,
+                r#"Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[
+                    (2728, r#"probe.ts"#, 37, 38, r#"'b' is declared here."#),
+                    (
+                        6500,
+                        r#"probe.ts"#,
+                        76,
+                        77,
+                        r#"The expected type comes from property 'x' which is declared here on type '{ readonly x: C; }'"#,
+                    ),
+                ],
+            )],
+        );
+    }
+}
+
+#[test]
+fn missing_property_refinement_preserves_supported_controls() {
+    // optional_target
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b?:number;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[],
+        );
+    }
+    // mismatch_only
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:string;} class C {a=1;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2322,
+                60,
+                61,
+                r#"Type 'I' is not assignable to type 'C'.
+  Types of property 'a' are incompatible.
+    Type 'string' is not assignable to type 'number'."#,
+                &[],
+            )],
+        );
+    }
+    // argument
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;} declare let i:I; declare function f(c:C):void; f(i);"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2345,
+                92,
+                93,
+                r#"Argument of type 'I' is not assignable to parameter of type 'C'.
+  Property 'b' is missing in type 'I' but required in type 'C'."#,
+                &[(2728, r#"probe.ts"#, 37, 38, r#"'b' is declared here."#)],
+            )],
+        );
+    }
+    // Non-strict nullable-union diagnostics remain a separate existing gap.
+    // null_union
+    for (strict, strict_null_checks) in
+        [(None, None), (Some(true), None), (Some(false), Some(true))]
+    {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;} class C {a=1;b=2;} declare let i:I|null; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[(
+                2322,
+                69,
+                70,
+                r#"Type 'I | null' is not assignable to type 'C'.
+  Type 'null' is not assignable to type 'C'."#,
+                &[],
+            )],
+        );
+    }
+    // valid
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"interface I {a:number;b:number;} class C {a=1;b=2;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[],
+        );
+    }
+    // private_valid
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            r#"class B {private b=2;} interface I extends B {a:number;} class C extends B {a=1;} declare let i:I; let c:C=i;"#,
+            strict,
+            strict_null_checks,
+            &[],
+        );
+    }
+}
+
+#[test]
+fn scoped_type_identity_keeps_existing_fallback() {
+    // These are preservation controls for the diagnostic-only refinement.
+    // Lexical type resolution still has a separate gap here: TypeScript 6
+    // accepts the first, second and fourth sources, and reports TS2741 at
+    // the third with the inner class declaration note. Until the underlying
+    // relation resolves that identity, do not replace its existing fallback
+    // with a different incorrect diagnostic or an outer declaration note.
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            "interface I{x:number;}class C{x=1;y=2;}function f(){interface I{x:number;y:number;}let i!:I;let c:C=i;}", strict, strict_null_checks,
+            &[(2322, 96, 97, "Type 'I' is not assignable to type 'C'.\n  Property 'y' is missing in type 'I' but required in type '{ x: number; y: number; }'.", &[])],
+        );
+    }
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            "interface I{x:number;}class C{x=1;y=2;}function f(){type I={x:number;y:number;};let i!:I;let c:C=i;}", strict, strict_null_checks,
+            &[(2322, 93, 94, "Type 'I' is not assignable to type 'C'.\n  Property 'y' is missing in type 'I' but required in type '{ x: number; y: number; }'.", &[])],
+        );
+    }
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            "interface I{x:number;}class C{x=1;y=2;}function f(){class C{x=1;y=2;}let i!:I;let c:C=i;}", strict, strict_null_checks,
+            &[(2322, 82, 83, "Type 'I' is not assignable to type 'C'.\n  Property 'y' is missing in type 'I' but required in type '{ x: number; y: number; }'.", &[])],
+        );
+    }
+    for (strict, strict_null_checks) in STRICT_OPTIONS {
+        assert_missing_property_diagnostics(
+            "interface I{x:number;}class C{x=1;y=2;}function f(){class C{x=1;}let i!:I;let c:C=i;}", strict, strict_null_checks,
+            &[(2322, 78, 79, "Type 'I' is not assignable to type 'C'.\n  Property 'y' is missing in type 'I' but required in type '{ x: number; y: number; }'.", &[])],
+        );
+    }
+}
