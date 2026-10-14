@@ -1185,3 +1185,174 @@ fn test_dts_signature_parameter_values_shadow_generic_constructors() {
         }
     }
 }
+
+#[test]
+fn test_dts_fresh_null_initializers_widen_without_strict_null_checks() {
+    let emit_non_strict = |source| {
+        let file = tsc_rs_parser::parse("test.ts", source);
+        emit(
+            &file,
+            &CompilerOptions {
+                declaration: Some(true),
+                strict: Some(false),
+                ..Default::default()
+            },
+        )
+        .declaration_file
+        .unwrap()
+    };
+    assert_eq!(
+        emit_non_strict("const c = null, p = (null), s = null satisfies null, n = null!; let l = null; var v = null;"),
+        "declare const c: any, p: any, s: any, n: any;\ndeclare let l: any;\ndeclare var v: any;\n"
+    );
+    assert_eq!(
+        emit_non_strict("namespace N { export const value = null; } class C { value = null; readonly immutable = null; }"),
+        "declare namespace N {\n    const value: any;\n}\ndeclare class C {\n    value: any;\n    readonly immutable: any;\n}\n"
+    );
+}
+
+#[test]
+fn test_dts_explicit_null_types_do_not_widen() {
+    assert_eq!(
+        emit_dts("const typed: null = null, asserted = null as null, cast = <null>null, wrapped = (null as null) satisfies null; class C { value: null = null; asserted = null as null; }"),
+        "declare const typed: null, asserted: null, cast: null, wrapped: null;\ndeclare class C {\n    value: null;\n    asserted: null;\n}\n"
+    );
+}
+
+#[test]
+fn test_dts_null_initializer_widening_respects_strict_option_precedence() {
+    let file = tsc_rs_parser::parse("test.ts", "const c = null; class C { value = null; }");
+    for (strict, strict_null_checks, ty) in [
+        (None, None, "null"),
+        (None, Some(true), "null"),
+        (None, Some(false), "any"),
+        (Some(false), None, "any"),
+        (Some(true), None, "null"),
+        (Some(false), Some(true), "null"),
+        (Some(true), Some(false), "any"),
+    ] {
+        let options = CompilerOptions {
+            declaration: Some(true),
+            strict,
+            strict_null_checks,
+            ..Default::default()
+        };
+        assert_eq!(
+            emit(&file, &options).declaration_file.unwrap(),
+            format!("declare const c: {ty};\ndeclare class C {{\n    value: {ty};\n}}\n")
+        );
+    }
+}
+
+#[test]
+fn test_dts_assertions_over_widened_null_preserve_all_public_positions() {
+    // Exact declaration output from TypeScript 6.0.3.
+    for (source, expected) in [
+        (
+            "const fresh=null; export const asserted=fresh as null;",
+            "export declare const asserted: null;\n",
+        ),
+        (
+            "const fresh=null; export const cast=<null>fresh;",
+            "export declare const cast: null;\n",
+        ),
+        (
+            "const fresh=null; export function f(){return fresh as null;}",
+            "export declare function f(): null;\n",
+        ),
+        (
+            "const fresh=null; export class C{value=fresh as null;}",
+            "export declare class C {\n    value: null;\n}\n",
+        ),
+        (
+            "const fresh=null; export class C{constructor(public value=fresh as null){}}",
+            "export declare class C {\n    value: null;\n    constructor(value?: null);\n}\n",
+        ),
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        for (strict, strict_null_checks) in [
+            (None, None),
+            (Some(false), None),
+            (Some(true), None),
+            (Some(true), Some(false)),
+            (Some(false), Some(true)),
+        ] {
+            let options = CompilerOptions {
+                declaration: Some(true),
+                strict,
+                strict_null_checks,
+                ..Default::default()
+            };
+            assert_eq!(
+                emit(&file, &options).declaration_file.unwrap(),
+                expected,
+                "{source}; strict={strict:?}; strict_null_checks={strict_null_checks:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_dts_null_assertion_wrappers_keep_existing_declaration_inference() {
+    // TypeScript 6.0.3 emits these declarations even for invalid as-const inputs.
+    for source in [
+        "const fresh=null; export const v=(fresh as null) as const;",
+        "const fresh=null; export const v=(fresh as string) as null;",
+        "const fresh=null; export const v=((fresh as null) as const);",
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        for (strict, strict_null_checks) in [
+            (false, None),
+            (true, None),
+            (true, Some(false)),
+            (false, Some(true)),
+        ] {
+            let options = CompilerOptions {
+                declaration: Some(true),
+                strict: Some(strict),
+                strict_null_checks,
+                ..Default::default()
+            };
+            assert_eq!(
+                emit(&file, &options).declaration_file.unwrap(),
+                "export declare const v: null;\n",
+                "{source}, strict={strict}, strict_null_checks={strict_null_checks:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_dts_nullish_assertions_keep_existing_non_strict_inference() {
+    // Existing non-null alias narrowing with strict null checks disabled.
+    for source in [
+        "const fresh=null; export const v=(fresh as (null))!;",
+        "const fresh=null; export const v=(fresh as (null|undefined))!;",
+        "type N=null; const fresh=null; export const v=(fresh as N)!;",
+        "type N=null|undefined; const fresh=null; export const v=(fresh as N)!;",
+        "type N=undefined|null; const fresh=null; export const v=(fresh as N)!;",
+        "const fresh=null;export const v=(fresh as ((null)|(undefined)))!;",
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        for (strict, strict_null_checks) in [(false, None), (true, Some(false))] {
+            let options = CompilerOptions {
+                declaration: Some(true),
+                strict: Some(strict),
+                strict_null_checks,
+                ..Default::default()
+            };
+            assert_eq!(
+                emit(&file, &options).declaration_file.unwrap(),
+                "export declare const v: null;\n",
+                "{source}, strict={strict}, strict_null_checks={strict_null_checks:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_dts_omitted_strict_options_preserve_fresh_null() {
+    // Exact TS6 output. A later for-in binding does not affect the declaration.
+    let source = "let l9=0,l10:string=\"\",l11=null;for(let l11 in {}){} const c=null;var v=null;namespace N{export const value=null;}class C{value=null;readonly immutable=null;}";
+    assert_eq!(emit_dts(source), "declare let l9: number, l10: string, l11: null;\ndeclare const c: null;\ndeclare var v: null;\ndeclare namespace N {\n    const value: null;\n}\ndeclare class C {\n    value: null;\n    readonly immutable: null;\n}\n");
+}

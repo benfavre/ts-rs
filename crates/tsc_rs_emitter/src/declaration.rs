@@ -32,6 +32,7 @@ pub struct DeclarationEmitter<'a> {
     strict_null_checks: bool,
     comments: Vec<Comment>,
     remove_comments: bool,
+    widen_fresh_null_initializers: bool,
 }
 
 impl<'a> DeclarationEmitter<'a> {
@@ -53,6 +54,7 @@ impl<'a> DeclarationEmitter<'a> {
             strict_null_checks: false,
             comments: Vec::new(),
             remove_comments: false,
+            widen_fresh_null_initializers: false,
         }
     }
 
@@ -62,6 +64,10 @@ impl<'a> DeclarationEmitter<'a> {
             .strict_null_checks
             .unwrap_or(options.strict.unwrap_or(false));
         emitter.remove_comments = options.remove_comments == Some(true);
+        // TypeScript 6 enables strict null checks by default. Limit this new
+        // widening behavior to an explicitly disabled effective option.
+        emitter.widen_fresh_null_initializers =
+            options.strict_null_checks.or(options.strict) == Some(false);
         emitter
     }
 
@@ -2112,7 +2118,7 @@ impl<'a> DeclarationEmitter<'a> {
                     let Some(init) = decl.init.as_deref() else {
                         continue;
                     };
-                    let Some(ty) = self.infer_var_type_text(init) else {
+                    let Some(ty) = self.infer_cached_var_type_text(init) else {
                         continue;
                     };
                     self.inferred_var_types.insert(name.to_string(), ty);
@@ -2196,6 +2202,28 @@ impl<'a> DeclarationEmitter<'a> {
     }
 
     fn infer_var_type_text(&mut self, expr: &Expr) -> Option<String> {
+        // Fresh null initializers widen to any without strict null checks.
+        // Parentheses, non-null assertions and satisfies do not introduce an
+        // explicit type, while `as null` and `<null>` must retain that type.
+        match &expr.kind {
+            ExprKind::NullLit if self.widen_fresh_null_initializers => {
+                return Some("any".to_string());
+            }
+            ExprKind::Paren(inner) | ExprKind::NonNull(inner) => {
+                return self.infer_var_type_text(inner);
+            }
+            ExprKind::Satisfies(expression) => {
+                return self.infer_var_type_text(&expression.expr);
+            }
+            _ => {}
+        }
+        self.infer_cached_var_type_text(expr)
+    }
+
+    // The cache retains the existing initializer inference. Widening a fresh
+    // null declaration must not change the operand type seen through a later
+    // assertion, such as `const n = null; export const value = n as null`.
+    fn infer_cached_var_type_text(&mut self, expr: &Expr) -> Option<String> {
         let expr = self.unwrap_inference_expr(expr);
         match &expr.kind {
             ExprKind::Member(_) => self
@@ -2232,6 +2260,7 @@ impl<'a> DeclarationEmitter<'a> {
                 renderer.indent = self.indent;
                 renderer.at_line_start = false;
                 renderer.strict_null_checks = self.strict_null_checks;
+                renderer.widen_fresh_null_initializers = self.widen_fresh_null_initializers;
                 renderer.write(&name);
                 renderer.write("<");
                 for (index, argument) in arguments.iter().enumerate() {
