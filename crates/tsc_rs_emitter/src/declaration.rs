@@ -49,6 +49,7 @@ pub struct DeclarationEmitter<'a> {
     comments: Vec<Comment>,
     remove_comments: bool,
     widen_fresh_null_initializers: bool,
+    allow_global_undefined_returns: bool,
     callable_namespace_scopes: Vec<HashSet<String>>,
     allow_scoped_callables: bool,
     uncertain_callable_dependencies: HashSet<String>,
@@ -83,6 +84,7 @@ impl<'a> DeclarationEmitter<'a> {
             comments: Vec::new(),
             remove_comments: false,
             widen_fresh_null_initializers: false,
+            allow_global_undefined_returns: false,
             callable_namespace_scopes: Vec::new(),
             allow_scoped_callables: false,
             uncertain_callable_dependencies: HashSet::new(),
@@ -187,6 +189,10 @@ impl<'a> DeclarationEmitter<'a> {
 
     pub fn emit_source_file(&mut self, file: &SourceFile) {
         self.comments.clone_from(&file.comments);
+        // These JavaScript extensions still need declaration module-identity
+        // resolution before a private function's inferred signature is emitted.
+        self.allow_global_undefined_returns =
+            !file.file_name.ends_with(".mjs") && !file.file_name.ends_with(".cjs");
         self.prepare_js_arguments_functions(file);
         // JavaScript accessors also depend on JSDoc and program-level context.
         // Recovered syntax cannot establish accessor ownership reliably.
@@ -1431,6 +1437,9 @@ impl<'a> DeclarationEmitter<'a> {
             self.emit_type_node(ret);
         } else if fn_decl.body.is_none() {
             self.write(": any");
+        } else if let Some(ret) = self.global_undefined_return_type(fn_decl) {
+            self.write(": ");
+            self.write(ret);
         } else if let Some(ret) = self.single_return_type(
             fn_decl.body.as_deref(),
             &fn_decl.params,
@@ -1675,6 +1684,77 @@ impl<'a> DeclarationEmitter<'a> {
             }
             _ => None,
         }
+    }
+
+    fn global_undefined_return_type(&self, function: &FnDecl) -> Option<&'static str> {
+        if !self.allow_global_undefined_returns || function.is_async || function.is_generator {
+            return None;
+        }
+        let [statement] = function.body.as_deref()? else {
+            return None;
+        };
+        let StmtKind::Return(Some(expression)) = &statement.kind else {
+            return None;
+        };
+        let mut expression = expression.as_ref();
+        while let ExprKind::Paren(inner) = &expression.kind {
+            expression = inner;
+        }
+        if !matches!(&expression.kind, ExprKind::Ident(name) if name == "undefined") {
+            return None;
+        }
+        // Type-only declarations can also change the checker's recovery for
+        // this name. Merged namespaces and global augmentations need a program
+        // symbol table, so retain existing inference in those environments.
+        if self.constructor_property_scopes.iter().any(|scope| {
+            scope.contains_key("undefined") || scope.keys().any(|name| name.contains('\\'))
+        }) || self
+            .constructor_value_bindings
+            .keys()
+            .any(|name| name.contains('\\'))
+            || self
+                .constructor_property_namespace_counts
+                .keys()
+                .any(|path| path.first().is_some_and(|name| name == "global"))
+            || (1..=self.enum_scope.len()).any(|depth| {
+                self.constructor_property_namespace_counts
+                    .get(&self.enum_scope[..depth])
+                    .is_some_and(|count| *count > 1)
+            })
+        {
+            return None;
+        }
+        // Only the global value has the intrinsic undefined type. Parameter,
+        // local and namespace bindings need ordinary symbol/type resolution.
+        if self
+            .local_constructor_bindings
+            .iter()
+            .any(|(scope, names)| {
+                scope.start <= expression.span.start
+                    && expression.span.end <= scope.end
+                    && (names.contains("undefined") || names.iter().any(|name| name.contains('\\')))
+            })
+        {
+            return None;
+        }
+        for depth in 0..=self.enum_scope.len() {
+            let scope = self.enum_scope[..depth].join(".");
+            let name = if scope.is_empty() {
+                "undefined".to_string()
+            } else {
+                format!("{scope}.undefined")
+            };
+            if self.constructor_value_bindings.contains_key(&name) {
+                return None;
+            }
+        }
+        // Like fresh null initializers, this intrinsic follows TypeScript 6's
+        // default: only explicitly disabled strict null checks widen to any.
+        Some(if self.widen_fresh_null_initializers {
+            "any"
+        } else {
+            "undefined"
+        })
     }
 
     fn emit_class_decl(&mut self, class_decl: &ClassDecl) {

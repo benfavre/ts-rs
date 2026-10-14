@@ -2617,3 +2617,60 @@ fn test_dts_class_documentation_honors_remove_comments() {
         "declare class C {\n    method(): void;\n}\n"
     );
 }
+
+#[test]
+fn global_undefined_function_returns_follow_effective_null_checks() {
+    let source = "function plain() { return undefined; }\n\
+                  function parenthesized() { return ((undefined)); }\n\
+                  function shadowed(undefined: number) { return undefined; }\n";
+    for (strict, strict_null_checks, expected_type) in [
+        (None, None, "undefined"),
+        (Some(false), None, "any"),
+        (Some(true), None, "undefined"),
+        (None, Some(false), "any"),
+        (None, Some(true), "undefined"),
+        (Some(true), Some(false), "any"),
+        (Some(false), Some(true), "undefined"),
+    ] {
+        let file = tsc_rs_parser::parse("test.ts", source);
+        let output = emit(
+            &file,
+            &CompilerOptions {
+                declaration: Some(true),
+                strict,
+                strict_null_checks,
+                ..Default::default()
+            },
+        )
+        .declaration_file
+        .unwrap();
+        assert_eq!(
+            output,
+            format!(
+                "declare function plain(): {expected_type};\n\
+             declare function parenthesized(): {expected_type};\n\
+             declare function shadowed(undefined: number): number;\n"
+            )
+        );
+    }
+}
+
+#[test]
+fn undefined_return_inference_does_not_assume_shadowed_intrinsic_identity() {
+    for source in [
+        "type undefined = number; export function f() { return undefined; }",
+        "interface undefined {} export function f() { return undefined; }",
+        "import { x as undef\\u0069ned } from 'pkg'; export function f() { return undefined; }",
+        "namespace N { export var undefined = 1; } namespace N { export function f() { return undefined; } }",
+    ] {
+        let file = tsc_rs_parser::parse("test.ts", source);
+        let output = emit(&file, &CompilerOptions {
+            declaration: Some(true),
+            strict: Some(true),
+            ..Default::default()
+        }).declaration_file.unwrap();
+        // TypeScript resolves these returns to any or number, never to the
+        // intrinsic undefined type, including its error-recovery cases.
+        assert!(!output.contains("function f(): undefined"), "{source}\n{output}");
+    }
+}
