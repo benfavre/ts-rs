@@ -20207,3 +20207,81 @@ console.log(events.join(','));
         }
     }
 }
+
+#[test]
+fn system_es5_class_assignment_matches_typescript_with_comment_options() {
+    for (remove_comments, expected) in [
+        (false, "System.register([], function (exports_1, context_1) {\n    \"use strict\";\n    var C;\n    var __moduleName = context_1 && context_1.id;\n    return {\n        setters: [],\n        execute: function () {\n            C = /** @class */ (function () {\n                function C() {\n                }\n                C = __decorate([\n                    dec\n                ], C);\n                return C;\n            }());\n        }\n    };\n});\n"),
+        (true, "System.register([], function (exports_1, context_1) {\n    \"use strict\";\n    var C;\n    var __moduleName = context_1 && context_1.id;\n    return {\n        setters: [],\n        execute: function () {\n            C = (function () {\n                function C() {\n                }\n                C = __decorate([\n                    dec\n                ], C);\n                return C;\n            }());\n        }\n    };\n});\n"),
+    ] {
+        let js = emit_ts_with(
+            "export {}; declare var dec: any; @dec class C {}",
+            CompilerOptions {
+                target: Some(ScriptTarget::ES5),
+                module: Some(ModuleKind::System),
+                experimental_decorators: Some(true),
+                no_emit_helpers: Some(true),
+                remove_comments: Some(remove_comments),
+                strict: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(js, expected);
+    }
+}
+
+#[test]
+fn system_es5_decorated_class_exports_after_metadata_and_before_disposal() {
+    for replacement in [false, true] {
+        for metadata in [false, true] {
+            let js = emit_ts_with(
+                "export {}; declare const dec: any; declare function resource(): any; declare function recordStatic(): number; declare function inspect(value: any): void; @dec export class C { static value = recordStatic(); constructor(public value: number = 2) {} method() { return this.value; } } inspect(C); using after = resource();",
+                CompilerOptions {
+                    target: Some(ScriptTarget::ES5),
+                    module: Some(ModuleKind::System),
+                    experimental_decorators: Some(true),
+                    emit_decorator_metadata: Some(metadata),
+                    strict: Some(false),
+                    ..Default::default()
+                },
+            );
+            let program = format!(
+                r#"var events=[];
+Reflect.metadata=function(key,value) {{ return function() {{ events.push('metadata:'+key+':'+value.length); }}; }};
+function recordStatic() {{ events.push('static'); return 7; }}
+function dec(value) {{
+    events.push('decorate:'+value.value);
+    if ({replacement}) {{
+        function Replacement() {{ this.value=3; }}
+        Replacement.prototype=value.prototype;
+        Object.setPrototypeOf(Replacement,value);
+        Replacement.tag='replacement';
+        return Replacement;
+    }}
+}}
+function inspect(value) {{ var instance=new value(); events.push('inspect:'+instance.method()+':'+value.value+':'+Object.getOwnPropertyDescriptor(value.prototype,'method').enumerable); }}
+function resource() {{ events.push('acquire'); return {{ [Symbol.dispose]() {{ events.push('dispose'); }} }}; }}
+var System={{ register(deps,factory) {{
+    var module=factory(function(name,value) {{ events.push('export:'+name+':'+(value.tag||'original')); return value; }},{{id:'probe'}});
+    module.execute();
+}} }};
+{js}
+console.log(events.join(','));
+"#
+            );
+            let output = execute_with_node(&program);
+            let metadata_event = if metadata {
+                "metadata:design:paramtypes:1,"
+            } else {
+                ""
+            };
+            let exported = if replacement {
+                "replacement"
+            } else {
+                "original"
+            };
+            let value = if replacement { 3 } else { 2 };
+            assert_eq!(output.trim(),format!("static,{metadata_event}decorate:7,export:C:{exported},inspect:{value}:7:true,acquire,dispose"));
+        }
+    }
+}

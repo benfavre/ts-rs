@@ -4966,7 +4966,13 @@ impl<'a> Emitter<'a> {
 
     fn emit_legacy_es5_class_decl(&mut self, class_decl: &ClassDecl, lower_metadata_class: bool) {
         let saved_super_name = self.es5_class_super_name.take();
-        self.emit_legacy_es5_class_decl_inner(class_decl, lower_metadata_class);
+        self.emit_legacy_es5_class_decl_inner(class_decl, lower_metadata_class, true);
+        self.es5_class_super_name = saved_super_name;
+    }
+
+    pub(super) fn emit_legacy_es5_class_assignment(&mut self, class_decl: &ClassDecl) {
+        let saved_super_name = self.es5_class_super_name.take();
+        self.emit_legacy_es5_class_decl_inner(class_decl, false, false);
         self.es5_class_super_name = saved_super_name;
     }
 
@@ -4974,9 +4980,10 @@ impl<'a> Emitter<'a> {
         &mut self,
         class_decl: &ClassDecl,
         lower_metadata_class: bool,
+        declare_binding: bool,
     ) {
         let name = class_decl.name.as_deref().unwrap();
-        if !class_decl.decorators.is_empty() {
+        if declare_binding && !class_decl.decorators.is_empty() {
             let let_prefix = format!("let {name} = ");
             if self.output.ends_with(&let_prefix) {
                 self.output.truncate(self.output.len() - let_prefix.len());
@@ -4996,9 +5003,15 @@ impl<'a> Emitter<'a> {
                 _ => None,
             });
 
-        self.write("var ");
+        if declare_binding {
+            self.write("var ");
+        }
         self.write(name);
-        self.write(" = /** @class */ (function (");
+        self.write(" = ");
+        if self.options.remove_comments != Some(true) {
+            self.write("/** @class */ ");
+        }
+        self.write("(function (");
         if class_decl.extends.is_some() {
             self.write(&super_name);
         }

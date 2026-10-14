@@ -2712,6 +2712,29 @@ impl<'a> Emitter<'a> {
                     export_name,
                     decorator_alias,
                 } => {
+                    let mut lowered_class = class_decl.clone();
+                    lowered_class.name = Some(name.clone());
+                    lowered_class.modifiers &= !(MOD_EXPORT | MOD_DEFAULT);
+                    // The shared IIFE emitter currently owns assignment
+                    // semantics; define semantics also change method descriptors.
+                    if decorator_alias.is_none()
+                        && !self.use_define_for_class_fields()
+                        && self.can_emit_legacy_es5_class_decl(&lowered_class)
+                    {
+                        self.emit_legacy_es5_class_assignment(&lowered_class);
+                        if self.options.experimental_decorators == Some(true) {
+                            self.emit_decorator_applications(&lowered_class, None);
+                        }
+                        if let Some(ref exported) = export_name {
+                            self.write(&exports_fn);
+                            self.write("(\"");
+                            self.write(exported);
+                            self.write("\", ");
+                            self.write(&name);
+                            self.writeln(");");
+                        }
+                        continue;
+                    }
                     let mut class_expr_decl = class_decl.clone();
                     if !self.use_define_for_class_fields() {
                         for member in &mut class_expr_decl.members {
