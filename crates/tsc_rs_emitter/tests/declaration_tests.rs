@@ -1413,3 +1413,90 @@ fn test_dts_typed_callable_initializers_keep_signatures_and_dependencies() {
         }
     }
 }
+
+#[test]
+fn test_dts_variable_any_assertions_preserve_boundaries_and_dependencies() {
+    // Complete declaration outputs checked against TypeScript 6.0.3 in each
+    // strict-option mode, including omitted options and child overrides.
+    let cases = [
+        ("class_any", "const anyThing=class{} as any;export class Foo extends anyThing{};", "declare const anyThing: any;\nexport declare class Foo extends anyThing {\n}\nexport {};\n"),
+        ("angle_any", "const anyThing=<any>class{};export class Foo extends anyThing{};", "declare const anyThing: any;\nexport declare class Foo extends anyThing {\n}\nexport {};\n"),
+        ("primitive_any", "export const n=1 as any,s=\"x\" as any,b=true as any;", "export declare const n: any, s: any, b: any;\n"),
+        ("var_let", "let n=1 as any;var s=<any>\"x\";", "declare let n: any;\ndeclare var s: any;\n"),
+        ("parenthesized", "export const v=(((1 as (any))));", "export declare const v: (any);\n"),
+        ("nonnull", "export const v=((null as any))!;", "export declare const v: any;\n"),
+        ("satisfies", "export const v=(1 as any) satisfies string;", "export declare const v: any;\n"),
+        ("satisfies_under_any", "export const v=(1 satisfies number) as any;", "export declare const v: any;\n"),
+        ("outer_any", "export const v=((null as string) as any);", "export declare const v: any;\n"),
+        ("outer_null", "export const v=((null as any) as null);", "export declare const v: null;\n"),
+        ("outer_number", "export const v=((1 as any) as number);", "export declare const v: number;\n"),
+        ("explicit_annotation", "export const v:number=1 as any;", "export declare const v: number;\n"),
+        ("explicit_null_annotation", "export const v:null=1 as any;", "export declare const v: null;\n"),
+        ("private_constructor", "class Private{};export const v=new Private() as any;", "export declare const v: any;\n"),
+        ("private_generic_constructor", "class Box<T>{};class Private{};export const v=new Box<Private>() as any;", "export declare const v: any;\n"),
+        ("private_generic_exported", "class Box<T>{};class Private{};export const v=new Box<Private>() as any;export const typed:Box<Private>=v;", "declare class Box<T> {\n}\ndeclare class Private {\n}\nexport declare const v: any;\nexport declare const typed: Box<Private>;\nexport {};\n"),
+        ("original_class", "const original=class{};export const cast=original as any;", "export declare const cast: any;\n"),
+        ("original_literal", "const original=1;export const cast=original as any;", "export declare const cast: any;\n"),
+        ("original_constructor", "class Private{};const original=new Private();export const cast=original as any;", "export declare const cast: any;\n"),
+        ("original_generic_constructor", "class Box<T>{};class Private{};const original=new Box<Private>();export const cast=original as any;", "export declare const cast: any;\n"),
+        ("cached_number_assertion", "const original=1;const cast=original as any;export const value=cast as number;", "export declare const value: number;\n"),
+        ("cached_null_assertion", "const original=null;const cast=original as any;export const value=cast as null;", "export declare const value: null;\n"),
+        ("exported_number_cast_assertion", "const original=1;export const cast=original as any;export const value=cast as number;", "export declare const cast: any;\nexport declare const value: number;\n"),
+        ("exported_null_cast_assertion", "const original=null;export const cast=original as any;export const value=cast as null;", "export declare const cast: any;\nexport declare const value: null;\n"),
+        ("cached_class_assertion", "class C{};const original=new C();const cast=original as any;export const value=cast as C;", "declare class C {\n}\nexport declare const value: C;\nexport {};\n"),
+        ("exported_class_cast_assertion", "class C{};const original=new C();export const cast=original as any;export const value=cast as C;", "declare class C {\n}\nexport declare const cast: any;\nexport declare const value: C;\nexport {};\n"),
+        ("namespace_private", "export namespace N{class Private{};export const v=new Private() as any;}", "export declare namespace N {\n    const v: any;\n}\n"),
+        ("namespace_shadow", "class Box<T>{};export namespace N{class Box{};export const v=new Box() as any;}", "export declare namespace N {\n    const v: any;\n}\n"),
+        ("namespace_outer_private", "class Private{};export namespace N{export const v=new Private() as any;}", "export declare namespace N {\n    const v: any;\n}\n"),
+        ("private_same_named", "class Hidden{};const original=new Hidden();export const cast=original as any;export const other:Hidden=original;", "declare class Hidden {\n}\nexport declare const cast: any;\nexport declare const other: Hidden;\nexport {};\n"),
+        ("explicit_return_assertion", "export function f():null{return null as any;}", "export declare function f(): null;\n"),
+        ("constructor_parameter_assertion", "export class C{constructor(public value=null as null){}}", "export declare class C {\n    value: null;\n    constructor(value?: null);\n}\n"),
+        ("fresh_null_asserted", "const fresh=null;export const value=fresh as null;", "export declare const value: null;\n"),
+        ("fresh_null_angle", "const fresh=null;export const value=<null>fresh;", "export declare const value: null;\n"),
+        ("fresh_null_function", "const fresh=null;export function f(){return fresh as null;}", "export declare function f(): null;\n"),
+        ("fresh_null_property", "const fresh=null;export class C{value=fresh as null;}", "export declare class C {\n    value: null;\n}\n"),
+        ("fresh_null_parameter", "const fresh=null;export class C{constructor(public value=fresh as null){}}", "export declare class C {\n    value: null;\n    constructor(value?: null);\n}\n"),
+        ("object_any", "export const v={x:1} as any;", "export declare const v: any;\n"),
+        ("array_any", "export const v=[1,2] as any;", "export declare const v: any;\n"),
+        ("function_any", "export const f=((x:string):string=>x) as any;", "export declare const f: any;\n"),
+        ("function_literal_any", "export const f=function(x:string){return x} as any;", "export declare const f: any;\n"),
+        ("array_member", "const arr=[1];export const value=arr[0] as any;", "export declare const value: any;\n"),
+        ("satisfies_outside_nonnull", "export const v=((null as any) satisfies null)!;", "export declare const v: any;\n"),
+        ("explicit_outer_type_alias", "type N=null;export const v:N=null as any;", "type N = null;\nexport declare const v: N;\nexport {};\n"),
+        ("ordinary_literals", "export const n=1,s=\"x\",b=true;", "export declare const n = 1, s = \"x\", b = true;\n"),
+        ("parenthesized_nonnull", "export const v=(1 as (any))!;", "export declare const v: any;\n"),
+        ("parenthesized_satisfies", "export const v=(1 as (any)) satisfies string;", "export declare const v: any;\n"),
+        ("parenthesized_angle", "export const v=<(any)>1;", "export declare const v: (any);\n"),
+        ("parenthesized_nested", "export const v=1 as (((any)));", "export declare const v: (((any)));\n"),
+        ("parenthesized_variable", "let v=1 as (any);", "declare let v: (any);\n"),
+        ("parenthesized_private", "class Hidden{};export const v=new Hidden() as (any);", "export declare const v: (any);\n"),
+        ("parenthesized_outer_any", "export const v=(1 as (any)) as any;", "export declare const v: any;\n"),
+        ("parenthesized_any_alias", "export const v=1 as any;export const x=v as (any);", "export declare const v: any;\nexport declare const x: (any);\n"),
+        ("parenthesized_explicit", "export const v:(any)=1 as any;", "export declare const v: (any);\n"),
+    ];
+    for (strict, strict_null_checks) in [
+        (None, None),
+        (Some(false), None),
+        (Some(true), None),
+        (Some(true), Some(false)),
+        (Some(false), Some(true)),
+        (None, Some(false)),
+        (None, Some(true)),
+    ] {
+        let options = CompilerOptions {
+            declaration: Some(true),
+            target: Some(ScriptTarget::ES2015),
+            strict,
+            strict_null_checks,
+            ..Default::default()
+        };
+        for (name, source, expected) in cases {
+            let file = tsc_rs_parser::parse("test.ts", source);
+            assert_eq!(
+                emit(&file, &options).declaration_file.unwrap(),
+                expected,
+                "{name}: strict={strict:?}, strictNullChecks={strict_null_checks:?}"
+            );
+        }
+    }
+}

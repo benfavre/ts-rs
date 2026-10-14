@@ -461,6 +461,14 @@ impl<'a> DeclarationEmitter<'a> {
                 for declarator in &decl.declarations {
                     if let Some(type_ann) = &declarator.type_ann {
                         Self::collect_type_dependencies(type_ann, &bound, &mut dependencies);
+                    } else if matches!(declarator.name.kind, PatKind::Ident(_))
+                        && declarator
+                            .init
+                            .as_deref()
+                            .is_some_and(|init| Self::any_assertion_type(init).is_some())
+                    {
+                        // The asserted any type has no dependency on the
+                        // initializer's inferred operand type.
                     } else if let Some(signature) =
                         matches!(declarator.name.kind, PatKind::Ident(_))
                             .then(|| {
@@ -1541,7 +1549,13 @@ impl<'a> DeclarationEmitter<'a> {
                     && matches!(decl.name.kind, PatKind::Ident(_)))
                 .then(|| Self::const_initializer_text(init))
                 .flatten();
-                if let Some(literal) = literal {
+                let asserted_any = matches!(decl.name.kind, PatKind::Ident(_))
+                    .then(|| Self::any_assertion_type(init))
+                    .flatten();
+                if let Some(ty) = asserted_any {
+                    self.write(": ");
+                    self.emit_type_node(ty);
+                } else if let Some(literal) = literal {
                     self.write(" = ");
                     self.write(&literal);
                 } else if let Some(signature) = matches!(decl.name.kind, PatKind::Ident(_))
@@ -1560,6 +1574,40 @@ impl<'a> DeclarationEmitter<'a> {
             }
         }
         self.writeln(";");
+    }
+
+    // Apply explicit any assertions at the declaration boundary only. The
+    // existing initializer cache is also used by later assertions, so changing
+    // that cache here would replace their operand types with any as well.
+    fn any_assertion_type(mut expr: &Expr) -> Option<&TypeNode> {
+        let mut preserve_parentheses = true;
+        let asserted_type = loop {
+            match &expr.kind {
+                ExprKind::Paren(inner) => expr = inner,
+                ExprKind::NonNull(inner) => {
+                    preserve_parentheses = false;
+                    expr = inner;
+                }
+                ExprKind::Satisfies(satisfies) => {
+                    preserve_parentheses = false;
+                    expr = &satisfies.expr;
+                }
+                ExprKind::As(assertion) => break &assertion.type_node,
+                ExprKind::TypeAssertion(assertion) => break &assertion.type_node,
+                _ => return None,
+            }
+        };
+        let mut ty = asserted_type;
+        while let TypeNodeKind::Paren(inner) = &ty.kind {
+            ty = inner;
+        }
+        matches!(ty.kind, TypeNodeKind::Keyword(KeywordTypeKind::Any)).then_some(
+            if preserve_parentheses {
+                asserted_type
+            } else {
+                ty
+            },
+        )
     }
 
     // A directly initialized callable can expose its annotated signature without
