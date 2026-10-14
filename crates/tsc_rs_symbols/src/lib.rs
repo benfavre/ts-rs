@@ -929,8 +929,9 @@ impl Binder {
                     for impl_type in &class_decl.implements {
                         self.bind_type_node(impl_type, file_name);
                     }
+                    let quoted_members = Self::unambiguous_quoted_class_members(class_decl);
                     for member in &class_decl.members {
-                        self.bind_class_member(member, class_sym, file_name);
+                        self.bind_class_member(member, class_sym, file_name, &quoted_members);
                     }
                     self.pop_scope();
                 }
@@ -1270,8 +1271,9 @@ impl Binder {
                         if let Some(ref type_params) = class_decl.type_params {
                             self.declare_type_params(type_params, file_name);
                         }
+                        let quoted_members = Self::unambiguous_quoted_class_members(class_decl);
                         for member in &class_decl.members {
-                            self.bind_class_member(member, class_sym, file_name);
+                            self.bind_class_member(member, class_sym, file_name, &quoted_members);
                         }
                     } else {
                         // Anonymous class expression -- still bind members
@@ -1281,8 +1283,9 @@ impl Binder {
                             .symbol_scopes
                             .entry(anon_sym)
                             .or_insert(self.current_scope);
+                        let quoted_members = Self::unambiguous_quoted_class_members(class_decl);
                         for member in &class_decl.members {
-                            self.bind_class_member(member, anon_sym, file_name);
+                            self.bind_class_member(member, anon_sym, file_name, &quoted_members);
                         }
                     }
                     self.pop_scope();
@@ -2060,12 +2063,74 @@ impl Binder {
             .push(sig);
     }
 
-    fn bind_class_member(&mut self, member: &ClassMember, class_sym: SymbolId, file_name: &str) {
+    /// Literal members can use the existing member table when their decoded
+    /// name is unambiguous. Keep unsupported name normalization and collisions
+    /// out of the shared lexical/static/instance map until those identities can
+    /// be represented separately.
+    fn unambiguous_quoted_class_members(class: &ClassDecl) -> std::collections::HashSet<String> {
+        // Anonymous class names depend on their containing expression's alias,
+        // which the current symbol table does not yet retain.
+        if class.name.is_none() {
+            return Default::default();
+        }
+        let mut names = HashMap::<String, usize>::new();
+        let mut quoted = std::collections::HashSet::new();
+        for name in class
+            .name
+            .iter()
+            .chain(class.type_params.iter().flatten().map(|p| &p.name))
+        {
+            if name.contains('\\') {
+                return Default::default();
+            }
+            *names.entry(name.clone()).or_default() += 1;
+        }
+        for member in &class.members {
+            let property = match &member.kind {
+                ClassMemberKind::Property(p) => &p.name,
+                ClassMemberKind::Method(m) => &m.name,
+                ClassMemberKind::GetAccessor(a) | ClassMemberKind::SetAccessor(a) => &a.name,
+                ClassMemberKind::Constructor(c) => {
+                    if c.params.iter().any(|p| {
+                        p.modifiers & (MOD_PUBLIC | MOD_PRIVATE | MOD_PROTECTED | MOD_READONLY) != 0
+                    }) {
+                        return Default::default();
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            let name = match property {
+                PropName::Ident(n, _) | PropName::String(n, _) if !n.contains('\\') => {
+                    n.to_string()
+                }
+                PropName::Private(n, _) if !n.contains('\\') => format!("#{n}"),
+                _ => return Default::default(),
+            };
+            if matches!(property, PropName::String(..)) && name != "constructor" {
+                quoted.insert(name.clone());
+            }
+            *names.entry(name).or_default() += 1;
+        }
+        quoted.retain(|name| names.get(name) == Some(&1));
+        quoted
+    }
+
+    fn bind_class_member(
+        &mut self,
+        member: &ClassMember,
+        class_sym: SymbolId,
+        file_name: &str,
+        quoted_members: &std::collections::HashSet<String>,
+    ) {
         match &member.kind {
             ClassMemberKind::Property(prop) => {
                 let prop_name_info = match prop.name {
                     PropName::Ident(ref name, _) => Some((name.to_string(), false)),
                     PropName::Private(ref name, _) => Some((format!("#{}", name), true)),
+                    PropName::String(ref name, _) if quoted_members.contains(name.as_str()) => {
+                        Some((name.to_string(), false))
+                    }
                     _ => None,
                 };
                 if let Some((name, _is_private)) = prop_name_info {
@@ -2100,6 +2165,9 @@ impl Binder {
                 let method_name_info = match method.name {
                     PropName::Ident(ref name, _) => Some((name.to_string(), false)),
                     PropName::Private(ref name, _) => Some((format!("#{}", name), true)),
+                    PropName::String(ref name, _) if quoted_members.contains(name.as_str()) => {
+                        Some((name.to_string(), false))
+                    }
                     _ => None,
                 };
                 if let Some((name, _is_private)) = method_name_info {

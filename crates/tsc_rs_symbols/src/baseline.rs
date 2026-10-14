@@ -91,7 +91,25 @@ fn symbol_display_name(
                     .is_some_and(|text| text.starts_with(['\'', '"']))
             });
         names.push(if quoted_member {
-            format!("[{}]", quote_property_name(&sym.name))
+            let quote = sym
+                .declarations
+                .first()
+                .and_then(|decl| file.text.get(decl.span.start as usize..)?.chars().next())
+                .unwrap_or('"');
+            // Class property/method literals are bound only after their names
+            // and declaration identities have been checked for ambiguity.
+            // Other member kinds can still have incomplete merged identities.
+            let resolved_class_literal = owners
+                .get(&current)
+                .is_some_and(|(owner, _)| table.symbols[*owner as usize].flags & SYM_CLASS != 0)
+                && sym.flags & (SYM_PROPERTY | SYM_METHOD) != 0
+                && sym.declarations.len() == 1;
+            let name = if resolved_class_literal {
+                quote_class_property_name(&sym.name, quote)
+            } else {
+                quote_property_name(&sym.name)
+            };
+            format!("[{name}]")
         } else {
             sym.name.clone()
         });
@@ -148,6 +166,47 @@ fn quote_property_name(name: &str) -> String {
         }
     }
     result.push('"');
+    result
+}
+
+fn quote_class_property_name(name: &str, source_quote: char) -> String {
+    // Escaped property identities still retain their raw parser spelling. Keep
+    // their previous representation until decoded names are available.
+    if name.contains('\\') {
+        return quote_property_name(name);
+    }
+    let quote = source_quote;
+    let mut result = quote.to_string();
+    let mut chars = name.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            ch if ch == quote => {
+                result.push('\\');
+                result.push(ch);
+            }
+            '\\' => result.push_str("\\\\"),
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            '\u{0008}' => result.push_str("\\b"),
+            '\u{000c}' => result.push_str("\\f"),
+            '\u{000b}' => result.push_str("\\v"),
+            '\0' => {
+                result.push_str(if chars.peek().is_some_and(|ch| ch.is_ascii_digit()) {
+                    "\\x00"
+                } else {
+                    "\\0"
+                });
+            }
+            ch if ch < ' ' || !ch.is_ascii() => {
+                for unit in ch.encode_utf16(&mut [0; 2]) {
+                    result.push_str(&format!("\\u{unit:04X}"));
+                }
+            }
+            ch => result.push(ch),
+        }
+    }
+    result.push(quote);
     result
 }
 

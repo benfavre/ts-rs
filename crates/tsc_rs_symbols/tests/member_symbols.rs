@@ -70,3 +70,51 @@ fn string_import_names_do_not_replace_the_local_binding_label() {
     assert_eq!(baseline.matches(">x : Symbol(x,").count(), 2, "{baseline}");
     assert!(!baseline.contains(">'missing' as x"), "{baseline}");
 }
+
+#[test]
+fn quoted_class_members_keep_declaration_and_lexical_identities() {
+    use tsc_rs_symbols::{SYM_METHOD, SYM_PROPERTY, SYM_STATIC, SYM_VARIABLE};
+
+    let source = "const outer = 1; class C { \"x-y\" = 1; static 'key'() {} \"outer\" = 2; read() { return outer; } }";
+    let file = tsc_rs_parser::parse("quoted.ts", source);
+    assert!(file.diagnostics.is_empty());
+    let table = bind(&file);
+    assert!(table.diagnostics.is_empty());
+    let class = table.symbols.iter().find(|s| s.name == "C").unwrap();
+    for (name, spelling, expected_flags) in [
+        ("x-y", "\"x-y\"", SYM_PROPERTY),
+        ("key", "'key'", SYM_METHOD | SYM_STATIC),
+    ] {
+        let member = &table.symbols[class.members[name] as usize];
+        assert_eq!(member.flags, expected_flags);
+        assert_eq!(member.declarations.len(), 1);
+        let span = member.declarations[0].span;
+        assert_eq!(&source[span.start as usize..span.end as usize], spelling);
+        assert_eq!(table.position_to_symbol[&span.start], member.id);
+    }
+    let reference = table
+        .scope_graph
+        .reference_at(source.rfind("outer;").unwrap() as u32)
+        .unwrap();
+    let outer = &table.symbols[reference.symbol_id as usize];
+    assert_ne!(outer.flags & SYM_VARIABLE, 0);
+    assert_eq!(outer.declarations[0].span.start, 6);
+    assert_ne!(reference.symbol_id, class.members["outer"]);
+    let baseline = generate_symbols_baseline(&file, &table);
+    assert!(baseline.contains(">\"x-y\" : Symbol(C[\"x-y\"],"));
+    assert!(baseline.contains(">'key' : Symbol(C['key'],"));
+}
+
+#[test]
+fn literal_member_display_preserves_quote_style_and_escapes_utf16() {
+    let source = "class C { 'é' = 1; \"𐐀\"() {} }";
+    let file = tsc_rs_parser::parse("unicode.ts", source);
+    let baseline = generate_symbols_baseline(&file, &bind(&file));
+    // Independently checked with TypeScript 6.0.3 symbolToString.
+    for expected in [
+        ">'é' : Symbol(C['\\u00E9'],",
+        ">\"𐐀\" : Symbol(C[\"\\uD801\\uDC00\"],",
+    ] {
+        assert!(baseline.contains(expected), "{expected}: {baseline}");
+    }
+}

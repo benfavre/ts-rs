@@ -26665,10 +26665,14 @@ pub fn references_at(
         }
     }
 
-    let target_id_opt = query_engine
-        .get_symbol_at(file_name, offset)
-        .and_then(|id| u32::try_from(id).ok())
-        .or_else(|| find_symbol_at_offset(sym_table, offset));
+    let member_identity =
+        definition::references::class_member_at(query_engine, file_name, sym_table, offset);
+    let target_id_opt = member_identity.or_else(|| {
+        query_engine
+            .get_symbol_at(file_name, offset)
+            .and_then(|id| u32::try_from(id).ok())
+            .or_else(|| find_symbol_at_offset(sym_table, offset))
+    });
 
     // Fallback: if we're on a keyword (export, default, constructor, etc.),
     // scan forward to find the next identifier that has a symbol.
@@ -26781,6 +26785,7 @@ pub fn references_at(
                         sid,
                         project,
                         true,
+                        false,
                     );
                 }
                 // No symbol found — do text-based search for both string literals
@@ -26822,6 +26827,7 @@ pub fn references_at(
                     sid,
                     project,
                     true,
+                    false,
                 );
             }
             // Do text-based search for the numeric literal
@@ -26902,9 +26908,20 @@ pub fn references_at(
     // `foo` of `export { foo as bar } from "./a"` resolves to `bar`); search
     // for the identifier actually under the cursor.
     let token = extract_token_at(source_text, offset);
+    let quoted_declaration = sym_table.get_symbol(target_id).is_some_and(|symbol| {
+        symbol.declarations.iter().any(|declaration| {
+            declaration.file_name == file_name
+                && declaration.span.start <= offset
+                && offset < declaration.span.end
+                && quoted_member_reference_span(sym_table, source_text, file_name, declaration.span)
+                    .is_some()
+        })
+    });
     let mismatched = sym_table
         .get_symbol(target_id)
         .is_some_and(|sym| !token.is_empty() && sym.name != token)
+        && !quoted_declaration
+        && member_identity != Some(target_id)
         && !KEYWORDS.contains(&token.as_str())
         && token.bytes().all(is_ascii_ident_byte);
     if mismatched {
@@ -26917,11 +26934,20 @@ pub fn references_at(
                 sid,
                 project,
                 false,
+                false,
             );
         }
         return name_references(file_name, source_text, &token, project);
     }
 
+    let declaration_identity = member_identity == Some(target_id)
+        || sym_table.get_symbol(target_id).is_some_and(|symbol| {
+            symbol.declarations.iter().any(|declaration| {
+                declaration.file_name == file_name
+                    && declaration.span.start <= offset
+                    && offset < declaration.span.end
+            })
+        });
     references_at_with_target(
         query_engine,
         sym_table,
@@ -26930,6 +26956,7 @@ pub fn references_at(
         target_id,
         project,
         false,
+        declaration_identity,
     )
 }
 
@@ -26976,22 +27003,41 @@ fn references_at_with_target(
     target_id: u32,
     project: Option<&ProjectState>,
     include_string_occurrences: bool,
+    declaration_identity: bool,
 ) -> Vec<(String, Span)> {
     let target_sym = match sym_table.get_symbol(target_id) {
         Some(s) => s,
         None => return Vec::new(),
     };
     let target_name = target_sym.name.clone();
+    // An empty property name has no searchable text span.
+    if target_name.is_empty() {
+        return Vec::new();
+    }
 
-    let mut refs = query_engine.get_symbol_uses(u64::from(target_id));
+    // Symbol IDs belong to a file. The same numeric ID in another file can
+    // denote an unrelated declaration; project references are resolved below.
+    let mut refs: Vec<_> = sym_table
+        .position_to_symbol
+        .iter()
+        .filter(|(_, id)| **id == target_id)
+        .map(|(&position, _)| {
+            (
+                file_name.to_string(),
+                Span::new(position, position.saturating_add(target_name.len() as u32)),
+            )
+        })
+        .collect();
 
     // Also include declarations
-    for (decl_file, decl_span) in query_engine.get_symbol_locations(u64::from(target_id)) {
+    for declaration in &target_sym.declarations {
+        let decl_file = &declaration.file_name;
+        let decl_span = declaration.span;
         let already = refs
             .iter()
-            .any(|(f, sp)| sp.start == decl_span.start && *f == decl_file);
+            .any(|(f, sp)| sp.start == decl_span.start && f == decl_file);
         if !already {
-            refs.push((decl_file, decl_span));
+            refs.push((decl_file.clone(), decl_span));
         }
     }
     if refs.is_empty() {
@@ -27102,8 +27148,80 @@ fn references_at_with_target(
         }
     }
 
-    refs.sort_by_key(|(f, sp)| (f.clone(), sp.start));
+    // A declaration gives us a proven owner. Name-only recovery at a use site
+    // may have selected a different same-name member, so cannot exclude owners.
+    let conflicting_members = if declaration_identity {
+        definition::references::conflicting_member_declarations(
+            query_engine,
+            file_name,
+            sym_table,
+            target_id,
+        )
+    } else {
+        Vec::new()
+    };
+    refs.retain(|(path, span)| {
+        path != file_name
+            || !conflicting_members
+                .iter()
+                .any(|declaration| declaration.start <= span.start && span.start < declaration.end)
+    });
+    // Binder declarations retain the whole property-name token. Reference
+    // ranges cover its content, so reconcile recorded declaration positions
+    // with the content ranges found by the source fallback.
+    for (path, span) in &mut refs {
+        let table = if path == file_name {
+            Some(sym_table)
+        } else {
+            query_engine.get_file_symbols(path).or_else(|| {
+                project.and_then(|project| project.files.get(path).map(|file| &file.sym_table))
+            })
+        };
+        let source = if path == file_name {
+            Some(source_text)
+        } else {
+            query_engine.get_source_file(path).or_else(|| {
+                project.and_then(|project| project.files.get(path).map(|file| file.source.as_str()))
+            })
+        };
+        if let (Some(table), Some(source)) = (table, source) {
+            if let Some(content) = quoted_member_reference_span(table, source, path, *span) {
+                *span = content;
+            }
+        }
+    }
+    refs.sort_by_key(|(f, sp)| (f.clone(), sp.start, sp.end));
+    refs.dedup();
     refs
+}
+
+fn quoted_member_reference_span(
+    table: &SymbolTable,
+    source: &str,
+    file_name: &str,
+    span: Span,
+) -> Option<Span> {
+    let symbol = table.get_symbol(*table.position_to_symbol.get(&span.start)?)?;
+    if symbol.flags & (SYM_PROPERTY | SYM_METHOD | SYM_GET_ACCESSOR | SYM_SET_ACCESSOR) == 0 {
+        return None;
+    }
+    let declaration = symbol.declarations.iter().find(|declaration| {
+        declaration.file_name == file_name && declaration.span.start == span.start
+    })?;
+    let raw = source.get(declaration.span.start as usize..declaration.span.end as usize)?;
+    let bytes = raw.as_bytes();
+    if bytes.len() < 2
+        || !matches!(bytes[0], b'\'' | b'"')
+        || bytes.last() != Some(&bytes[0])
+        || raw.contains('\\')
+        || raw.get(1..raw.len() - 1)? != symbol.name
+    {
+        return None;
+    }
+    Some(Span::new(
+        declaration.span.start + 1,
+        declaration.span.end - 1,
+    ))
 }
 
 // ---------------------------------------------------------------------------
