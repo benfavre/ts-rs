@@ -20021,3 +20021,119 @@ fn system_native_using_reserves_escaped_identifiers_for_plain_resources() {
         );
     }
 }
+
+#[test]
+fn top_level_using_environment_honors_es5_target() {
+    for module in [ModuleKind::CommonJS, ModuleKind::ESNext] {
+        for target in [
+            ScriptTarget::ES5,
+            ScriptTarget::ES2015,
+            ScriptTarget::ES2022,
+        ] {
+            for no_emit_helpers in [false, true] {
+                for declaration in ["using", "await using"] {
+                    let source = format!("export {{}}; {declaration} resource = null;");
+                    let js = emit_ts_with(
+                        &source,
+                        CompilerOptions {
+                            target: Some(target),
+                            module: Some(module),
+                            no_emit_helpers: Some(no_emit_helpers),
+                            ..Default::default()
+                        },
+                    );
+                    let keyword = if target == ScriptTarget::ES5 {
+                        "var"
+                    } else {
+                        "const"
+                    };
+                    assert!(
+                        js.contains(&format!(
+                            "{keyword} env_1 = {{ stack: [], error: void 0, hasError: false }};"
+                        )),
+                        "{module:?}/{target:?}/{declaration}: {js}"
+                    );
+                    if target == ScriptTarget::ES5 {
+                        assert!(!js.contains("const ") && !js.contains("let "), "{js}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn es5_decorated_class_before_using_matches_typescript() {
+    let js = emit_ts_with(
+        "export {}; declare var dec: any; @dec class C {} using after = null;",
+        CompilerOptions {
+            target: Some(ScriptTarget::ES5),
+            module: Some(ModuleKind::CommonJS),
+            experimental_decorators: Some(true),
+            no_emit_helpers: Some(true),
+            ..Default::default()
+        },
+    );
+    // TypeScript 6.0.3, ES5/CommonJS with legacy decorators and noEmitHelpers.
+    assert_eq!(
+        js,
+        concat!(
+            "\"use strict\";\n",
+            "Object.defineProperty(exports, \"__esModule\", { value: true });\n",
+            "var C = /** @class */ (function () {\n",
+            "    function C() {\n    }\n",
+            "    C = __decorate([\n        dec\n    ], C);\n",
+            "    return C;\n}());\n",
+            "var after;\n",
+            "var env_1 = { stack: [], error: void 0, hasError: false };\n",
+            "try {\n    after = __addDisposableResource(env_1, null, false);\n}\n",
+            "catch (e_1) {\n    env_1.error = e_1;\n    env_1.hasError = true;\n}\n",
+            "finally {\n    __disposeResources(env_1);\n}\n",
+        )
+    );
+}
+
+#[test]
+fn es5_top_level_using_preserves_decorator_and_disposal_order() {
+    for throw_from_body in [false, true] {
+        let js = emit_ts_with(
+            "declare var dec: any; declare function resource(name: string): any; declare function body(): void; @dec export class C {} using first = resource('first'); using second = resource('second'); body();",
+            CompilerOptions {
+                target: Some(ScriptTarget::ES5),
+                module: Some(ModuleKind::CommonJS),
+                experimental_decorators: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(!js.contains("const ") && !js.contains("let "), "{js}");
+        let program = format!(
+            r#"var events = [];
+function dec(C) {{ events.push('decorate'); return C; }}
+function resource(name) {{
+    events.push('acquire:' + name);
+    var result = {{}};
+    result[Symbol.dispose] = function () {{ events.push('dispose:' + name); }};
+    return result;
+}}
+function body() {{ events.push('body'); if ({throw_from_body}) throw Error('body'); }}
+var moduleExports = {{}};
+try {{ (function (exports) {{
+{js}
+}})(moduleExports); }} catch (error) {{ events.push('caught:' + error.message); }}
+events.push(typeof moduleExports.C);
+console.log(events.join(','));
+"#
+        );
+        let output = run_node_from_stdin(&["-"], &program);
+        assert!(
+            output.status.success(),
+            "{}\n{program}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let caught = if throw_from_body { "caught:body," } else { "" };
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("decorate,acquire:first,acquire:second,body,dispose:second,dispose:first,{caught}function")
+        );
+    }
+}

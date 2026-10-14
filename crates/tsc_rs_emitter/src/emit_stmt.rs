@@ -16462,9 +16462,15 @@ impl<'a> Emitter<'a> {
             self.writeln(";");
         }
 
-        // 3. Emit envelope
+        // 3. Emit envelope. Its declaration must also honor downlevel targets;
+        // this scope is emitted after ordinary variable lowering has finished.
+        let declaration_kind = if self.effective_target() < ScriptTarget::ES2015 {
+            "var"
+        } else {
+            "const"
+        };
         self.writeln(&format!(
-            "const env_{env_num} = {{ stack: [], error: void 0, hasError: false }};"
+            "{declaration_kind} env_{env_num} = {{ stack: [], error: void 0, hasError: false }};"
         ));
 
         // 4. Try block
