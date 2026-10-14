@@ -16660,20 +16660,29 @@ impl<'a> Emitter<'a> {
             match &s.kind {
                 StmtKind::Var(vs) if matches!(vs.kind, VarKind::Using | VarKind::AwaitUsing) => {
                     let is_await = vs.kind == VarKind::AwaitUsing;
+                    let mut first = true;
                     for d in &vs.declarations {
                         if let PatKind::Ident(name) = &d.name.kind {
                             if let Some(init) = &d.init {
-                                self.write(keyword);
-                                self.write(" ");
+                                if first {
+                                    self.write(keyword);
+                                    self.write(" ");
+                                    first = false;
+                                } else {
+                                    self.write(", ");
+                                }
                                 self.write(name);
                                 self.write(" = ");
                                 self.write(self.helper_prefix());
                                 self.write(&format!("__addDisposableResource(env_{env_num}, "));
                                 self.emit_using_initializer(name, init);
                                 self.write(if is_await { ", true" } else { ", false" });
-                                self.writeln(");");
+                                self.write(")");
                             }
                         }
+                    }
+                    if !first {
+                        self.writeln(";");
                     }
                 }
                 _ => self.emit_stmt(s),
