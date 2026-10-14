@@ -34,6 +34,8 @@ pub struct DeclarationEmitter<'a> {
     remove_comments: bool,
     widen_fresh_null_initializers: bool,
     callable_namespace_scopes: Vec<HashSet<String>>,
+    default_export_names: Option<(HashSet<String>, HashSet<String>)>,
+    default_export_names_ambiguous: bool,
 }
 
 impl<'a> DeclarationEmitter<'a> {
@@ -57,6 +59,8 @@ impl<'a> DeclarationEmitter<'a> {
             remove_comments: false,
             widen_fresh_null_initializers: false,
             callable_namespace_scopes: Vec::new(),
+            default_export_names: None,
+            default_export_names_ambiguous: false,
         }
     }
 
@@ -134,6 +138,14 @@ impl<'a> DeclarationEmitter<'a> {
 
     pub fn emit_source_file(&mut self, file: &SourceFile) {
         self.comments.clone_from(&file.comments);
+        // The batch scanner does not distinguish JSX text from identifiers.
+        // Preserve the existing path when source-level naming needs that context.
+        self.default_export_names_ambiguous = (file.file_name.ends_with(".tsx")
+            || file.file_name.ends_with(".jsx"))
+            && tsc_rs_scanner::Scanner::new(self.source)
+                .scan_all()
+                .iter()
+                .any(|token| token.kind == tsc_rs_scanner::TokenKind::LessThan);
         self.collect_inferred_types(file);
         let forced_module = Self::has_module_file_identity(file);
         let external_module = forced_module || Self::has_syntactic_module_indicator(file);
@@ -1066,7 +1078,7 @@ impl<'a> DeclarationEmitter<'a> {
                 self.writeln(";");
             }
             StmtKind::Export(export_decl) => {
-                self.emit_export_decl(export_decl);
+                self.emit_export_decl(export_decl, top_level);
             }
             StmtKind::ExportAssign(expr) => {
                 self.write("export = ");
@@ -1971,7 +1983,137 @@ impl<'a> DeclarationEmitter<'a> {
         }
     }
 
-    fn emit_export_decl(&mut self, export_decl: &ExportDecl) {
+    // Primitive expressions need no inferred variable cache or private type
+    // dependencies. Keep other default expressions on their existing path.
+    fn default_export_primitive_type(expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            // A parenthesized expression is inferred normally, whereas a bare
+            // literal default export retains its literal type.
+            ExprKind::Paren(_) => Self::closed_primitive_kind(expr).map(str::to_string),
+            ExprKind::BigIntLit(text) => Some(text.replace('_', "").to_ascii_lowercase()),
+            ExprKind::Unary(unary) if unary.op == UnaryOp::Neg => {
+                if let ExprKind::BigIntLit(text) = &unary.argument.kind {
+                    Some(format!("-{}", text.replace('_', "").to_ascii_lowercase()))
+                } else if let ExprKind::NumLit(_) = &unary.argument.kind {
+                    Self::const_initializer_text(&unary.argument).map(|text| format!("-{text}"))
+                } else {
+                    Self::const_initializer_text(expr)
+                        .or_else(|| Self::closed_primitive_kind(expr).map(str::to_string))
+                }
+            }
+            _ => Self::const_initializer_text(expr)
+                .or_else(|| Self::closed_primitive_kind(expr).map(str::to_string)),
+        }
+    }
+
+    fn closed_primitive_kind(expr: &Expr) -> Option<&'static str> {
+        match &expr.kind {
+            ExprKind::Paren(inner) => Self::closed_primitive_kind(inner),
+            ExprKind::NumLit(_) => Some("number"),
+            ExprKind::BigIntLit(_) => Some("bigint"),
+            ExprKind::StrLit(_) | ExprKind::NoSubstTemplate(_) => Some("string"),
+            ExprKind::BoolLit(_) => Some("boolean"),
+            ExprKind::Unary(unary) => {
+                match (unary.op, Self::closed_primitive_kind(&unary.argument)?) {
+                    (UnaryOp::Pos | UnaryOp::Neg | UnaryOp::BitNot, "number") => Some("number"),
+                    (UnaryOp::Neg | UnaryOp::BitNot, "bigint") => Some("bigint"),
+                    _ => None,
+                }
+            }
+            ExprKind::Binary(binary) => {
+                let left = Self::closed_primitive_kind(&binary.left)?;
+                let right = Self::closed_primitive_kind(&binary.right)?;
+                match binary.op {
+                    BinaryOp::Add if (left == "string" || right == "string") => Some("string"),
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod
+                    | BinaryOp::Exp
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitXor
+                    | BinaryOp::Shl
+                    | BinaryOp::Shr
+                        if left == right && matches!(left, "number" | "bigint") =>
+                    {
+                        Some(left)
+                    }
+                    BinaryOp::UShr if left == "number" && right == "number" => Some("number"),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn next_default_export_name(&mut self, primitive_span: Span) -> Option<String> {
+        if self.default_export_names_ambiguous {
+            return None;
+        }
+        let ambiguous_names = &mut self.default_export_names_ambiguous;
+        let (names, ambiguous_strings) = self.default_export_names.get_or_insert_with(|| {
+            let mut names = HashSet::new();
+            let mut strings = HashSet::new();
+            let mut previous = tsc_rs_scanner::TokenKind::EndOfFile;
+            for token in tsc_rs_scanner::Scanner::new(self.source).scan_all() {
+                let Some(text) = self
+                    .source
+                    .get(token.span.start as usize..token.span.end as usize)
+                else {
+                    continue;
+                };
+                match token.kind {
+                    tsc_rs_scanner::TokenKind::Identifier => {
+                        names.insert(crate::normalize_unicode_escapes(text));
+                    }
+                    tsc_rs_scanner::TokenKind::Slash => {
+                        // After a condition/block this may begin a regex that
+                        // the batch scanner treats as division. Its end cannot
+                        // be guessed from later slashes or quotes. Only the
+                        // already-proven primitive expression is unambiguous.
+                        *ambiguous_names |= matches!(
+                            previous,
+                            tsc_rs_scanner::TokenKind::CloseParen
+                                | tsc_rs_scanner::TokenKind::CloseBrace
+                        ) && !(primitive_span.start <= token.span.start
+                            && token.span.end <= primitive_span.end);
+                    }
+                    tsc_rs_scanner::TokenKind::StringLiteral
+                    | tsc_rs_scanner::TokenKind::NoSubstitutionTemplate
+                        if text.len() >= 2 =>
+                    {
+                        strings.insert(crate::emit_class::decode_js_string_content(
+                            &text[1..text.len() - 1],
+                        ));
+                    }
+                    _ => {}
+                }
+                previous = token.kind;
+            }
+            (names, strings)
+        });
+        if *ambiguous_names {
+            return None;
+        }
+        let mut name = "_default".to_string();
+        let mut suffix = 1;
+        while names.contains(&name) {
+            name = format!("_default_{suffix}");
+            suffix += 1;
+        }
+        // TypeScript also reserves some quoted property/module names. Until
+        // their AST context and ambiguous regex regions are tracked here, do
+        // not guess whether those tokens belong to the identifier table.
+        if ambiguous_strings.contains(&name) {
+            return None;
+        }
+        names.insert(name.clone());
+        Some(name)
+    }
+
+    fn emit_export_decl(&mut self, export_decl: &ExportDecl, top_level: bool) {
         match &export_decl.kind {
             ExportDeclKind::Decl(decl) => {
                 // For exported declarations, emit "export declare" for value-level
@@ -2029,8 +2171,25 @@ impl<'a> DeclarationEmitter<'a> {
                 self.writeln(";");
             }
             ExportDeclKind::Default(expr) => {
-                self.write("export default ");
-                self.copy_span(expr.span);
+                let generated = Self::default_export_primitive_type(expr).and_then(|ty| {
+                    self.next_default_export_name(expr.span)
+                        .map(|name| (name, ty))
+                });
+                if let Some((name, ty)) = generated {
+                    if top_level {
+                        self.write("declare ");
+                    }
+                    self.write("const ");
+                    self.write(&name);
+                    self.write(": ");
+                    self.write(&ty);
+                    self.writeln(";");
+                    self.write("export default ");
+                    self.write(&name);
+                } else {
+                    self.write("export default ");
+                    self.copy_span(expr.span);
+                }
                 self.writeln(";");
             }
             ExportDeclKind::DefaultDecl(decl) => {

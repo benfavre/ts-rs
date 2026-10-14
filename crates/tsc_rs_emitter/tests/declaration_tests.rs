@@ -1500,3 +1500,147 @@ fn test_dts_variable_any_assertions_preserve_boundaries_and_dependencies() {
         }
     }
 }
+
+#[test]
+fn test_dts_primitive_default_exports_preserve_types_and_unique_names() {
+    // Complete outputs verified against TypeScript 6.0.3. The source includes
+    // collisions in nested scopes, Unicode names, literals and arithmetic.
+    let cases = [
+        ("number", "export default 3.14159;", "declare const _default: 3.14159;\nexport default _default;\n"),
+        ("string", "export default \"a\\n\\\"b\";", "declare const _default: \"a\\n\\\"b\";\nexport default _default;\n"),
+        ("boolean", "export default true;", "declare const _default: true;\nexport default _default;\n"),
+        ("false", "export default false;", "declare const _default: false;\nexport default _default;\n"),
+        ("bigint", "export default 0x12n;", "declare const _default: 0x12n;\nexport default _default;\n"),
+        ("negative", "export default -12;", "declare const _default: -12;\nexport default _default;\n"),
+        ("positive", "export default +12;", "declare const _default: 12;\nexport default _default;\n"),
+        ("negative_bigint", "export default -12n;", "declare const _default: -12n;\nexport default _default;\n"),
+        ("hex", "export default 0x12;", "declare const _default: 18;\nexport default _default;\n"),
+        ("separators", "export default 1_234;", "declare const _default: 1234;\nexport default _default;\n"),
+        ("parenthesized", "export default (((1)));", "declare const _default: number;\nexport default _default;\n"),
+        ("arithmetic", "export default 1+2;", "declare const _default: number;\nexport default _default;\n"),
+        ("arithmetic_nested", "export default (1+2)*(3-4)/5;", "declare const _default: number;\nexport default _default;\n"),
+        ("shift", "export default 1<<2;", "declare const _default: number;\nexport default _default;\n"),
+        ("bitwise", "export default 1&2|3^4;", "declare const _default: number;\nexport default _default;\n"),
+        ("remainder", "export default 5%2;", "declare const _default: number;\nexport default _default;\n"),
+        ("exponent", "export default 5**2;", "declare const _default: number;\nexport default _default;\n"),
+        ("bigint_arithmetic", "export default 1n+2n;", "declare const _default: bigint;\nexport default _default;\n"),
+        ("string_concat", "export default \"a\"+\"b\";", "declare const _default: string;\nexport default _default;\n"),
+        ("mixed_concat", "export default \"a\"+1;", "declare const _default: string;\nexport default _default;\n"),
+        ("undefined", "export default undefined;", "export default undefined;\n"),
+        ("identifier", "const value=1;export default value;", "declare const value = 1;\nexport default value;\n"),
+        ("function_decl", "export default function f(x:number):number{return x;}", "export default function f(x: number): number;\n"),
+        ("class_decl", "export default class C{}", "export default class C {\n}\n"),
+        ("collision", "var _default=1;export {_default as d};export default 1+2;", "declare var _default: number;\nexport { _default as d };\ndeclare const _default_1: number;\nexport default _default_1;\n"),
+        ("collision_suffix", "const _default=1,_default_1=2;export default 3;", "declare const _default_2: 3;\nexport default _default_2;\n"),
+        ("collision_type", "type _default=number;export default 1;", "declare const _default_1: 1;\nexport default _default_1;\n"),
+        ("collision_parameter", "function f(_default:number){};export default 1;", "declare const _default_1: 1;\nexport default _default_1;\n"),
+        ("collision_namespace", "namespace N{const _default=1;}export default 1;", "declare const _default_1: 1;\nexport default _default_1;\n"),
+        ("collision_property", "const v={_default:1};export default 1;", "declare const _default_1: 1;\nexport default _default_1;\n"),
+        ("collision_reference", "const v=_default;export default 1;", "declare const _default_1: 1;\nexport default _default_1;\n"),
+        ("collision_unicode", "const \\u005fdefault=1;export default 2;", "declare const _default_1: 2;\nexport default _default_1;\n"),
+        ("collision_unicode_suffix", "const _default=1,\\u005fdefault_1=2;export default 3;", "declare const _default_2: 3;\nexport default _default_2;\n"),
+        ("collision_exportalias", "const v=1;export {v as _default};export default 2;", "declare const v = 1;\nexport { v as _default };\ndeclare const _default_1: 2;\nexport default _default_1;\n"),
+        ("ordinary_regex", "const text=/_default/;export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("ordinary_comment", "/* _default */ export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("collision_template_substitution", "const text=`x${_default}`;export default 1;", "declare const _default_1: 1;\nexport default _default_1;\n"),
+        ("duplicate_default", "export default 1;export default 2;", "declare const _default: 1;\nexport default _default;\ndeclare const _default_1: 2;\nexport default _default_1;\n"),
+        ("namespace_default", "export namespace N{export default 1;}", "export declare namespace N {\n    const _default: 1;\n    export default _default;\n}\n"),
+        ("ambient_module", "declare module \"pkg\"{export default 1;}", "declare module \"pkg\" {\n    const _default: 1;\n    export default _default;\n}\n"),
+        ("sibling_module", "declare module \"a\"{export default 1;}declare module \"b\"{export default 2;}", "declare module \"a\" {\n    const _default: 1;\n    export default _default;\n}\ndeclare module \"b\" {\n    const _default_1: 2;\n    export default _default_1;\n}\n"),
+        ("shadow_nested", "export namespace N{const _default=1;export default 2;}", "export declare namespace N {\n    const _default_1: 2;\n    export default _default_1;\n}\n"),
+        ("explicit_outer_annotation", "const value:number=1;export default value;", "declare const value: number;\nexport default value;\n"),
+        ("private_signature", "interface Hidden{x:1};export default function f(x:Hidden):Hidden{return x;}", "interface Hidden {\n    x: 1;\n}\nexport default function f(x: Hidden): Hidden;\nexport {};\n"),
+        ("bigint_upper", "export default 0XFn;", "declare const _default: 0xfn;\nexport default _default;\n"),
+        ("bigint_separators", "export default 1_234n;", "declare const _default: 1234n;\nexport default _default;\n"),
+        ("bigint_hex_separators", "export default 0x1_2n;", "declare const _default: 0x12n;\nexport default _default;\n"),
+        ("bigint_negative_hex", "export default -0x12n;", "declare const _default: -0x12n;\nexport default _default;\n"),
+        ("bigint_zero", "export default -0n;", "declare const _default: -0n;\nexport default _default;\n"),
+        ("bigint_parenthesized", "export default (12n);", "declare const _default: bigint;\nexport default _default;\n"),
+        ("parenthesized_string", "export default (\"a\");", "declare const _default: string;\nexport default _default;\n"),
+        ("parenthesized_bool", "export default (true);", "declare const _default: boolean;\nexport default _default;\n"),
+        ("parenthesized_negative", "export default (-12);", "declare const _default: number;\nexport default _default;\n"),
+        ("parenthesized_unary", "export default -(12);", "declare const _default: number;\nexport default _default;\n"),
+        ("template_literal", "export default `abc`;", "declare const _default: \"abc\";\nexport default _default;\n"),
+    ];
+    for (strict, strict_null_checks) in [
+        (None, None),
+        (Some(false), None),
+        (Some(true), None),
+        (Some(true), Some(false)),
+        (Some(false), Some(true)),
+        (None, Some(false)),
+        (None, Some(true)),
+    ] {
+        let options = CompilerOptions {
+            declaration: Some(true),
+            target: Some(ScriptTarget::ES2015),
+            strict,
+            strict_null_checks,
+            ..Default::default()
+        };
+        for (name, source, expected) in cases {
+            let file = tsc_rs_parser::parse("test.ts", source);
+            assert_eq!(
+                emit(&file, &options).declaration_file.unwrap(),
+                expected,
+                "{name}: strict={strict:?}, strictNullChecks={strict_null_checks:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_dts_default_export_lexical_names_and_signed_zero() {
+    // TypeScript 6.0.3 outputs. JSX-mode comments and literal text must not be
+    // treated as JSX syntax; regex bodies must not reserve identifier names.
+    let cases = [
+        ("regex_text", "probe.ts", "const r=/_default/;export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("regex_class", "probe.ts", "const r=/[_default]/;export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("regex_unicode", "probe.ts", "const r=/\\u005fdefault/;export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("regex_escaped", "probe.ts", "const r=/\\x5fdefault/;export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("regex_nested", "probe.ts", "const r=/(?:_default|[_default])/;export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("interpolated_template", "probe.ts", "const x=`${_default}`;export default 1;", "declare const _default_1: 1;\nexport default _default_1;\n"),
+        ("raw_template_substitution", "probe.ts", "const x=`_default${1}`;export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("interleaved_function", "probe.ts", "export default 1;export default function(){};export default 2;", "declare const _default: 1;\nexport default _default;\nexport default function (): void;\ndeclare const _default_1: 2;\nexport default _default_1;\n"),
+        ("interleaved_class", "probe.ts", "export default 1;export default class{};export default 2;", "declare const _default: 1;\nexport default _default;\nexport default class {\n}\ndeclare const _default_1: 2;\nexport default _default_1;\n"),
+        ("function_before", "probe.ts", "export default function(){};export default 1;", "export default function (): void;\ndeclare const _default: 1;\nexport default _default;\n"),
+        ("class_before", "probe.ts", "export default class{};export default 1;", "export default class {\n}\ndeclare const _default: 1;\nexport default _default;\n"),
+        ("number_negative_zero", "probe.ts", "export default -0;", "declare const _default: -0;\nexport default _default;\n"),
+        ("number_exp", "probe.ts", "export default 1e3;", "declare const _default: 1000;\nexport default _default;\n"),
+        ("number_fraction", "probe.ts", "export default .5;", "declare const _default: 0.5;\nexport default _default;\n"),
+        ("number_parenthesized_zero", "probe.ts", "export default (-0);", "declare const _default: number;\nexport default _default;\n"),
+        ("number_positive_zero", "probe.ts", "export default +0;", "declare const _default: 0;\nexport default _default;\n"),
+        ("bigint_zero", "probe.ts", "export default 0n;", "declare const _default: 0n;\nexport default _default;\n"),
+        ("bigint_negative_zero", "probe.ts", "export default -0n;", "declare const _default: -0n;\nexport default _default;\n"),
+        ("bigint_parenthesized_zero", "probe.ts", "export default (-0n);", "declare const _default: bigint;\nexport default _default;\n"),
+        ("jsx_plain_literal", "probe.tsx", "export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("jsx_angle_comment", "probe.tsx", "/* < _default */export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("jsx_angle_string", "probe.tsx", "const s=\"< _default\";export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+        ("jsx_angle_template", "probe.tsx", "const s=`< _default`;export default 1;", "declare const _default: 1;\nexport default _default;\n"),
+    ];
+    for (strict, strict_null_checks) in [
+        (None, None),
+        (Some(false), None),
+        (Some(true), None),
+        (Some(true), Some(false)),
+        (Some(false), Some(true)),
+        (None, Some(false)),
+        (None, Some(true)),
+    ] {
+        let options = CompilerOptions {
+            declaration: Some(true),
+            target: Some(ScriptTarget::ES2015),
+            strict,
+            strict_null_checks,
+            ..Default::default()
+        };
+        for (name, file_name, source, expected) in cases {
+            let file = tsc_rs_parser::parse(file_name, source);
+            assert_eq!(
+                emit(&file, &options).declaration_file.unwrap(),
+                expected,
+                "{name}: strict={strict:?}, strictNullChecks={strict_null_checks:?}"
+            );
+        }
+    }
+}
