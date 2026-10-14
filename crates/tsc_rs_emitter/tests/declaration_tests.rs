@@ -2049,3 +2049,168 @@ fn const_asserted_object_declarations_reset_file_eligibility() {
         assert_eq!(emitter.output, expected, "{file_name}");
     }
 }
+
+#[test]
+fn test_dts_nested_callable_signatures_keep_type_and_value_dependencies() {
+    // Complete declaration outputs from TypeScript 6.0.3. Value parameter names
+    // do not hide type aliases, and generic names do not hide queried values.
+    for (source, expected) in [
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{a?():void;b?:()=>void}):void=>{};", "export declare const f: (p: {\n    a?(): void;\n    b?: () => void;\n}) => void;\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:<T>(x:T)=>T):void=>{};", "export declare const f: (p: <T>(x: T) => T) => void;\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:<T extends Hidden>(x:T)=>T):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: <T extends Hidden>(x: T) => T) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:new(x:Hidden)=>Hidden):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: new (x: Hidden) => Hidden) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{m(T:T):T}):void=>{};", "type T = {\n    t: string;\n};\ndeclare const T = 1;\nexport declare const f: (p: {\n    m(T: T): T;\n}) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{m<T>(x:T):T}):void=>{};", "export declare const f: (p: {\n    m<T>(x: T): T;\n}) => void;\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{m(x:unknown):x is Hidden}):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: {\n    m(x: unknown): x is Hidden;\n}) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{m(x:unknown):asserts x is Hidden}):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: {\n    m(x: unknown): asserts x is Hidden;\n}) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{():Hidden}):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: {\n    (): Hidden;\n}) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{new(x:Hidden):Hidden}):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: {\n    new (x: Hidden): Hidden;\n}) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{[x:string]:Hidden}):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: {\n    [x: string]: Hidden;\n}) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{m(x:string):typeof x}):void=>{};", "export declare const f: (p: {\n    m(x: string): typeof x;\n}) => void;\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{m<T>():typeof T}):void=>{};", "type T = {\n    t: string;\n};\ndeclare const T = 1;\nexport declare const f: (p: {\n    m<T>(): typeof T;\n}) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:<T>(x:T)=>typeof T):void=>{};", "type T = {\n    t: string;\n};\ndeclare const T = 1;\nexport declare const f: (p: <T>(x: T) => typeof T) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{m<T = Hidden>():T}):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: {\n    m<T = Hidden>(): T;\n}) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{[K in keyof Hidden]:()=>Hidden[K]}):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: { [K in keyof Hidden]: () => Hidden[K]; }) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{[K in keyof Hidden as K]:<T>(x:T)=>Hidden[K]}):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: { [K in keyof Hidden as K]: <T>(x: T) => Hidden[K]; }) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{m(this:Hidden):void}):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f: (p: {\n    m(this: Hidden): void;\n}) => void;\nexport {};\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{m(x:string):string;m(x:number):number}):void=>{};", "export declare const f: (p: {\n    m(x: string): string;\n    m(x: number): number;\n}) => void;\n"),
+        ("type T={t:number};export const f=(T:T):typeof T=>T;", "type T = {\n    t: number;\n};\nexport declare const f: (T: T) => typeof T;\nexport {};\n"),
+        ("const T=1;export const f=<T>(x:T):typeof T=>1;", "declare const T = 1;\nexport declare const f: <T>(x: T) => typeof T;\nexport {};\n"),
+        ("const x=1;export const f=(x:string):typeof x=>x;", "export declare const f: (x: string) => typeof x;\n"),
+        ("const x=1;export const f=(p:(x:string)=>typeof x):void=>{};", "export declare const f: (p: (x: string) => typeof x) => void;\n"),
+        ("type T={t:number};export const f=(p:(T:T)=>T):void=>{};", "type T = {\n    t: number;\n};\nexport declare const f: (p: (T: T) => T) => void;\nexport {};\n"),
+        ("type T={t:number};export const f=(p:<T>(T:T)=>T):void=>{};", "export declare const f: (p: <T>(T: T) => T) => void;\n"),
+        ("const T=1;export const f=(p:<T>(x:T)=>typeof T):void=>{};", "declare const T = 1;\nexport declare const f: (p: <T>(x: T) => typeof T) => void;\nexport {};\n"),
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        for strict in [None, Some(false), Some(true)] {
+            let options = CompilerOptions { declaration: Some(true), strict, ..Default::default() };
+            assert_eq!(emit(&file, &options).declaration_file.unwrap(), expected, "{source}; strict={strict:?}");
+        }
+    }
+}
+
+#[test]
+fn test_dts_nested_callable_unmodeled_shapes_keep_existing_fallback() {
+    // These shapes still require serializer/inference work. Preserve the prior
+    // complete output rather than introducing a partially correct signature.
+    for (source, expected) in [
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:abstract new(x:Hidden)=>Hidden):void=>{};", "export declare const f;\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{get x():Hidden;set x(value:Hidden)}):void=>{};", "export declare const f;\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{[key]():Hidden}):void=>{};", "export declare const f;\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:{m<const T>(x:T):T}):void=>{};", "export declare const f;\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:Hidden extends infer U ? (x:U)=>U : never):void=>{};", "type Hidden = {\n    x: number;\n};\nexport declare const f, Hidden: any;\n"),
+        ("type Hidden={x:number};type T={t:string};const T=1;declare const key:unique symbol;export const f=(p:({p:x=1}:{p?:number})=>number):void=>{};", "export declare const f;\n"),
+        ("const internal=1;export const f=function internal():typeof internal{return internal;};", "export declare const f;\n"),
+        ("export const f=async(p:()=>void):Promise<void>=>{};", "export declare const f;\n"),
+        ("export const f=(p:()=>void=()=>{}):void=>{};", "export declare const f;\n"),
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        let options = CompilerOptions { declaration: Some(true), strict: Some(true), ..Default::default() };
+        assert_eq!(emit(&file, &options).declaration_file.unwrap(), expected, "{source}");
+    }
+}
+
+#[test]
+fn test_dts_nested_callables_only_retain_supported_dependency_declarations() {
+    for (source, expected) in [
+        ("const value=1e999;export const f=(p:()=>typeof value):void=>{};", "export declare const f;\n"),
+        ("const value=-1e999;export const f=(p:()=>typeof value):void=>{};", "export declare const f;\n"),
+        ("const T={tag:1};type Alias=<T>()=>typeof T;export const f=(p:()=>Alias):void=>{};", "export declare const f;\n"),
+        ("const value={tag:1};type Alias=typeof value;export const f=(p:()=>Alias):void=>{};", "export declare const f;\n"),
+        ("const value={tag:1};interface Alias{v:typeof value}export const f=(p:()=>Alias):void=>{};", "export declare const f;\n"),
+        ("const T={tag:1};interface Alias<T>{v:typeof T}export const f=(p:()=>Alias<number>):void=>{};", "export declare const f;\n"),
+        ("type T={tag:1};const T={tag:1};export const f=(p:(T:T)=>typeof T):void=>{};", "export declare const f;\n"),
+        ("type T={tag:1};const T:{tag:number}={tag:1};export const f=(p:(T:T)=>typeof T):void=>{};", "type T = {\n    tag: 1;\n};\ndeclare const T: {\n    tag: number;\n};\nexport declare const f: (p: (T: T) => typeof T) => void;\nexport {};\n"),
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        let options = CompilerOptions { declaration: Some(true), strict: Some(true), ..Default::default() };
+        assert_eq!(emit(&file, &options).declaration_file.unwrap(), expected, "{source}");
+    }
+}
+
+#[test]
+fn test_dts_nested_callable_eligibility_resets_between_ts_and_js_files() {
+    let source = "export const f=(p:()=>void):void=>{};";
+    let mut emitter = tsc_rs_emitter::declaration::DeclarationEmitter::new(source);
+    for filename in [
+        "probe.ts",
+        "probe.js",
+        "probe.jsx",
+        "probe.mjs",
+        "probe.cjs",
+        "probe.ts",
+    ] {
+        let file = tsc_rs_parser::parse(filename, source);
+        emitter.output.clear();
+        emitter.emit_source_file(&file);
+        assert_eq!(
+            emitter.output,
+            if filename.ends_with(".ts") {
+                "export declare const f: (p: () => void) => void;\n"
+            } else {
+                "export declare const f;\n"
+            },
+            "{filename}"
+        );
+    }
+}
+
+#[test]
+fn test_dts_nested_callable_dependency_proof_visits_qualified_namespaces() {
+    for (source, expected) in [
+        ("namespace A.B{type T={tag:1};const T={tag:1};export const f=(p:(T:T)=>T):void=>{};}", "declare namespace A.B {\n    const f;\n}\n"),
+        ("namespace A.B{const T={tag:1};type Alias=typeof T;export const f=(p:()=>Alias):void=>{};}", "declare namespace A.B {\n    const f;\n}\n"),
+        ("namespace A.B{type T={tag:1};const T:{tag:number}={tag:1};export const f=(p:(T:T)=>T):void=>{};}", "declare namespace A.B {\n    type T = {\n        tag: 1;\n    };\n    const T: {\n        tag: number;\n    };\n    export const f: (p: (T: T) => T) => void;\n    export {};\n}\n"),
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        let options = CompilerOptions { declaration: Some(true), strict: Some(true), ..Default::default() };
+        assert_eq!(emit(&file, &options).declaration_file.unwrap(), expected, "{source}");
+    }
+}
+
+#[test]
+fn test_dts_nested_callable_retention_checks_full_dependency_signatures() {
+    // Keep the existing fallback when retaining a declaration would lose an
+    // outer value dependency, capture an extra outer value, or lose string data.
+    for (source, expected) in [
+        ("const T={tag:1};const dep:<T>(x:T)=>typeof T=null as any;export const f=(x:()=>typeof dep):()=>typeof dep=>x;", "export declare const f;\n"),
+        ("const T={tag:1};function dep<T>(x:T):typeof T { return T; }export const f=(x:()=>typeof dep):()=>typeof dep=>x;", "export declare const f;\n"),
+        ("const T=1;declare function dep<T>(x:T):typeof T;export const f=(x:()=>typeof dep):()=>typeof dep=>x;", "export declare const f;\n"),
+        ("const T=1;function dep(T:number):typeof T { return T; }export const f=(x:()=>typeof dep):()=>typeof dep=>x;", "export declare const f;\n"),
+        ("const dep='\\ud800';export const f=(x:()=>typeof dep):()=>typeof dep=>x;", "export declare const f;\n"),
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        let options = CompilerOptions { declaration: Some(true), strict: Some(true), ..Default::default() };
+        assert_eq!(emit(&file, &options).declaration_file.unwrap(), expected, "{source}");
+    }
+}
+
+#[test]
+fn test_dts_nested_callables_defer_annotation_serialization_and_name_rewrites() {
+    for (source, expected) in [
+        ("export const f=(p:()=>0x10):void=>{};", "export declare const f;\n"),
+        ("export const f=(p:()=>12n):void=>{};", "export declare const f;\n"),
+        ("export const f=(p:()=>'a\"b'):void=>{};", "export declare const f;\n"),
+        ("export const f=(p:()=>'\\ud800'):void=>{};", "export declare const f;\n"),
+        ("export const f=(p:()=>{\\u0078:number}):void=>{};", "export declare const f;\n"),
+        ("export const f=(p:()=>{'x'?():void}):void=>{};", "export declare const f;\n"),
+        ("export const f=(p:()=>{0x10:number}):void=>{};", "export declare const f;\n"),
+        ("export const f=(\\u0070:()=>void):void=>{};", "export declare const f;\n"),
+        ("export const f=(p:(\\u0078:number)=>void):void=>{};", "export declare const f;\n"),
+        ("type T=number;export const f=(p:()=>\\u0054):void=>{};", "export declare const f;\n"),
+        ("export const f=(p:({\\u0078:x}:{x:number})=>void):void=>{};", "export declare const f;\n"),
+        ("export const f=({\\u0078:x}:{x:()=>void}):void=>{};", "export declare const f;\n"),
+        ("type Dep<T extends abstract new()=>object>=T;export const f=(x:()=>Dep<any>):()=>Dep<any>=>x;", "export declare const f;\n"),
+        ("type Dep<T = abstract new()=>object>=T;export const f=(x:()=>Dep<any>):()=>Dep<any>=>x;", "export declare const f;\n"),
+        ("type Dep<const T>=T;export const f=(x:()=>Dep<any>):()=>Dep<any>=>x;", "export declare const f;\n"),
+        ("interface Dep<T extends abstract new()=>object>{value:T}export const f=(x:()=>Dep<any>):()=>Dep<any>=>x;", "export declare const f;\n"),
+        ("interface Dep<T = abstract new()=>object>{value:T}export const f=(x:()=>Dep<any>):()=>Dep<any>=>x;", "export declare const f;\n"),
+        ("interface Dep<const T>{value:T}export const f=(x:()=>Dep<any>):()=>Dep<any>=>x;", "export declare const f;\n"),
+        ("type Dep<T>={[K in \"\\ud800\"]:K};export const f=(x:()=>Dep<string>):()=>Dep<string>=>x;", "export declare const f;\n"),
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        let options = CompilerOptions { declaration: Some(true), strict: Some(true), ..Default::default() };
+        assert_eq!(emit(&file, &options).declaration_file.unwrap(), expected, "{source}");
+    }
+}

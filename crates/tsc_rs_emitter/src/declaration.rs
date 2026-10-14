@@ -42,6 +42,8 @@ pub struct DeclarationEmitter<'a> {
     remove_comments: bool,
     widen_fresh_null_initializers: bool,
     callable_namespace_scopes: Vec<HashSet<String>>,
+    allow_scoped_callables: bool,
+    uncertain_callable_dependencies: HashSet<String>,
     default_export_names: Option<(HashSet<String>, HashSet<String>)>,
     default_export_names_ambiguous: bool,
     constructor_property_scopes: Vec<HashMap<String, ConstructorPropertyType>>,
@@ -71,6 +73,8 @@ impl<'a> DeclarationEmitter<'a> {
             remove_comments: false,
             widen_fresh_null_initializers: false,
             callable_namespace_scopes: Vec::new(),
+            allow_scoped_callables: false,
+            uncertain_callable_dependencies: HashSet::new(),
             default_export_names: None,
             default_export_names_ambiguous: false,
             constructor_property_scopes: Vec::new(),
@@ -178,6 +182,7 @@ impl<'a> DeclarationEmitter<'a> {
         self.can_emit_const_literal_objects = !is_javascript && file.diagnostics.is_empty();
         self.collect_inferred_types(file);
         self.collect_shorthand_function_objects(file);
+        self.prepare_scoped_callables(file);
         let forced_module = Self::has_module_file_identity(file);
         let external_module = forced_module || Self::has_syntactic_module_indicator(file);
         let named_exports = Self::named_local_exports(&file.statements);
@@ -525,12 +530,12 @@ impl<'a> DeclarationEmitter<'a> {
                                 declarator
                                     .init
                                     .as_deref()
-                                    .and_then(Self::typed_callable_initializer)
+                                    .and_then(|init| self.typed_callable_initializer(init))
                             })
                             .flatten()
                             .filter(|signature| self.callable_dependencies_are_visible(signature))
                     {
-                        Self::collect_type_dependencies(&signature, &bound, &mut dependencies);
+                        Self::collect_callable_dependencies(&signature, &bound, &mut dependencies);
                     } else if let Some(properties) =
                         self.shorthand_function_objects.get(&declarator.span.start)
                     {
@@ -560,24 +565,21 @@ impl<'a> DeclarationEmitter<'a> {
         dependencies
     }
 
+    // Type parameters and callable parameters bind different namespaces. In
+    // particular, `<T>(x: T) => typeof T` still depends on an outer value T,
+    // while `(T: T) => typeof T` keeps the outer type but binds the value locally.
+    fn callable_value_scope(params: &[Param], values: &HashSet<String>) -> HashSet<String> {
+        let mut scoped = values.clone();
+        scoped.extend(params.iter().flat_map(|p| Self::binding_names(&p.name)));
+        scoped
+    }
+
     fn collect_type_params(
         params: &Option<Vec<TypeParam>>,
         bound: &HashSet<String>,
         dependencies: &mut HashSet<String>,
     ) -> HashSet<String> {
-        let mut scoped = bound.clone();
-        if let Some(params) = params {
-            scoped.extend(params.iter().map(|param| param.name.clone()));
-            for param in params {
-                if let Some(constraint) = &param.constraint {
-                    Self::collect_type_dependencies(constraint, &scoped, dependencies);
-                }
-                if let Some(default) = &param.default {
-                    Self::collect_type_dependencies(default, &scoped, dependencies);
-                }
-            }
-        }
-        scoped
+        Self::collect_type_params_in_scope(params, bound, None, dependencies)
     }
 
     fn collect_params(
@@ -585,11 +587,7 @@ impl<'a> DeclarationEmitter<'a> {
         bound: &HashSet<String>,
         dependencies: &mut HashSet<String>,
     ) {
-        for param in params {
-            if let Some(type_ann) = &param.type_ann {
-                Self::collect_type_dependencies(type_ann, bound, dependencies);
-            }
-        }
+        Self::collect_params_in_scope(params, bound, None, dependencies)
     }
 
     fn collect_types(
@@ -597,9 +595,7 @@ impl<'a> DeclarationEmitter<'a> {
         bound: &HashSet<String>,
         dependencies: &mut HashSet<String>,
     ) {
-        for type_node in types {
-            Self::collect_type_dependencies(type_node, bound, dependencies);
-        }
+        Self::collect_types_in_scope(types, bound, None, dependencies)
     }
 
     fn collect_type_dependencies(
@@ -607,12 +603,84 @@ impl<'a> DeclarationEmitter<'a> {
         bound: &HashSet<String>,
         dependencies: &mut HashSet<String>,
     ) {
+        Self::collect_type_dependencies_in_scope(type_node, bound, None, dependencies)
+    }
+
+    fn collect_type_members(
+        members: &[TypeMember],
+        bound: &HashSet<String>,
+        dependencies: &mut HashSet<String>,
+    ) {
+        Self::collect_type_members_in_scope(members, bound, None, dependencies)
+    }
+
+    fn collect_type_params_in_scope(
+        params: &Option<Vec<TypeParam>>,
+        bound: &HashSet<String>,
+        values: Option<&HashSet<String>>,
+        dependencies: &mut HashSet<String>,
+    ) -> HashSet<String> {
+        let mut scoped = bound.clone();
+        if let Some(params) = params {
+            scoped.extend(params.iter().map(|param| param.name.clone()));
+            for param in params {
+                if let Some(constraint) = &param.constraint {
+                    Self::collect_type_dependencies_in_scope(
+                        constraint,
+                        &scoped,
+                        values,
+                        dependencies,
+                    );
+                }
+                if let Some(default) = &param.default {
+                    Self::collect_type_dependencies_in_scope(
+                        default,
+                        &scoped,
+                        values,
+                        dependencies,
+                    );
+                }
+            }
+        }
+        scoped
+    }
+
+    fn collect_params_in_scope(
+        params: &[Param],
+        bound: &HashSet<String>,
+        values: Option<&HashSet<String>>,
+        dependencies: &mut HashSet<String>,
+    ) {
+        for param in params {
+            if let Some(type_ann) = &param.type_ann {
+                Self::collect_type_dependencies_in_scope(type_ann, bound, values, dependencies);
+            }
+        }
+    }
+
+    fn collect_types_in_scope(
+        types: &[TypeNode],
+        bound: &HashSet<String>,
+        values: Option<&HashSet<String>>,
+        dependencies: &mut HashSet<String>,
+    ) {
+        for type_node in types {
+            Self::collect_type_dependencies_in_scope(type_node, bound, values, dependencies);
+        }
+    }
+
+    fn collect_type_dependencies_in_scope(
+        type_node: &TypeNode,
+        bound: &HashSet<String>,
+        values: Option<&HashSet<String>>,
+        dependencies: &mut HashSet<String>,
+    ) {
         match &type_node.kind {
             TypeNodeKind::Keyword(_) | TypeNodeKind::This | TypeNodeKind::Literal(_) => {}
             TypeNodeKind::Reference(reference) => {
                 Self::collect_entity_name_dependencies(&reference.name, bound, dependencies);
                 if let Some(type_args) = &reference.type_args {
-                    Self::collect_types(type_args, bound, dependencies);
+                    Self::collect_types_in_scope(type_args, bound, values, dependencies);
                 }
             }
             TypeNodeKind::Array(inner)
@@ -623,131 +691,274 @@ impl<'a> DeclarationEmitter<'a> {
             | TypeNodeKind::Rest(inner)
             | TypeNodeKind::Optional(inner)
             | TypeNodeKind::TypeOperator(_, inner) => {
-                Self::collect_type_dependencies(inner, bound, dependencies);
+                Self::collect_type_dependencies_in_scope(inner, bound, values, dependencies);
             }
             TypeNodeKind::Tuple(elements) => {
                 for element in elements {
-                    Self::collect_type_dependencies(&element.type_node, bound, dependencies);
+                    Self::collect_type_dependencies_in_scope(
+                        &element.type_node,
+                        bound,
+                        values,
+                        dependencies,
+                    );
                 }
             }
             TypeNodeKind::Union(types) | TypeNodeKind::Intersection(types) => {
-                Self::collect_types(types, bound, dependencies);
+                Self::collect_types_in_scope(types, bound, values, dependencies);
             }
             TypeNodeKind::Function(function) | TypeNodeKind::Constructor(function) => {
-                let scoped = Self::collect_type_params(&function.type_params, bound, dependencies);
-                Self::collect_params(&function.params, &scoped, dependencies);
-                Self::collect_type_dependencies(&function.return_type, &scoped, dependencies);
+                let local_values =
+                    values.map(|values| Self::callable_value_scope(&function.params, values));
+                let values = local_values.as_ref();
+                let scoped = Self::collect_type_params_in_scope(
+                    &function.type_params,
+                    bound,
+                    values,
+                    dependencies,
+                );
+                Self::collect_params_in_scope(&function.params, &scoped, values, dependencies);
+                Self::collect_type_dependencies_in_scope(
+                    &function.return_type,
+                    &scoped,
+                    values,
+                    dependencies,
+                );
             }
             TypeNodeKind::TypeLit(members) => {
-                Self::collect_type_members(members, bound, dependencies);
+                Self::collect_type_members_in_scope(members, bound, values, dependencies);
             }
             TypeNodeKind::Conditional(conditional) => {
-                Self::collect_type_dependencies(&conditional.check, bound, dependencies);
-                Self::collect_type_dependencies(&conditional.extends, bound, dependencies);
-                Self::collect_type_dependencies(&conditional.true_type, bound, dependencies);
-                Self::collect_type_dependencies(&conditional.false_type, bound, dependencies);
+                Self::collect_type_dependencies_in_scope(
+                    &conditional.check,
+                    bound,
+                    values,
+                    dependencies,
+                );
+                Self::collect_type_dependencies_in_scope(
+                    &conditional.extends,
+                    bound,
+                    values,
+                    dependencies,
+                );
+                Self::collect_type_dependencies_in_scope(
+                    &conditional.true_type,
+                    bound,
+                    values,
+                    dependencies,
+                );
+                Self::collect_type_dependencies_in_scope(
+                    &conditional.false_type,
+                    bound,
+                    values,
+                    dependencies,
+                );
             }
             TypeNodeKind::Mapped(mapped) => {
                 if let Some(constraint) = &mapped.type_param.constraint {
-                    Self::collect_type_dependencies(constraint, bound, dependencies);
+                    Self::collect_type_dependencies_in_scope(
+                        constraint,
+                        bound,
+                        values,
+                        dependencies,
+                    );
                 }
                 if let Some(default) = &mapped.type_param.default {
-                    Self::collect_type_dependencies(default, bound, dependencies);
+                    Self::collect_type_dependencies_in_scope(default, bound, values, dependencies);
                 }
                 let mut scoped = bound.clone();
                 scoped.insert(mapped.type_param.name.clone());
                 if let Some(name_type) = &mapped.name_type {
-                    Self::collect_type_dependencies(name_type, &scoped, dependencies);
+                    Self::collect_type_dependencies_in_scope(
+                        name_type,
+                        &scoped,
+                        values,
+                        dependencies,
+                    );
                 }
                 if let Some(type_ann) = &mapped.type_ann {
-                    Self::collect_type_dependencies(type_ann, &scoped, dependencies);
+                    Self::collect_type_dependencies_in_scope(
+                        type_ann,
+                        &scoped,
+                        values,
+                        dependencies,
+                    );
                 }
             }
             TypeNodeKind::IndexedAccess(object, index) => {
-                Self::collect_type_dependencies(object, bound, dependencies);
-                Self::collect_type_dependencies(index, bound, dependencies);
+                Self::collect_type_dependencies_in_scope(object, bound, values, dependencies);
+                Self::collect_type_dependencies_in_scope(index, bound, values, dependencies);
             }
             TypeNodeKind::TypeQuery(expression) => {
-                Self::collect_entity_name_dependencies(expression, bound, dependencies);
+                Self::collect_entity_name_dependencies(
+                    expression,
+                    values.unwrap_or(bound),
+                    dependencies,
+                );
             }
             TypeNodeKind::Infer(_, constraint) => {
                 if let Some(constraint) = constraint {
-                    Self::collect_type_dependencies(constraint, bound, dependencies);
+                    Self::collect_type_dependencies_in_scope(
+                        constraint,
+                        bound,
+                        values,
+                        dependencies,
+                    );
                 }
             }
             TypeNodeKind::TemplateLit(template) => {
-                Self::collect_types(&template.types, bound, dependencies);
+                Self::collect_types_in_scope(&template.types, bound, values, dependencies);
             }
             TypeNodeKind::JSDocNullable(inner) => {
                 if let Some(inner) = inner {
-                    Self::collect_type_dependencies(inner, bound, dependencies);
+                    Self::collect_type_dependencies_in_scope(inner, bound, values, dependencies);
                 }
             }
             TypeNodeKind::ImportType(import_type) => {
                 if let Some(type_args) = &import_type.type_args {
-                    Self::collect_types(type_args, bound, dependencies);
+                    Self::collect_types_in_scope(type_args, bound, values, dependencies);
                 }
             }
             TypeNodeKind::Predicate(predicate) => {
                 if let Some(type_ann) = &predicate.type_ann {
-                    Self::collect_type_dependencies(type_ann, bound, dependencies);
+                    Self::collect_type_dependencies_in_scope(type_ann, bound, values, dependencies);
                 }
             }
             TypeNodeKind::NamedTupleMember(member) => {
-                Self::collect_type_dependencies(&member.type_node, bound, dependencies);
+                Self::collect_type_dependencies_in_scope(
+                    &member.type_node,
+                    bound,
+                    values,
+                    dependencies,
+                );
             }
         }
     }
 
-    fn collect_type_members(
+    fn collect_type_members_in_scope(
         members: &[TypeMember],
         bound: &HashSet<String>,
+        values: Option<&HashSet<String>>,
         dependencies: &mut HashSet<String>,
     ) {
         for member in members {
             match &member.kind {
                 TypeMemberKind::PropertySig(property) => {
-                    Self::collect_prop_name_dependencies(&property.name, bound, dependencies);
+                    Self::collect_prop_name_dependencies(
+                        &property.name,
+                        values.unwrap_or(bound),
+                        dependencies,
+                    );
                     if let Some(type_ann) = &property.type_ann {
-                        Self::collect_type_dependencies(type_ann, bound, dependencies);
+                        Self::collect_type_dependencies_in_scope(
+                            type_ann,
+                            bound,
+                            values,
+                            dependencies,
+                        );
                     }
                 }
                 TypeMemberKind::MethodSig(method) => {
-                    Self::collect_prop_name_dependencies(&method.name, bound, dependencies);
-                    let scoped =
-                        Self::collect_type_params(&method.type_params, bound, dependencies);
-                    Self::collect_params(&method.params, &scoped, dependencies);
+                    Self::collect_prop_name_dependencies(
+                        &method.name,
+                        values.unwrap_or(bound),
+                        dependencies,
+                    );
+                    let local_values =
+                        values.map(|values| Self::callable_value_scope(&method.params, values));
+                    let values = local_values.as_ref();
+                    let scoped = Self::collect_type_params_in_scope(
+                        &method.type_params,
+                        bound,
+                        values,
+                        dependencies,
+                    );
+                    Self::collect_params_in_scope(&method.params, &scoped, values, dependencies);
                     if let Some(return_type) = &method.return_type {
-                        Self::collect_type_dependencies(return_type, &scoped, dependencies);
+                        Self::collect_type_dependencies_in_scope(
+                            return_type,
+                            &scoped,
+                            values,
+                            dependencies,
+                        );
                     }
                 }
                 TypeMemberKind::CallSig(call) => {
-                    let scoped = Self::collect_type_params(&call.type_params, bound, dependencies);
-                    Self::collect_params(&call.params, &scoped, dependencies);
+                    let local_values =
+                        values.map(|values| Self::callable_value_scope(&call.params, values));
+                    let values = local_values.as_ref();
+                    let scoped = Self::collect_type_params_in_scope(
+                        &call.type_params,
+                        bound,
+                        values,
+                        dependencies,
+                    );
+                    Self::collect_params_in_scope(&call.params, &scoped, values, dependencies);
                     if let Some(return_type) = &call.return_type {
-                        Self::collect_type_dependencies(return_type, &scoped, dependencies);
+                        Self::collect_type_dependencies_in_scope(
+                            return_type,
+                            &scoped,
+                            values,
+                            dependencies,
+                        );
                     }
                 }
                 TypeMemberKind::ConstructSig(constructor) => {
-                    let scoped =
-                        Self::collect_type_params(&constructor.type_params, bound, dependencies);
-                    Self::collect_params(&constructor.params, &scoped, dependencies);
+                    let local_values = values
+                        .map(|values| Self::callable_value_scope(&constructor.params, values));
+                    let values = local_values.as_ref();
+                    let scoped = Self::collect_type_params_in_scope(
+                        &constructor.type_params,
+                        bound,
+                        values,
+                        dependencies,
+                    );
+                    Self::collect_params_in_scope(
+                        &constructor.params,
+                        &scoped,
+                        values,
+                        dependencies,
+                    );
                     if let Some(return_type) = &constructor.return_type {
-                        Self::collect_type_dependencies(return_type, &scoped, dependencies);
+                        Self::collect_type_dependencies_in_scope(
+                            return_type,
+                            &scoped,
+                            values,
+                            dependencies,
+                        );
                     }
                 }
                 TypeMemberKind::IndexSig(index) => {
-                    Self::collect_params(&index.params, bound, dependencies);
+                    let local_values =
+                        values.map(|values| Self::callable_value_scope(&index.params, values));
+                    let values = local_values.as_ref();
+                    Self::collect_params_in_scope(&index.params, bound, values, dependencies);
                     if let Some(type_ann) = &index.type_ann {
-                        Self::collect_type_dependencies(type_ann, bound, dependencies);
+                        Self::collect_type_dependencies_in_scope(
+                            type_ann,
+                            bound,
+                            values,
+                            dependencies,
+                        );
                     }
                 }
                 TypeMemberKind::GetAccessorSig(accessor)
                 | TypeMemberKind::SetAccessorSig(accessor) => {
-                    Self::collect_prop_name_dependencies(&accessor.name, bound, dependencies);
-                    Self::collect_params(&accessor.params, bound, dependencies);
+                    Self::collect_prop_name_dependencies(
+                        &accessor.name,
+                        values.unwrap_or(bound),
+                        dependencies,
+                    );
+                    let local_values =
+                        values.map(|values| Self::callable_value_scope(&accessor.params, values));
+                    let values = local_values.as_ref();
+                    Self::collect_params_in_scope(&accessor.params, bound, values, dependencies);
                     if let Some(return_type) = &accessor.return_type {
-                        Self::collect_type_dependencies(return_type, bound, dependencies);
+                        Self::collect_type_dependencies_in_scope(
+                            return_type,
+                            bound,
+                            values,
+                            dependencies,
+                        );
                     }
                 }
             }
@@ -2119,7 +2330,7 @@ impl<'a> DeclarationEmitter<'a> {
                     self.write(" = ");
                     self.write(&literal);
                 } else if let Some(signature) = matches!(decl.name.kind, PatKind::Ident(_))
-                    .then(|| Self::typed_callable_initializer(init))
+                    .then(|| self.typed_callable_initializer(init))
                     .flatten()
                     .filter(|signature| self.callable_dependencies_are_visible(signature))
                 {
@@ -2208,7 +2419,7 @@ impl<'a> DeclarationEmitter<'a> {
     // A directly initialized callable can expose its annotated signature without
     // resolving its body. Preserve binding patterns: aliases can affect both
     // duplicate parameter names and the meaning of `typeof` in the signature.
-    fn typed_callable_initializer(mut expr: &Expr) -> Option<TypeNode> {
+    fn typed_callable_initializer(&self, mut expr: &Expr) -> Option<TypeNode> {
         while let ExprKind::Paren(inner) = &expr.kind {
             expr = inner;
         }
@@ -2245,16 +2456,31 @@ impl<'a> DeclarationEmitter<'a> {
             },
             None => return None,
         };
-        let mut local_values: HashSet<String> = params
+        let local_values: HashSet<String> = local_name.into_iter().map(str::to_string).collect();
+        let mut legacy_values = Self::callable_value_scope(params, &local_values);
+        legacy_values.extend(type_params.iter().flatten().map(|p| p.name.clone()));
+        let legacy_check =
+            |ty: &TypeNode| Self::callable_type_needs_scope(ty, &legacy_values, false);
+        let legacy_supported = !params
             .iter()
-            .flat_map(|p| Self::binding_names(&p.name))
-            .collect();
-        local_values.extend(local_name.map(str::to_string));
-        // The collector currently shares a bound-name set between value and
-        // type references. A typeof query matching a type parameter therefore
-        // also needs scope resolution before its dependency can be retained.
-        local_values.extend(type_params.iter().flatten().map(|p| p.name.clone()));
-        let needs_scope = |ty: &TypeNode| Self::callable_type_needs_scope(ty, &local_values);
+            .filter_map(|p| p.type_ann.as_ref())
+            .any(legacy_check)
+            && !legacy_check(&return_type)
+            && !type_params.iter().flatten().any(|p| {
+                p.constraint.as_deref().is_some_and(legacy_check)
+                    || p.default.as_deref().is_some_and(legacy_check)
+            });
+        let needs_scope = |ty: &TypeNode| {
+            Self::callable_type_needs_scope(
+                ty,
+                if legacy_supported {
+                    &legacy_values
+                } else {
+                    &local_values
+                },
+                !legacy_supported,
+            )
+        };
         if params
             .iter()
             .filter_map(|p| p.type_ann.as_ref())
@@ -2277,19 +2503,330 @@ impl<'a> DeclarationEmitter<'a> {
             })),
             span: expr.span,
         };
+        if Self::callable_requires_scoped_dependencies(&signature) {
+            let TypeNodeKind::Function(function) = &signature.kind else {
+                unreachable!()
+            };
+            if !self.allow_scoped_callables
+                || Self::callable_signature_needs_scope(
+                    &function.type_params,
+                    &function.params,
+                    Some(&function.return_type),
+                    &local_values,
+                )
+            {
+                return None;
+            }
+            let mut dependencies = HashSet::new();
+            Self::collect_callable_dependencies(&signature, &HashSet::new(), &mut dependencies);
+            if !dependencies.is_disjoint(&self.uncertain_callable_dependencies) {
+                return None;
+            }
+        }
         Some(signature)
     }
 
-    // Do not infer signatures whose dependency collection needs additional
-    // callable value scopes. This preserves the existing fallback for those
-    // cases instead of binding a local typeof query to an outer declaration.
-    fn callable_type_needs_scope(ty: &TypeNode, locals: &HashSet<String>) -> bool {
-        let check = |ty: &TypeNode| Self::callable_type_needs_scope(ty, locals);
+    fn callable_requires_scoped_dependencies(signature: &TypeNode) -> bool {
+        let TypeNodeKind::Function(function) = &signature.kind else {
+            return false;
+        };
+        let mut locals = Self::callable_value_scope(&function.params, &HashSet::new());
+        locals.extend(
+            function
+                .type_params
+                .iter()
+                .flatten()
+                .map(|p| p.name.clone()),
+        );
+        let check = |ty: &TypeNode| Self::callable_type_needs_scope(ty, &locals, false);
+        function
+            .params
+            .iter()
+            .filter_map(|p| p.type_ann.as_ref())
+            .any(check)
+            || check(&function.return_type)
+            || function.type_params.iter().flatten().any(|p| {
+                p.constraint.as_deref().is_some_and(check)
+                    || p.default.as_deref().is_some_and(check)
+            })
+    }
+
+    fn collect_callable_dependencies(
+        signature: &TypeNode,
+        bound: &HashSet<String>,
+        dependencies: &mut HashSet<String>,
+    ) {
+        if Self::callable_requires_scoped_dependencies(signature) {
+            Self::collect_type_dependencies_in_scope(
+                signature,
+                bound,
+                Some(&HashSet::new()),
+                dependencies,
+            );
+        } else {
+            Self::collect_type_dependencies(signature, bound, dependencies);
+        }
+    }
+
+    fn callable_literal_dependency_is_supported(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Paren(inner) => Self::callable_literal_dependency_is_supported(inner),
+            // Dependency retention must not expose lossy decoding or unsupported
+            // string serialization (in particular, lone UTF-16 surrogates).
+            ExprKind::StrLit(text) | ExprKind::NoSubstTemplate(text) => {
+                text.is_ascii() && !text.contains('\\') && !text.chars().any(char::is_control)
+            }
+            _ => Self::const_initializer_text(expr)
+                .is_some_and(|text| text != "inf" && text != "-inf"),
+        }
+    }
+
+    fn prepare_scoped_callables(&mut self, file: &SourceFile) {
+        // This source-local proof must reset when an emitter is reused. It does
+        // not attempt new body inference or resolution of merged namespace owners.
+        self.allow_scoped_callables = false;
+        self.uncertain_callable_dependencies.clear();
+        let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
+        self.collect_callable_dependency_graph(&file.statements, &mut graph);
+        let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, dependencies) in graph {
+            for dependency in dependencies {
+                dependents.entry(dependency).or_default().push(name.clone());
+            }
+        }
+        let mut pending: Vec<String> = self
+            .uncertain_callable_dependencies
+            .iter()
+            .cloned()
+            .collect();
+        while let Some(dependency) = pending.pop() {
+            if let Some(names) = dependents.get(&dependency) {
+                for name in names {
+                    if self.uncertain_callable_dependencies.insert(name.clone()) {
+                        pending.push(name.clone());
+                    }
+                }
+            }
+        }
+        self.allow_scoped_callables = file.diagnostics.is_empty()
+            && ![".js", ".jsx", ".mjs", ".cjs"]
+                .iter()
+                .any(|ext| file.file_name.ends_with(ext));
+    }
+
+    fn collect_callable_dependency_graph(
+        &mut self,
+        statements: &[Stmt],
+        graph: &mut HashMap<String, HashSet<String>>,
+    ) {
+        for statement in statements {
+            let mut stmt = statement;
+            while let StmtKind::Export(export) = &stmt.kind {
+                match &export.kind {
+                    ExportDeclKind::Decl(inner) | ExportDeclKind::DefaultDecl(inner) => {
+                        stmt = inner
+                    }
+                    _ => break,
+                }
+            }
+            let names = Self::stmt_declared_names(stmt);
+            let dependencies = self.stmt_declaration_dependencies(stmt);
+            for name in &names {
+                graph
+                    .entry(name.clone())
+                    .or_default()
+                    .extend(dependencies.iter().cloned());
+            }
+            match &stmt.kind {
+                StmtKind::Var(variable) => {
+                    for binding in &variable.declarations {
+                        let known_annotation = binding.type_ann.as_ref().is_some_and(|ty| {
+                            let empty = HashSet::new();
+                            let mut legacy = HashSet::new();
+                            let mut expanded = HashSet::new();
+                            Self::collect_type_dependencies(ty, &empty, &mut legacy);
+                            Self::collect_type_dependencies_in_scope(
+                                ty,
+                                &empty,
+                                Some(&empty),
+                                &mut expanded,
+                            );
+                            legacy == expanded && !Self::callable_type_needs_scope(ty, &empty, true)
+                        });
+                        let known = known_annotation
+                            || (binding.type_ann.is_none()
+                                && variable.kind == VarKind::Const
+                                && binding.init.as_deref().is_some_and(|init| {
+                                    Self::callable_literal_dependency_is_supported(init)
+                                }));
+                        if !known {
+                            self.uncertain_callable_dependencies
+                                .extend(Self::binding_names(&binding.name));
+                        }
+                    }
+                }
+                StmtKind::FnDecl(function) => {
+                    let known_return = function.return_type.is_some()
+                        || (!function.is_async
+                            && Self::no_value_return_type(
+                                function.body.as_deref(),
+                                false,
+                                function.is_generator,
+                            )
+                            .is_some());
+                    let empty = HashSet::new();
+                    let values = Self::callable_value_scope(&function.params, &empty);
+                    let mut expanded = HashSet::new();
+                    let bound = Self::collect_type_params_in_scope(
+                        &function.type_params,
+                        &empty,
+                        Some(&values),
+                        &mut expanded,
+                    );
+                    Self::collect_params_in_scope(
+                        &function.params,
+                        &bound,
+                        Some(&values),
+                        &mut expanded,
+                    );
+                    if let Some(ty) = &function.return_type {
+                        Self::collect_type_dependencies_in_scope(
+                            ty,
+                            &bound,
+                            Some(&values),
+                            &mut expanded,
+                        );
+                    }
+                    if !known_return
+                        || expanded != dependencies
+                        || Self::callable_signature_needs_scope(
+                            &function.type_params,
+                            &function.params,
+                            function.return_type.as_ref(),
+                            &empty,
+                        )
+                    {
+                        self.uncertain_callable_dependencies.extend(names);
+                    }
+                }
+                StmtKind::TypeAlias(alias) => {
+                    let mut expanded = HashSet::new();
+                    let empty = HashSet::new();
+                    let bound = Self::collect_type_params_in_scope(
+                        &alias.type_params,
+                        &empty,
+                        Some(&empty),
+                        &mut expanded,
+                    );
+                    Self::collect_type_dependencies_in_scope(
+                        &alias.type_ann,
+                        &bound,
+                        Some(&empty),
+                        &mut expanded,
+                    );
+                    let mut annotation = &alias.type_ann;
+                    while let TypeNodeKind::Paren(inner) = &annotation.kind {
+                        annotation = inner;
+                    }
+                    if expanded != dependencies
+                        || matches!(annotation.kind, TypeNodeKind::Mapped(_))
+                        || Self::callable_signature_needs_scope(
+                            &alias.type_params,
+                            &[],
+                            Some(&alias.type_ann),
+                            &empty,
+                        )
+                    {
+                        self.uncertain_callable_dependencies.extend(names);
+                    }
+                }
+                StmtKind::InterfaceDecl(interface) => {
+                    let mut expanded = HashSet::new();
+                    let empty = HashSet::new();
+                    let bound = Self::collect_type_params_in_scope(
+                        &interface.type_params,
+                        &empty,
+                        Some(&empty),
+                        &mut expanded,
+                    );
+                    Self::collect_type_members_in_scope(
+                        &interface.members,
+                        &bound,
+                        Some(&empty),
+                        &mut expanded,
+                    );
+                    for heritage in &interface.extends {
+                        if self.should_emit_interface_heritage(heritage) {
+                            Self::collect_type_dependencies_in_scope(
+                                heritage,
+                                &bound,
+                                Some(&empty),
+                                &mut expanded,
+                            );
+                        }
+                    }
+                    let shape = TypeNode {
+                        kind: TypeNodeKind::TypeLit(interface.members.clone()),
+                        span: stmt.span,
+                    };
+                    if expanded != dependencies
+                        || Self::callable_signature_needs_scope(
+                            &interface.type_params,
+                            &[],
+                            Some(&shape),
+                            &empty,
+                        )
+                    {
+                        self.uncertain_callable_dependencies.extend(names);
+                    }
+                }
+                StmtKind::ClassDecl(_) | StmtKind::EnumDecl(_) => {
+                    self.uncertain_callable_dependencies.extend(names);
+                }
+                StmtKind::ModuleDecl(module) => {
+                    self.uncertain_callable_dependencies.extend(names);
+                    let mut module = module;
+                    loop {
+                        match &module.body {
+                            Some(ModuleBody::Block(body)) => {
+                                self.collect_callable_dependency_graph(body, graph);
+                                break;
+                            }
+                            Some(ModuleBody::Module(inner)) => {
+                                if let ModuleName::Ident(name) = &inner.name {
+                                    self.uncertain_callable_dependencies.insert(name.clone());
+                                }
+                                module = inner;
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Keep signatures that need name rewriting or unsupported syntax on the
+    // existing fallback. Nested callables introduce their own value bindings.
+    fn callable_type_needs_scope(ty: &TypeNode, locals: &HashSet<String>, expanded: bool) -> bool {
+        let check = |ty: &TypeNode| Self::callable_type_needs_scope(ty, locals, expanded);
         match &ty.kind {
-            TypeNodeKind::Function(_)
-            | TypeNodeKind::Constructor(_)
-            | TypeNodeKind::Infer(_, _) => true,
-            TypeNodeKind::Reference(reference) => reference.type_args.iter().flatten().any(check),
+            TypeNodeKind::Function(function) | TypeNodeKind::Constructor(function) => {
+                !expanded
+                    || function.is_abstract
+                    || Self::callable_signature_needs_scope(
+                        &function.type_params,
+                        &function.params,
+                        Some(&function.return_type),
+                        locals,
+                    )
+            }
+            TypeNodeKind::Infer(_, _) => true,
+            TypeNodeKind::Reference(reference) => {
+                (expanded && !Self::callable_entity_name_is_supported(&reference.name))
+                    || reference.type_args.iter().flatten().any(check)
+            }
             TypeNodeKind::Array(inner)
             | TypeNodeKind::Keyof(inner)
             | TypeNodeKind::Unique(inner)
@@ -2302,11 +2839,45 @@ impl<'a> DeclarationEmitter<'a> {
             TypeNodeKind::Union(types) | TypeNodeKind::Intersection(types) => {
                 types.iter().any(check)
             }
-            TypeNodeKind::TypeLit(members) => members.iter().any(|m| match &m.kind {
+            TypeNodeKind::TypeLit(members) if !expanded => members.iter().any(|m| match &m.kind {
                 TypeMemberKind::PropertySig(property) => {
                     property.type_ann.as_ref().is_some_and(check)
                 }
                 _ => true,
+            }),
+            TypeNodeKind::TypeLit(members) => members.iter().any(|m| match &m.kind {
+                TypeMemberKind::PropertySig(property) => {
+                    !Self::callable_property_name_is_supported(&property.name)
+                        || property.type_ann.as_ref().is_some_and(check)
+                }
+                TypeMemberKind::MethodSig(method) => {
+                    !Self::callable_property_name_is_supported(&method.name)
+                        || Self::callable_signature_needs_scope(
+                            &method.type_params,
+                            &method.params,
+                            method.return_type.as_ref(),
+                            locals,
+                        )
+                }
+                TypeMemberKind::CallSig(call) => Self::callable_signature_needs_scope(
+                    &call.type_params,
+                    &call.params,
+                    call.return_type.as_ref(),
+                    locals,
+                ),
+                TypeMemberKind::ConstructSig(call) => Self::callable_signature_needs_scope(
+                    &call.type_params,
+                    &call.params,
+                    call.return_type.as_ref(),
+                    locals,
+                ),
+                TypeMemberKind::IndexSig(index) => Self::callable_signature_needs_scope(
+                    &None,
+                    &index.params,
+                    index.type_ann.as_ref(),
+                    locals,
+                ),
+                TypeMemberKind::GetAccessorSig(_) | TypeMemberKind::SetAccessorSig(_) => true,
             }),
             TypeNodeKind::Conditional(conditional) => [
                 &conditional.check,
@@ -2318,8 +2889,10 @@ impl<'a> DeclarationEmitter<'a> {
             .any(|ty| check(ty)),
             TypeNodeKind::Mapped(mapped) => {
                 let mut scoped = locals.clone();
-                scoped.insert(mapped.type_param.name.clone());
-                let check = |ty: &TypeNode| Self::callable_type_needs_scope(ty, &scoped);
+                if !expanded {
+                    scoped.insert(mapped.type_param.name.clone());
+                }
+                let check = |ty: &TypeNode| Self::callable_type_needs_scope(ty, &scoped, expanded);
                 mapped.type_param.constraint.as_deref().is_some_and(check)
                     || mapped.type_param.default.as_deref().is_some_and(check)
                     || mapped.name_type.as_deref().is_some_and(check)
@@ -2328,16 +2901,100 @@ impl<'a> DeclarationEmitter<'a> {
             TypeNodeKind::IndexedAccess(object, index) => check(object) || check(index),
             TypeNodeKind::JSDocNullable(constraint) => constraint.as_deref().is_some_and(check),
             TypeNodeKind::TemplateLit(template) => template.types.iter().any(check),
-            TypeNodeKind::ImportType(import) => import.type_args.iter().flatten().any(check),
+            TypeNodeKind::ImportType(import) => {
+                (expanded
+                    && (check(&import.argument)
+                        || import
+                            .qualifier
+                            .as_ref()
+                            .is_some_and(|name| !Self::callable_entity_name_is_supported(name))))
+                    || import.type_args.iter().flatten().any(check)
+            }
             TypeNodeKind::Predicate(predicate) => predicate.type_ann.as_deref().is_some_and(check),
             TypeNodeKind::NamedTupleMember(member) => check(&member.type_node),
             TypeNodeKind::TypeQuery(expression) => {
                 let mut names = HashSet::new();
                 Self::collect_entity_name_dependencies(expression, &HashSet::new(), &mut names);
-                names.iter().any(|name| locals.contains(name))
+                (expanded && !Self::callable_entity_name_is_supported(expression))
+                    || names.iter().any(|name| locals.contains(name))
             }
+            TypeNodeKind::Literal(literal) if expanded => match literal {
+                LiteralTypeKind::String(text) => {
+                    !text.is_ascii()
+                        || text.contains(['\\', '"'])
+                        || text.chars().any(char::is_control)
+                }
+                LiteralTypeKind::Number(text) | LiteralTypeKind::Minus(text) => {
+                    !crate::enum_eval::parse_js_number(text).is_some_and(|value| {
+                        value.is_finite() && crate::Emitter::format_f64_as_js(value) == *text
+                    })
+                }
+                LiteralTypeKind::BigInt(_) => true,
+                LiteralTypeKind::Boolean(_) | LiteralTypeKind::Null => false,
+            },
             TypeNodeKind::Keyword(_) | TypeNodeKind::This | TypeNodeKind::Literal(_) => false,
         }
+    }
+
+    fn callable_property_name_is_supported(name: &PropName) -> bool {
+        matches!(name, PropName::Ident(name, _) if !name.contains('\\'))
+    }
+
+    fn callable_entity_name_is_supported(name: &Expr) -> bool {
+        match &name.kind {
+            ExprKind::Ident(name) => !name.contains('\\'),
+            ExprKind::Member(member) => {
+                !member.property.contains('\\')
+                    && Self::callable_entity_name_is_supported(&member.object)
+            }
+            _ => false,
+        }
+    }
+
+    fn callable_binding_needs_rewrite(pattern: &Pat) -> bool {
+        match &pattern.kind {
+            PatKind::Ident(name) => name.contains('\\'),
+            PatKind::Assign(_, _) => true,
+            PatKind::Rest(pattern) => Self::callable_binding_needs_rewrite(pattern),
+            PatKind::Array(elements) => elements.iter().flatten().any(|element| match element {
+                ArrayPatElem::Pat(pattern) | ArrayPatElem::Rest(pattern) => {
+                    Self::callable_binding_needs_rewrite(pattern)
+                }
+            }),
+            PatKind::Object(properties) => properties.iter().any(|property| match property {
+                ObjPatProp::KeyValue(name, pattern) => {
+                    !Self::callable_property_name_is_supported(name)
+                        || Self::callable_binding_needs_rewrite(pattern)
+                }
+                ObjPatProp::Rest(pattern) => Self::callable_binding_needs_rewrite(pattern),
+                ObjPatProp::Shorthand(name, _) => name.contains('\\'),
+                ObjPatProp::ShorthandAssign(_, _, _) => true,
+            }),
+        }
+    }
+
+    fn callable_signature_needs_scope(
+        type_params: &Option<Vec<TypeParam>>,
+        params: &[Param],
+        return_type: Option<&TypeNode>,
+        locals: &HashSet<String>,
+    ) -> bool {
+        let mut scoped = locals.clone();
+        for name in params.iter().flat_map(|p| Self::binding_names(&p.name)) {
+            scoped.remove(&name);
+        }
+        let check = |ty: &TypeNode| Self::callable_type_needs_scope(ty, &scoped, true);
+        params.iter().any(|p| {
+            p.initializer.is_some()
+                || Self::callable_binding_needs_rewrite(&p.name)
+                || p.type_ann.as_ref().is_none_or(check)
+        }) || return_type.is_some_and(check)
+            || type_params.iter().flatten().any(|p| {
+                p.modifiers & MOD_CONST != 0
+                    || p.name.contains('\\')
+                    || p.constraint.as_deref().is_some_and(check)
+                    || p.default.as_deref().is_some_and(check)
+            })
     }
 
     fn callable_dependencies_are_visible(&self, signature: &TypeNode) -> bool {
@@ -2345,13 +3002,15 @@ impl<'a> DeclarationEmitter<'a> {
             return true;
         }
         let mut dependencies = HashSet::new();
-        Self::collect_type_dependencies(signature, &HashSet::new(), &mut dependencies);
+        Self::collect_callable_dependencies(signature, &HashSet::new(), &mut dependencies);
         let TypeNodeKind::Function(function) = &signature.kind else {
             return false;
         };
         // Namespace retained names do not distinguish values from types. A
         // named typeof query may refer past a same-named local type alias.
-        let has_value_query = |ty: &TypeNode| Self::callable_type_needs_scope(ty, &dependencies);
+        let expanded = Self::callable_requires_scoped_dependencies(signature);
+        let has_value_query =
+            |ty: &TypeNode| Self::callable_type_needs_scope(ty, &dependencies, expanded);
         if has_value_query(&function.return_type)
             || function
                 .params
