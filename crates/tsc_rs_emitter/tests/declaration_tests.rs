@@ -35,6 +35,90 @@ fn test_dts_function_declaration() {
     assert!(!dts.contains("Hello"));
 }
 
+#[test]
+fn test_dts_inferred_constructor_types_preserve_explicit_arguments() {
+    let source = r#"class Box<T> {}
+namespace N { export class Pair<A, B> {} }
+class Plain {}
+function make<T>() { return new Box<T>(); }
+function qualified() { return new N.Pair<string, number>(); }
+const instance = new N.Pair<Box<number[]>, [string, boolean]>();
+const withoutParens = new Box<string>;
+function nongeneric() { return new Plain(); }
+function explicit(): Box<unknown> { return new Box<string>(); }
+"#;
+    assert_eq!(
+        emit_dts(source),
+        "declare class Box<T> {\n}\n\
+         declare namespace N {\n    class Pair<A, B> {\n    }\n}\n\
+         declare class Plain {\n}\n\
+         declare function make<T>(): Box<T>;\n\
+         declare function qualified(): N.Pair<string, number>;\n\
+         declare const instance: N.Pair<Box<number[]>, [string, boolean]>;\n\
+         declare const withoutParens: Box<string>;\n\
+         declare function nongeneric(): Plain;\n\
+         declare function explicit(): Box<unknown>;\n"
+    );
+}
+
+#[test]
+fn test_dts_inferred_constructor_arguments_retain_type_dependencies() {
+    let source = r#"interface Hidden { value: string; }
+class Box<T> { item!: T; }
+export function make() { return new Box<Hidden>(); }
+export const value = new Box<Hidden>();
+"#;
+    assert_eq!(
+        emit_dts(source),
+        "interface Hidden {\n    value: string;\n}\n\
+         declare class Box<T> {\n    item: T;\n}\n\
+         export declare function make(): Box<Hidden>;\n\
+         export declare const value: Box<Hidden>;\n\
+         export {};\n"
+    );
+}
+
+#[test]
+fn test_dts_inferred_constructor_arguments_use_declaration_type_formatting() {
+    let source = r#"class Box<T> {}
+class Pair<A, B> {}
+const value = new Pair < (string | number)[] , Box< [string, boolean] > >();
+function shape() { return new Box<{ readonly value: string; next?: Box<number>; }>(); }
+"#;
+    assert_eq!(
+        emit_dts(source),
+        "declare class Box<T> {\n}\n\
+         declare class Pair<A, B> {\n}\n\
+         declare const value: Pair<(string | number)[], Box<[string, boolean]>>;\n\
+         declare function shape(): Box<{\n    readonly value: string;\n    next?: Box<number>;\n}>;\n"
+    );
+}
+
+#[test]
+fn test_dts_inferred_constructor_types_keep_nongeneric_error_recovery() {
+    // These initializers have TS2558 errors, but declaration emit still uses
+    // the nongeneric instance types rather than copying the invalid arguments.
+    let source = "class Plain {}\nconst local = new Plain<string>();\nconst builtin = new String<string>();\n";
+    assert_eq!(
+        emit_dts(source),
+        "declare class Plain {\n}\ndeclare const local: Plain;\ndeclare const builtin: String;\n"
+    );
+}
+
+#[test]
+fn test_dts_inferred_constructor_types_respect_namespace_class_shadowing() {
+    let source = r#"class Box<T> {}
+namespace N {
+    export class Box {}
+    export function make() { return new Box<string>(); }
+}
+"#;
+    assert_eq!(
+        emit_dts(source),
+        "declare class Box<T> {\n}\ndeclare namespace N {\n    class Box {\n    }\n    function make(): Box;\n}\n"
+    );
+}
+
 // ---------------------------------------------------------------
 // 2. Class declaration
 // ---------------------------------------------------------------
@@ -1046,4 +1130,58 @@ fn test_dts_exported_and_namespace_variables_keep_implicit_any_types() {
         emit_dts("export let value; export declare const ambient; export namespace N { export var member, typed: number; }"),
         "export declare let value: any;\nexport declare const ambient: any;\nexport declare namespace N {\n    var member: any, typed: number;\n}\n"
     );
+}
+
+#[test]
+fn test_dts_generic_constructor_lookup_stops_at_nearer_values() {
+    // Exact TypeScript 6.0.3 declarations, including erroneous type arguments.
+    let cases = [
+        ("class Box<T> {} namespace N { export type Box={}; export declare const Box:new()=>Box; export const value=new Box<string>(); }", &[false][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    type Box = {};\n    const Box: new () => Box;\n    const value: Box;\n}\n"),
+        ("class Box<T> {} export namespace N { export type Box={}; export declare const Box:new()=>Box; export const value=new Box<string>(); }", &[false][..], "export declare namespace N {\n    type Box = {};\n    const Box: new () => Box;\n    const value: Box;\n}\n"),
+        ("class Box<T> {} namespace N { export interface Box {} export declare const Box:new()=>Box; export const value=new Box<string>(); }", &[false][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    const Box: new () => Box;\n    const value: Box;\n}\n"),
+        ("class Box<T> {} namespace N { export type Box={}; export declare const Box:new()=>Box; export namespace Deep{export const value=new Box<string>();} }", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    type Box = {};\n    const Box: new () => Box;\n    namespace Deep {\n        const value: Box;\n    }\n}\n"),
+        ("class Box<T>{} interface Box<T>{value:T} export const value=new Box<string>();", &[false, true][..], "declare class Box<T> {\n}\ninterface Box<T> {\n    value: T;\n}\nexport declare const value: Box<string>;\nexport {};\n"),
+        ("class Box<T>{} namespace Box{export class Inner<T>{}} export const a=new Box<string>();export const b=new Box.Inner<number>();", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace Box {\n    class Inner<T> {\n    }\n}\nexport declare const a: Box<string>;\nexport declare const b: Box.Inner<number>;\nexport {};\n"),
+        ("namespace N{export class Box<T>{}} namespace N{export const value=new Box<string>();}", &[false, true][..], "declare namespace N {\n    class Box<T> {\n    }\n}\ndeclare namespace N {\n    const value: Box<string>;\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export function make(Box:new()=>Box){return new Box<string>();}}", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    function make(Box: new () => Box): Box;\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export function make({Box}:{Box:new()=>Box}){return new Box<string>();}}", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    function make({ Box }: {\n        Box: new () => Box;\n    }): Box;\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export function make(){const Box:new()=>Box=null!;return new Box<string>();}}", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    function make(): Box;\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export function make(source:{Box:new()=>Box}){const {Box}=source;return new Box<string>();}}", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    function make(source: {\n        Box: new () => Box;\n    }): Box;\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export function make(){ {const Box:new()=>Box=null!;return new Box<string>();} }}", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    function make(): Box;\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export function make(){if(false){var Box:new()=>Box;}return new Box<string>();}}", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    function make(): Box;\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export function make(Box:new()=>Box,value=new Box<string>()){}}", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    function make(Box: new () => Box, value?: Box): void;\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export class C{constructor(Box:new()=>Box,public value=new Box<string>()){}}}", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    class C {\n        value: Box;\n        constructor(Box: new () => Box, value?: Box);\n    }\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export class C{make(Box:new()=>Box,value=new Box<string>()){}}}", &[false, true][..], "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    class C {\n        make(Box: new () => Box, value?: Box): void;\n    }\n}\n"),
+    ];
+    for (source, strict_modes, expected) in cases {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        for &strict in strict_modes {
+            let options = CompilerOptions {
+                declaration: Some(true),
+                strict: Some(strict),
+                ..Default::default()
+            };
+            assert_eq!(
+                emit(&file, &options).declaration_file.unwrap(),
+                expected,
+                "{source}, strict={strict}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_dts_signature_parameter_values_shadow_generic_constructors() {
+    // Erroneous signature initializers still have declaration emit baselines.
+    for (source, expected) in [
+        ("class Box<T>{} namespace N{export interface Box{} export interface I{make(Box:new()=>Box,value=new Box<string>()):void}}", "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    interface I {\n        make(Box: new () => Box, value?: Box): void;\n    }\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export interface I{(Box:new()=>Box,value=new Box<string>()):void}}", "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    interface I {\n        (Box: new () => Box, value?: Box): void;\n    }\n}\n"),
+        ("class Box<T>{} namespace N{export interface Box{} export type Fn=(Box:new()=>Box,value=new Box<string>())=>void;}", "declare class Box<T> {\n}\ndeclare namespace N {\n    interface Box {\n    }\n    type Fn = (Box: new () => Box, value?: Box) => void;\n}\n"),
+    ] {
+        let file = tsc_rs_parser::parse("probe.ts", source);
+        for strict in [false, true] {
+            let options = CompilerOptions { declaration: Some(true), strict: Some(strict), ..Default::default() };
+            assert_eq!(emit(&file, &options).declaration_file.unwrap(), expected, "{source}, strict={strict}");
+        }
+    }
 }

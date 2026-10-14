@@ -22,6 +22,10 @@ pub struct DeclarationEmitter<'a> {
     at_line_start: bool,
     inferred_var_types: HashMap<String, String>,
     inferred_function_return_types: HashMap<String, String>,
+    class_type_parameter_counts: HashMap<String, Option<usize>>,
+    constructor_value_bindings: HashMap<String, bool>,
+    local_constructor_bindings: Vec<(Span, HashSet<String>)>,
+    inferred_type_argument_dependencies: HashMap<String, HashSet<String>>,
     enum_values: HashMap<String, HashMap<String, EnumValue>>,
     enum_scope: Vec<String>,
     enum_ambient: bool,
@@ -39,6 +43,10 @@ impl<'a> DeclarationEmitter<'a> {
             at_line_start: true,
             inferred_var_types: HashMap::new(),
             inferred_function_return_types: HashMap::new(),
+            class_type_parameter_counts: HashMap::new(),
+            constructor_value_bindings: HashMap::new(),
+            local_constructor_bindings: Vec::new(),
+            inferred_type_argument_dependencies: HashMap::new(),
             enum_values: HashMap::new(),
             enum_scope: Vec::new(),
             enum_ambient: false,
@@ -377,7 +385,7 @@ impl<'a> DeclarationEmitter<'a> {
                     Self::collect_type_dependencies(return_type, &scoped, &mut dependencies);
                 } else if let Some(name) = &decl.name {
                     if let Some(return_type) = self.inferred_function_return_types.get(name) {
-                        Self::collect_inferred_type_dependencies(
+                        self.collect_inferred_type_dependencies(
                             return_type,
                             &scoped,
                             &mut dependencies,
@@ -447,7 +455,7 @@ impl<'a> DeclarationEmitter<'a> {
                         Self::collect_type_dependencies(type_ann, &bound, &mut dependencies);
                     } else if let PatKind::Ident(name) = &declarator.name.kind {
                         if let Some(inferred_type) = self.inferred_var_types.get(name.as_str()) {
-                            Self::collect_inferred_type_dependencies(
+                            self.collect_inferred_type_dependencies(
                                 inferred_type,
                                 &bound,
                                 &mut dependencies,
@@ -804,10 +812,19 @@ impl<'a> DeclarationEmitter<'a> {
     }
 
     fn collect_inferred_type_dependencies(
+        &self,
         inferred_type: &str,
         bound: &HashSet<String>,
         dependencies: &mut HashSet<String>,
     ) {
+        if let Some(arguments) = self.inferred_type_argument_dependencies.get(inferred_type) {
+            dependencies.extend(
+                arguments
+                    .iter()
+                    .filter(|name| !bound.contains(*name))
+                    .cloned(),
+            );
+        }
         let inferred_type = inferred_type
             .strip_prefix("typeof ")
             .unwrap_or(inferred_type);
@@ -1801,16 +1818,281 @@ impl<'a> DeclarationEmitter<'a> {
     }
 
     fn emit_params(&mut self, params: &[Param]) {
+        let scope_count = self.local_constructor_bindings.len();
+        if let (Some(first), Some(last)) = (params.first(), params.last()) {
+            let names = params
+                .iter()
+                .flat_map(|param| Self::binding_names(&param.name))
+                .collect();
+            self.local_constructor_bindings.push((
+                Span {
+                    start: first.span.start,
+                    end: last.span.end,
+                },
+                names,
+            ));
+        }
         self.emit_parameter_list(params, false);
+        self.local_constructor_bindings.truncate(scope_count);
     }
 
     fn collect_inferred_types(&mut self, file: &SourceFile) {
+        self.collect_class_type_parameter_counts(&file.statements, "");
         let mut changed = true;
         while changed {
             changed = false;
             for stmt in &file.statements {
                 changed |= self.collect_inferred_types_from_stmt(stmt);
             }
+        }
+    }
+
+    fn collect_class_type_parameter_counts(&mut self, statements: &[Stmt], prefix: &str) {
+        for statement in statements {
+            let namespace_or_class = matches!(
+                statement.kind,
+                StmtKind::ClassDecl(_) | StmtKind::ModuleDecl(_)
+            );
+            for name in Self::constructor_binding_names(statement) {
+                self.constructor_value_bindings
+                    .entry(format!("{prefix}{name}"))
+                    .and_modify(|known| *known &= namespace_or_class)
+                    .or_insert(namespace_or_class);
+            }
+            match &statement.kind {
+                StmtKind::ClassDecl(class) => {
+                    for member in &class.members {
+                        let params = match &member.kind {
+                            ClassMemberKind::Constructor(member) => &member.params,
+                            ClassMemberKind::Method(member) => &member.params,
+                            ClassMemberKind::GetAccessor(member)
+                            | ClassMemberKind::SetAccessor(member) => &member.params,
+                            _ => continue,
+                        };
+                        let names = params
+                            .iter()
+                            .flat_map(|param| Self::binding_names(&param.name))
+                            .collect();
+                        self.local_constructor_bindings.push((member.span, names));
+                    }
+                    if let Some(name) = &class.name {
+                        self.class_type_parameter_counts
+                            .entry(format!("{prefix}{name}"))
+                            // Conflicting declarations need checker resolution.
+                            .and_modify(|count| *count = None)
+                            .or_insert(Some(class.type_params.as_ref().map_or(0, Vec::len)));
+                    }
+                }
+                StmtKind::ModuleDecl(module) => {
+                    self.collect_module_class_type_parameter_counts(module, prefix);
+                }
+                StmtKind::FnDecl(function) => {
+                    let mut names = function
+                        .params
+                        .iter()
+                        .flat_map(|param| Self::binding_names(&param.name))
+                        .collect();
+                    if let Some(body) = &function.body {
+                        Self::collect_local_constructor_bindings(body, &mut names);
+                    }
+                    self.local_constructor_bindings.push((function.span, names));
+                }
+                StmtKind::Export(export) => match &export.kind {
+                    ExportDeclKind::Decl(inner) | ExportDeclKind::DefaultDecl(inner) => {
+                        self.collect_class_type_parameter_counts(
+                            std::slice::from_ref(inner),
+                            prefix,
+                        );
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+
+    fn constructor_binding_names(statement: &Stmt) -> Vec<String> {
+        match &statement.kind {
+            StmtKind::Var(_)
+            | StmtKind::FnDecl(_)
+            | StmtKind::ClassDecl(_)
+            | StmtKind::EnumDecl(_)
+            | StmtKind::ModuleDecl(_) => Self::stmt_declared_names(statement),
+            StmtKind::Import(import) => match &import.specifiers {
+                ImportClause::Named {
+                    default,
+                    named,
+                    namespace,
+                } => default
+                    .iter()
+                    .chain(namespace.iter())
+                    .cloned()
+                    .chain(named.iter().map(|specifier| specifier.local.clone()))
+                    .collect(),
+                ImportClause::Require(name) => vec![name.clone()],
+            },
+            StmtKind::ImportEquals(import) => vec![import.name.clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    // This syntax-only inference cannot resolve local constructors. Record
+    // local value names conservatively instead of guessing at an outer class.
+    fn collect_local_constructor_bindings(statements: &[Stmt], names: &mut HashSet<String>) {
+        for statement in statements {
+            names.extend(Self::constructor_binding_names(statement));
+            match &statement.kind {
+                StmtKind::Block(body) => Self::collect_local_constructor_bindings(body, names),
+                StmtKind::If(statement) => {
+                    Self::collect_local_constructor_bindings(
+                        std::slice::from_ref(&statement.consequent),
+                        names,
+                    );
+                    if let Some(alternate) = &statement.alternate {
+                        Self::collect_local_constructor_bindings(
+                            std::slice::from_ref(alternate),
+                            names,
+                        );
+                    }
+                }
+                StmtKind::While(statement) => Self::collect_local_constructor_bindings(
+                    std::slice::from_ref(&statement.body),
+                    names,
+                ),
+                StmtKind::DoWhile(statement) => Self::collect_local_constructor_bindings(
+                    std::slice::from_ref(&statement.body),
+                    names,
+                ),
+                StmtKind::For(statement) => {
+                    if let Some(ForInit::Var(variable)) = &statement.init {
+                        names.extend(
+                            variable
+                                .declarations
+                                .iter()
+                                .flat_map(|declaration| Self::binding_names(&declaration.name)),
+                        );
+                    }
+                    Self::collect_local_constructor_bindings(
+                        std::slice::from_ref(&statement.body),
+                        names,
+                    );
+                }
+                StmtKind::ForIn(statement) => {
+                    if let ForInOfLeft::Var(variable) = &statement.left {
+                        names.extend(
+                            variable
+                                .declarations
+                                .iter()
+                                .flat_map(|declaration| Self::binding_names(&declaration.name)),
+                        );
+                    }
+                    Self::collect_local_constructor_bindings(
+                        std::slice::from_ref(&statement.body),
+                        names,
+                    );
+                }
+                StmtKind::ForOf(statement) => {
+                    if let ForInOfLeft::Var(variable) = &statement.left {
+                        names.extend(
+                            variable
+                                .declarations
+                                .iter()
+                                .flat_map(|declaration| Self::binding_names(&declaration.name)),
+                        );
+                    }
+                    Self::collect_local_constructor_bindings(
+                        std::slice::from_ref(&statement.body),
+                        names,
+                    );
+                }
+                StmtKind::Switch(statement) => {
+                    for case in &statement.cases {
+                        Self::collect_local_constructor_bindings(&case.consequent, names);
+                    }
+                }
+                StmtKind::Try(statement) => {
+                    Self::collect_local_constructor_bindings(&statement.block, names);
+                    if let Some(handler) = &statement.handler {
+                        if let Some(parameter) = &handler.param {
+                            names.extend(Self::binding_names(parameter));
+                        }
+                        Self::collect_local_constructor_bindings(&handler.body, names);
+                    }
+                    if let Some(finalizer) = &statement.finalizer {
+                        Self::collect_local_constructor_bindings(finalizer, names);
+                    }
+                }
+                StmtKind::Labeled(statement) => Self::collect_local_constructor_bindings(
+                    std::slice::from_ref(&statement.body),
+                    names,
+                ),
+                StmtKind::With(statement) => Self::collect_local_constructor_bindings(
+                    std::slice::from_ref(&statement.body),
+                    names,
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    fn constructor_parameter_count(&self, name: &str, span: Span) -> Option<usize> {
+        let root = name.split('.').next()?;
+        if self
+            .local_constructor_bindings
+            .iter()
+            .any(|(scope, names)| {
+                scope.start <= span.start && span.end <= scope.end && names.contains(root)
+            })
+        {
+            return None;
+        }
+        for depth in (0..=self.enum_scope.len()).rev() {
+            let scope = self.enum_scope[..depth].join(".");
+            let mut qualified = if scope.is_empty() {
+                root.to_string()
+            } else {
+                format!("{scope}.{root}")
+            };
+            let Some(known) = self.constructor_value_bindings.get(&qualified) else {
+                continue;
+            };
+            if !known {
+                return None;
+            }
+            for member in name.split('.').skip(1) {
+                qualified.push('.');
+                qualified.push_str(member);
+                if self.constructor_value_bindings.get(&qualified) != Some(&true) {
+                    return None;
+                }
+            }
+            // Finding any nearer value binding terminates lexical lookup,
+            // even when that binding is not a known generic class.
+            return self
+                .class_type_parameter_counts
+                .get(&qualified)
+                .copied()
+                .flatten();
+        }
+        None
+    }
+
+    fn collect_module_class_type_parameter_counts(&mut self, module: &ModuleDecl, prefix: &str) {
+        let ModuleName::Ident(name) = &module.name else {
+            return;
+        };
+        self.constructor_value_bindings
+            .entry(format!("{prefix}{name}"))
+            .or_insert(true);
+        let prefix = format!("{prefix}{name}.");
+        match &module.body {
+            Some(ModuleBody::Block(statements)) => {
+                self.collect_class_type_parameter_counts(statements, &prefix);
+            }
+            Some(ModuleBody::Module(inner)) => {
+                self.collect_module_class_type_parameter_counts(inner, &prefix);
+            }
+            None => {}
         }
     }
 
@@ -1865,14 +2147,14 @@ impl<'a> DeclarationEmitter<'a> {
         }
     }
 
-    fn infer_function_return_type_text(&self, fn_decl: &FnDecl) -> Option<String> {
+    fn infer_function_return_type_text(&mut self, fn_decl: &FnDecl) -> Option<String> {
         let body = fn_decl.body.as_ref()?;
         Self::no_value_return_type(Some(body), fn_decl.is_async, fn_decl.is_generator)
             .map(str::to_string)
             .or_else(|| self.infer_return_type_from_stmts(body))
     }
 
-    fn infer_return_type_from_stmts(&self, stmts: &[Stmt]) -> Option<String> {
+    fn infer_return_type_from_stmts(&mut self, stmts: &[Stmt]) -> Option<String> {
         for stmt in stmts {
             match &stmt.kind {
                 StmtKind::Return(expr) => {
@@ -1903,7 +2185,7 @@ impl<'a> DeclarationEmitter<'a> {
         None
     }
 
-    fn infer_return_type_from_stmt(&self, stmt: &Stmt) -> Option<String> {
+    fn infer_return_type_from_stmt(&mut self, stmt: &Stmt) -> Option<String> {
         match &stmt.kind {
             StmtKind::Block(stmts) => self.infer_return_type_from_stmts(stmts),
             StmtKind::Return(expr) => expr
@@ -1913,7 +2195,7 @@ impl<'a> DeclarationEmitter<'a> {
         }
     }
 
-    fn infer_var_type_text(&self, expr: &Expr) -> Option<String> {
+    fn infer_var_type_text(&mut self, expr: &Expr) -> Option<String> {
         let expr = self.unwrap_inference_expr(expr);
         match &expr.kind {
             ExprKind::Member(_) => self
@@ -1923,7 +2205,7 @@ impl<'a> DeclarationEmitter<'a> {
         }
     }
 
-    fn infer_expr_type_text(&self, expr: &Expr) -> Option<String> {
+    fn infer_expr_type_text(&mut self, expr: &Expr) -> Option<String> {
         let expr = self.unwrap_inference_expr(expr);
         match &expr.kind {
             ExprKind::NumLit(_) => Some("number".to_string()),
@@ -1934,7 +2216,39 @@ impl<'a> DeclarationEmitter<'a> {
             ExprKind::BoolLit(_) => Some("boolean".to_string()),
             ExprKind::NullLit => Some("null".to_string()),
             ExprKind::Ident(name) => self.inferred_var_types.get(name.as_str()).cloned(),
-            ExprKind::New(new_expr) => self.expr_source_text(&new_expr.callee),
+            ExprKind::New(new_expr) => {
+                let name = self.expr_source_text(&new_expr.callee)?;
+                let Some(arguments) = &new_expr.type_args else {
+                    return Some(name);
+                };
+                // Unknown constructors and invalid argument counts require
+                // checker resolution. In particular, TypeScript discards
+                // erroneous type arguments on nongeneric constructors.
+                let parameter_count = self.constructor_parameter_count(&name, expr.span);
+                if arguments.is_empty() || parameter_count != Some(arguments.len()) {
+                    return Some(name);
+                }
+                let mut renderer = Self::new(self.source);
+                renderer.indent = self.indent;
+                renderer.at_line_start = false;
+                renderer.strict_null_checks = self.strict_null_checks;
+                renderer.write(&name);
+                renderer.write("<");
+                for (index, argument) in arguments.iter().enumerate() {
+                    if index > 0 {
+                        renderer.write(", ");
+                    }
+                    renderer.emit_type_node(argument);
+                }
+                renderer.write(">");
+                let mut dependencies = HashSet::new();
+                Self::collect_types(arguments, &HashSet::new(), &mut dependencies);
+                self.inferred_type_argument_dependencies
+                    .entry(renderer.output.clone())
+                    .or_default()
+                    .extend(dependencies);
+                Some(renderer.output)
+            }
             ExprKind::Call(call) => match &self.unwrap_inference_expr(&call.callee).kind {
                 ExprKind::Ident(name) => self
                     .inferred_function_return_types
