@@ -1,5 +1,8 @@
 // Diagnostic expectations checked against TypeScript 6.0.3.
-use tsc_rs_ast::{CompilerOptions, Diagnostic, ModuleKind, ScriptTarget, Span};
+use tsc_rs_ast::{
+    CompilerOptions, Diagnostic, DiagnosticCategory, ModuleKind, RelatedDiagnostic, ScriptTarget,
+    Span,
+};
 use tsc_rs_types::TypeChecker;
 
 fn check(source: &str, expected: &[(u32, &str, u32, u32)]) {
@@ -1746,5 +1749,129 @@ fn global_object_jsdoc_array_typedefs_use_desugared_binding_metadata() {
             },
         );
         assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+    }
+}
+
+fn overload_arity_diagnostics(source: &str) -> Vec<Diagnostic> {
+    let file = tsc_rs_parser::parse("probe.ts", source);
+    let symbols = tsc_rs_symbols::bind(&file);
+    TypeChecker::new()
+        .check_with_options(
+            &file,
+            &symbols,
+            &CompilerOptions {
+                strict: Some(true),
+                target: Some(ScriptTarget::ES2015),
+                ..Default::default()
+            },
+        )
+        .diagnostics
+}
+
+#[test]
+fn overload_arity_missing_argument_reports_exact_declaration_note() {
+    // TypeScript 6.0.3: the first signature with the smallest minimum owns
+    // the missing-parameter note, independently of the implementation.
+    for source in [
+        "declare function f(x:number):void;declare function f(x:string):void;f();",
+        "function f(x:string):void;function f(x:number):void;function f(x:any){}f();",
+        "declare function f(x:number,y:number,z:number):void;declare function f(x:string):void;f();",
+    ] {
+        let diagnostics = overload_arity_diagnostics(source);
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+        let call_start = source.rfind("f()").unwrap() as u32;
+        let note_text = if source.contains("z:number") { "x:string" } else if source.starts_with("function") { "x:string" } else { "x:number" };
+        let parameter_start = source.find(note_text).unwrap() as u32;
+        assert_eq!(diagnostics[0], Diagnostic {
+            code: 2554,
+            message: if source.contains("z:number") { "Expected 1-3 arguments, but got 0." } else { "Expected 1 arguments, but got 0." }.into(),
+            category: DiagnosticCategory::Error,
+            file_name: None,
+            span: Some(Span::new(call_start, call_start + 1)),
+            related: Some(vec![RelatedDiagnostic {
+                code: 6210, message: "An argument for 'x' was not provided.".into(),
+                file_name: Some("probe.ts".into()),
+                span: Some(Span::new(parameter_start, parameter_start + note_text.len() as u32)),
+            }]),
+        });
+    }
+}
+
+#[test]
+fn overload_arity_excess_arguments_span_only_the_extra_expressions() {
+    let source = "declare function f(x:number):void;declare function f(x:string):void;f(1, /*extra*/ 2,\n 3);";
+    let diagnostics = overload_arity_diagnostics(source);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    let first = source.find("2,").unwrap() as u32;
+    let last = source.rfind('3').unwrap() as u32 + 1;
+    assert_eq!(diagnostics[0].code, 2554);
+    assert_eq!(diagnostics[0].message, "Expected 1 arguments, but got 3.");
+    assert_eq!(diagnostics[0].span, Some(Span::new(first, last)));
+    assert_eq!(diagnostics[0].related, None);
+}
+
+#[test]
+fn overload_arity_gap_uses_declared_endpoints() {
+    for (source, expected) in [
+        ("declare function f(x:number):void;declare function f(x:number,y:number,z:number):void;f(1,2);",
+         "No overload expects 2 arguments, but overloads do exist that expect either 1 or 3 arguments."),
+        ("declare function f(x:number,y?:number):void;declare function f(x:string,y:string,z:string,w:string,q?:string,r?:string):void;f(1,2,3);",
+         "No overload expects 3 arguments, but overloads do exist that expect either 1 or 6 arguments."),
+    ] {
+        let diagnostics = overload_arity_diagnostics(source);
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+        assert_eq!(diagnostics[0].code, 2575);
+        assert_eq!(diagnostics[0].message, expected);
+        let start = source.rfind("f(1").unwrap() as u32;
+        assert_eq!(diagnostics[0].span, Some(Span::new(start, start + 1)));
+        assert_eq!(diagnostics[0].related, None);
+    }
+}
+
+#[test]
+fn overload_arity_excludes_this_and_keeps_binding_pattern_note() {
+    for (source, code, message, parameter) in [
+        ("declare function f(this:any,x:number):void;declare function f(this:any,x:string):void;f();", 6210, "An argument for 'x' was not provided.", "x:number"),
+        ("declare function f({x}:{x:number}):void;declare function f([x]:[number]):void;f();", 6211, "An argument matching this binding pattern was not provided.", "{x}:{x:number}"),
+    ] {
+        let diagnostics = overload_arity_diagnostics(source);
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+        assert_eq!(diagnostics[0].code, 2554);
+        assert_eq!(diagnostics[0].message, "Expected 1 arguments, but got 0.");
+        let start = source.find(parameter).unwrap() as u32;
+        assert_eq!(diagnostics[0].related, Some(vec![RelatedDiagnostic {
+            code, message: message.into(), file_name: Some("probe.ts".into()),
+            span: Some(Span::new(start, start + parameter.len() as u32)),
+        }]));
+    }
+}
+
+#[test]
+fn overload_arity_preserves_accepted_calls_and_shadowed_bindings() {
+    for source in [
+        "declare function f(x:number):number;declare function f(x:string):string;f(1);f('ok');",
+        "declare function f(x?:number):void;declare function f(x?:string):void;f();",
+        "declare function f(x:number):number;declare function f(x:string):string;{const f=()=>{};f();}",
+        "declare function f(x:number):number;declare function f(x:string):string;function outer(f:()=>void){f();}",
+        "declare function f<T>(x:T):T;declare function f<T>(x:T,y:T):T;f<number>(1);",
+        "String.fromCharCode();",
+    ] {
+        assert!(overload_arity_diagnostics(source).is_empty(), "{source}");
+    }
+}
+
+#[test]
+fn overload_arity_retains_uniform_exports_and_module_local_library_names() {
+    for (source, name) in [
+        ("export function f(a:number):void;export function f(a:number,b:number,c:number):void;export function f(...args:any[]){};f(1,2);", "f"),
+        ("export {};declare function Date(a:number):number;declare function Date(a:number,b:number,c:number):number;Date(1,2);", "Date"),
+    ] {
+        let diagnostics = overload_arity_diagnostics(source);
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+        let start = source.rfind(&format!("{name}(1,2)")).unwrap() as u32;
+        assert_eq!(diagnostics[0].code, 2575);
+        assert_eq!(diagnostics[0].span, Some(Span::new(start, start + name.len() as u32)));
+        assert_eq!(diagnostics[0].message, "No overload expects 2 arguments, but overloads do exist that expect either 1 or 3 arguments.");
+        assert_eq!(diagnostics[0].related, None);
     }
 }

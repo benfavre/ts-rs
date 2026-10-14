@@ -3161,6 +3161,10 @@ pub struct TypeChecker {
     /// provided." note under TS2554).
     function_param_spans:
         rustc_hash::FxHashMap<std::string::String, Vec<(std::string::String, Span)>>,
+    /// Exact current-file overloads and their parameter declarations. Kept
+    /// apart from donor/name-only metadata for arity diagnostics and notes.
+    overload_parameter_notes:
+        rustc_hash::FxHashMap<String, (Vec<FunctionType>, Vec<Vec<tsc_rs_ast::RelatedDiagnostic>>)>,
     /// Full parameter declarations for decorator arity notes, including
     /// ambient functions and overloads in the current file.
     decorator_parameter_notes: rustc_hash::FxHashMap<
@@ -3626,6 +3630,7 @@ impl Clone for TypeChecker {
             file_hoisted_binding_names: rustc_hash::FxHashSet::default(),
             file_has_module_syntax: false,
             function_param_spans: rustc_hash::FxHashMap::default(),
+            overload_parameter_notes: rustc_hash::FxHashMap::default(),
             decorator_parameter_notes: rustc_hash::FxHashMap::default(),
             user_global_type_names: self.user_global_type_names.clone(),
             user_global_value_names: self.user_global_value_names.clone(),
@@ -3887,6 +3892,7 @@ impl TypeChecker {
             file_hoisted_binding_names: rustc_hash::FxHashSet::default(),
             file_has_module_syntax: false,
             function_param_spans: rustc_hash::FxHashMap::default(),
+            overload_parameter_notes: rustc_hash::FxHashMap::default(),
             decorator_parameter_notes: rustc_hash::FxHashMap::default(),
             user_global_type_names: rustc_hash::FxHashSet::default(),
             user_global_value_names: rustc_hash::FxHashSet::default(),
@@ -15356,6 +15362,7 @@ impl TypeChecker {
     // -----------------------------------------------------------------------
 
     fn populate_from_symbols(&mut self, file: &SourceFile, symbols: &SymbolTable) {
+        self.overload_parameter_notes.clear();
         // Walk top-level statements to register declared names with types
         for stmt in &file.statements {
             self.register_top_level(stmt);
@@ -15391,6 +15398,57 @@ impl TypeChecker {
                         .then_some(function.as_ref())
                     })
                     .collect();
+                // Exported and local declarations can bind distinct overload
+                // groups even when the lightweight table combines their names.
+                // Verify the implementation too, and decline other declaration
+                // kinds or default-export groups instead of guessing ownership.
+                let group: Vec<_> = file
+                    .statements
+                    .iter()
+                    .filter_map(|statement| {
+                        let (statement, export_kind) = match &statement.kind {
+                            StmtKind::Export(export) => match &export.kind {
+                                ExportDeclKind::Decl(inner) => (inner.as_ref(), MOD_EXPORT),
+                                ExportDeclKind::DefaultDecl(inner) => {
+                                    (inner.as_ref(), MOD_EXPORT | MOD_DEFAULT)
+                                }
+                                _ => return None,
+                            },
+                            _ => (statement, 0),
+                        };
+                        let StmtKind::FnDecl(function) = &statement.kind else {
+                            return None;
+                        };
+                        (function.name.as_deref() == Some(&sym.name)).then_some((
+                            function.name_span,
+                            export_kind | (function.modifiers & (MOD_EXPORT | MOD_DEFAULT)),
+                        ))
+                    })
+                    .collect();
+                let coherent_group = group.first().is_some_and(|(_, export_kind)| {
+                    export_kind & MOD_DEFAULT == 0
+                        && group.iter().all(|(_, kind)| kind == export_kind)
+                        && sym.declarations.iter().all(|declaration| {
+                            group
+                                .iter()
+                                .any(|(span, _)| *span == Some(declaration.span))
+                        })
+                });
+                let parameter_notes = (declarations.len() == sigs.len() && coherent_group).then(|| {
+                    declarations
+                        .iter()
+                        .map(|function| {
+                            function.params.iter().filter(|parameter| {
+                                !matches!(&parameter.name.kind, PatKind::Ident(name) if name == "this")
+                            }).map(|parameter| {
+                                let name = match &parameter.name.kind {
+                                    PatKind::Ident(name) => name.as_str(),
+                                    _ => "",
+                                };
+                                self.missing_argument_note(name, parameter.span)
+                            }).collect()
+                        }).collect()
+                });
                 let fn_types: Vec<FunctionType> = if declarations.len() == sigs.len() {
                     declarations
                         .into_iter()
@@ -15401,6 +15459,11 @@ impl TypeChecker {
                         .map(|sig| self.resolve_overload_signature(sig))
                         .collect()
                 };
+                self.overload_parameter_notes.remove(&sym.name);
+                if let Some(notes) = parameter_notes {
+                    self.overload_parameter_notes
+                        .insert(sym.name.clone(), (fn_types.clone(), notes));
+                }
                 if !fn_types.is_empty() {
                     let implementation = file.statements.iter().find_map(|stmt| {
                         match &Self::unwrap_export_stmt(stmt).kind {
@@ -49381,15 +49444,23 @@ mod tests {
     }
 
     #[test]
-    fn test_overload_wrong_arg_count_ts2769() {
-        // Wrong argument count should not match any overload
+    fn test_overload_wrong_arg_count_ts2554() {
+        // TypeScript reports arity, rather than a type mismatch, when no
+        // overload accepts the argument count. Only excess arguments are marked.
         let src = r#"
             function qux(x: number): number;
             function qux(x: string): string;
             function qux(x: any): any { return x; }
             qux(1, 2, 3);
         "#;
-        check_has_error(src, 2769);
+        let output = parse_and_check(src);
+        assert_eq!(output.diagnostics.len(), 1);
+        let diagnostic = &output.diagnostics[0];
+        assert_eq!(diagnostic.code, 2554);
+        assert_eq!(diagnostic.message, "Expected 1 arguments, but got 3.");
+        let start = src.find("2, 3").unwrap() as u32;
+        assert_eq!(diagnostic.span, Some(Span::new(start, start + 4)));
+        assert_eq!(diagnostic.related, None);
     }
 
     #[test]

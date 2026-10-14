@@ -14268,7 +14268,134 @@ impl TypeChecker {
         call: &CallExpr,
         expr: &Expr,
     ) -> Diagnostic {
-        self.no_overload_arguments(sigs, arg_types, &call.args, expr.span)
+        self.fixed_overload_arity_diagnostic(sigs, arg_types, call)
+            .unwrap_or_else(|| self.no_overload_arguments(sigs, arg_types, &call.args, expr.span))
+    }
+
+    /// Choose an arity diagnostic only after existing overload selection has
+    /// failed. This does not change which calls or signatures are accepted.
+    fn fixed_overload_arity_diagnostic(
+        &self,
+        signatures: &[FunctionType],
+        argument_types: &[Type],
+        call: &CallExpr,
+    ) -> Option<Diagnostic> {
+        let ExprKind::Ident(name) = &call.callee.kind else {
+            return None;
+        };
+        if self.current_file_is_js()
+            || call.type_args.is_some()
+            || self.binding_scope_is_root(name) == Some(false)
+            || call.args.len() != argument_types.len()
+            || call
+                .args
+                .iter()
+                .any(|arg| matches!(arg.kind, ExprKind::Spread(_)))
+        {
+            return None;
+        }
+        // Script declarations can merge or conflict with library or injected
+        // program globals. Their full callable group is not represented by
+        // local notes. The injected name set has no source ownership, so also
+        // defer current-file globals in such programs rather than guess.
+        if self.current_file_is_script
+            && (self.user_global_value_names.contains(name.as_str())
+                || self.builtins.global_values.contains_key(name.as_str())
+                || stdlib::stdlib_member_availability(&self.compiler_options)
+                    .is_some_and(|library| library.declares_global_value(name)))
+        {
+            return None;
+        }
+        // Only AST-backed overloads belonging to this exact local binding are
+        // reliable here. Library, imported and synthesized signatures retain
+        // their previous diagnostics until their metadata can be verified.
+        let (recorded, notes) = self.overload_parameter_notes.get(name.as_str())?;
+        if recorded != signatures || notes.len() != signatures.len() {
+            return None;
+        }
+        fn fixed_parameter(ty: &Type) -> bool {
+            match ty {
+                // Trailing void (including aliases) can lower minimum arity.
+                // Rest tuples, deferred parameters and generic substitution
+                // need the complete signature rules; keep them unchanged.
+                Type::Void
+                | Type::TypeReference(..)
+                | Type::TypeParameter(_)
+                | Type::Conditional { .. }
+                | Type::IndexedAccess(..)
+                | Type::Keyof(_)
+                | Type::Infer(_) => false,
+                Type::Union(members) | Type::Intersection(members) => {
+                    members.iter().all(fixed_parameter)
+                }
+                Type::Optional(inner) | Type::Readonly(inner) => fixed_parameter(inner),
+                _ => true,
+            }
+        }
+        let mut counts = Vec::with_capacity(signatures.len());
+        for (signature, parameter_notes) in signatures.iter().zip(notes) {
+            let parameters: Vec<_> = signature
+                .params
+                .iter()
+                .filter(|(name, _)| name != "this")
+                .collect();
+            if parameters.len() != parameter_notes.len()
+                || parameters
+                    .iter()
+                    .any(|(name, ty)| name.starts_with("...") || !fixed_parameter(ty))
+            {
+                return None;
+            }
+            let minimum = parameters
+                .iter()
+                .rposition(|(name, _)| !name.starts_with('?'))
+                .map_or(0, |index| index + 1);
+            counts.push((minimum, parameters.len()));
+        }
+        let provided = argument_types.len();
+        if counts
+            .iter()
+            .any(|(min, max)| *min <= provided && provided <= *max)
+        {
+            return None;
+        }
+        let minimum = counts.iter().map(|(min, _)| *min).min()?;
+        let maximum = counts.iter().map(|(_, max)| *max).max()?;
+        if provided < minimum {
+            let closest = counts.iter().position(|(min, _)| *min == minimum)?;
+            let mut diagnostic = error_arg_count(minimum, maximum, provided, call.callee.span);
+            diagnostic.related = Some(vec![notes.get(closest)?.get(provided)?.clone()]);
+            Some(diagnostic)
+        } else if provided > maximum {
+            let first = call.args.get(maximum)?;
+            let last = call.args.last()?;
+            Some(error_arg_count(
+                minimum,
+                maximum,
+                provided,
+                Span::new(first.span.start, last.span.end),
+            ))
+        } else {
+            // Match tsc's nearest declared endpoint wording for an arity gap.
+            let below = counts
+                .iter()
+                .map(|(min, _)| *min)
+                .filter(|min| *min < provided)
+                .max()?;
+            let above = counts
+                .iter()
+                .map(|(_, max)| *max)
+                .filter(|max| provided < *max)
+                .min()?;
+            Some(Diagnostic {
+                code: 2575,
+                message: format!("No overload expects {provided} arguments, but overloads do exist that expect either {below} or {above} arguments."),
+                category: DiagnosticCategory::Error,
+                file_name: None,
+                span: Some(call.callee.span),
+                related: None,
+            })
+        }
     }
 
     fn no_overload_arguments(
