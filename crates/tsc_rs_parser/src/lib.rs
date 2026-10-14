@@ -83,6 +83,7 @@ pub fn has_syntax_errors(diagnostics: &[Diagnostic]) -> bool {
             1002 | 1003
                 | 1005
                 | 1010
+                | 1068
                 | 1109
                 | 1110
                 | 1124
@@ -5892,6 +5893,7 @@ impl<'a> Parser<'a> {
         } else {
             self.parse_member_modifiers()
         };
+        let modifier_end = self.pos;
         if self.is_js_file {
             let modifier_spans: Vec<Span> = self.tokens[modifier_pos..self.pos]
                 .iter()
@@ -5927,6 +5929,11 @@ impl<'a> Parser<'a> {
                 self.parse_binding_pattern()
             }
         });
+        // Decorator validity depends on compiler options and can take
+        // precedence over modifier ordering. Keep that context with the checker.
+        if decorators.is_empty() && !matches!(&name.kind, PatKind::Ident(name) if name == "this") {
+            self.check_parameter_modifier_order(modifier_pos..modifier_end);
+        }
         if matches!(&name.kind, PatKind::Ident(name) if name == "this") {
             if let Some(decorator) = decorators.first() {
                 let span = self.decorator_diagnostic_span(decorator, true);
@@ -8936,6 +8943,51 @@ impl<'a> Parser<'a> {
         flags
     }
 
+    fn check_parameter_modifier_order(&mut self, modifiers: std::ops::Range<usize>) {
+        // TypeScript stops at the first modifier grammar error. Check the
+        // parameter-property ordering we can determine from these tokens,
+        // retaining earlier duplicate/conflicting and context-specific errors.
+        let accessibility = MOD_PUBLIC | MOD_PRIVATE | MOD_PROTECTED;
+        let mut seen = MOD_NONE;
+        for index in modifiers {
+            // The parser currently recovers readonly across a line break as a
+            // modifier, where TypeScript instead ends the parameter name.
+            if self.tokens[index + 1].preceded_by_line_break {
+                return;
+            }
+            let token = &self.tokens[index];
+            let (flag, name) = match token.kind {
+                TokenKind::Public => (MOD_PUBLIC, "public"),
+                TokenKind::Private => (MOD_PRIVATE, "private"),
+                TokenKind::Protected => (MOD_PROTECTED, "protected"),
+                TokenKind::Override => (MOD_OVERRIDE, "override"),
+                TokenKind::Readonly => (MOD_READONLY, "readonly"),
+                // Other parameter modifiers already have a context error.
+                _ => return,
+            };
+            let is_accessibility = flag & accessibility != 0;
+            if seen & flag != 0 || (is_accessibility && seen & accessibility != 0) {
+                return;
+            }
+            let predecessor = if is_accessibility && seen & MOD_OVERRIDE != 0 {
+                Some("override")
+            } else if (is_accessibility || flag == MOD_OVERRIDE) && seen & MOD_READONLY != 0 {
+                Some("readonly")
+            } else {
+                None
+            };
+            if let Some(predecessor) = predecessor {
+                self.grammar_error_at_span(
+                    1029,
+                    format!("'{name}' modifier must precede '{predecessor}' modifier."),
+                    token.span,
+                );
+                return;
+            }
+            seen |= flag;
+        }
+    }
+
     fn parse_member_modifiers(&mut self) -> ModifierFlags {
         let mut flags = MOD_NONE;
         let mut has_seen_static = false;
@@ -9825,7 +9877,9 @@ impl<'a> Parser<'a> {
             // specific parameter-property diagnostic. Rejecting `public`
             // here made us fall back to a parenthesized type and cascade
             // generic TS1005/TS1109 parser errors instead.
+            let modifier_pos = self.pos;
             let modifiers = self.parse_member_modifiers();
+            let modifier_end = self.pos;
             let dotdotdot = self.eat(TokenKind::DotDotDot).is_some();
             // Accept identifiers, `this`, and destructuring patterns ({, [)
             if !self.is_identifier()
@@ -9850,6 +9904,11 @@ impl<'a> Parser<'a> {
                     span,
                 }
             };
+            // TypeScript does not accept these recovered modifier/rest lists
+            // as function-type parameters; their syntax recovery is separate.
+            if !dotdotdot && !matches!(&pat.kind, PatKind::Ident(name) if name == "this") {
+                self.check_parameter_modifier_order(modifier_pos..modifier_end);
+            }
             let optional = self.eat(TokenKind::Question).is_some();
             let type_ann = if self.eat(TokenKind::Colon).is_some() {
                 Some(self.parse_type())

@@ -1,6 +1,272 @@
 use tsc_rs_parser::parse;
 
 #[test]
+fn invalid_class_members_suppress_parameter_modifier_grammar_errors() {
+    // TS1068 is emitted by TypeScript's class-member parser, so it prevents
+    // later grammar checks just as a missing-token diagnostic does.
+    for (source, start, end) in [
+        (
+            "class C{ constructor(readonly public x:number){} , }",
+            49,
+            50,
+        ),
+        (
+            "class C{ = constructor(readonly public x:number){} }",
+            9,
+            10,
+        ),
+        (
+            "class C{ : number; constructor(override public x:number){} }",
+            9,
+            10,
+        ),
+    ] {
+        let parsed = parse("input.ts", source);
+        let diagnostics: Vec<_> = parsed
+            .diagnostics
+            .iter()
+            .map(|d| (d.code, d.span, d.message.as_str()))
+            .collect();
+        assert_eq!(
+            diagnostics,
+            vec![(
+                1068,
+                Some(tsc_rs_ast::Span::new(start, end)),
+                "Unexpected token. A constructor, method, accessor, or property was expected."
+            )],
+            "{source}"
+        );
+        assert!(tsc_rs_parser::has_syntax_errors(&parsed.diagnostics));
+    }
+
+    let source = "function f(x:number){} class C{ = }";
+    let parsed = parse("input.js", source);
+    let mut codes: Vec<_> = parsed.diagnostics.iter().map(|d| d.code).collect();
+    codes.sort_unstable();
+    assert_eq!(codes, vec![1068, 8010]);
+}
+
+#[test]
+fn jsx_recovery_errors_suppress_ordering_in_either_source_order() {
+    for modifiers in ["readonly public", "override public", "readonly override"] {
+        let constructor = format!("constructor({modifiers} x:number){{}}");
+        for body in [
+            format!("{constructor} x=<C/>[y]:number;"),
+            format!("x=<C/>[y]:number; {constructor}"),
+        ] {
+            let source = format!("class C{{ {body} }}");
+            let parsed = parse("input.tsx", &source);
+            // JSX member-chain recovery still differs from TypeScript. Its
+            // parse error must nevertheless suppress modifier grammar errors.
+            assert!(tsc_rs_parser::has_syntax_errors(&parsed.diagnostics));
+            assert!(
+                parsed.diagnostics.iter().all(|d| d.code != 1029),
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+        }
+    }
+
+    let parsed = parse(
+        "input.ts",
+        "class C{constructor(readonly public x:number){}}",
+    );
+    assert_eq!(parsed.diagnostics.len(), 1);
+    assert_eq!(parsed.diagnostics[0].code, 1029);
+    assert!(!tsc_rs_parser::has_syntax_errors(&parsed.diagnostics));
+}
+
+#[test]
+fn parameter_modifier_order_reports_the_later_modifier() {
+    for (source, marker, modifier, predecessor) in [
+        (
+            "class C { constructor(override public x:number) {} }",
+            "public x",
+            "public",
+            "override",
+        ),
+        (
+            "function f(readonly private x:number) {}",
+            "private x",
+            "private",
+            "readonly",
+        ),
+        (
+            "class C { m(override protected x:number) {} }",
+            "protected x",
+            "protected",
+            "override",
+        ),
+        (
+            "const f=(override readonly public x:number)=>x;",
+            "public x",
+            "public",
+            "override",
+        ),
+        (
+            "function f(readonly override public x:number) {}",
+            "override public",
+            "override",
+            "readonly",
+        ),
+        (
+            "function f(readonly /* comment */ public x:number) {}",
+            "public x",
+            "public",
+            "readonly",
+        ),
+        (
+            "function f(readonly public ...x:number[]) {}",
+            "public ...",
+            "public",
+            "readonly",
+        ),
+    ] {
+        for filename in ["input.ts", "input.tsx", "input.js", "input.jsx"] {
+            let parsed = parse(filename, source);
+            let diagnostics: Vec<_> = parsed
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == 1029)
+                .collect();
+            assert_eq!(
+                diagnostics.len(),
+                1,
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+            let start = source.find(marker).unwrap() as u32;
+            assert_eq!(
+                diagnostics[0].span,
+                Some(tsc_rs_ast::Span::new(start, start + modifier.len() as u32))
+            );
+            assert_eq!(
+                diagnostics[0].message,
+                format!("'{modifier}' modifier must precede '{predecessor}' modifier.")
+            );
+        }
+    }
+    let parsed = parse("input.ts", "type F=(readonly public x:number)=>void;");
+    assert_eq!(parsed.diagnostics.len(), 1, "{:?}", parsed.diagnostics);
+    assert_eq!(parsed.diagnostics[0].code, 1029);
+    assert_eq!(
+        parsed.diagnostics[0].span,
+        Some(tsc_rs_ast::Span::new(17, 23))
+    );
+}
+
+#[test]
+fn parameter_modifier_order_preserves_earlier_grammar_and_recovery_errors() {
+    for modifiers in [
+        "public private readonly",
+        "readonly readonly public",
+        "override override public",
+        "public readonly private",
+        "static override public",
+        "declare readonly public",
+        "abstract override public",
+        "accessor readonly public",
+    ] {
+        let source = format!("function f({modifiers} x:number) {{}}");
+        let parsed = parse("input.ts", &source);
+        // TypeScript stops at the earlier duplicate/conflicting or invalid
+        // parameter modifier, before a later ordering error can be reported.
+        assert!(
+            !parsed.diagnostics.iter().any(|d| d.code == 1029),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+    for source in [
+        "function f(readonly public this:C) {}",
+        "class C { constructor(override public this:C) {} }",
+        "type F=(readonly public this:C)=>void;",
+        "function f(readonly\npublic x:number) {}",
+        "function f(readonly /*\n*/ public x:number) {}",
+        "class C { constructor(@dec override public x:number) {} }",
+        "type F=(readonly public ...x:number[])=>number;",
+    ] {
+        let parsed = parse("input.ts", source);
+        // These constructs have earlier syntax/decorator errors or retain
+        // existing recovery whose modifier boundary differs from TypeScript.
+        assert!(
+            !parsed.diagnostics.iter().any(|d| d.code == 1029),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
+fn parameter_modifier_order_uses_the_grammar_diagnostic_phase() {
+    let invalid_order = "function f(readonly public x:number) {}";
+    for source in [
+        format!("const broken=; {invalid_order}"),
+        format!("{invalid_order} const broken=;"),
+    ] {
+        let parsed = parse("input.ts", &source);
+        assert!(parsed.diagnostics.iter().any(|d| d.code == 1109));
+        assert!(
+            !parsed.diagnostics.iter().any(|d| d.code == 1029),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+    let parsed = parse("input.js", "function f(readonly public x) {}");
+    assert!(parsed.diagnostics.iter().any(|d| d.code == 8012));
+    assert!(parsed.diagnostics.iter().any(|d| d.code == 1029));
+    assert!(!tsc_rs_parser::has_syntax_errors(&parsed.diagnostics));
+
+    // Successful parameter-list speculation can still fall back when there
+    // is no arrow. Its grammar diagnostic must not survive the type recovery.
+    for source in [
+        "type T=(readonly public x:number);",
+        "type T=((readonly public x:number));",
+        "type T<X>=X extends (readonly public x:number) ? 1 : 2;",
+        "type T<X>=X extends (infer R extends (readonly public x:number)) ? R : never;",
+        "type T=(x:(readonly public x:number))=>number;",
+    ] {
+        let parsed = parse("input.ts", source);
+        assert!(tsc_rs_parser::has_syntax_errors(&parsed.diagnostics));
+        assert!(
+            !parsed.diagnostics.iter().any(|d| d.code == 1029),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
+fn parameter_modifier_order_preserves_parameters_and_valid_forms() {
+    use tsc_rs_ast::{PatKind, StmtKind, MOD_PUBLIC, MOD_READONLY};
+    let parsed = parse(
+        "input.ts",
+        "function f(readonly public x:number) {} let after=1;",
+    );
+    assert_eq!(parsed.statements.len(), 2);
+    let StmtKind::FnDecl(function) = &parsed.statements[0].kind else {
+        panic!("expected function");
+    };
+    assert_eq!(function.params.len(), 1);
+    assert_eq!(function.params[0].modifiers, MOD_PUBLIC | MOD_READONLY);
+    assert!(matches!(&function.params[0].name.kind, PatKind::Ident(name) if name == "x"));
+    for source in [
+        "class C { constructor(public override readonly x:number) {} }",
+        "class C { constructor(private readonly x:number) {} }",
+        "function f(public:number, readonly:number, override:number) {}",
+        "type F=(x:number)=>number;",
+        "type T=(number);",
+    ] {
+        let parsed = parse("input.ts", source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
 fn initialized_class_properties_require_separators_before_colons_and_commas() {
     // Exact TypeScript 6.0.3 parse diagnostic spans, including a computed
     // member consumed as element access on the preceding initializer.
