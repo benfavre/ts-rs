@@ -8525,6 +8525,16 @@ impl<'a> Parser<'a> {
                 if let Some((name, span)) = self.parse_identifier_name() {
                     Some(PropName::Ident(name.into(), span))
                 } else {
+                    if self
+                        .pos
+                        .checked_sub(1)
+                        .and_then(|index| self.tokens.get(index))
+                        .is_some_and(|token| token.kind == TokenKind::Asterisk)
+                    {
+                        // The generator marker requires a member name even
+                        // when the enclosing member's recovery omits it.
+                        self.error_code(1003, "Identifier expected.".into());
+                    }
                     None
                 }
             }

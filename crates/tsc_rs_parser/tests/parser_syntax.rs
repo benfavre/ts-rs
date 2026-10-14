@@ -1,6 +1,83 @@
 use tsc_rs_parser::parse;
 
 #[test]
+fn bare_generator_members_report_missing_identifier() {
+    // Exact TypeScript 6.0.3 code/spans for missing names at the closing brace.
+    for (filename, source, start, end) in [
+        ("input.ts", "var v = { * }", 12, 13),
+        ("input.js", "var v = { * }", 12, 13),
+        ("input.tsx", "var v = { * }", 12, 13),
+        ("input.ts", "class C {\n   *\n}", 15, 16),
+        ("input.js", "class C {\n   *\n}", 15, 16),
+    ] {
+        let parsed = parse(filename, source);
+        assert_eq!(
+            parsed.diagnostics.len(),
+            1,
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+        let diagnostic = &parsed.diagnostics[0];
+        assert_eq!(diagnostic.code, 1003, "{source}");
+        assert_eq!(diagnostic.message, "Identifier expected.", "{source}");
+        assert_eq!(
+            diagnostic.span,
+            Some(tsc_rs_ast::Span::new(start, end)),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn bare_generator_recovery_preserves_following_statements() {
+    use tsc_rs_ast::{ExprKind, StmtKind};
+    let source = "const value = { * }; const after = 1;";
+    let parsed = parse("input.ts", source);
+    assert_eq!(parsed.diagnostics.len(), 1, "{:?}", parsed.diagnostics);
+    assert_eq!(parsed.diagnostics[0].code, 1003);
+    assert_eq!(
+        parsed.diagnostics[0].span,
+        Some(tsc_rs_ast::Span::new(18, 19))
+    );
+    assert_eq!(parsed.statements.len(), 2);
+    let StmtKind::Var(var) = &parsed.statements[0].kind else {
+        panic!("expected an object declaration after the bare generator marker");
+    };
+    let ExprKind::ObjectLit(properties) = &var.declarations[0].init.as_ref().unwrap().kind else {
+        panic!("expected the object literal");
+    };
+    assert!(
+        properties.is_empty(),
+        "a bare star must not invent a method"
+    );
+    let StmtKind::Var(var) = &parsed.statements[1].kind else {
+        panic!("expected the following declaration");
+    };
+    assert_eq!(var.declarations.len(), 1);
+}
+
+#[test]
+fn valid_generator_member_names_remain_valid() {
+    let source = r#"const value = {
+        *method() { yield 1; }, *"quoted"() {}, *0() {},
+        *[Symbol.iterator]() {}, async *async() {},
+        *generic<T>(value: T) { yield value; }
+    };
+    class C { *method() {} *"quoted"() {} *0() {} *[Symbol.iterator]() {} }
+    function* generator() { yield 1; }
+    const expression = function* () { yield 1; };
+    const product = 2 * (3 + 4);"#;
+    for filename in ["input.ts", "input.tsx"] {
+        let parsed = parse(filename, source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{filename}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
 fn missing_commas_after_rest_parameters_report_the_following_token() {
     // The parser retains grammar diagnostics for the compiler to filter when
     // syntax errors are present. TypeScript 6.0.3 only reports the missing
