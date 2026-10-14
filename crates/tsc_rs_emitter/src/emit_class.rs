@@ -1277,6 +1277,11 @@ impl<'a> Emitter<'a> {
         class_decl: &ClassDecl,
         name: &str,
     ) {
+        let has_user_static_members = class_decl.members.iter().any(|member| match &member.kind {
+            ClassMemberKind::StaticBlock(_) => true,
+            ClassMemberKind::Property(prop) => prop.modifiers & MOD_STATIC != 0,
+            _ => false,
+        });
         self.needs_es_decorate_helper = true;
         self.needs_run_initializers_helper = true;
         self.needs_set_function_name_helper = true;
@@ -1320,6 +1325,10 @@ impl<'a> Emitter<'a> {
         self.write(name);
         self.writeln(" = _classThis = _classDescriptor.value;");
         self.writeln("if (_metadata) Object.defineProperty(_classThis, Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: _metadata });");
+        if !has_user_static_members {
+            self.write(self.helper_prefix());
+            self.writeln("__runInitializers(_classThis, _classExtraInitializers);");
+        }
         self.indent -= 1;
         self.writeln("})();");
 
@@ -1367,12 +1376,14 @@ impl<'a> Emitter<'a> {
         }
         self.static_this_alias = saved_static_this_alias;
 
-        self.writeln("(() => {");
-        self.indent += 1;
-        self.write(self.helper_prefix());
-        self.writeln("__runInitializers(_classThis, _classExtraInitializers);");
-        self.indent -= 1;
-        self.writeln("})();");
+        if has_user_static_members {
+            self.writeln("(() => {");
+            self.indent += 1;
+            self.write(self.helper_prefix());
+            self.writeln("__runInitializers(_classThis, _classExtraInitializers);");
+            self.indent -= 1;
+            self.writeln("})();");
+        }
         self.write("return ");
         self.write(name);
         self.writeln(" = _classThis;");

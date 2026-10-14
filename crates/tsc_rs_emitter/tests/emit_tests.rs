@@ -20137,3 +20137,73 @@ console.log(events.join(','));
         );
     }
 }
+
+#[test]
+fn standard_class_extra_initializers_match_typescript_without_static_members() {
+    for target in [ScriptTarget::ES2015, ScriptTarget::ES2017] {
+        let js = emit_ts_with(
+            "export {}; declare var dec: any; @dec class C {  } ",
+            CompilerOptions {
+                target: Some(target),
+                module: Some(ModuleKind::ESNext),
+                experimental_decorators: Some(false),
+                no_emit_helpers: Some(true),
+                strict: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(js, "let C = (() => {\n    let _classDecorators = [dec];\n    let _classDescriptor;\n    let _classExtraInitializers = [];\n    let _classThis;\n    var C = _classThis = class {\n    };\n    __setFunctionName(_classThis, \"C\");\n    (() => {\n        const _metadata = typeof Symbol === \"function\" && Symbol.metadata ? Object.create(null) : void 0;\n        __esDecorate(null, _classDescriptor = { value: _classThis }, _classDecorators, { kind: \"class\", name: _classThis.name, metadata: _metadata }, null, _classExtraInitializers);\n        C = _classThis = _classDescriptor.value;\n        if (_metadata) Object.defineProperty(_classThis, Symbol.metadata, { enumerable: true, configurable: true, writable: true, value: _metadata });\n        __runInitializers(_classThis, _classExtraInitializers);\n    })();\n    return C = _classThis;\n})();\nexport {};\n");
+    }
+}
+#[test]
+fn standard_class_initializers_preserve_static_and_disposal_order() {
+    for static_field in [false, true] {
+        for throw_from_initializer in [false, true] {
+            let member = if static_field {
+                "static field = recordStatic();"
+            } else {
+                ""
+            };
+            let source = format!("declare const dec: any; declare function resource(): any; declare function recordStatic(): number; declare function body(): void; using item = resource(); @dec class C {{ {member} }} body();");
+            let js = emit_ts_with(
+                &source,
+                CompilerOptions {
+                    target: Some(ScriptTarget::ES2015),
+                    module: Some(ModuleKind::CommonJS),
+                    experimental_decorators: Some(false),
+                    ..Default::default()
+                },
+            );
+            let program = format!(
+                r#"var events = [];
+function dec(value, context) {{
+    events.push('decorate');
+    context.addInitializer(function() {{
+        events.push('initialize');
+        if ({throw_from_initializer}) throw Error('initializer');
+    }});
+}}
+function recordStatic() {{ events.push('static'); return 1; }}
+function resource() {{
+    events.push('acquire');
+    return {{ [Symbol.dispose]() {{ events.push('dispose'); }} }};
+}}
+function body() {{ events.push('body'); }}
+try {{ (function() {{ {js} }})(); }} catch (error) {{ events.push('caught:' + error.message); }}
+console.log(events.join(','));
+"#
+            );
+            let output = execute_with_node(&program);
+            let static_event = if static_field { "static," } else { "" };
+            let ending = if throw_from_initializer {
+                "dispose,caught:initializer"
+            } else {
+                "body,dispose"
+            };
+            assert_eq!(
+                output.trim(),
+                format!("acquire,decorate,{static_event}initialize,{ending}")
+            );
+        }
+    }
+}
