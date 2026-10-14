@@ -1325,7 +1325,7 @@ impl<'a> Parser<'a> {
         let parse_error = |code: u32| {
             matches!(
                 code,
-                1003 | 1005 | 1109 | 1128 | 1134 | 1135 | 1136 | 1138 | 1142 | 1144 | 1357
+                1003 | 1005 | 1068 | 1109 | 1128 | 1134 | 1135 | 1136 | 1138 | 1142 | 1144 | 1357
             )
         };
         // Scanner errors go through the same check in tsc.
@@ -3975,7 +3975,18 @@ impl<'a> Parser<'a> {
                         .into(),
                 );
             }
-            self.eat_semicolon();
+            if matches!(self.cur(), TokenKind::Colon | TokenKind::Comma)
+                && initializer
+                    .as_deref()
+                    .is_some_and(|expr| !self.initializer_has_separator_recovery_boundary(expr))
+            {
+                // An initializer can consume a following computed member as
+                // element access, leaving its colon here. Neither that colon
+                // nor a comma can separate properties on the same line.
+                self.eat_declaration_semicolon();
+            } else {
+                self.eat_semicolon();
+            }
             Some(ClassMember {
                 kind: ClassMemberKind::Property(ClassProp {
                     name,
@@ -3989,6 +4000,148 @@ impl<'a> Parser<'a> {
                 span: self.span_from(start),
             })
         }
+    }
+
+    fn initializer_has_separator_recovery_boundary(&self, expr: &Expr) -> bool {
+        // JSX recovery currently accepts member/call chains directly on JSX,
+        // unlike TypeScript. Do not add a separator diagnostic based on that
+        // recovery. Parentheses around the JSX establish a valid chain base.
+        // JavaScript also parses instantiations as comparisons and angle-
+        // bracket assertions as JSX; those recovered TS nodes have a different
+        // boundary in JS. TS assertions and as/satisfies keep their checks.
+        let is_jsx = |expr: &Expr| {
+            matches!(
+                expr.kind,
+                ExprKind::JsxElement(_) | ExprKind::JsxSelfClosing(_) | ExprKind::JsxFragment(_)
+            )
+        };
+        let mut pending = vec![expr];
+        while let Some(expr) = pending.pop() {
+            match &expr.kind {
+                ExprKind::Member(member) => {
+                    if is_jsx(&member.object) {
+                        return true;
+                    }
+                    pending.push(&member.object);
+                }
+                ExprKind::ElemAccess(access) => {
+                    if is_jsx(&access.object) {
+                        return true;
+                    }
+                    pending.extend([access.object.as_ref(), access.index.as_ref()]);
+                }
+                ExprKind::Call(call) => {
+                    if is_jsx(&call.callee) {
+                        return true;
+                    }
+                    pending.push(&call.callee);
+                    pending.extend(call.args.iter().map(Box::as_ref));
+                }
+                ExprKind::TaggedTemplate(template) => {
+                    if is_jsx(&template.tag) {
+                        return true;
+                    }
+                    pending.push(&template.tag);
+                    pending.extend(template.quasi.exprs.iter().map(Box::as_ref));
+                }
+                ExprKind::New(new) => {
+                    if is_jsx(&new.callee) {
+                        return true;
+                    }
+                    pending.push(&new.callee);
+                    if let Some(args) = &new.args {
+                        pending.extend(args.iter().map(Box::as_ref));
+                    }
+                }
+                ExprKind::Arrow(arrow) => {
+                    if let ArrowBody::Expr(body) = &arrow.body {
+                        pending.push(body);
+                    }
+                }
+                ExprKind::Binary(binary) => {
+                    pending.extend([binary.left.as_ref(), binary.right.as_ref()]);
+                }
+                ExprKind::Assign(assignment) => {
+                    pending.extend([assignment.left.as_ref(), assignment.right.as_ref()]);
+                }
+                ExprKind::Cond(conditional) => {
+                    pending.extend([
+                        conditional.test.as_ref(),
+                        conditional.consequent.as_ref(),
+                        conditional.alternate.as_ref(),
+                    ]);
+                }
+                ExprKind::Unary(unary) => pending.push(&unary.argument),
+                ExprKind::Update(update) => {
+                    if is_jsx(&update.argument) {
+                        return true;
+                    }
+                    pending.push(&update.argument);
+                }
+                ExprKind::Await(inner) | ExprKind::Yield(_, Some(inner)) => {
+                    // Await/yield JSX also depends on a function context that
+                    // the current expression parser does not distinguish yet.
+                    if is_jsx(inner) {
+                        return true;
+                    }
+                    pending.push(inner);
+                }
+                ExprKind::NonNull(inner) => {
+                    if is_jsx(inner) {
+                        return true;
+                    }
+                    pending.push(inner);
+                }
+                ExprKind::Instantiation(instantiation) => {
+                    if self.is_js_file || is_jsx(&instantiation.expr) {
+                        return true;
+                    }
+                    pending.push(&instantiation.expr);
+                }
+                ExprKind::Paren(inner)
+                | ExprKind::Delete(inner)
+                | ExprKind::Typeof(inner)
+                | ExprKind::Void(inner)
+                | ExprKind::Spread(inner) => pending.push(inner),
+                ExprKind::Comma(elements) => pending.extend(elements.iter().map(Box::as_ref)),
+                ExprKind::ArrayLit(elements) => {
+                    pending.extend(elements.iter().flatten().map(Box::as_ref));
+                }
+                ExprKind::ObjectLit(properties) => {
+                    for property in properties {
+                        let name = match property {
+                            ObjLitProp::Property(property) => {
+                                pending.push(&property.value);
+                                Some(&property.key)
+                            }
+                            ObjLitProp::Method(method) => Some(&method.name),
+                            ObjLitProp::Get(accessor) | ObjLitProp::Set(accessor) => {
+                                Some(&accessor.name)
+                            }
+                            ObjLitProp::ShorthandDefault(_, value, _)
+                            | ObjLitProp::Spread(value, _) => {
+                                pending.push(value);
+                                None
+                            }
+                            ObjLitProp::Shorthand(..) => None,
+                        };
+                        if let Some(PropName::Computed(expression, _)) = name {
+                            pending.push(expression);
+                        }
+                    }
+                }
+                ExprKind::Template(template) => {
+                    pending.extend(template.exprs.iter().map(Box::as_ref));
+                }
+                ExprKind::TypeAssertion(_) if self.is_js_file => return true,
+                kind => {
+                    if let Some(inner) = kind.type_layer_inner() {
+                        pending.push(inner);
+                    }
+                }
+            }
+        }
+        false
     }
 
     fn parse_class_constructor(

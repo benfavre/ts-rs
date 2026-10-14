@@ -1,6 +1,262 @@
 use tsc_rs_parser::parse;
 
 #[test]
+fn initialized_class_properties_require_separators_before_colons_and_commas() {
+    // Exact TypeScript 6.0.3 parse diagnostic spans, including a computed
+    // member consumed as element access on the preceding initializer.
+    for source in [
+        "class C { x=0, y=1; }",
+        "class C { x=0: number; }",
+        "class C { [e] = 0\n[e2]: number }",
+    ] {
+        let start = if source.contains("[e2]") { 22 } else { 13 };
+        for filename in ["input.ts", "input.tsx", "input.js"] {
+            let parsed = parse(filename, source);
+            assert_eq!(
+                parsed.diagnostics.len(),
+                1,
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+            let diagnostic = &parsed.diagnostics[0];
+            assert_eq!(diagnostic.code, 1005, "{filename}: {source}");
+            assert_eq!(diagnostic.message, "';' expected.");
+            assert_eq!(
+                diagnostic.span,
+                Some(tsc_rs_ast::Span::new(start, start + 1))
+            );
+        }
+    }
+}
+
+#[test]
+fn class_property_separator_diagnostic_preserves_initializer_recovery() {
+    use tsc_rs_ast::{ClassMemberKind, ExprKind, PropName, StmtKind};
+    let parsed = parse("input.ts", "class C { [e] = 0\n[e2]: number; after=1; }");
+    assert_eq!(parsed.diagnostics.len(), 1, "{:?}", parsed.diagnostics);
+    assert_eq!(parsed.diagnostics[0].code, 1005);
+    let StmtKind::ClassDecl(class) = &parsed.statements[0].kind else {
+        panic!("expected the class declaration");
+    };
+    let ClassMemberKind::Property(first) = &class.members[0].kind else {
+        panic!("expected the initialized property");
+    };
+    let ExprKind::ElemAccess(access) = &first.initializer.as_ref().unwrap().kind else {
+        panic!("the next-line brackets must remain part of the initializer");
+    };
+    assert!(matches!(&access.index.kind, ExprKind::Ident(name) if name == "e2"));
+    let ClassMemberKind::Property(last) = &class.members.last().unwrap().kind else {
+        panic!("expected the following property");
+    };
+    assert!(matches!(&last.name, PropName::Ident(name, _) if name == "after"));
+    assert!(
+        matches!(&last.initializer.as_ref().unwrap().kind, ExprKind::NumLit(value) if value == "1")
+    );
+}
+
+#[test]
+fn class_property_separator_checks_preserve_asi_and_other_recovery_errors() {
+    for filename in ["input.ts", "input.tsx", "input.js"] {
+        for source in [
+            "class C { x=0\ny=1; }",
+            "class C { x=0; [y]=1; method() {} }",
+            "class C { x=0\n[y]; }",
+            "class C { x=0/*\n*/y=1; }",
+        ] {
+            let parsed = parse(filename, source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+        }
+        for source in ["class C { x=0;:number }", "class C { x=0\n:number }"] {
+            let parsed = parse(filename, source);
+            assert_eq!(
+                parsed.diagnostics.len(),
+                1,
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            assert_eq!(parsed.diagnostics[0].code, 1068);
+            assert_eq!(
+                parsed.diagnostics[0].span,
+                Some(tsc_rs_ast::Span::new(14, 15))
+            );
+        }
+        for (source, code) in [
+            ("class C { x=0@dec y=1; }", 1436),
+            ("class C { x=; y=1; }", 1109),
+        ] {
+            let parsed = parse(filename, source);
+            assert_eq!(
+                parsed.diagnostics.len(),
+                1,
+                "{source}: {:?}",
+                parsed.diagnostics
+            );
+            assert_eq!(parsed.diagnostics[0].code, code);
+        }
+    }
+}
+
+#[test]
+fn class_property_separator_checks_respect_jsx_expression_boundaries() {
+    for filename in ["input.tsx", "input.jsx"] {
+        for initializer in ["<C/>", "()=> <C/>", "flag ? 1 : <C/>", "flag && <C/>"] {
+            let source = format!("class C {{ x={initializer}\n[y]:number; }}");
+            let parsed = parse(filename, &source);
+            // Existing JSX recovery absorbs the next computed property and
+            // reports TS1068. Defer the new separator check rather than adding
+            // a TS1005 that TypeScript does not report for this source.
+            assert!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.code != 1005),
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+        }
+        for (source, position) in [
+            ("class C { x=(<C/>)\n[y]:number; }", 22),
+            ("class C { x=()=> (<C/>)\n[y]:number; }", 27),
+            ("class C { x=(0,<C/>)\n[y]:number; }", 24),
+            ("class C { x=((0,<C/>))\n[y]:number; }", 26),
+            ("class C { x=new (<C/>):number; }", 22),
+            ("class C { x=await (<C/>):number; }", 24),
+        ] {
+            let parsed = parse(filename, source);
+            assert_eq!(
+                parsed.diagnostics.len(),
+                1,
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+            assert_eq!(parsed.diagnostics[0].code, 1005);
+            assert_eq!(
+                parsed.diagnostics[0].span,
+                Some(tsc_rs_ast::Span::new(position, position + 1))
+            );
+        }
+        for (source, position) in [
+            ("class C { x=(<C/>[a]):number; }", 21),
+            ("class C { x=(0,<C/>[y]):number; }", 23),
+            ("class C { x=(<C/>[a],0):number; }", 23),
+            ("class C { x=((0,<C/>[y])):number; }", 25),
+        ] {
+            let parsed = parse(filename, source);
+            let colon = Some(tsc_rs_ast::Span::new(position, position + 1));
+            assert!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == 1068 && diagnostic.span == colon),
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+            assert!(
+                !parsed
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == 1005 && diagnostic.span == colon),
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+        }
+        for source in [
+            "class C { x=await <C/>:number; }",
+            "class C { x=new <C/>:number; }",
+            "class C { x=++<C/>:number; }",
+            "class C { x=<C/>!:number; }",
+            "class C { x=<C/><T>:number; }",
+            "class C { x=yield <C/>:number; }",
+            "class C { x=({[<C/>[a]](){}}):number; }",
+            "class C { x=({get [<C/>[a]](){return 0;}}):number; }",
+            "class C { x=({set [<C/>[a]](x){}}):number; }",
+        ] {
+            let parsed = parse(filename, source);
+            assert!(
+                parsed
+                    .diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.code != 1005),
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+        }
+        let parsed = parse(filename, "class C { x=<C/>; y=1; z=()=> <C/>; }");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{filename}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
+fn class_property_separator_checks_distinguish_javascript_type_syntax_recovery() {
+    for initializer in ["foo<T>", "(foo)<T>", "(foo<T>)", "((foo)<T>)"] {
+        let source = format!("class C {{ x={initializer}:number; }}");
+        let colon = source.find(":number").unwrap() as u32;
+        for filename in ["input.ts", "input.tsx"] {
+            let parsed = parse(filename, &source);
+            assert_eq!(
+                parsed.diagnostics.len(),
+                1,
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+            assert_eq!(parsed.diagnostics[0].code, 1005);
+            assert_eq!(
+                parsed.diagnostics[0].span,
+                Some(tsc_rs_ast::Span::new(colon, colon + 1))
+            );
+        }
+        for filename in ["input.js", "input.jsx"] {
+            let parsed = parse(filename, &source);
+            // JavaScript treats <T> as comparisons, not type arguments. The
+            // existing instantiation recovery cannot determine its separator.
+            assert!(
+                !parsed
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == 1005
+                        && diagnostic.span == Some(tsc_rs_ast::Span::new(colon, colon + 1))),
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+        }
+    }
+    for initializer in ["<T>foo", "(<T>foo)"] {
+        let source = format!("class C {{ x={initializer}:number; }}");
+        let colon = source.find(":number").unwrap() as u32;
+        let parsed = parse("input.ts", &source);
+        assert_eq!(
+            parsed.diagnostics.len(),
+            1,
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+        assert_eq!(parsed.diagnostics[0].code, 1005);
+        assert_eq!(
+            parsed.diagnostics[0].span,
+            Some(tsc_rs_ast::Span::new(colon, colon + 1))
+        );
+        let parsed = parse("input.js", &source);
+        assert!(
+            !parsed
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == 1005
+                    && diagnostic.span == Some(tsc_rs_ast::Span::new(colon, colon + 1))),
+            "{source}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
 fn bare_generator_members_report_missing_identifier() {
     // Exact TypeScript 6.0.3 code/spans for missing names at the closing brace.
     for (filename, source, start, end) in [
