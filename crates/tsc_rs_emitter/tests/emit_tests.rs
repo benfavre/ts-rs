@@ -19360,7 +19360,299 @@ fn test_using_declaration_lists_keep_acquisition_and_disposal_order() {
                 target: Some(target), module: Some(ModuleKind::ESNext),
                 strict: Some(false), ..Default::default()
             });
+            assert!(
+                !javascript.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("using ") || line.starts_with("await using ")
+                }),
+                "resource syntax was not lowered for {target:?}: {javascript}"
+            );
             assert_eq!(execute_with_node(&javascript), expected, "{target:?}: {javascript}");
+        }
+    }
+}
+
+#[test]
+fn test_try_clauses_lower_sync_resources_and_preserve_comments() {
+    // Runtime traces independently verified with TypeScript 6.0.3 and Node 22.
+    let preamble = r#"const trace=[];function make(name, fail=false){trace.push("acquire:"+name);if(fail)throw Error(name);return {name,[Symbol.dispose](){trace.push("dispose:"+name);},async [Symbol.asyncDispose](){trace.push("start:"+name);await Promise.resolve();trace.push("end:"+name);}};}"#;
+    for (name, body, expected, markers) in [
+        (
+            "try-acquisition-fails",
+            r#"try{using a=make("a"),b=make("b",true),c=make("c");trace.push("body");}catch(e){trace.push("caught:"+e.message);}console.log(JSON.stringify(trace));"#,
+            r#"["acquire:a","acquire:b","dispose:a","caught:b"]"#,
+            &[][..],
+        ),
+        (
+            "catch-resource",
+            r#"try{throw Error("body");}catch(e){using a=make("catch");trace.push("caught:"+e.message);}finally{trace.push("finally");}console.log(JSON.stringify(trace));"#,
+            r#"["acquire:catch","caught:body","dispose:catch","finally"]"#,
+            &[][..],
+        ),
+        (
+            "finally-resource",
+            r#"try{trace.push("body");}finally{using a=make("finally");trace.push("inside");}console.log(JSON.stringify(trace));"#,
+            r#"["body","acquire:finally","inside","dispose:finally"]"#,
+            &[][..],
+        ),
+        (
+            "all-clauses",
+            r#"try{using a=make("try");throw Error("body");}catch(e){using b=make("catch");trace.push("caught");}finally{using c=make("finally");trace.push("final");}console.log(JSON.stringify(trace));"#,
+            r#"["acquire:try","dispose:try","acquire:catch","caught","dispose:catch","acquire:finally","final","dispose:finally"]"#,
+            &[][..],
+        ),
+        (
+            "nested-try",
+            r#"try{using a=make("outer");try{using b=make("inner");throw Error("body");}catch(e){trace.push("inner-catch");}}finally{trace.push("outer-finally");}console.log(JSON.stringify(trace));"#,
+            r#"["acquire:outer","acquire:inner","dispose:inner","inner-catch","dispose:outer","outer-finally"]"#,
+            &[][..],
+        ),
+        (
+            "comments",
+            r#"try /*try-head*/ { /*try-open*/ using a=make("try"); /*try-tail*/ } catch /*catch-head*/ (e) { /*catch-open*/ using b=make("catch"); /*catch-tail*/ } finally /*finally-head*/ { /*finally-open*/ using c=make("finally"); /*finally-tail*/ }console.log(JSON.stringify(trace));"#,
+            r#"["acquire:try","dispose:try","acquire:finally","dispose:finally"]"#,
+            &[
+                "/*try-head*/",
+                "/*try-open*/",
+                "/*try-tail*/",
+                "/*catch-head*/",
+                "/*catch-open*/",
+                "/*catch-tail*/",
+                "/*finally-head*/",
+                "/*finally-open*/",
+                "/*finally-tail*/",
+            ][..],
+        ),
+        (
+            "nested-block",
+            r#"try /*head*/ { {using a=make("nested");trace.push("body");} }finally{trace.push("finally");}console.log(JSON.stringify(trace));"#,
+            r#"["acquire:nested","body","dispose:nested","finally"]"#,
+            &["/*head*/"][..],
+        ),
+        (
+            "prefix-effects",
+            r#"try{trace.push("prefix");const value=1;using a=make("try");trace.push(String(value));}finally{trace.push("finally");}console.log(JSON.stringify(trace));"#,
+            r#"["prefix","acquire:try","1","dispose:try","finally"]"#,
+            &[][..],
+        ),
+        (
+            "return",
+            r#"function work(){try{using a=make("try");return "result";}finally{trace.push("finally");}}trace.push(work());console.log(JSON.stringify(trace));"#,
+            r#"["acquire:try","dispose:try","finally","result"]"#,
+            &[][..],
+        ),
+        (
+            "middle-comments",
+            r#"try {using a=make("a"); /*between-using*/ using b=make("b"); /*before-effect*/ trace.push("body");} finally {trace.push("finally");}console.log(JSON.stringify(trace));"#,
+            r#"["acquire:a","acquire:b","body","dispose:b","dispose:a","finally"]"#,
+            &["/*between-using*/", "/*before-effect*/"][..],
+        ),
+    ] {
+        let source = format!("{preamble}\n{body}");
+        for target in [
+            ScriptTarget::ES2015,
+            ScriptTarget::ES2017,
+            ScriptTarget::ES2022,
+        ] {
+            let javascript = emit_ts_with(
+                &source,
+                CompilerOptions {
+                    target: Some(target),
+                    module: Some(ModuleKind::ESNext),
+                    strict: Some(false),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !javascript.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("using ") || line.starts_with("await using ")
+                }),
+                "{name}, {target:?}: resource syntax remains: {javascript}"
+            );
+            assert_eq!(
+                execute_with_node(&javascript),
+                expected,
+                "{name}, {target:?}: {javascript}"
+            );
+            for marker in markers {
+                assert_eq!(
+                    javascript.matches(marker).count(),
+                    1,
+                    "{name}, {target:?}: {marker}: {javascript}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_try_clauses_lower_async_resources_and_preserve_comments() {
+    // Runtime traces independently verified with TypeScript 6.0.3 and Node 22.
+    let preamble = r#"const trace=[];function make(name, fail=false){trace.push("acquire:"+name);if(fail)throw Error(name);return {name,[Symbol.dispose](){trace.push("dispose:"+name);},async [Symbol.asyncDispose](){trace.push("start:"+name);await Promise.resolve();trace.push("end:"+name);}};}"#;
+    for (name, body, expected, markers) in [
+        (
+            "await-try",
+            r#"async function main(){
+try{await using a=make("a"),b=make("b",true);trace.push("body");}catch(e){trace.push("caught:"+e.message);}
+}
+main().then(()=>console.log(JSON.stringify(trace)),e=>{trace.push("unexpected:"+e.message);console.log(JSON.stringify(trace));});"#,
+            r#"["acquire:a","acquire:b","start:a","end:a","caught:b"]"#,
+            &[] as &[&str],
+        ),
+        (
+            "await-catch",
+            r#"async function main(){
+try{throw Error("body");}catch(e){await using a=make("catch");trace.push("caught");}finally{trace.push("finally");}
+}
+main().then(()=>console.log(JSON.stringify(trace)),e=>{trace.push("unexpected:"+e.message);console.log(JSON.stringify(trace));});"#,
+            r#"["acquire:catch","caught","start:catch","end:catch","finally"]"#,
+            &[] as &[&str],
+        ),
+        (
+            "await-finally",
+            r#"async function main(){
+try{trace.push("body");}finally{await using a=make("finally");trace.push("inside");}
+}
+main().then(()=>console.log(JSON.stringify(trace)),e=>{trace.push("unexpected:"+e.message);console.log(JSON.stringify(trace));});"#,
+            r#"["body","acquire:finally","inside","start:finally","end:finally"]"#,
+            &[] as &[&str],
+        ),
+        (
+            "mixed",
+            r#"async function main(){
+try{using a=make("sync");await using b=make("async");trace.push("body");}finally{trace.push("finally");}
+}
+main().then(()=>console.log(JSON.stringify(trace)),e=>{trace.push("unexpected:"+e.message);console.log(JSON.stringify(trace));});"#,
+            r#"["acquire:sync","acquire:async","body","start:async","end:async","dispose:sync","finally"]"#,
+            &[] as &[&str],
+        ),
+    ] {
+        let source = format!("{preamble}\n{body}");
+        for target in [
+            ScriptTarget::ES2015,
+            ScriptTarget::ES2017,
+            ScriptTarget::ES2022,
+        ] {
+            let javascript = emit_ts_with(
+                &source,
+                CompilerOptions {
+                    target: Some(target),
+                    module: Some(ModuleKind::ESNext),
+                    strict: Some(false),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !javascript.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("using ") || line.starts_with("await using ")
+                }),
+                "{name}, {target:?}: resource syntax remains: {javascript}"
+            );
+            assert_eq!(
+                execute_with_node(&javascript),
+                expected,
+                "{name}, {target:?}: {javascript}"
+            );
+            for marker in markers {
+                assert_eq!(
+                    javascript.matches(marker).count(),
+                    1,
+                    "{name}, {target:?}: {marker}: {javascript}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_try_clauses_do_not_acquire_erased_resources() {
+    for body in [
+        "try { declare using erased = fail(); } finally {}",
+        "try { throw 1; } catch { declare using erased = fail(); }",
+        "try {} finally { declare using erased = fail(); }",
+        "try { declare using erased = fail(); using kept = null; } finally {}",
+        "try { /*head*/ declare using erased = fail(); using kept = null; } finally { void 0; }",
+        "try { using kept = null; declare await using erased = fail(); } finally {}",
+    ] {
+        for target in [
+            ScriptTarget::ES2015,
+            ScriptTarget::ES2017,
+            ScriptTarget::ES2022,
+        ] {
+            let source = format!("function fail() {{ throw Error('erased initializer'); }}\n{body}\nconsole.log('ok');");
+            let javascript = emit_ts_with(
+                &source,
+                CompilerOptions {
+                    target: Some(target),
+                    module: Some(ModuleKind::ESNext),
+                    strict: Some(false),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !javascript.contains("await result_"),
+                "{target:?}: {javascript}"
+            );
+            assert_eq!(
+                execute_with_node(&javascript),
+                "ok",
+                "{target:?}: {javascript}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_try_clauses_keep_comments_with_native_async_and_lowered_resources() {
+    let preamble = r#"const trace=[];function make(name, fail=false){trace.push("acquire:"+name);if(fail)throw Error(name);return {name,[Symbol.dispose](){trace.push("dispose:"+name);},async [Symbol.asyncDispose](){trace.push("start:"+name);await Promise.resolve();trace.push("end:"+name);}};}"#;
+    for (name, body, expected, markers) in [(
+        "await-comments",
+        r#"async function main(){
+try /*head*/ { /*open*/ await using a=make("try"); /*tail*/ } finally /*head2*/ { /*open2*/ await using b=make("finally"); /*tail2*/ }
+}
+main().then(()=>console.log(JSON.stringify(trace)),e=>{trace.push("unexpected:"+e.message);console.log(JSON.stringify(trace));});"#,
+        r#"["acquire:try","start:try","end:try","acquire:finally","start:finally","end:finally"]"#,
+        &[
+            "/*head*/",
+            "/*open*/",
+            "/*tail*/",
+            "/*head2*/",
+            "/*open2*/",
+            "/*tail2*/",
+        ][..],
+    )] {
+        let source = format!("{preamble}\n{body}");
+        for target in [ScriptTarget::ES2017, ScriptTarget::ES2022] {
+            let javascript = emit_ts_with(
+                &source,
+                CompilerOptions {
+                    target: Some(target),
+                    module: Some(ModuleKind::ESNext),
+                    strict: Some(false),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !javascript.lines().any(|line| {
+                    let line = line.trim_start();
+                    line.starts_with("using ") || line.starts_with("await using ")
+                }),
+                "{name}, {target:?}: resource syntax remains: {javascript}"
+            );
+            assert_eq!(
+                execute_with_node(&javascript),
+                expected,
+                "{name}, {target:?}: {javascript}"
+            );
+            for marker in markers {
+                assert_eq!(
+                    javascript.matches(marker).count(),
+                    1,
+                    "{name}, {target:?}: {marker}: {javascript}"
+                );
+            }
         }
     }
 }

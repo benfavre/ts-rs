@@ -11116,6 +11116,31 @@ impl<'a> Emitter<'a> {
         true
     }
 
+    /// Try clauses have their own statement loops, so block emission cannot
+    /// supply their resource-disposal scope. Keep the whole clause inside the
+    /// envelope, including effects before the first resource acquisition.
+    fn emit_try_clause_body(&mut self, stmts: &[Stmt]) {
+        let has_resource = stmts.iter().any(|stmt| {
+            matches!(&stmt.kind, StmtKind::Var(var)
+                if matches!(var.kind, VarKind::Using | VarKind::AwaitUsing)
+                    && var.modifiers & MOD_DECLARE == 0)
+        });
+        if self.needs_downlevel("using") && has_resource {
+            let keyword = if self.effective_target() < ScriptTarget::ES2015 {
+                "var"
+            } else {
+                "const"
+            };
+            self.emit_block_using_dispose_scope_with_comments(stmts, keyword, true);
+        } else {
+            for stmt in stmts {
+                self.emit_leading_comments(stmt.span.start);
+                self.emit_stmt(stmt);
+                self.advance_comment_pos(stmt.span.end);
+            }
+        }
+    }
+
     fn emit_try_stmt_preserving_internal_comments(
         &mut self,
         try_stmt: &TryStmt,
@@ -11236,11 +11261,7 @@ impl<'a> Emitter<'a> {
             self.newline();
             self.advance_comment_pos(self.clause_open_line_end_pos(try_block_open, try_body_start));
             self.indent += 1;
-            for s in &try_stmt.block {
-                self.emit_leading_comments(s.span.start);
-                self.emit_stmt(s);
-                self.advance_comment_pos(s.span.end);
-            }
+            self.emit_try_clause_body(&try_stmt.block);
             let try_tail_start = try_stmt
                 .block
                 .last()
@@ -11450,11 +11471,7 @@ impl<'a> Emitter<'a> {
                     self.clause_open_line_end_pos(catch_block_open, catch_body_start),
                 );
                 self.indent += 1;
-                for s in &handler.body {
-                    self.emit_leading_comments(s.span.start);
-                    self.emit_stmt(s);
-                    self.advance_comment_pos(s.span.end);
-                }
+                self.emit_try_clause_body(&handler.body);
                 let catch_tail_start = handler
                     .body
                     .last()
@@ -11525,11 +11542,7 @@ impl<'a> Emitter<'a> {
                     self.clause_open_line_end_pos(finally_block_open, finally_body_start),
                 );
                 self.indent += 1;
-                for s in fin {
-                    self.emit_leading_comments(s.span.start);
-                    self.emit_stmt(s);
-                    self.advance_comment_pos(s.span.end);
-                }
+                self.emit_try_clause_body(fin);
                 let finally_tail_start = fin
                     .last()
                     .map(|stmt| stmt.span.end)
@@ -11583,11 +11596,7 @@ impl<'a> Emitter<'a> {
             self.writeln("try {");
             self.indent += 1;
             self.cjs_inline_export_depth += 1;
-            for s in &try_stmt.block {
-                self.emit_leading_comments(s.span.start);
-                self.emit_stmt(s);
-                self.advance_comment_pos(s.span.end);
-            }
+            self.emit_try_clause_body(&try_stmt.block);
             self.cjs_inline_export_depth -= 1;
             self.indent -= 1;
             self.writeln("}");
@@ -11691,11 +11700,7 @@ impl<'a> Emitter<'a> {
                         self.emit_rest_param_destructuring(temp_name, param);
                     }
                 }
-                for s in &handler.body {
-                    self.emit_leading_comments(s.span.start);
-                    self.emit_stmt(s);
-                    self.advance_comment_pos(s.span.end);
-                }
+                self.emit_try_clause_body(&handler.body);
                 self.cjs_inline_export_depth -= 1;
                 // Emit comments between the last catch statement and the
                 // closing `}` of the catch block.
@@ -11761,11 +11766,7 @@ impl<'a> Emitter<'a> {
                 self.writeln("finally {");
                 self.indent += 1;
                 self.cjs_inline_export_depth += 1;
-                for s in fin {
-                    self.emit_leading_comments(s.span.start);
-                    self.emit_stmt(s);
-                    self.advance_comment_pos(s.span.end);
-                }
+                self.emit_try_clause_body(fin);
                 self.cjs_inline_export_depth -= 1;
                 self.indent -= 1;
                 self.writeln("}");
@@ -16644,9 +16645,19 @@ impl<'a> Emitter<'a> {
         stmts: &[Stmt],
         keyword: &str,
     ) {
-        let has_await = stmts
-            .iter()
-            .any(|s| matches!(&s.kind, StmtKind::Var(vs) if vs.kind == VarKind::AwaitUsing));
+        self.emit_block_using_dispose_scope_with_comments(stmts, keyword, false);
+    }
+
+    fn emit_block_using_dispose_scope_with_comments(
+        &mut self,
+        stmts: &[Stmt],
+        keyword: &str,
+        preserve_comments: bool,
+    ) {
+        let has_await = stmts.iter().any(|s| {
+            matches!(&s.kind, StmtKind::Var(vs) if vs.kind == VarKind::AwaitUsing
+                && (!preserve_comments || vs.modifiers & MOD_DECLARE == 0))
+        });
         self.needs_add_disposable_resource_helper = true;
         self.needs_dispose_resources_helper = true;
         let env_num = self.next_using_env_num();
@@ -16657,6 +16668,13 @@ impl<'a> Emitter<'a> {
         self.writeln("try {");
         self.indent += 1;
         for s in stmts {
+            if preserve_comments {
+                if stmt_is_erased(s, self.preserve_const_enums_effective()) {
+                    self.advance_comment_pos(s.span.end);
+                    continue;
+                }
+                self.emit_leading_comments(s.span.start);
+            }
             match &s.kind {
                 StmtKind::Var(vs) if matches!(vs.kind, VarKind::Using | VarKind::AwaitUsing) => {
                     let is_await = vs.kind == VarKind::AwaitUsing;
@@ -16686,6 +16704,9 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 _ => self.emit_stmt(s),
+            }
+            if preserve_comments {
+                self.advance_comment_pos(s.span.end);
             }
         }
         self.indent -= 1;
