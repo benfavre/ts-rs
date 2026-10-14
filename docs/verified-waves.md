@@ -3243,3 +3243,54 @@ Remaining diagnostic, emit, type, symbol and LSP failures remain visible.
 
 Measured public source: `2638bbade`. The preceding snapshot remains at
 `docs/compatibility-metrics-2026-10-14-75023f14b.json`.
+
+## 2026-10-14: compatibility rounds 21-30
+
+Ten verified rounds improve compiler compatibility. Each round preserves
+previous passes, oracle identities and skip counts across all twelve compiler
+and conformance matrices. Public measurements match the private results.
+
+| Round | Change | Newly passing comparisons |
+|---|---|---:|
+| 21 | [diagnose separators after class property initializers](https://github.com/benfavre/ts-rs/commit/ce726bcaaa2e382c161d2cd4f21db51733940af8) | 1 |
+| 22 | [declare primitive default export expressions](https://github.com/benfavre/ts-rs/commit/fb75877872591241ab4b02132e9acf2054629c62) | 8 |
+| 23 | [Preserve declaration lists when lowering resource blocks](https://github.com/benfavre/ts-rs/commit/fe84bb7ac3ba80b9c1515ba7f5ec562cdb7d5919) | 12 |
+| 24 | [validate Object overrides with JSDoc option guards](https://github.com/benfavre/ts-rs/commit/ac9d5d2ba9834e16f49cf69a1d278b5d5e76d3f2) | 2 |
+| 25 | [emit typed destructured constructor properties](https://github.com/benfavre/ts-rs/commit/caf62b5f0cc2b009f2a10eddfd2e5891a00913fe) | 2 |
+| 26 | [report arity failures for fixed local overloads](https://github.com/benfavre/ts-rs/commit/158025ed14ef17b059c91890fa4d6eba4b6d4019) | 3 |
+| 27 | [diagnose parameter modifier order without cascades](https://github.com/benfavre/ts-rs/commit/3a8288a794ba5f19b99ab8cd4f0681075d3d92db) | 1 |
+| 28 | [preserve native System resource disposal bindings](https://github.com/benfavre/ts-rs/commit/66b0b128311fe9c6ae97c299699108d98e2197df) | 20 |
+| 29 | [preserve syntax diagnostics during expression recovery](https://github.com/benfavre/ts-rs/commit/da234876705c0919d03b9e5a6e510d3155805c3a) | 6 |
+| 30 | [bind bare export-assignment references](https://github.com/benfavre/ts-rs/commit/01614c3f11a7dcfe52baf6572ad1eae9b04e6774) | 37 |
+
+A separate [resource-lowering runtime repair](https://github.com/benfavre/ts-rs/commit/22969e1112133967f8acbbcbf43541e55901a1e5) restores disposal behavior in try clauses. Its 62 additional passing runtime controls do not increment the round count or the baseline gain total.
+
+Variant comparisons are not counts of distinct source programs.
+
+| Suite | Baseline | Before | After | Failed | Skipped |
+|---|---|---:|---:|---:|---:|
+| Compiler | Diagnostics | 5,009 | 5,013 | 1,516 | 0 |
+| Compiler | JavaScript | 6,032 | 6,032 | 0 | 497 |
+| Compiler | Types | 1,972 | 1,972 | 4,462 | 95 |
+| Compiler | Symbols | 1,732 | 1,765 | 4,669 | 95 |
+| Compiler | Expanded JavaScript | 6,494 | 6,494 | 210 | 497 |
+| Compiler | Expanded declarations | 5,928 | 5,938 | 766 | 497 |
+| Conformance | Diagnostics | 4,069 | 4,078 | 1,829 | 0 |
+| Conformance | JavaScript | 5,388 | 5,388 | 0 | 519 |
+| Conformance | Types | 1,471 | 1,471 | 4,146 | 290 |
+| Conformance | Symbols | 1,590 | 1,594 | 4,023 | 290 |
+| Conformance | Expanded JavaScript | 6,445 | 6,477 | 622 | 519 |
+| Conformance | Expanded declarations | 6,356 | 6,356 | 743 | 519 |
+
+Diagnostic accuracy checks preserve matches and do not add false positives for
+any TS code. The five supported language-server operations preserve their
+passing cases and skip counts. The full inventory, including unsupported
+operations, is retained in the metrics snapshot.
+
+All 5,792 public Rust tests pass, with zero failures and
+37 ignored. Formatting, `make ci` and workspace Clippy pass.
+Pass rates exclude skips.
+Remaining diagnostic, emit, type, symbol and LSP failures remain visible.
+
+Measured public source: `01614c3f1`. The preceding snapshot remains at
+`docs/compatibility-metrics-2026-10-14-2638bbade.json`.
