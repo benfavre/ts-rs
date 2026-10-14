@@ -7436,6 +7436,7 @@ impl<'a> Parser<'a> {
                     )
                 });
                 if next_could_start_expr {
+                    self.error_at_span(1109, "Expression expected.".to_string(), self.cur_span());
                     // Don't consume `>` — the binary expression parser will
                     // handle it as an operator.
                     Expr {
@@ -9832,9 +9833,11 @@ impl<'a> Parser<'a> {
         // spurious TS1002 even after rollback. Mirrors the pattern already
         // used around line 3843 for the speculative arrow-fn parse.
         let saved_diag = self.diagnostics.len();
+        let saved_grammar_errors = self.grammar_errors.len();
         let bail = |this: &mut Self| -> Option<Vec<Param>> {
             this.rewind_to(saved);
             this.diagnostics.truncate(saved_diag);
+            this.grammar_errors.truncate(saved_grammar_errors);
             None
         };
         // Lookahead disambiguator: if we see `(` followed by `{`, peek
@@ -9938,8 +9941,13 @@ impl<'a> Parser<'a> {
             return bail(self);
         }
         self.bump(); // )
-                     // Speculative parse succeeded — keep `self.diagnostics` as-is
-                     // (any genuine errors from a successful parse path stay).
+                     // The caller commits this speculation only when an arrow follows.
+                     // Otherwise it reparses a parenthesized type, so diagnostics and their
+                     // grammar ownership must roll back along with the token position.
+        if !self.at(TokenKind::FatArrow) {
+            self.diagnostics.truncate(saved_diag);
+            self.grammar_errors.truncate(saved_grammar_errors);
+        }
         Some(params)
     }
 }

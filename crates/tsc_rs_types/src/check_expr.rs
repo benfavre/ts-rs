@@ -6909,7 +6909,20 @@ impl TypeChecker {
                     }
                     _ => false,
                 };
-                let right_ty = self.check_expr(&bin.right);
+                // A diagnosed zero-width operand is parser recovery, not an
+                // evaluated undefined value. Keep real array elisions on the
+                // normal Omitted path and preserve this operator's result type.
+                let right_ty = if matches!(bin.right.kind, ExprKind::Omitted)
+                    && bin.right.span.start == bin.right.span.end
+                    && self
+                        .syntax_error_starts
+                        .binary_search(&bin.right.span.start)
+                        .is_ok()
+                {
+                    Type::Error
+                } else {
+                    self.check_expr(&bin.right)
+                };
                 if and_narrowed {
                     self.pop_scope();
                 }

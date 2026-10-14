@@ -305,3 +305,257 @@ recovered + booleanValue;
         ["numberValue + booleanValue"]
     );
 }
+
+fn recovery_diagnostic_tuples(
+    source: &str,
+    options: CompilerOptions,
+) -> Vec<(u32, u32, u32, String)> {
+    let file = tsc_rs_parser::parse("input.ts", source);
+    let symbols = tsc_rs_symbols::bind(&file);
+    let checked = TypeChecker::new().check_with_options(&file, &symbols, &options);
+    let mut diagnostics: Vec<_> = file
+        .diagnostics
+        .into_iter()
+        .chain(checked.diagnostics)
+        .map(|d| {
+            let span = d.span.unwrap();
+            (d.code, span.start, span.end, d.message)
+        })
+        .collect();
+    diagnostics.sort();
+    diagnostics
+}
+
+#[test]
+fn missing_binary_rhs_uses_error_type_but_preserves_operator_results() {
+    // Exact TypeScript 6.0.3 parser + checker diagnostics, including outer
+    // boolean/number incompatibilities and assignment/call result types.
+    for (source, expected) in [
+        (
+            "1 > > 2;",
+            vec![
+                (1109, 4, 5, "Expression expected."),
+                (
+                    2365,
+                    0,
+                    7,
+                    "Operator '>' cannot be applied to types 'boolean' and 'number'.",
+                ),
+            ],
+        ),
+        ("1 >> > 2;", vec![(1109, 5, 6, "Expression expected.")]),
+        ("1 + > 2;", vec![(1109, 4, 5, "Expression expected.")]),
+        ("1 - > 2;", vec![(1109, 4, 5, "Expression expected.")]),
+        ("1 * > 2;", vec![(1109, 4, 5, "Expression expected.")]),
+        (
+            "function f(x:number){} f(1 > > 2);",
+            vec![
+                (1109, 29, 30, "Expression expected."),
+                (
+                    2345,
+                    25,
+                    32,
+                    "Argument of type 'boolean' is not assignable to parameter of type 'number'.",
+                ),
+                (
+                    2365,
+                    25,
+                    32,
+                    "Operator '>' cannot be applied to types 'boolean' and 'number'.",
+                ),
+            ],
+        ),
+        (
+            "const x=[1 > > 2];",
+            vec![
+                (1109, 13, 14, "Expression expected."),
+                (
+                    2365,
+                    9,
+                    16,
+                    "Operator '>' cannot be applied to types 'boolean' and 'number'.",
+                ),
+            ],
+        ),
+        (
+            "const x=(1 > > 2);",
+            vec![
+                (1109, 13, 14, "Expression expected."),
+                (
+                    2365,
+                    9,
+                    16,
+                    "Operator '>' cannot be applied to types 'boolean' and 'number'.",
+                ),
+            ],
+        ),
+        (
+            "const x:number=1 > > 2;",
+            vec![
+                (1109, 19, 20, "Expression expected."),
+                (
+                    2322,
+                    6,
+                    7,
+                    "Type 'boolean' is not assignable to type 'number'.",
+                ),
+                (
+                    2365,
+                    15,
+                    22,
+                    "Operator '>' cannot be applied to types 'boolean' and 'number'.",
+                ),
+            ],
+        ),
+        (
+            "const x:boolean=1 > > 2;",
+            vec![
+                (1109, 20, 21, "Expression expected."),
+                (
+                    2365,
+                    16,
+                    23,
+                    "Operator '>' cannot be applied to types 'boolean' and 'number'.",
+                ),
+            ],
+        ),
+        (
+            "const x:number=1 >> > 2;",
+            vec![
+                (1109, 20, 21, "Expression expected."),
+                (
+                    2322,
+                    6,
+                    7,
+                    "Type 'boolean' is not assignable to type 'number'.",
+                ),
+            ],
+        ),
+        (
+            "const x:boolean=1 >> > 2;",
+            vec![(1109, 21, 22, "Expression expected.")],
+        ),
+    ] {
+        let mut expected: Vec<_> = expected
+            .into_iter()
+            .map(|(code, start, end, message)| (code, start, end, message.to_string()))
+            .collect();
+        expected.sort();
+        for (strict, strict_null_checks) in [
+            (None, None),
+            (Some(true), None),
+            (Some(false), None),
+            (Some(true), Some(false)),
+            (Some(false), Some(true)),
+        ] {
+            let actual = recovery_diagnostic_tuples(
+                source,
+                CompilerOptions {
+                    strict,
+                    strict_null_checks,
+                    target: Some(ScriptTarget::ES2015),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                actual, expected,
+                "{source}, strict={strict:?}, strictNullChecks={strict_null_checks:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn genuine_nullish_unknown_and_array_elision_operands_keep_diagnostics() {
+    for (source, expected) in [
+        (
+            "1 > undefined;",
+            vec![(18050, 4, 13, "The value 'undefined' cannot be used here.")],
+        ),
+        (
+            "1 > null;",
+            vec![(18050, 4, 8, "The value 'null' cannot be used here.")],
+        ),
+        (
+            "declare let x:number|undefined;1 > x;",
+            vec![(18048, 35, 36, "'x' is possibly 'undefined'.")],
+        ),
+        (
+            "declare function f():undefined;1 > f();",
+            vec![(2532, 35, 38, "Object is possibly 'undefined'.")],
+        ),
+        (
+            "declare let x:unknown;1 > x;",
+            vec![(18046, 26, 27, "'x' is of type 'unknown'.")],
+        ),
+        (
+            "const x=[,];1 > x[0];",
+            vec![(2532, 16, 20, "Object is possibly 'undefined'.")],
+        ),
+        (
+            "const x=[...[,,]];1 > x[0];",
+            vec![(2532, 22, 26, "Object is possibly 'undefined'.")],
+        ),
+        (
+            "const x=[,];1 >> x[0];",
+            vec![(2532, 17, 21, "Object is possibly 'undefined'.")],
+        ),
+        (
+            "const a=[,]; const x:number=a[0];",
+            vec![(
+                2322,
+                19,
+                20,
+                "Type 'undefined' is not assignable to type 'number'.",
+            )],
+        ),
+    ] {
+        let mut expected: Vec<_> = expected
+            .into_iter()
+            .map(|(code, start, end, message)| (code, start, end, message.to_string()))
+            .collect();
+        expected.sort();
+        let actual = recovery_diagnostic_tuples(
+            source,
+            CompilerOptions {
+                strict: Some(true),
+                target: Some(ScriptTarget::ES2015),
+                ..Default::default()
+            },
+        );
+        assert_eq!(actual, expected, "{source}");
+    }
+    for source in ["const x=[,];1 > x[0];", "const x=[...[,,]];1 > x[0];"] {
+        assert_eq!(
+            recovery_diagnostic_tuples(
+                source,
+                CompilerOptions {
+                    strict: Some(false),
+                    target: Some(ScriptTarget::ES2015),
+                    ..Default::default()
+                }
+            ),
+            vec![],
+            "{source}"
+        );
+    }
+    // Disabling strict null checks does not disable noImplicitAny inherited
+    // from strict: this real elision still gets TypeScript's TS7005.
+    assert_eq!(
+        recovery_diagnostic_tuples(
+            "const x=[,];1 > x[0];",
+            CompilerOptions {
+                strict: Some(true),
+                strict_null_checks: Some(false),
+                target: Some(ScriptTarget::ES2015),
+                ..Default::default()
+            }
+        ),
+        vec![(
+            7005,
+            6,
+            7,
+            "Variable 'x' implicitly has an 'any[]' type.".to_string()
+        )]
+    );
+}

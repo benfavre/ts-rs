@@ -1321,3 +1321,195 @@ fn exponent_digit_checks_ignore_complete_numbers_and_literal_text() {
         Some(tsc_rs_ast::Span::new(38, 38))
     );
 }
+
+#[test]
+fn stray_greater_than_reports_expression_expected() {
+    // TypeScript 6.0.3 reports the single unexpected token, including when
+    // comments or a newline separate it from a preceding shift operator.
+    for (source, start) in [
+        ("1 > > 2;", 4),
+        ("1 >/**/> 2;", 7),
+        ("1 >\n> 2;", 4),
+        ("1 >> > 2;", 5),
+        ("1 >>/**/> 2;", 8),
+        ("1 >>\n> 2;", 5),
+    ] {
+        for filename in ["input.ts", "input.tsx", "input.js", "input.jsx"] {
+            let parsed = parse(filename, source);
+            assert_eq!(parsed.diagnostics.len(), 1, "{filename}: {source}");
+            let diagnostic = &parsed.diagnostics[0];
+            assert_eq!(diagnostic.code, 1109, "{filename}: {source}");
+            assert_eq!(diagnostic.message, "Expression expected.");
+            assert_eq!(
+                diagnostic.span,
+                Some(tsc_rs_ast::Span::new(start, start + 1))
+            );
+        }
+    }
+}
+
+#[test]
+fn stray_greater_than_preserves_binary_recovery() {
+    use tsc_rs_ast::{BinaryOp, ExprKind, StmtKind};
+    for (source, first_op) in [
+        ("1 > > 2; const after = 3;", BinaryOp::Gt),
+        ("1 >> > 2; const after = 3;", BinaryOp::Shr),
+    ] {
+        let parsed = parse("input.ts", source);
+        assert_eq!(parsed.statements.len(), 2);
+        let StmtKind::Expr(expr) = &parsed.statements[0].kind else {
+            panic!("expected recovered expression");
+        };
+        let ExprKind::Binary(outer) = &expr.kind else {
+            panic!("expected outer comparison");
+        };
+        assert_eq!(outer.op, BinaryOp::Gt);
+        assert!(matches!(&outer.right.kind, ExprKind::NumLit(value) if value.as_str() == "2"));
+        let ExprKind::Binary(inner) = &outer.left.kind else {
+            panic!("expected the first operator to keep its missing right operand");
+        };
+        assert_eq!(inner.op, first_op);
+        assert!(matches!(inner.right.kind, ExprKind::Omitted));
+        assert!(matches!(parsed.statements[1].kind, StmtKind::Var(_)));
+    }
+}
+
+#[test]
+fn stray_greater_than_diagnostics_survive_speculation_once() {
+    for (source, start) in [
+        ("(1 > > 2);", 5),
+        ("((1 > > 2));", 6),
+        ("(x = 1 > > 2);", 9),
+        ("(x = 1 > > 2) => x;", 9),
+        ("async (x = 1 > > 2) => x;", 15),
+        ("f((x = 1 > > 2));", 11),
+    ] {
+        for filename in ["input.ts", "input.tsx", "input.js", "input.jsx"] {
+            let parsed = parse(filename, source);
+            let diagnostics: Vec<_> = parsed
+                .diagnostics
+                .iter()
+                .map(|d| (d.code, d.span))
+                .collect();
+            assert_eq!(
+                diagnostics,
+                vec![(1109, Some(tsc_rs_ast::Span::new(start, start + 1)))],
+                "{filename}: {source}"
+            );
+        }
+    }
+}
+
+#[test]
+fn stray_greater_than_is_a_syntax_error_for_tracked_grammar_suppression() {
+    let source = "class C{readonly public x:number;}1 > > 2;";
+    let parsed = parse("input.ts", source);
+    assert_eq!(parsed.diagnostics.len(), 1, "{:?}", parsed.diagnostics);
+    assert_eq!(parsed.diagnostics[0].code, 1109);
+    assert_eq!(
+        parsed.diagnostics[0].span,
+        Some(tsc_rs_ast::Span::new(38, 39))
+    );
+    assert!(tsc_rs_parser::has_syntax_errors(&parsed.diagnostics));
+    // JavaScript language diagnostics are independent of grammar suppression.
+    let parsed = parse("input.js", source);
+    let actual: Vec<_> = parsed
+        .diagnostics
+        .iter()
+        .map(|d| {
+            let span = d.span.unwrap();
+            (d.code, span.start, span.end, d.message.as_str())
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        vec![
+            (
+                8009,
+                8,
+                16,
+                "The 'readonly' modifier can only be used in TypeScript files."
+            ),
+            (
+                8009,
+                17,
+                23,
+                "The 'public' modifier can only be used in TypeScript files."
+            ),
+            (
+                8010,
+                26,
+                32,
+                "Type annotations can only be used in TypeScript files."
+            ),
+            (1109, 38, 39, "Expression expected."),
+        ]
+    );
+}
+
+#[test]
+fn valid_greater_than_operators_and_type_delimiters_remain_valid() {
+    for filename in ["input.ts", "input.tsx"] {
+        for source in [
+            "let x: A<B<C>> = f<A<B<C>>>();",
+            "let x: A<B<C>>=f<A<B<C>>>();",
+            "const f=<T extends Array<number>>(x:T)=>x;",
+            "const x = (<T,>(x:T) => x)(value);",
+            "type T = (x: Array<Array<number>>) => Array<number>;",
+            "type T = A extends B ? Array<Array<C>> : D;",
+            "const x = a > (b > c); a >>= b; a >>>= b; a >> b; a >>> b;",
+        ] {
+            let parsed = parse(filename, source);
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "{filename}: {source}: {:?}",
+                parsed.diagnostics
+            );
+        }
+    }
+    for filename in ["input.tsx", "input.jsx"] {
+        let parsed = parse(filename, "const x = <X value={a > b}>{a >> b}</X>;");
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "{filename}: {:?}",
+            parsed.diagnostics
+        );
+    }
+}
+
+#[test]
+fn speculative_function_type_diagnostics_roll_back_without_an_arrow() {
+    // Other parenthesized-type recovery diagnostics remain incomplete. The
+    // real TS1109 at the missing operand must survive fallback exactly once.
+    for (source, start) in [
+        ("type T=(x = 1 > > 2);", 16),
+        ("type T=((x = 1 > > 2));", 17),
+        ("type T=A extends ((x = 1 > > 2)) ? C:D;", 27),
+        ("let a:(x = 1 > > 2);", 15),
+    ] {
+        let file = parse("input.ts", source);
+        let at_operand: Vec<_> = file
+            .diagnostics
+            .iter()
+            .filter(|d| d.span == Some(tsc_rs_ast::Span::new(start, start + 1)))
+            .collect();
+        assert_eq!(at_operand.len(), 1, "{source}: {:?}", file.diagnostics);
+        assert_eq!(at_operand[0].code, 1109);
+        assert_eq!(at_operand[0].message, "Expression expected.");
+    }
+}
+
+#[test]
+fn committed_function_type_keeps_its_own_diagnostics() {
+    for (source, expected) in [
+        ("type T=(x = 1 > > 2)=>number;", vec![(1109,16,17,"Expression expected."),(2371,8,19,"A parameter initializer is only allowed in a function or constructor implementation.")]),
+        ("type T=(x=1)=>number;", vec![(2371,8,11,"A parameter initializer is only allowed in a function or constructor implementation.")]),
+        ("type T=(x?:number,y:number)=>number;", vec![(1016,18,19,"A required parameter cannot follow an optional parameter.")]),
+    ] {
+        let file = parse("input.ts", source);
+        let actual: Vec<_> = file.diagnostics.iter().map(|d| {
+            let span=d.span.unwrap(); (d.code,span.start,span.end,d.message.as_str())
+        }).collect();
+        assert_eq!(actual,expected,"{source}");
+    }
+}
