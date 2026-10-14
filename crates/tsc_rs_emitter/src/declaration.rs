@@ -38,6 +38,8 @@ pub struct DeclarationEmitter<'a> {
     enum_scope: Vec<String>,
     enum_ambient: bool,
     strict_null_checks: bool,
+    js_arguments_functions: HashSet<u32>,
+    allow_js_arguments_signatures: bool,
     comments: Vec<Comment>,
     remove_comments: bool,
     widen_fresh_null_initializers: bool,
@@ -69,6 +71,8 @@ impl<'a> DeclarationEmitter<'a> {
             enum_scope: Vec::new(),
             enum_ambient: false,
             strict_null_checks: false,
+            js_arguments_functions: HashSet::new(),
+            allow_js_arguments_signatures: true,
             comments: Vec::new(),
             remove_comments: false,
             widen_fresh_null_initializers: false,
@@ -89,6 +93,24 @@ impl<'a> DeclarationEmitter<'a> {
             .strict_null_checks
             .unwrap_or(options.strict.unwrap_or(false));
         emitter.remove_comments = options.remove_comments == Some(true);
+        let node_module = matches!(
+            options.module,
+            Some(
+                ModuleKind::Node16 | ModuleKind::Node18 | ModuleKind::Node20 | ModuleKind::NodeNext
+            )
+        );
+        let module_detection = options
+            .module_detection
+            .as_deref()
+            .unwrap_or(if node_module { "force" } else { "auto" });
+        // Forced modules do not retain private JS functions. Auto detection can
+        // also depend on package identity or an automatic JSX runtime, neither
+        // of which this declaration-only path currently models. Preserve those
+        // outputs until declaration retention has that context.
+        emitter.allow_js_arguments_signatures = module_detection.eq_ignore_ascii_case("legacy")
+            || (module_detection.eq_ignore_ascii_case("auto")
+                && !node_module
+                && !matches!(options.jsx, Some(JsxEmit::ReactJSX | JsxEmit::ReactJSXDev)));
         // TypeScript 6 enables strict null checks by default. Limit this new
         // widening behavior to an explicitly disabled effective option.
         emitter.widen_fresh_null_initializers =
@@ -157,6 +179,7 @@ impl<'a> DeclarationEmitter<'a> {
 
     pub fn emit_source_file(&mut self, file: &SourceFile) {
         self.comments.clone_from(&file.comments);
+        self.prepare_js_arguments_functions(file);
         // The batch scanner does not distinguish JSX text from identifiers.
         // Preserve the existing path when source-level naming needs that context.
         self.default_export_names_ambiguous = (file.file_name.ends_with(".tsx")
@@ -1353,6 +1376,14 @@ impl<'a> DeclarationEmitter<'a> {
         self.emit_type_params(&fn_decl.type_params);
         self.write("(");
         self.emit_params(&fn_decl.params);
+        if self.js_arguments_functions.contains(&fn_decl.span.start)
+            && Self::function_needs_js_arguments_rest(fn_decl)
+        {
+            if !fn_decl.params.is_empty() {
+                self.write(", ");
+            }
+            self.write("...args: any[]");
+        }
         self.write(")");
         if let Some(ref ret) = fn_decl.return_type {
             self.write(": ");
@@ -1379,6 +1410,229 @@ impl<'a> DeclarationEmitter<'a> {
         {
             self.write(": ");
             self.write(&ret);
+        }
+    }
+
+    // Restrict new signatures to unambiguous source-file declaration owners.
+    // Duplicate JS implementations can serialize only their first declaration,
+    // and namespace/function merges need checker ownership information.
+    fn prepare_js_arguments_functions(&mut self, file: &SourceFile) {
+        // JSDoc can replace a function's signature or reinterpret its last
+        // parameter as variadic. Keep that path until its binding information
+        // is available here, including when the caller has already desugared it.
+        let eligible = self.allow_js_arguments_signatures
+            && [".js", ".jsx"]
+                .iter()
+                .any(|extension| file.file_name.ends_with(extension))
+            && file.diagnostics.is_empty()
+            && !file.comments.iter().any(|comment| {
+                self.source
+                    .get(comment.pos as usize..comment.end as usize)
+                    .is_some_and(|text| text.starts_with("/**"))
+            });
+        self.js_arguments_functions.clear();
+        if !eligible {
+            return;
+        }
+        fn declaration(statement: &Stmt) -> &Stmt {
+            match &statement.kind {
+                StmtKind::Export(export) => match &export.kind {
+                    ExportDeclKind::Decl(inner) | ExportDeclKind::DefaultDecl(inner) => {
+                        declaration(inner)
+                    }
+                    _ => statement,
+                },
+                _ => statement,
+            }
+        }
+        let mut counts = HashMap::new();
+        for statement in &file.statements {
+            for name in Self::constructor_binding_names(declaration(statement)) {
+                let Some(name) = Self::js_arguments_binding_identity(&name) else {
+                    return;
+                };
+                *counts.entry(name).or_insert(0usize) += 1;
+            }
+        }
+        for statement in &file.statements {
+            if let StmtKind::FnDecl(function) = &declaration(statement).kind {
+                if function
+                    .name
+                    .as_ref()
+                    .and_then(|name| Self::js_arguments_binding_identity(name))
+                    .is_some_and(|name| counts.get(&name) == Some(&1))
+                {
+                    self.js_arguments_functions.insert(function.span.start);
+                }
+            }
+        }
+    }
+
+    fn js_arguments_binding_identity(name: &str) -> Option<String> {
+        if !name.contains('\\') {
+            return Some(name.to_owned());
+        }
+        // AST identifier spellings retain Unicode escapes. Compare the
+        // scanner's cooked identity so `f` and `\u0066` cannot become two
+        // supposedly independent declaration owners.
+        let mut scanner = tsc_rs_scanner::TsScanner::new(name);
+        if scanner.scan() != tsc_rs_scanner::TokenKind::Identifier
+            || scanner.text_pos() != name.len()
+        {
+            return None;
+        }
+        Some(scanner.token_value().to_owned())
+    }
+
+    /// Prove implicit-arguments ownership without reconstructing the binder.
+    /// Only ordinary, unannotated functions with simple parameters and bodies
+    /// that introduce no bindings are handled. Nested functions/arrows, local
+    /// declarations, catch/with scopes, and value-return inference stay on the
+    /// existing path. Property names and literal text are not value references.
+    fn function_needs_js_arguments_rest(function: &FnDecl) -> bool {
+        if function.is_async
+            || function.is_generator
+            || function.modifiers & (MOD_EXPORT | MOD_DEFAULT | MOD_DECLARE) != 0
+            || function.type_params.is_some()
+            || function.return_type.is_some()
+            || !function.decorators.is_empty()
+            || function.params.iter().any(|parameter| {
+                parameter.dotdotdot
+                    || parameter.optional
+                    || parameter.type_ann.is_some()
+                    || parameter.initializer.is_some()
+                    || !parameter.decorators.is_empty()
+                    || !matches!(&parameter.name.kind, PatKind::Ident(name)
+                        if name != "arguments" && !name.contains('\\'))
+            })
+        {
+            return false;
+        }
+        function.body.as_deref().is_some_and(|body| {
+            let mut found = false;
+            for statement in body {
+                let Some(reference) = Self::js_arguments_statement(statement, 0) else {
+                    return false;
+                };
+                found |= reference;
+            }
+            found
+        })
+    }
+
+    fn js_arguments_statement(node: &Stmt, depth: usize) -> Option<bool> {
+        if depth >= 64 {
+            return None;
+        }
+        let expression = |expr: &Expr| Self::js_arguments_expression(expr, depth + 1);
+        let statement = |stmt: &Stmt| Self::js_arguments_statement(stmt, depth + 1);
+        match &node.kind {
+            StmtKind::Expr(expr) | StmtKind::Throw(expr) => expression(expr),
+            StmtKind::Return(None)
+            | StmtKind::Empty
+            | StmtKind::Debugger
+            | StmtKind::Break(_)
+            | StmtKind::Continue(_) => Some(false),
+            StmtKind::Block(statements) => {
+                let mut found = false;
+                for stmt in statements {
+                    found |= statement(stmt)?;
+                }
+                Some(found)
+            }
+            StmtKind::If(branch) => Some(
+                expression(&branch.test)?
+                    | statement(&branch.consequent)?
+                    | branch.alternate.as_deref().map_or(Some(false), statement)?,
+            ),
+            StmtKind::While(loop_) => Some(expression(&loop_.test)? | statement(&loop_.body)?),
+            StmtKind::DoWhile(loop_) => Some(statement(&loop_.body)? | expression(&loop_.test)?),
+            StmtKind::Labeled(label) => statement(&label.body),
+            // Every other body shape may declare/shadow names, contain a nested
+            // signature, or depend on return inference beyond this proof.
+            _ => None,
+        }
+    }
+
+    fn js_arguments_expression(expr: &Expr, depth: usize) -> Option<bool> {
+        if depth >= 64 {
+            return None;
+        }
+        let visit = |expr: &Expr| Self::js_arguments_expression(expr, depth + 1);
+        match &expr.kind {
+            ExprKind::Ident(name) if !name.contains('\\') => Some(name == "arguments"),
+            ExprKind::NumLit(_)
+            | ExprKind::BigIntLit(_)
+            | ExprKind::StrLit(_)
+            | ExprKind::BoolLit(_)
+            | ExprKind::NullLit
+            | ExprKind::RegexpLit(_)
+            | ExprKind::NoSubstTemplate(_)
+            | ExprKind::This
+            | ExprKind::Super => Some(false),
+            ExprKind::Member(member) => visit(&member.object),
+            ExprKind::ElemAccess(member) => Some(visit(&member.object)? | visit(&member.index)?),
+            ExprKind::Call(call) if call.type_args.is_none() => {
+                let mut found = visit(&call.callee)?;
+                for argument in &call.args {
+                    found |= visit(argument)?;
+                }
+                Some(found)
+            }
+            ExprKind::Binary(binary) => Some(visit(&binary.left)? | visit(&binary.right)?),
+            ExprKind::Assign(assign) => Some(visit(&assign.left)? | visit(&assign.right)?),
+            ExprKind::Cond(branch) => {
+                Some(visit(&branch.test)? | visit(&branch.consequent)? | visit(&branch.alternate)?)
+            }
+            ExprKind::Unary(unary) => visit(&unary.argument),
+            ExprKind::Update(update) => visit(&update.argument),
+            ExprKind::Paren(inner)
+            | ExprKind::Delete(inner)
+            | ExprKind::Typeof(inner)
+            | ExprKind::Void(inner)
+            | ExprKind::Spread(inner) => visit(inner),
+            ExprKind::ArrayLit(elements) => {
+                let mut found = false;
+                for element in elements.iter().flatten() {
+                    found |= visit(element)?;
+                }
+                Some(found)
+            }
+            ExprKind::ObjectLit(properties) => {
+                let mut found = false;
+                for property in properties {
+                    found |= match property {
+                        ObjLitProp::Property(property) => {
+                            let computed = match &property.key {
+                                PropName::Computed(key, _) => visit(key)?,
+                                _ => false,
+                            };
+                            computed | visit(&property.value)?
+                        }
+                        ObjLitProp::Shorthand(name, _) if !name.contains('\\') => {
+                            name == "arguments"
+                        }
+                        ObjLitProp::Spread(expr, _) => visit(expr)?,
+                        _ => return None,
+                    };
+                }
+                Some(found)
+            }
+            ExprKind::Template(template) => {
+                let mut found = false;
+                for expression in &template.exprs {
+                    found |= visit(expression)?;
+                }
+                Some(found)
+            }
+            ExprKind::Comma(expressions) => {
+                let mut found = false;
+                for expression in expressions {
+                    found |= visit(expression)?;
+                }
+                Some(found)
+            }
+            _ => None,
         }
     }
 

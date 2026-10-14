@@ -2214,3 +2214,163 @@ fn test_dts_nested_callables_defer_annotation_serialization_and_name_rewrites() 
         assert_eq!(emit(&file, &options).declaration_file.unwrap(), expected, "{source}");
     }
 }
+
+#[test]
+fn test_dts_js_implicit_arguments_adds_synthetic_rest() {
+    let source = "function f(x) { arguments; }\nf(1, 2, 3);";
+    for filename in ["test.js", "test.jsx"] {
+        assert_eq!(
+            emit_dts_named(filename, source),
+            "declare function f(x: any, ...args: any[]): void;\n"
+        );
+    }
+    assert_eq!(
+        emit_dts_named("test.ts", source),
+        "declare function f(x: any): void;\n"
+    );
+    assert_eq!(
+        emit_dts_named("test.js", "function f(args, args_1) { arguments; }"),
+        "declare function f(args: any, args_1: any, ...args: any[]): void;\n"
+    );
+}
+
+#[test]
+fn test_dts_js_arguments_value_references_and_property_names() {
+    for body in [
+        "arguments.length;",
+        "arguments[0];",
+        "void arguments;",
+        "arguments = 1;",
+        "delete arguments;",
+        "({ value: arguments });",
+        "({ arguments });",
+        "({ [arguments]: 1 });",
+        "obj[arguments];",
+        "`value ${arguments}`;",
+        "if (x) { arguments; } else { void 0; }",
+    ] {
+        assert_eq!(
+            emit_dts_named("test.js", &format!("function f(x) {{ {body} }}")),
+            "declare function f(x: any, ...args: any[]): void;\n",
+            "{body}"
+        );
+    }
+    for body in [
+        "x.arguments;",
+        "({ arguments: 1 });",
+        "({ 'arguments': 1 });",
+        "'arguments';",
+        "`arguments`;",
+        "/arguments/;",
+    ] {
+        assert_eq!(
+            emit_dts_named("test.js", &format!("function f(x) {{ {body} }}")),
+            "declare function f(x: any): void;\n",
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn test_dts_js_arguments_shadowing_keeps_ordinary_signatures() {
+    for body in [
+        "var arguments; arguments;",
+        "let arguments = 0; arguments;",
+        "const { arguments } = x; arguments;",
+        "{ let arguments = 0; arguments; }",
+        "function arguments() {} arguments;",
+        "function nested() { arguments; }",
+        "((arguments) => arguments)(1);",
+        "try {} catch (arguments) { arguments; }",
+    ] {
+        assert_eq!(
+            emit_dts_named("test.js", &format!("function f(x) {{ {body} }}")),
+            "declare function f(x: any): void;\n",
+            "{body}"
+        );
+    }
+    assert_eq!(
+        emit_dts_named("test.js", "function f(arguments) { arguments; }"),
+        "declare function f(arguments: any): void;\n"
+    );
+    assert_eq!(
+        emit_dts_named("test.js", "function f(...rest) { arguments; }"),
+        "declare function f(...rest: any[]): void;\n"
+    );
+}
+
+#[test]
+fn test_dts_js_arguments_eligibility_resets_between_files() {
+    use tsc_rs_emitter::declaration::DeclarationEmitter;
+    let source = "function f(x) { arguments; }";
+    let js = tsc_rs_parser::parse("test.js", source);
+    let ts = tsc_rs_parser::parse("test.ts", source);
+    let mut emitter = DeclarationEmitter::new(source);
+    for (file, expected) in [
+        (&js, "declare function f(x: any, ...args: any[]): void;\n"),
+        (&ts, "declare function f(x: any): void;\n"),
+        (&js, "declare function f(x: any, ...args: any[]): void;\n"),
+    ] {
+        emitter.output.clear();
+        emitter.emit_source_file(file);
+        assert_eq!(emitter.output, expected);
+    }
+}
+
+#[test]
+fn test_dts_js_arguments_duplicate_cooked_owners_are_deferred() {
+    for source in [
+        "function f() {} function f(x) { arguments; }",
+        r"function f() {} function \u0066(x) { arguments; }",
+        r"function \u0066() {} function f(x) { arguments; }",
+    ] {
+        // TypeScript emits only the first implementation's signature. Adding
+        // rest to an extra implementation would broaden that visible API.
+        assert!(!emit_dts_named("test.js", source).contains("...args"));
+    }
+}
+
+#[test]
+fn test_dts_js_arguments_respects_module_detection_boundaries() {
+    let file = tsc_rs_parser::parse("test.js", "function f(x) { arguments; }");
+    for (module, detection, jsx, supported) in [
+        (ModuleKind::CommonJS, None, None, true),
+        (ModuleKind::CommonJS, Some("auto"), None, true),
+        (ModuleKind::CommonJS, Some("legacy"), None, true),
+        (ModuleKind::CommonJS, Some("force"), None, false),
+        (ModuleKind::NodeNext, None, None, false),
+        (ModuleKind::NodeNext, Some("auto"), None, false),
+        (ModuleKind::NodeNext, Some("legacy"), None, true),
+        (
+            ModuleKind::CommonJS,
+            Some("auto"),
+            Some(JsxEmit::ReactJSX),
+            false,
+        ),
+        (
+            ModuleKind::CommonJS,
+            Some("legacy"),
+            Some(JsxEmit::ReactJSX),
+            true,
+        ),
+    ] {
+        let options = CompilerOptions {
+            declaration: Some(true),
+            module: Some(module),
+            module_detection: detection.map(str::to_owned),
+            jsx,
+            ..Default::default()
+        };
+        let actual = emit(&file, &options).declaration_file.unwrap();
+        if supported {
+            assert_eq!(
+                actual,
+                "declare function f(x: any, ...args: any[]): void;\n"
+            );
+        } else {
+            // Keep preexisting retention behavior; do not add a signature for
+            // a function that may be private to the detected module.
+            assert!(!actual.contains("...args"));
+        }
+    }
+}
