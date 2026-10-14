@@ -1814,3 +1814,53 @@ fn test_dts_constructor_patterns_defaults_without_semantic_narrowing() {
         ("class C{constructor(public[[x]=[1]]:number[][]){}}", "declare class C {\n    x: number;\n    constructor([[x]]: number[][]);\n}\n"),
     ]);
 }
+
+#[test]
+fn shorthand_function_properties_preserve_generic_declaration_identity() {
+    assert_eq!(
+        emit_dts("function keys<T>(...names: (keyof T)[]) {} const utility = { keys };"),
+        "declare function keys<T>(...names: (keyof T)[]): void;\ndeclare const utility: {\n    keys: typeof keys;\n};\n"
+    );
+}
+
+#[test]
+fn exported_shorthand_objects_retain_private_overloads_and_dependencies() {
+    assert_eq!(
+        emit_dts("interface Item { value: string; } function f(x: Item): Item; function f(x: string): string; function f(x: any): any { return x; } export const utility = { f };"),
+        "interface Item {\n    value: string;\n}\ndeclare function f(x: Item): Item;\ndeclare function f(x: string): string;\nexport declare const utility: {\n    f: typeof f;\n};\nexport {};\n"
+    );
+}
+
+#[test]
+fn shorthand_function_objects_keep_property_and_declaration_order() {
+    assert_eq!(
+        emit_dts("const utility = { g, f }; function f() {} function g<T>(x: T): T { return x; } let other = { f };"),
+        "declare const utility: {\n    g: typeof g;\n    f: typeof f;\n};\ndeclare function f(): void;\ndeclare function g<T>(x: T): T;\ndeclare let other: {\n    f: typeof f;\n};\n"
+    );
+}
+
+#[test]
+fn shorthand_inference_respects_explicit_types_and_nested_scopes() {
+    assert_eq!(
+        emit_dts("function f() {} const typed: { f: () => void } = { f }; namespace N { export const utility: number = 1; } function g(f: number): number { const utility = { f }; return utility.f; } const utility = { f };"),
+        "declare function f(): void;\ndeclare const typed: {\n    f: () => void;\n};\ndeclare namespace N {\n    const utility: number;\n}\ndeclare function g(f: number): number;\ndeclare const utility: {\n    f: typeof f;\n};\n"
+    );
+}
+
+#[test]
+fn shorthand_objects_do_not_expose_uncertain_private_return_inference() {
+    // These unannotated returns are not modeled precisely yet. Retaining the
+    // private function would newly publish an incorrect widened/partial type.
+    for source in [
+        "function f() { return 1 as const; } export const utility = { f };",
+        "function f() { if (Math.random()) return 1; return 'x'; } export const utility = { f };",
+        "function f(x = { value: 1 }) {} export const utility = { f };",
+        "type Promise<T> = { value: T }; async function f() {} export const utility = { f };",
+    ] {
+        assert_eq!(emit_dts(source), "export declare const utility;\n");
+    }
+    assert_eq!(
+        emit_dts("function f(): 1 { return 1 as const; } export const utility = { f };"),
+        "declare function f(): 1;\nexport declare const utility: {\n    f: typeof f;\n};\nexport {};\n"
+    );
+}

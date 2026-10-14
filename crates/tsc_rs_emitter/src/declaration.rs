@@ -33,6 +33,7 @@ pub struct DeclarationEmitter<'a> {
     constructor_value_bindings: HashMap<String, bool>,
     local_constructor_bindings: Vec<(Span, HashSet<String>)>,
     inferred_type_argument_dependencies: HashMap<String, HashSet<String>>,
+    shorthand_function_objects: HashMap<u32, Vec<String>>,
     enum_values: HashMap<String, HashMap<String, EnumValue>>,
     enum_scope: Vec<String>,
     enum_ambient: bool,
@@ -60,6 +61,7 @@ impl<'a> DeclarationEmitter<'a> {
             constructor_value_bindings: HashMap::new(),
             local_constructor_bindings: Vec::new(),
             inferred_type_argument_dependencies: HashMap::new(),
+            shorthand_function_objects: HashMap::new(),
             enum_values: HashMap::new(),
             enum_scope: Vec::new(),
             enum_ambient: false,
@@ -166,6 +168,7 @@ impl<'a> DeclarationEmitter<'a> {
         self.constructor_property_scopes
             .push(Self::constructor_property_scope(&file.statements));
         self.collect_inferred_types(file);
+        self.collect_shorthand_function_objects(file);
         let forced_module = Self::has_module_file_identity(file);
         let external_module = forced_module || Self::has_syntactic_module_indicator(file);
         let named_exports = Self::named_local_exports(&file.statements);
@@ -513,6 +516,10 @@ impl<'a> DeclarationEmitter<'a> {
                             .filter(|signature| self.callable_dependencies_are_visible(signature))
                     {
                         Self::collect_type_dependencies(&signature, &bound, &mut dependencies);
+                    } else if let Some(properties) =
+                        self.shorthand_function_objects.get(&declarator.span.start)
+                    {
+                        dependencies.extend(properties.iter().cloned());
                     } else if let PatKind::Ident(name) = &declarator.name.kind {
                         if let Some(inferred_type) = self.inferred_var_types.get(name.as_str()) {
                             self.collect_inferred_type_dependencies(
@@ -2082,6 +2089,21 @@ impl<'a> DeclarationEmitter<'a> {
                 {
                     self.write(": ");
                     self.emit_type_node(&signature);
+                } else if let Some(properties) = self
+                    .shorthand_function_objects
+                    .get(&decl.span.start)
+                    .cloned()
+                {
+                    self.writeln(": {");
+                    self.indent += 1;
+                    for name in properties {
+                        self.write(&name);
+                        self.write(": typeof ");
+                        self.write(&name);
+                        self.writeln(";");
+                    }
+                    self.indent -= 1;
+                    self.write("}");
                 } else if let Some(ty) = self.infer_var_type_text(init) {
                     self.write(": ");
                     self.write(&ty);
@@ -2754,6 +2776,102 @@ impl<'a> DeclarationEmitter<'a> {
         }
         self.emit_parameter_list(params, false);
         self.local_constructor_bindings.truncate(scope_count);
+    }
+
+    fn collect_shorthand_function_objects(&mut self, file: &SourceFile) {
+        // Keep declaration identity instead of reconstructing generic or overloaded
+        // function signatures. The span key limits this inference to the top-level
+        // declarations inspected here; nested scopes may shadow these functions.
+        self.shorthand_function_objects.clear();
+        if [".js", ".jsx", ".mjs", ".cjs"]
+            .iter()
+            .any(|ext| file.file_name.ends_with(ext))
+        {
+            return;
+        }
+        fn declaration(stmt: &Stmt) -> &Stmt {
+            match &stmt.kind {
+                StmtKind::Export(export) => match &export.kind {
+                    ExportDeclKind::Decl(inner) | ExportDeclKind::DefaultDecl(inner) => {
+                        declaration(inner)
+                    }
+                    _ => stmt,
+                },
+                _ => stmt,
+            }
+        }
+        let mut functions = HashSet::new();
+        let mut other_names = HashSet::new();
+        for stmt in &file.statements {
+            if Self::is_function_overload_implementation(stmt, &file.statements) {
+                continue;
+            }
+            let stmt = declaration(stmt);
+            if let StmtKind::FnDecl(function) = &stmt.kind {
+                if let Some(name) = &function.name {
+                    // Retention can expose a formerly private signature. Avoid
+                    // inferred value returns, async Promise ownership, and
+                    // parameter inference that is not modeled precisely yet.
+                    let known_return = function.return_type.is_some()
+                        || (!function.is_async
+                            && Self::no_value_return_type(
+                                function.body.as_deref(),
+                                false,
+                                function.is_generator,
+                            )
+                            .is_some());
+                    let known_parameters = function.params.iter().all(|param| {
+                        param.type_ann.is_some()
+                            || (param.initializer.is_none()
+                                && matches!(param.name.kind, PatKind::Ident(_)))
+                    });
+                    if known_return && known_parameters {
+                        functions.insert(name.clone());
+                    } else {
+                        other_names.insert(name.clone());
+                    }
+                }
+            } else {
+                other_names.extend(Self::stmt_declared_names(stmt));
+            }
+        }
+        functions.retain(|name| !other_names.contains(name) && !name.contains('\\'));
+        for stmt in &file.statements {
+            let StmtKind::Var(var) = &declaration(stmt).kind else {
+                continue;
+            };
+            if !matches!(var.kind, VarKind::Var | VarKind::Let | VarKind::Const) {
+                continue;
+            }
+            for decl in &var.declarations {
+                if decl.type_ann.is_some() || !matches!(decl.name.kind, PatKind::Ident(_)) {
+                    continue;
+                }
+                let Some(init) = decl.init.as_deref() else {
+                    continue;
+                };
+                let ExprKind::ObjectLit(properties) = &init.kind else {
+                    continue;
+                };
+                if properties.is_empty() {
+                    continue;
+                }
+                let mut names = Vec::new();
+                for property in properties {
+                    let ObjLitProp::Shorthand(name, _) = property else {
+                        break;
+                    };
+                    if !functions.contains(name.as_str()) || names.contains(&name.to_string()) {
+                        break;
+                    }
+                    names.push(name.to_string());
+                }
+                if names.len() == properties.len() {
+                    self.shorthand_function_objects
+                        .insert(decl.span.start, names);
+                }
+            }
+        }
     }
 
     fn collect_inferred_types(&mut self, file: &SourceFile) {
