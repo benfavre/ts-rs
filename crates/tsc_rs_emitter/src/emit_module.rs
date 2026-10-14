@@ -32,6 +32,9 @@ impl<'a> Emitter<'a> {
                 init: Box<Expr>,
                 export_name: Option<String>,
             },
+            NativeUsing {
+                declaration: VarStmt,
+            },
             ExportEmptyBinding {
                 value_temp: String,
                 export_name: String,
@@ -629,6 +632,49 @@ impl<'a> Emitter<'a> {
             set
         };
 
+        // Native resource declarations need a second binding inside execute:
+        // the module binding is hoisted, while this alias owns disposal.
+        let mut native_using_aliases = HashSet::<AstString>::default();
+        let native_using_tokens = (!self.needs_downlevel("using")
+            && file.statements.iter().any(|stmt| matches!(&stmt.kind, StmtKind::Var(var_decl) if var_decl.kind == VarKind::Using)))
+            .then(|| Scanner::new(self.source).scan_all());
+        let preserve_native_using = native_using_tokens.as_ref().is_some_and(|tokens| {
+            // Ambiguous lexical contexts cannot reliably reserve generated
+            // names. Defer the complete file so later lists share the same
+            // alias sequence as earlier lists; never reserve partial aliases.
+            !tokens.iter().any(|token| matches!(token.kind, TokenKind::Slash | TokenKind::SlashEquals | TokenKind::LessThan))
+                && file.statements.iter().all(|stmt| {
+                    let var_decl = match &stmt.kind {
+                        StmtKind::Var(var_decl) if var_decl.kind == VarKind::Using => var_decl,
+                        StmtKind::Export(export) => {
+                            return !matches!(&export.kind, ExportDeclKind::Decl(inner) if matches!(&inner.kind, StmtKind::Var(var_decl) if var_decl.kind == VarKind::Using));
+                        }
+                        _ => return true,
+                    };
+                    var_decl.modifiers & MOD_DECLARE != 0 || (
+                        !self.comments.iter().any(|comment| comment.pos >= stmt.span.start && comment.pos < stmt.span.end)
+                        && var_decl.declarations.iter().all(|decl| {
+                            // Binding spellings retain Unicode escapes, while
+                            // identifier reservations use decoded names. Until
+                            // alias identity is shared, defer escaped resources
+                            // to avoid capturing an equivalent plain name.
+                            matches!(&decl.name.kind, PatKind::Ident(name) if !name.is_empty() && name != "<error>" && !name.contains('\\')) && decl.init.is_some()
+                        })
+                        && !tokens.iter().any(|token| {
+                            token.kind == TokenKind::StringLiteral
+                                && self.source.get(token.span.start as usize..token.span.end as usize).is_some_and(|text| {
+                                    let Some(contents) = text.get(1..text.len().saturating_sub(1)) else { return true; };
+                                    let name = super::emit_class::decode_js_string_content(contents);
+                                    var_decl.declarations.iter().any(|decl| {
+                                        let PatKind::Ident(binding) = &decl.name.kind else { return false; };
+                                        name.strip_prefix(&format!("{binding}_")).is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+                                    })
+                                })
+                        })
+                    )
+                })
+        });
+
         for stmt in &file.statements {
             if is_use_strict_directive(stmt) {
                 continue;
@@ -816,6 +862,24 @@ impl<'a> Emitter<'a> {
                     // `export =` is erased in SystemJS emit.
                 }
                 StmtKind::Var(var_decl) => {
+                    if var_decl.kind == VarKind::Using && preserve_native_using {
+                        for decl in &var_decl.declarations {
+                            let PatKind::Ident(name) = &decl.name.kind else {
+                                unreachable!();
+                            };
+                            add_var_name(name, &mut var_names, &mut seen_var_names);
+                            register_local_symbol(
+                                name,
+                                &mut local_symbol_order,
+                                &mut next_local_symbol_order,
+                            );
+                        }
+                        execute_actions.push(ExecuteAction::EmitLeadingComments(stmt.span.start));
+                        execute_actions.push(ExecuteAction::NativeUsing {
+                            declaration: (**var_decl).clone(),
+                        });
+                        continue;
+                    }
                     // using / await using → disposal scope
                     if matches!(var_decl.kind, VarKind::Using | VarKind::AwaitUsing)
                         && self.needs_downlevel("using")
@@ -1882,10 +1946,11 @@ impl<'a> Emitter<'a> {
                                 continue;
                             }
                             let assign_idx = execute_actions.iter().position(|action| {
-                                matches!(
-                                    action,
-                                    ExecuteAction::AssignVar { name, .. } if name == local
-                                )
+                                match action {
+                                    ExecuteAction::AssignVar { name, .. } => name == local,
+                                    ExecuteAction::NativeUsing { declaration, .. } => declaration.declarations.iter().any(|decl| matches!(&decl.name.kind, PatKind::Ident(name) if name == local)),
+                                    _ => false,
+                                }
                             });
                             if let Some(idx) = assign_idx {
                                 let mut already_inline_export = false;
@@ -2477,6 +2542,40 @@ impl<'a> Emitter<'a> {
                         self.emit_expr(&init);
                         self.writeln(";");
                     }
+                }
+                ExecuteAction::NativeUsing { declaration } => {
+                    self.write("using ");
+                    for (index, decl) in declaration.declarations.iter().enumerate() {
+                        let PatKind::Ident(name) = &decl.name.kind else {
+                            unreachable!();
+                        };
+                        // All module/import bindings are known now, including
+                        // declarations that occur after this resource list.
+                        let mut suffix = 1;
+                        let alias = loop {
+                            let alias = format!("{name}_{suffix}");
+                            if !self.source_has_identifier(&alias)
+                                && !native_using_aliases.contains(alias.as_str())
+                                && !self.emitted_var_names.contains(alias.as_str())
+                                && !seen_var_names.contains(&alias)
+                                && alias != exports_fn
+                                && alias != context_var
+                            {
+                                break alias;
+                            }
+                            suffix += 1;
+                        };
+                        native_using_aliases.insert(alias.clone().into());
+                        if index != 0 {
+                            self.write(", ");
+                        }
+                        self.write(&alias);
+                        self.write(" = ");
+                        self.emit_binding_name(&decl.name);
+                        self.write(" = ");
+                        self.emit_expr(decl.init.as_ref().expect("native resource initializer"));
+                    }
+                    self.writeln(";");
                 }
                 ExecuteAction::ExportEmptyBinding {
                     value_temp,

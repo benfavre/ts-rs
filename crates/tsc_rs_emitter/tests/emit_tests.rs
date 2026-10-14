@@ -19656,3 +19656,368 @@ main().then(()=>console.log(JSON.stringify(trace)),e=>{trace.push("unexpected:"+
         }
     }
 }
+
+#[test]
+fn system_native_using_lists_preserve_disposal_and_hoisted_bindings() {
+    let cases = [
+        (
+            r####"export {}; using x = resource, y = x;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var x, y;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            using x_1 = x = resource, y_1 = y = x;
+        }
+    };
+});
+"####,
+        ),
+        (
+            r####"export {}; using exports=resource,context=resource; export{exports,context};"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var exports, context;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            using exports_2 = exports = resource, context_2 = context = resource;
+            exports_1("exports", exports);
+            exports_1("context", context);
+        }
+    };
+});
+"####,
+        ),
+        (
+            r####"export {}; using x=resource,x_1=resource;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var x, x_1;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            using x_2 = x = resource, x_1_1 = x_1 = resource;
+        }
+    };
+});
+"####,
+        ),
+        (
+            r####"using x=resource,y=resource; export{x,y};"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var x, y;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            using x_1 = x = resource, y_1 = y = resource;
+            exports_1("x", x);
+            exports_1("y", y);
+        }
+    };
+});
+"####,
+        ),
+        (
+            r####"import {resource} from "./donor"; using x=resource; export{x};"####,
+            r####"System.register(["./donor"], function (exports_1, context_1) {
+    "use strict";
+    var donor_1, x;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [
+            function (donor_1_1) {
+                donor_1 = donor_1_1;
+            }
+        ],
+        execute: function () {
+            using x_1 = x = donor_1.resource;
+            exports_1("x", x);
+        }
+    };
+});
+"####,
+        ),
+        (
+            r####"export {}; using café=resource; const café_1=1;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var café, café_1;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            using café_2 = café = resource;
+            café_1 = 1;
+        }
+    };
+});
+"####,
+        ),
+        (
+            r####"export {}; const r=`${x_1}`; using x=resource;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var r, x;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            r = `${x_1}`;
+            using x_2 = x = resource;
+        }
+    };
+});
+"####,
+        ),
+        (
+            r####"export {}; const z={x_1:1}; using x=resource;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var z, x;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            z = { x_1: 1 };
+            using x_2 = x = resource;
+        }
+    };
+});
+"####,
+        ),
+    ];
+    for (source, expected) in cases {
+        let actual = emit_ts_with(
+            source,
+            CompilerOptions {
+                target: Some(ScriptTarget::ESNext),
+                module: Some(ModuleKind::System),
+                strict: Some(false),
+                no_emit_helpers: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(actual, expected, "{source}");
+    }
+}
+
+#[test]
+fn system_native_using_keeps_unsupported_naming_and_lower_targets_unchanged() {
+    let cases = [
+        (
+            ScriptTarget::ESNext,
+            r####"export {}; const z={"x_1":1}; using x=resource;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var z, x;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            z = { "x_1": 1 };
+            x = resource;
+        }
+    };
+});
+"####,
+        ),
+        (
+            ScriptTarget::ESNext,
+            r####"export {}; if (true) /x_1/.test(""); using x=resource;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var x;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            if (true)
+                /x_1/.test("");
+            x = resource;
+        }
+    };
+});
+"####,
+        ),
+        (
+            ScriptTarget::ESNext,
+            r####"export {}; const y={"y_1":1}; using x=resource,y=resource; using x=resource;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var y, x;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            y = { "y_1": 1 };
+            x = resource;
+            y = resource;
+            x = resource;
+        }
+    };
+});
+"####,
+        ),
+        (
+            ScriptTarget::ESNext,
+            r####"export {}; using x=resource,y; using x=resource;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var x, y;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            x = resource;
+            x = resource;
+        }
+    };
+});
+"####,
+        ),
+        (
+            ScriptTarget::ESNext,
+            r####"export {}; // before
+using x = /*init*/resource, /*between*/ y = resource; // end
+"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var x, y;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            x = resource;
+            y = resource;
+        }
+    };
+});
+"####,
+        ),
+        (
+            ScriptTarget::ESNext,
+            r####"export {}; await using x=resource;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var x;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            x = resource;
+        }
+    };
+});
+"####,
+        ),
+        (
+            ScriptTarget::ES2022,
+            r####"export {}; using x = resource, y = x;"####,
+            r####"System.register([], function (exports_1, context_1) {
+    "use strict";
+    var x, y, env_1;
+    var __moduleName = context_1 && context_1.id;
+    return {
+        setters: [],
+        execute: function () {
+            env_1 = { stack: [], error: void 0, hasError: false };
+            try {
+                x = __addDisposableResource(env_1, resource, false);
+                y = __addDisposableResource(env_1, x, false);
+            }
+            catch (e_1) {
+                env_1.error = e_1;
+                env_1.hasError = true;
+            }
+            finally {
+                __disposeResources(env_1);
+            }
+        }
+    };
+});
+"####,
+        ),
+    ];
+    for (target, source, expected) in cases {
+        let actual = emit_ts_with(
+            source,
+            CompilerOptions {
+                target: Some(target),
+                module: Some(ModuleKind::System),
+                strict: Some(false),
+                no_emit_helpers: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(actual, expected, "{source}");
+    }
+}
+
+#[test]
+fn system_native_using_defers_escaped_resource_bindings_for_the_whole_file() {
+    let cases = [
+        r"export {}; const x_1=1; using \u0078=resource; trace.push(x.id);",
+        r"export {}; using \u0078=resource; const x_1=1; trace.push(x.id);",
+        r"export {}; const \u0078_1=1; using \u0078=resource; trace.push(x.id);",
+        r"export {}; const é_1=1; using \u00e9=resource; trace.push(é.id);",
+        r"export {}; const 𝒜_1=1; using \u{1D49C}=resource; trace.push(𝒜.id);",
+        r"export {}; using ordinary=resource; using \u0078=resource; trace.push(x.id);",
+        r"export {}; using ordinary=resource,\u0078=resource; trace.push(x.id);",
+        r"export {}; using \u0078=resource; using ordinary=resource; trace.push(x.id);",
+    ];
+    for source in cases {
+        let actual = emit_ts_with(
+            source,
+            CompilerOptions {
+                target: Some(ScriptTarget::ESNext),
+                module: Some(ModuleKind::System),
+                strict: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(!actual.contains("using "), "{source}\n{actual}");
+        let runnable = format!(
+            r#"const trace = [];
+const resource = {{ id: "value", [Symbol.dispose]() {{ trace.push("disposed"); }} }};
+const System = {{ register(_deps, body) {{ body(() => {{}}, {{id:"test"}}).execute(); }} }};
+{actual}
+console.log(trace.join(","));"#
+        );
+        assert_eq!(execute_with_node(&runnable), "value", "{source}");
+    }
+}
+
+#[test]
+fn system_native_using_reserves_escaped_identifiers_for_plain_resources() {
+    for (source, alias) in [
+        (r"export {}; const \u0078_1=1; using x=resource;", "x_2 = x"),
+        (r"export {}; using x=resource; const x_\u0031=1;", "x_2 = x"),
+        (r"export {}; const \u00e9_1=1; using é=resource;", "é_2 = é"),
+        (r"export {}; const 𝒜_1=1; using 𝒜=resource;", "𝒜_2 = 𝒜"),
+        (
+            r"export {}; declare using \u0079:any; using x=resource;",
+            "x_1 = x",
+        ),
+    ] {
+        let actual = emit_ts_with(
+            source,
+            CompilerOptions {
+                target: Some(ScriptTarget::ESNext),
+                module: Some(ModuleKind::System),
+                strict: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(
+            actual.contains(&format!("using {alias} = resource;")),
+            "{source}\n{actual}"
+        );
+    }
+}
