@@ -1738,7 +1738,15 @@ impl<'a> DeclarationEmitter<'a> {
                     continue;
                 }
             }
+            let output_start = self.output.len();
+            let saved_line_start = self.at_line_start;
+            self.emit_leading_jsdoc(member.span.start);
+            let declaration_start = self.output.len();
             self.emit_class_member(member, &class_decl.members);
+            if self.output.len() == declaration_start {
+                self.output.truncate(output_start);
+                self.at_line_start = saved_line_start;
+            }
         }
         self.indent -= 1;
         self.writeln("}");

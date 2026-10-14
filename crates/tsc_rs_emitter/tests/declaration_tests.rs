@@ -2563,3 +2563,57 @@ fn declaration_import_erasure_removes_documentation_with_erased_imports() {
         );
     }
 }
+#[test]
+fn test_dts_class_member_documentation_preserves_member_ownership() {
+    let source = "class C {\n    /** Field. */\n    value: number = 1;\n    /** Method.\n     * Details.\n     */\n    method(): void { /** Body only. */ }\n    /** Constructor. */\n    constructor() {}\n    /** Getter. */\n    get flag(): boolean { return true; }\n    /** Setter. */\n    set flag(value: boolean) {}\n}";
+    assert_eq!(
+        emit_dts(source),
+        "declare class C {\n    /** Field. */\n    value: number;\n    /** Method.\n     * Details.\n     */\n    method(): void;\n    /** Constructor. */\n    constructor();\n    /** Getter. */\n    get flag(): boolean;\n    /** Setter. */\n    set flag(value: boolean);\n}\n"
+    );
+}
+
+#[test]
+fn test_dts_class_documentation_omits_erased_members_and_implementations() {
+    let source = "class C {\n    /** Hidden name. */\n    #hidden = 1;\n    /** Static initialization. */\n    static {}\n    /** Empty member. */\n    ;\n    /** String overload. */\n    method(x: string): void;\n    /** Number overload. */\n    method(x: number): void;\n    /** Implementation only. */\n    method(x: string | number): void {}\n    /** First private overload. */\n    private secret(x: string): void;\n    /** Erased private overload. */\n    private secret(x: number): void;\n    private secret(x: string | number): void {}\n}";
+    assert_eq!(
+        emit_dts(source),
+        "declare class C {\n    #private;\n    /** String overload. */\n    method(x: string): void;\n    /** Number overload. */\n    method(x: number): void;\n    /** First private overload. */\n    private secret;\n}\n"
+    );
+}
+
+#[test]
+fn test_dts_class_documentation_does_not_convert_ordinary_comments() {
+    let source = "class C {\n    first(): void {}\n    second(): void {}\n    // Ordinary.\n    /* Also ordinary. */\n    third(): void {}\n    /** Retained. */\n    // Separating ordinary comment.\n    fourth(): void {}\n}";
+    assert_eq!(
+        emit_dts(source),
+        "declare class C {\n    first(): void;\n    second(): void;\n    third(): void;\n    /** Retained. */\n    fourth(): void;\n}\n"
+    );
+}
+
+#[test]
+fn test_dts_javascript_class_keeps_parameter_documentation() {
+    assert_eq!(
+        emit_dts_named(
+            "test.js",
+            "class C {\n    /**\n     * @param {any} input\n     */\n    method(input) {}\n}"
+        ),
+        "declare class C {\n    /**\n     * @param {any} input\n     */\n    method(input: any): void;\n}\n"
+    );
+}
+
+#[test]
+fn test_dts_class_documentation_honors_remove_comments() {
+    let file = tsc_rs_parser::parse(
+        "test.ts",
+        "/** Class. */\nclass C {\n    /** Member. */\n    method(): void {}\n}",
+    );
+    let options = CompilerOptions {
+        declaration: Some(true),
+        remove_comments: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(
+        emit(&file, &options).declaration_file.unwrap(),
+        "declare class C {\n    method(): void;\n}\n"
+    );
+}
