@@ -16,7 +16,7 @@
 //!
 //! Configuration parsing and checking both use the external native tsrs binary.
 //! Our transpiler is not involved. This is report-only: errors and failed
-//! checks still exit 0. Inspect `errors` and `skipped`; invalid CLI usage exits 2.
+//! checks still exit 0. Inspect `errors`, `external_errors` and `skipped`; invalid CLI usage exits 2.
 //!
 //! Options: `--framework <dir>` (else `BEXT_FRAMEWORK_DIR`, else a
 //! `shared/framework` next to an ancestor of the site), `--json`,
@@ -441,7 +441,6 @@ impl Check {
                 "1G",
                 "--checkerAssignment",
                 "go",
-                "--noLazyMembers",
             ])
             .env("RAYON_NUM_THREADS", "4");
         command.output()

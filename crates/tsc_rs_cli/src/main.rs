@@ -2261,7 +2261,7 @@ fn print_help() {
         "  --checker tsrs -p tsconfig.json  Check with pinned native tsrs; always disables emit"
     );
     println!("  --checker tsrs --lsp --stdio     External tsrs language server");
-    println!("  check-site <dir> --json          Bext site report; inspect errors and skipped");
+    println!("  check-site <dir> --json          Bext site report; inspect errors, external_errors and skipped");
     println!();
     println!("tsc-rs {VERSION} - TypeScript compiler (Rust)");
     println!();
