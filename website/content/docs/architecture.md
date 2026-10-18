@@ -98,4 +98,4 @@ See [Testing and the harness](/docs/testing).
 - **Same output as `tsc`.** The emitter is written to reproduce `tsc` formatting byte for byte, because the test oracle is `tsc`'s own baseline files.
 - **Error recovery matters.** The parser recovers the way `tsc` does, so diagnostics on broken code can be compared too.
 - **Diagnostics reuse `tsc` wording.** Messages and codes reproduce TypeScript's, so tools that parse `tsc` output keep working.
-- **Parallel by default.** Files are processed across a Rayon thread pool sized to the physical cores; see `--jobs` in the [CLI reference](/docs/cli).
+- **Parallel by default.** Files are processed across a Rayon thread pool sized by default to the logical CPU count; see `--jobs` in the [CLI reference](/docs/cli).

@@ -204,6 +204,8 @@ Transpilation stays in the native parser/emitter. The native diagnostic
 percentages below do not measure this external checker, and full-project
 parity with Microsoft's compiler has not been established. See
 [installation, platforms, memory limits and report-only site checks](docs/external-checker.md).
+The [configuration-session benchmark](docs/tsrs-config-performance.md) records
+the measured startup improvement and its limits.
 
 ### Transpile only
 

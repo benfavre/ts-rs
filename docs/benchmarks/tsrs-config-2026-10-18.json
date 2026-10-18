@@ -1,0 +1,52 @@
+{
+  "projects": 128,
+  "jobs": 4,
+  "rounds": 5,
+  "seconds": {
+    "before": [
+      2.4896509423851967,
+      2.2287697419524193,
+      2.261475373059511,
+      2.246081728488207,
+      2.265535417944193
+    ],
+    "after": [
+      2.393561592325568,
+      2.23764768242836,
+      2.153614452108741,
+      2.17635134793818,
+      2.1754490956664085
+    ]
+  },
+  "median_seconds": {
+    "before": 2.261475373059511,
+    "after": 2.17635134793818
+  },
+  "median_change_percent": -3.7640925094916455,
+  "api_processes": {
+    "before": 128,
+    "after": 4
+  },
+  "responses_equal": true,
+  "sha256": {
+    "before": "cff7127c9a854e077d6f4c5887423dba89f3ff76253eed14a7ad2d08d19988fd",
+    "after": "dc4fbc3381cffffee28a292f09f75f704012973eaeed098c3130202c4c6f629a"
+  },
+  "notes": [
+    "Process-count runs use a separate instrumented invocation.",
+    "This fixture measures small independent projects, not large monorepo checking."
+  ],
+  "measured_at": "2026-10-18",
+  "before_commit": "67647c0b947aff4cc6f75f1b3db5f2df294101f2",
+  "after_commit": "fcc2ea21b159efcd07e1bd5ceeebcfe524c76ee7",
+  "profile": "release-fast",
+  "tsrs_version": "0.16.0-ts7.1.0-dev.20260929",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+  "platform": "Linux x86_64, AMD Ryzen 9 5900X (12 cores / 24 threads)",
+  "limits": {
+    "MemoryMax": "12G",
+    "MemorySwapMax": "0",
+    "CARGO_BUILD_JOBS": 4,
+    "RAYON_NUM_THREADS": 4
+  }
+}

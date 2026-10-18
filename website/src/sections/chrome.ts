@@ -63,7 +63,7 @@ function col(title: string, links: string[][]): string {
 export function footerInnerHtml(): string {
   return (
     '<div class="t-foot-top"><div class="t-foot-brand">' + logo() +
-    "<p>A TypeScript compiler, type checker and language server written in Rust. MIT licensed and measured in the open.</p></div>" +
+    "<p>Native compiler tooling with optional external tsrs checking. MIT licensed, with dated native compatibility measurements.</p></div>" +
     col("Documentation", [
       ["Installation", "/docs/installation"],
       ["CLI reference", "/docs/cli"],
@@ -101,7 +101,7 @@ export function pageMeta(path: string): PageMeta {
   if (path === "/") {
     return {
       title: "tsc-rs: a TypeScript compiler written in Rust",
-      desc: "Scanner, parser, binder, type checker, emitter and language server in one Cargo workspace, measured against the upstream TypeScript test suites.",
+      desc: "Native TypeScript transpilation, experimental compiler tools and optional external tsrs checking, with dated compatibility results.",
     };
   }
   if (path === "/conformance") {

@@ -7,8 +7,8 @@ title: Type-check daemon
 
 The cost model:
 
-- **Start-up** parses and binds the whole project once. That is a few seconds on a monorepo of 5,000 files.
-- **Each request** re-checks a single file against the cached project state, typically in tens of milliseconds.
+- **Start-up** parses and binds the whole project once. Its cost depends on project size and types.
+- **Each request** re-checks a single file against the cached project state.
 
 This daemon uses the experimental native checker. A clean result can miss errors. External project checking uses `--checker tsrs`; see [External project checking](/docs/external-checker).
 

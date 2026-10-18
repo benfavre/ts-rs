@@ -3,7 +3,7 @@ title: Installation
 ---
 # Installation
 
-tsc-rs is distributed as source. You build one binary, `tsc-rs`, with Cargo.
+Build current source with Cargo to get the optional external tsrs integration. The previously released 0.4.2 native binaries and npm package predate that integration.
 
 ## Requirements
 
@@ -33,6 +33,10 @@ The release profile uses thin LTO and a single codegen unit, so the first build 
 :::note
 The repository vendors the TypeScript test corpus under `tests/`, so the clone is large. That corpus is what makes the [conformance numbers](/conformance) reproducible.
 :::
+
+## Optional external checker
+
+After building current source, run `python3 scripts/install-tsrs.py`, then `tsc-rs --checker tsrs -p tsconfig.json`. The native checker package and its declarations are installed separately; native transpilation remains independent. See [platforms, memory controls and command behavior](/docs/external-checker).
 
 ## Check the install
 

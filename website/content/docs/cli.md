@@ -7,7 +7,7 @@ title: CLI reference
 tsc-rs [options] [file ...]
 ```
 
-This page lists what `tsc-rs --help` prints for version 0.4.1, grouped the same way, with notes where the behaviour was checked and differs from the help text.
+This page describes the current source CLI, grouped like `tsc-rs --help`. Source-only external checker commands are identified below; older release artifacts have a smaller command surface.
 
 ## Compilation
 
@@ -22,7 +22,7 @@ This page lists what `tsc-rs --help` prints for version 0.4.1, grouped the same 
 
 ## External project checking (source builds)
 
-`tsc-rs --checker tsrs -p tsconfig.json` uses the separately installed, pinned native tsrs executable and always disables emit. `tsc-rs --checker tsrs --lsp --stdio` forwards LSP startup. `tsc-rs check-site <dir> --json` is a report-only Bext bridge: inspect `errors` and `skipped` even when it exits 0.
+`tsc-rs --checker tsrs -p tsconfig.json` uses the separately installed, pinned native tsrs executable and always disables emit. `tsc-rs --checker tsrs --lsp --stdio` forwards LSP startup. `tsc-rs check-site <dir> --json` is a report-only Bext bridge: inspect `errors`, `external_errors` and `skipped` even when it exits 0.
 
 These commands are newer than the published 0.4.2 artifacts. See [installation, platform support and memory controls](/docs/external-checker).
 
@@ -118,6 +118,6 @@ tsc-rs run-suite <ts-repo> <suite> '<oracle>' '<candidate>' [max]
 
 ## Exit status
 
-`tsc-rs` exits with `0` when compilation succeeds and `1` when it reports errors.
+Native compilation exits `0` on success and `1` on diagnostics. External checker commands return the upstream checker status. `check-site` is report-only: it exits `0` even with diagnostics or a skipped check, so inspect `errors`, `external_errors` and `skipped`. Invalid site-check usage exits `2`.
 
 Unlike `tsc`, version 0.4.1 writes no output files when the type checker reports errors. Use `--transpileOnly` to emit regardless of type errors.

@@ -362,7 +362,7 @@ function preserve(): string {
     "<h2>Keep the types when you need them.</h2>" +
     "<p>tsc throws all type information away. tsc-rs can carry some of it into the output, so downstream tools see what the author wrote.</p></div>" +
     '<ul class="t-list rv">' +
-    "<li>" + icon("check", 16) + "<span><b>Type annotations.</b> Keep <code>as</code>, <code>satisfies</code> and angle-bracket assertions in the emitted JavaScript.</span></li>" +
+    "<li>" + icon("check", 16) + "<span><b>Type annotations.</b> Keep <code>as</code>, <code>satisfies</code> and angle-bracket assertions in emitted code for downstream tools; this type syntax requires further processing before execution.</span></li>" +
     "<li>" + icon("check", 16) + "<span><b>Comments.</b> Keep comments even when <code>removeComments</code> is set.</span></li>" +
     "<li>" + icon("check", 16) + "<span><b>Whitespace.</b> Keep the original layout (partial).</span></li>" +
     "</ul></div>" +

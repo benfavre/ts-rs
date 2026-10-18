@@ -3362,3 +3362,22 @@ Broad parser-ranking and fixed emit-speedup claims have been replaced with
 their historical measurement scope. Full-project parity with Microsoft's
 native checker is unverified; the migration's independent full-project
 comparison exceeded its timeout.
+
+
+## 2026-10-18: reuse configuration sessions within a site-check batch
+
+Public source `fcc2ea21b1` reuses a tsrs configuration API process per
+preparation worker, with explicit ownership and synchronous cleanup before
+checking starts. Invalid configurations do not leak project state into the
+next site. Single-site and batched API-child cleanup have a regression test.
+
+All 5,873 public Rust tests passed, with zero failures and 37 ignored;
+`make ci` passed. Eight integration tests cover the external checker boundary.
+The [recorded 128-project benchmark](tsrs-config-performance.md) reduced API
+starts from 128 to 4 at four workers. Median wall time was 2.261 s before and
+2.176 s after across five interleaved rounds, with overlapping ranges and
+identical reports. This does not establish a general checker speedup, an RSS
+reduction, or diagnostic parity on large applications.
+
+Native conformance remains the 2026-10-14 snapshot; no new baseline percentage
+is claimed. Source integration is still newer than existing v0.4.2 artifacts.

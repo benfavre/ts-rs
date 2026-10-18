@@ -90,3 +90,11 @@ reproducible small-project benchmark is provided by
 `--after` and `--out`. It checks complete report equality and measures API
 process counts separately from timed runs. It does not represent a large
 monorepo or establish an across-project speedup.
+
+
+The [2026-10-18 small-project measurement](https://github.com/benfavre/ts-rs/blob/main/docs/tsrs-config-performance.md)
+reduced configuration API starts from 128 to 4 through worker-session reuse.
+Median wall time over five interleaved rounds was 2.261 s before and 2.176 s
+after (3.8% lower). Timing ranges overlap; reports matched. Each site still
+launches its own checker. Sessions are reaped before checking starts and do
+not persist across CLI invocations.
