@@ -51,6 +51,9 @@ jobs:
           npm install --no-save --no-package-lock --prefix "$RUNNER_TEMP/ts" typescript@6.0.3
           echo "TSC_RS_TYPESCRIPT_LIB_DIR=$RUNNER_TEMP/ts/node_modules/typescript/lib" >> "$GITHUB_ENV"
 
+      - name: Install pinned native tsrs checker
+        run: python3 scripts/install-tsrs.py
+
       - name: Unit tests (all crates)
         run: cargo test --workspace
 

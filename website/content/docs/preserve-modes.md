@@ -96,4 +96,4 @@ All three are also accepted as `compilerOptions`: `preserveTypeAnnotations`, `pr
 
 ## Related: fast emit
 
-`--fast-emit` is a different trade. It produces plain JavaScript, but copies statements that need no transform verbatim from the source instead of normalizing their formatting the way `tsc` would. Combined with `--transpileOnly` it runs two to four times faster than the structured path, and is intended for consumers that feed the result straight to a JavaScript engine.
+`--fast-emit` is a different trade. It produces plain JavaScript, but copies statements that need no transform verbatim from the source instead of normalizing their formatting the way `tsc` would. Combined with `--transpileOnly` it reduces formatting work and is intended for consumers that feed the result straight to a JavaScript engine. Measure the benefit on your own inputs.

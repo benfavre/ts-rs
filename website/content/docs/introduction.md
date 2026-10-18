@@ -5,6 +5,8 @@ title: Introduction
 
 tsc-rs is a TypeScript compiler written in Rust: scanner, parser, binder, type checker, JavaScript and declaration emitter, and a language server, all in one Cargo workspace.
 
+Current source builds also offer [external tsrs checking](/docs/external-checker). The native checker and native language server are experimental; their conformance results are separate from the external checker.
+
 ## What it is for
 
 tsc-rs is a tooling-first compiler. It aims to produce the same output as `tsc`, and then goes further in the directions that tools need:

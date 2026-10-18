@@ -2,7 +2,7 @@
 
 # tsc-rs
 
-**A TypeScript compiler, type checker and language server, written in Rust.**
+**Native TypeScript transpilation and compiler tooling, with optional external tsrs checking.**
 
 [Website](https://ts-rs.bext.dev/) ·
 [Documentation](https://ts-rs.bext.dev/docs) ·
@@ -19,13 +19,17 @@
 
 `tsc-rs` implements the TypeScript compiler end to end: scanner, parser,
 binder, type checker, JavaScript/declaration emitter and a language server, in
-one Cargo workspace. Every change is measured against the upstream TypeScript
-test suites (`compiler`, `conformance`, `fourslash`), with the real `tsc`
-baselines as the oracle.
+one Cargo workspace. The native checker and language server are experimental;
+use the optional external [tsrs checker](docs/external-checker.md) for project
+checking. Native compatibility is evaluated against the upstream TypeScript
+test suites (`compiler`, `conformance`, `fourslash`).
 
-- **Emit matches `tsc` byte for byte** on all 11,420 JavaScript baselines.
-- **Diagnostics reproduce `tsc`'s messages, positions and codes**; 73.1%
-  of the upstream cases match in full, and the rest is the active front.
+- **Native transpilation** powers the [bext](https://bext.dev) engine. The
+  dated compatibility snapshot below describes its tested configurations.
+- **External project checking** uses a separately installed, pinned native
+  [tsrs](https://github.com/oxc-project/tsrs) executable. It never supplies emit.
+- **Experimental native diagnostics** match a subset of upstream cases.
+  A clean native result is not a guarantee that a project is type-correct.
 - **Language server and VS Code extension**: hover, go-to-definition,
   references, completions, signature help, rename, formatting.
 - **Tooling modes**: a persistent transpile pipe, a type-check daemon, preserve
@@ -60,9 +64,11 @@ Found 2 errors in 1 file.
 
 ## Status at a glance
 
-All results below were measured on 2026-10-14 at `9133631d9`, with the
+The **native compiler snapshot** below was measured on 2026-10-14 at
+`9133631d9`, with the
 result cache disabled. Pass rates are `passed / (passed + failed)`; skipped
-cases are never counted as passes.
+cases are never counted as passes. These measurements cover the native
+implementation, not the optional external tsrs checker or every option variant.
 
 | Lane | Compiler suite | Conformance suite | What it measures |
 |---|---:|---:|---|
@@ -76,8 +82,8 @@ JavaScript emit skips 497 compiler and 519 conformance cases without a `.js`
 oracle (mostly `noEmit`); diagnostics exercises all of them. Symbols and types
 skip 95 compiler and 290 conformance cases without a uniquely selected oracle.
 
-Public workspace validation: **5,845 Rust tests passed**, zero failed, and
-37 ignored; `make ci` passes.
+That historical checkpoint recorded 5,845 Rust tests passed and 37 ignored.
+Later changes require their own validation; this is not a current CI result.
 
 Language server, against the `fourslash` suite:
 
@@ -106,7 +112,7 @@ LSP gaps include contextual typing, generics, JSDoc and cross-file information.
 Symbol and type baselines still have substantial gaps.
 
 [docs/compatibility-metrics.json](docs/compatibility-metrics.json) contains the
-current counts, measurement commit, report hashes and reproduction commands.
+published snapshot, measurement commit, report hashes and reproduction commands.
 The [September 7 snapshot](docs/compatibility-metrics-2026-09-07.json) remains
 available as historical evidence.
 
@@ -153,7 +159,7 @@ On Linux x86-64 the workspace links with `clang` and `lld` (see
 under `tests/`, so the clone is large; that corpus is what makes the numbers
 above reproducible.
 
-Version 0.4.2 is available as [GitHub release downloads](https://github.com/benfavre/ts-rs/releases/tag/v0.4.2)
+The previously published version 0.4.2 is available as [GitHub release downloads](https://github.com/benfavre/ts-rs/releases/tag/v0.4.2)
 for Linux x64/ARM64, macOS Intel/Apple Silicon, and Windows x64. Each release
 includes SHA256 checksums and the VS Code extension.
 
@@ -163,6 +169,9 @@ The npm package ships the Linux x64 compiler:
 npm install --save-dev @bext-stack/tsc-rs@0.4.2
 npx tsc-rs --version
 ```
+
+External tsrs checking is available in current source builds. The existing
+0.4.2 release downloads and npm package predate this integration.
 
 See the [installation guide](https://ts-rs.bext.dev/docs/installation) for
 details.
@@ -182,12 +191,27 @@ tsc-rs --help
 
 Full flag list: [CLI reference](https://ts-rs.bext.dev/docs/cli).
 
+### External project checking (source builds)
+
+```bash
+python3 scripts/install-tsrs.py
+cargo build --release --bin tsc-rs
+target/release/tsc-rs --checker tsrs -p tsconfig.json --pretty false
+```
+
+This path launches the pinned native tsrs executable and forces `noEmit`.
+Transpilation stays in the native parser/emitter. The native diagnostic
+percentages below do not measure this external checker, and full-project
+parity with Microsoft's compiler has not been established. See
+[installation, platforms, memory limits and report-only site checks](docs/external-checker.md).
+
 ### Transpile only
 
 `--transpileOnly` skips type checking and only parses and emits. Parser errors
 are still reported, so a broken file fails the build. `--fast-emit` also skips
 formatting normalization: the output is valid JavaScript but not laid out the
-way `tsc` would, and it runs two to four times faster.
+way `tsc` would. Its performance depends on the input; benchmark the
+structured and fast paths on the files your application actually compiles.
 
 ```bash
 tsc-rs --transpileOnly --jsx react-jsx --module esnext button.tsx
@@ -204,7 +228,9 @@ $ echo '{"id":"1","file":"b.tsx","source":"export const Save = () => <Button lab
 {"id":"1","ok":true,"output":"import { jsx as _jsx } from \"react/jsx-runtime\";\nexport const Save = () => _jsx(Button, { label: \"Save\" });\n","elapsed_ms":0,"exports":["Save"]}
 ```
 
-`tsc-rs --check-pipe -p tsconfig.json` is the type-checking equivalent. See
+`tsc-rs --check-pipe -p tsconfig.json` uses the experimental native checker.
+External project checking and LSP forwarding use `--checker tsrs`; see
+[External checking](docs/external-checker.md). Also see
 [Transpile pipe](https://ts-rs.bext.dev/docs/pipe) and
 [Type-check daemon](https://ts-rs.bext.dev/docs/check-pipe).
 
@@ -354,17 +380,18 @@ Harness notes:
 
 ## Performance
 
-The parser is competitive with the fastest native TypeScript parsers. In one
-same-session comparison on the 7.8 MB `typescript.js` fixture:
+The following historical single-fixture comparison used the 7.8 MB
+`typescript.js` input. It measures the native parser, not external tsrs checking:
 
 | | tsc-rs | oxc |
 |---|---:|---:|
 | Parse | 44.5 ms | 35.2 ms |
 | Parse and semantic analysis | 96.0 ms | 97.9 ms |
 
-oxc parses faster; `tsc-rs` is ahead once binding and symbol resolution are
-included, and it parses faster than SWC on every file in the benchmark set.
-The benchmarks live in `crates/tsc_rs_bench` (`make bench`, `make bench-vs-oxc`).
+The recorded values apply to that fixture and measurement session. Reproduce
+current results with `crates/tsc_rs_bench` (`make bench`, `make bench-vs-oxc`).
+External checking performance is separate and depends on the project and
+pinned checker version; see [external checking](docs/external-checker.md).
 
 Checker changes are measured before and after on 1,000 compiler diagnostic
 cases (one thread, no cache); the method and raw timings are in

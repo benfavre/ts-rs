@@ -3343,3 +3343,22 @@ Remaining diagnostic, emit, type, symbol and LSP failures remain visible.
 
 Measured public source: `9133631d9`. The preceding snapshot remains at
 `docs/compatibility-metrics-2026-10-14-01614c3f1.json`.
+
+## 2026-10-18: optional external checker and corrected claim boundaries
+
+Current source builds add pinned external tsrs project checking and Bext site
+reports while retaining the native parser/emitter for transpilation. Native
+checker and language-server results remain experimental and separate from the
+external checker. Existing v0.4.2 release artifacts predate this integration.
+
+Validation on the public source passed all 5,872 Rust tests, with zero failures
+and 37 ignored. `make ci` also passed. The tests include inherited project paths and JSX types,
+report-only failed checks, independent native transpilation, forced no-emit,
+Unix checker PID/signal preservation, and batch configuration isolation.
+
+The native compatibility snapshot stays dated 2026-10-14 at `9133631d9`.
+It has not been relabeled as a new measurement or an external checker result.
+Broad parser-ranking and fixed emit-speedup claims have been replaced with
+their historical measurement scope. Full-project parity with Microsoft's
+native checker is unverified; the migration's independent full-project
+comparison exceeded its timeout.

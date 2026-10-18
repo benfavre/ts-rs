@@ -20,6 +20,12 @@ This page lists what `tsc-rs --help` prints for version 0.4.1, grouped the same 
 | `tsc-rs --init` | Write a default `tsconfig.json` |
 | `tsc-rs -b [tsconfig.json]` | Check project references in dependency order. Writes no output in 0.4.1, see [Projects and watch](/docs/projects) |
 
+## External project checking (source builds)
+
+`tsc-rs --checker tsrs -p tsconfig.json` uses the separately installed, pinned native tsrs executable and always disables emit. `tsc-rs --checker tsrs --lsp --stdio` forwards LSP startup. `tsc-rs check-site <dir> --json` is a report-only Bext bridge: inspect `errors` and `skipped` even when it exits 0.
+
+These commands are newer than the published 0.4.2 artifacts. See [installation, platform support and memory controls](/docs/external-checker).
+
 ## Compiler flags
 
 | Flag | Meaning |

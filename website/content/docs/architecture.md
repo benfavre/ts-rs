@@ -19,6 +19,10 @@ All five share `tsc_rs_ast`, which defines the AST, spans, diagnostics and compi
 
 Emit does not depend on the checker. A transpile-only run is scanner, parser, emitter; type checking adds the binder and the checker in between.
 
+## External project checking
+
+`--checker tsrs` launches a separately installed, pinned native executable. Native transpilation remains in the pipeline above. Bext site checks use its configuration API and checker, with no Node adapter or upstream AST transfer. The native Rust checker and language server remain separate experimental tools. See [External project checking](/docs/external-checker).
+
 ## Using the crates as a library
 
 The WebAssembly bindings are a compact example of driving the pipeline by hand. Transpile:

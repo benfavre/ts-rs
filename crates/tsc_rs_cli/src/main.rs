@@ -16,7 +16,9 @@ use tsc_rs_harness::{BootstrapHarness, CommandTemplate, Suite, SuiteRunConfig};
 use tsc_rs_project::{CompilationResult, TsProject};
 
 mod check_pipe;
+mod check_site;
 mod pipe;
+mod tsrs;
 
 // ---------------------------------------------------------------------------
 // Version
@@ -138,6 +140,31 @@ fn configure_rayon() {
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    match tsrs::checker_arguments(&raw_args, std::env::var("TSC_RS_CHECKER").ok().as_deref()) {
+        Ok(Some(args)) => match tsrs::run_checker(args) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("tsc-rs: {error}");
+                std::process::exit(2);
+            }
+        },
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("tsc-rs: {error}");
+            std::process::exit(2);
+        }
+    }
+    if std::env::var("TSC_RS_EMIT").is_ok_and(|value| !value.is_empty() && value != "native") {
+        eprintln!("tsc-rs: external emit backends were removed; use the native transpiler (unset TSC_RS_EMIT)");
+        std::process::exit(2);
+    }
+    // The external checker reserves a 32 GiB virtual arena. Dispatch it and
+    // site checks before the native compiler's virtual-address guard.
+    if raw_args.first().is_some_and(|arg| arg == "check-site") {
+        std::process::exit(check_site::run(&raw_args[1..]));
+    }
+
     // FIRST thing — before any allocation-heavy work happens. setrlimit is
     // inherited by forked threads, so this also bounds the rayon worker
     // threads spawned by pipe-mode batch handling.
@@ -2229,6 +2256,13 @@ fn exit_with(message: &str) -> ! {
 // ---------------------------------------------------------------------------
 
 fn print_help() {
+    println!("External checking (source builds; install with scripts/install-tsrs.py):");
+    println!(
+        "  --checker tsrs -p tsconfig.json  Check with pinned native tsrs; always disables emit"
+    );
+    println!("  --checker tsrs --lsp --stdio     External tsrs language server");
+    println!("  check-site <dir> --json          Bext site report; inspect errors and skipped");
+    println!();
     println!("tsc-rs {VERSION} - TypeScript compiler (Rust)");
     println!();
     println!("Usage:");

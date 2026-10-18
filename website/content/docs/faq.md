@@ -7,24 +7,24 @@ Short answers to the questions that come up first. Each one links to the page wi
 
 ## Is tsc-rs a drop-in replacement for tsc?
 
-No, not yet. Default JavaScript emit matches `tsc` on every test case that has a JavaScript oracle, but diagnostics, declaration emit and the command line surface are not at parity. The [conformance report](/conformance) has the numbers and [Limitations](/docs/limitations) lists the differences you are most likely to meet.
+No. The published native snapshot of {{metrics.measured}} matched the JavaScript cases with an oracle in their default tested configuration. Expanded option variants, native diagnostics, declaration emit and the CLI are not at parity. External tsrs checking is a separate integration. The [conformance report](/conformance) has the numbers and [Limitations](/docs/limitations) lists the differences you are most likely to meet.
 
 ## What is it good for today?
 
-- **Transpiling.** TypeScript and TSX to JavaScript, with output that matches `tsc` byte for byte on the default configuration. This path runs in production inside the [bext](https://bext.dev) engine.
+- **Transpiling.** Native TypeScript and TSX to JavaScript, evaluated against the dated baseline configurations. This path runs in production inside the [bext](https://bext.dev) engine.
 - **Embedding.** A [transpile pipe](/docs/pipe), a [type-check daemon](/docs/check-pipe), a [WebAssembly build](/docs/wasm) and [Rust crates](/docs/library) you can link.
 - **Fast feedback.** A first-pass type check and a language server that start quickly. Treat the result as advisory and keep `tsc` as the final word.
 - **Tooling.** [Preserve modes](/docs/preserve-modes) that keep type syntax in the output, and [import graph audits](/docs/analyze).
 
 ## How is it different from SWC, oxc or esbuild?
 
-Those tools remove TypeScript types without checking them. They are transpilers, and very good ones. tsc-rs implements the rest of the compiler too: the binder, the type checker, declaration emit and a language server, and it measures all of it against `tsc`'s own baselines.
+The native tsc-rs workspace includes a parser, emitter, experimental checker and language server. OXC also publishes tsrs, which current source builds can use as an external checker. Native transpilation and preservation modes remain in tsc-rs; selecting tsrs never selects upstream transpilation. See [External project checking](/docs/external-checker).
 
 If all you need is fast transpilation, those tools are mature choices. tsc-rs is for cases where you want the types understood, not only erased, in Rust.
 
 ## What about Microsoft's native port of TypeScript?
 
-Microsoft is porting the TypeScript compiler to Go. It is the official implementation, and if your goal is simply a faster `tsc`, it is the one to follow.
+Microsoft's native TypeScript compiler is a separate implementation. Its diagnostic results remain an independent reference; the tsrs integration does not establish full-project parity with it.
 
 tsc-rs is an independent implementation with a different focus: a Rust codebase that tools can link as a library, modes that `tsc` does not have (preserve modes, the JSON pipes), and a compiler small enough to ship as WebAssembly.
 
@@ -46,11 +46,11 @@ Yes. The [0.4.2 GitHub release](https://github.com/benfavre/ts-rs/releases/tag/v
 
 ## Which platforms does it build on?
 
-Anywhere a stable Rust toolchain runs. The repository's release workflow builds for Linux x64 and arm64, macOS x64 and arm64, and Windows x64. On Linux x64 the workspace is configured to link with `clang` and `lld`.
+The native compiler release workflow targets Linux x64 and arm64, macOS x64 and arm64, and Windows x64. On Linux x64 it links with `clang` and `lld`. The optional tsrs package has a narrower platform set; see [External project checking](/docs/external-checker).
 
 ## How fast is it?
 
-On `typescript.js`, a 7.8 MB fixture, one same-session comparison measured tsc-rs parsing in 44.5 ms against 35.2 ms for oxc, and parsing plus semantic analysis in 96.0 ms against 97.9 ms. `--fast-emit` transpilation runs two to four times faster than the structured emit path. The benchmarks are in `crates/tsc_rs_bench`; see [Testing and the harness](/docs/testing) to run them.
+On `typescript.js`, a 7.8 MB fixture, one same-session comparison measured tsc-rs parsing in 44.5 ms against 35.2 ms for oxc, and parsing plus semantic analysis in 96.0 ms against 97.9 ms. Those historical single-fixture numbers do not predict project checking performance. Benchmark `--fast-emit` and structured emit on your own inputs. The benchmarks are in `crates/tsc_rs_bench`; see [Testing and the harness](/docs/testing) to run them.
 
 ## Can I try it without installing anything?
 

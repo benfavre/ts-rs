@@ -37,6 +37,7 @@ export function docsNav(): DocsNavSection[] {
       icon: "terminal",
       items: [
         { title: "CLI reference", href: "/docs/cli", desc: "Every tsc-rs command, flag and environment variable." },
+        { title: "External project checking", href: "/docs/external-checker", desc: "Install the pinned native tsrs checker, select it explicitly, and keep native transpilation." },
         { title: "tsconfig support", href: "/docs/tsconfig", desc: "The compilerOptions that tsc-rs reads and applies." },
         { title: "Projects and watch", href: "/docs/projects", desc: "Project builds, output layout, incremental builds, project references and watch mode." },
         { title: "JSX", href: "/docs/jsx", desc: "JSX modes, factories and import sources, with real output and the differences from tsc." },

@@ -185,13 +185,13 @@ function hero(): string {
     '<span class="t-pill"><span class="t-pill-dot"></span><b>v' + esc(VERSION) + "</b> &middot; open source, MIT licensed</span>" +
     "<h1>A TypeScript compiler, written in <em>Rust</em>.</h1>" +
     '<p class="t-hero-lead">Scanner, parser, binder, type checker, emitter and language server in one Cargo workspace. ' +
-    "Every change is measured against the upstream TypeScript test suites, with the real tsc baselines as the oracle.</p>" +
+    "Native compatibility is evaluated against upstream baselines. Source builds can use a pinned external tsrs checker for project checks.</p>" +
     '<div class="t-hero-actions">' +
     button({ href: "/docs/installation", label: "Get started", kind: "primary", icon: "arrow" }) +
     button({ href: "/playground", label: "Try it in the browser", kind: "ghost" }) +
     "</div>" +
     '<div class="t-hero-meta">' +
-    "<span>" + icon("check", 15) + "100% of default JavaScript emit baselines</span>" +
+    "<span>" + icon("check", 15) + "Published native compatibility snapshot</span>" +
     "<span>" + icon("check", 15) + "LSP server and VS Code extension</span>" +
     "<span>" + icon("check", 15) + "Runs in the browser as WebAssembly</span>" +
     "</div></div>" +
@@ -228,8 +228,8 @@ function scoreboard(): string {
     '<section class="t-sec" style="padding-top:2rem"><div class="t-wrap">' +
     sectionHead({
       eyebrow: "Status at a glance",
-      title: "Measured, not claimed.",
-      lead: "tsc-rs runs the TypeScript project's own compiler, conformance and fourslash suites. A case passes only when the output matches what tsc produced. Skipped cases are never counted as passes.",
+      title: "A dated native compatibility snapshot.",
+      lead: "These historical results describe the native implementation at the measured commit. They do not measure the external tsrs checker. Skipped cases are excluded, and expanded option variants have separate results.",
     }) +
     '<div class="t-score rv">' +
     scoreCell(pctLabel(emitPass, emitTotal).replace("%", ""), "%", "JavaScript emit",
@@ -260,16 +260,16 @@ function toolchain(): string {
     '<section class="t-sec t-sec-tint"><div class="t-wrap">' +
     sectionHead({
       eyebrow: "One workspace",
-      title: "The whole toolchain, not just a transpiler.",
-      lead: "Most Rust TypeScript tools stop at stripping types. tsc-rs implements the compiler end to end, then adds the modes that tooling needs.",
+      title: "Native compiler tools and external checking.",
+      lead: "Use the native pipeline for transpilation and preserve modes. Project checks can select external tsrs explicitly; the native checker remains experimental.",
     }) +
     '<div class="t-cards rv">' +
     card("code", "Compiler and emitter",
       "JavaScript, source map and declaration emit for ES3 through ESNext, with CommonJS, ESM, AMD, UMD and SystemJS module output.",
       "tsc-rs -p tsconfig.json") +
-    card("shield", "Type checker",
-      "Inference, narrowing, relations and diagnostics that reproduce tsc's messages, positions and codes. Incomplete, and measured case by case.",
-      "tsc-rs --noEmit --strict") +
+    card("shield", "External project checking",
+      "Source builds can launch the pinned native tsrs checker. JavaScript emission is disabled; native transpilation stays independent.",
+      "tsc-rs --checker tsrs -p tsconfig.json") +
     card("cursor", "Language server",
       "Diagnostics, hover, go-to-definition, references, completions, signature help, rename and formatting over stdio, plus a VS Code extension.",
       "tsc-rs --lsp") +
@@ -327,7 +327,7 @@ function performance(): string {
     '<section class="t-sec t-sec-tint"><div class="t-wrap">' +
     sectionHead({
       eyebrow: "Performance",
-      title: "In the same league as the fastest native parsers.",
+      title: "Historical parser measurements.",
       lead: "Historical same-session comparison on typescript.js, a 7.8 MB fixture. Lower is better. The benchmarks live in crates/tsc_rs_bench so you can run them yourself.",
     }) +
     '<div class="t-bench rv">' +
@@ -335,11 +335,11 @@ function performance(): string {
     '<div class="t-bench-box"><h3>Parse and semantic analysis</h3><p>AST plus binding and symbol resolution.</p>' + bar("tsc-rs", 96.0, true) + bar("oxc", 97.9, false) + "</div>" +
     "</div>" +
     '<div class="t-facts rv">' +
-    '<div class="t-fact"><b>2 to 4x</b><span>Transpile-only emit with <code class="t-inline">--fast-emit</code> skips type checking and formatting normalization.</span></div>' +
-    '<div class="t-fact"><b>Every file</b><span>tsc-rs parses faster than SWC on every file in the benchmark set.</span></div>' +
-    '<div class="t-fact"><b>48 MB</b><span>Peak memory while checking 1,000 compiler diagnostic cases on one thread.</span></div>' +
+    '<div class="t-fact"><b>Native emit</b><span><code class="t-inline">--fast-emit</code> reduces formatting work. Measure its benefit on the files your application compiles.</span></div>' +
+    '<div class="t-fact"><b>Project checks</b><span>Source builds can select the external tsrs checker. Its performance is separate from these native parser samples.</span></div>' +
+    '<div class="t-fact"><b>Measured scope</b><span>Native compatibility and parser measurements cover their stated inputs and revisions.</span></div>' +
     "</div>" +
-    '<p class="t-note">oxc parses faster; tsc-rs is ahead once semantic analysis is included. Method and raw timings are in the ' +
+    '<p class="t-note">These fixture timings do not establish a general parser or checker ranking. Historical methods and raw timings are in the ' +
     '<a href="' + REPO_BLOB + 'docs/verified-waves.md" target="_blank" rel="noopener">verified waves log</a>.</p>' +
     "</div></section>"
   );
