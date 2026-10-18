@@ -57,3 +57,78 @@ for this comparison. Site checks use a 1 GiB soft target instead.
 include all measured modes, including the rejected alternatives. The site-bridge code change is `77de548146`; the server commands use the
 same four-thread lazy-member setting.
 The native compatibility snapshot remains dated 2026-10-14.
+
+
+## Further search: incremental full-project checks
+
+An explicit local incremental mode was the strongest additional result in
+2026-10-18 experiments. It uses the pinned checker's existing incremental
+implementation; the native transpiler, default checking commands and cold
+campaign baselines are unchanged.
+
+| Full-app check | Wall time | Maximum RSS |
+|---|---:|---:|
+| Existing cold command, one probe | 14.354 s | 6.396 GiB |
+| First incremental run | 14.021 s | 7.212 GiB |
+| Unchanged incremental repeat | 3.497 s | 3.816 GiB |
+| Second unchanged repeat | 2.382 s | 3.821 GiB |
+
+A separate invalidation sequence measured another unchanged repeat at 2.343 s.
+Every full-app run retained all 23 existing diagnostic messages and a nonzero
+status. A previous failed check's diagnostics remained visible on cached
+repeats. The first incremental check still pays the full cost and uses more
+memory than the current cold command in this sample; subsequent repeats are
+the benefit. The cache file was approximately 22 MB.
+
+The real-app invalidation sequence also tested adding a clean file, introducing
+three tRPC/Zod/environment errors, repeating that failed check, changing an
+imported type without editing its consumer, repairing the errors and deleting
+the added files. The original 23 diagnostics were preserved throughout;
+new errors appeared and disappeared as expected. A separate fixture changed
+`strictNullChecks` through false, true and false again against the same build
+state and returned clean, TS2322 and clean results. These tests cover this
+pinned version and project, not all possible cache invalidation cases.
+
+### Guarded local recipe on the configured server
+
+From the app monorepo root, use a cache unique to the absolute project path and
+checker pin. This is an explicit local reuse command; continue using the
+existing cold command for independent CI and campaign comparisons.
+
+```bash
+project_key="$(realpath apps/app/tsconfig.json | sha256sum | cut -d ' ' -f 1)"
+checker_pin="$(cat /usr/local/share/tsc-rs/TSRS_VERSION)"
+check_cache="${XDG_CACHE_HOME:-$HOME/.cache}/tsc-rs/$checker_pin/$project_key"
+mkdir -p "$check_cache"
+systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 \
+  choom -n 1000 -- env RAYON_NUM_THREADS=4 TSGO_MAX_PEAK_RSS_GIB=10 \
+  node scripts/ts-waves/safe-tsgo.mjs \
+    --noEmit -p apps/app/tsconfig.json --pretty false \
+    --incremental true --tsBuildInfoFile "$check_cache/app.tsbuildinfo"
+```
+
+The guard retains its environment-contract validation, singleton, memory
+headroom, RSS monitoring and timeout. Use another cache directory when trying a
+custom checker binary or custom checker-history settings. Deleting only this
+build-info file starts a fresh local cache. Missing binaries and compiler
+crashes remain failed checks, not cached clean results.
+
+### Other candidates
+
+Single exploratory probes kept identical diagnostic output but did not justify
+new defaults. Automatic scheduling took 34.305 s with about 4.765 GiB maximum
+RSS; a timing-cost cache took 35.166 s cold and 33.399 s warm. Eight checker
+threads took 13.230 s versus 14.354 s at four, but used about 8.419 GiB rather
+than 6.396 GiB. Raising the soft target to 6 GiB measured 13.782 s and essentially
+the same RSS as the current setting; one sample does not establish a gain.
+These are tradeoffs and rejected default changes, not a statistical ranking.
+
+The instrumented profile identified large tRPC and Prisma type materialization
+as the dominant work. Its extra instrumentation was excluded from candidate
+comparisons. A persisted AST/front-end cache is still an upstream design, not a
+shipped feature to enable. See [upstream performance options](https://github.com/oxc-project/tsrs/blob/main/docs/USAGE.md).
+
+[All exploratory samples and invalidation results](benchmarks/tsrs-further-search-2026-10-18.json)
+are recorded, including unsuccessful candidates. Temporary cache state and
+canary sources were removed after the experiments; no persistent cache was
+enabled globally.

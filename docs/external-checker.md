@@ -102,3 +102,11 @@ threads. The [2026-10-18 lazy-member comparison](tsrs-lazy-performance.md)
 records a large-app improvement, unchanged diagnostics on that app and 32
 sites, and a slower small synthetic fixture. Project CLI checks can explicitly
 pass `--noLazyMembers` when reproducing the forced-eager comparison.
+
+
+For repeated local full checks, the [incremental-mode experiment and guarded
+recipe](tsrs-lazy-performance.md#further-search-incremental-full-project-checks)
+measured 2.3-3.5 s warm checks after a roughly 14 s first run, with all existing
+app diagnostics retained. Source, dependency, deletion and compiler-option
+invalidation were exercised. This is opt-in; cold CI and campaign checks remain
+independent. Other scheduling and cost-cache probes did not justify new defaults.

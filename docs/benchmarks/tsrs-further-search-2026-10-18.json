@@ -1,0 +1,220 @@
+{
+  "measured_at": "2026-10-18",
+  "tsrs_version": "0.16.0-ts7.1.0-dev.20260929",
+  "tsrs_binary_sha256": "0a5549ad15fc942c72c388f15ba813139d4d273c3a9d0184c514b686aa093043",
+  "frontend_sha256": "a899cd6a7aebda747bc62be475e29e45a5cb43267dad874a77dcfee1ac054938",
+  "environment": {
+    "cpu": "AMD Ryzen 9 5900X (12 cores / 24 threads)",
+    "RAYON_NUM_THREADS": 4,
+    "checkers_default": 4,
+    "memory_soft_target": "4G",
+    "RSS_guard_gib": 10,
+    "MemoryMax": "12G",
+    "MemorySwapMax": "0",
+    "timeout_ms": 90000
+  },
+  "candidate_probes": [
+    {
+      "mode": "go4",
+      "seconds": 14.354425873607397,
+      "peak_rss_kib": 6706968,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57"
+    },
+    {
+      "mode": "auto4",
+      "seconds": 34.30478308722377,
+      "peak_rss_kib": 4996964,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57"
+    },
+    {
+      "mode": "auto4-cache-cold",
+      "seconds": 35.16590184904635,
+      "peak_rss_kib": 4769232,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57"
+    },
+    {
+      "mode": "auto4-cache-warm",
+      "seconds": 33.39899135008454,
+      "peak_rss_kib": 4841424,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57"
+    },
+    {
+      "mode": "go8",
+      "seconds": 13.23010510019958,
+      "peak_rss_kib": 8827688,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57"
+    },
+    {
+      "mode": "go4-memory6",
+      "seconds": 13.782002311199903,
+      "peak_rss_kib": 6710956,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57"
+    }
+  ],
+  "incremental": [
+    {
+      "mode": "cache-cold",
+      "seconds": 14.02077423967421,
+      "peak_rss_kib": 7562232,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57",
+      "cache_written": true,
+      "cache_bytes": 22010688
+    },
+    {
+      "mode": "cache-warm",
+      "seconds": 3.497209383174777,
+      "peak_rss_kib": 4001788,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57",
+      "cache_written": true,
+      "cache_bytes": 22010688
+    },
+    {
+      "mode": "cache-warm-repeat",
+      "seconds": 2.381712470203638,
+      "peak_rss_kib": 4006540,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57",
+      "cache_written": true,
+      "cache_bytes": 22010688
+    }
+  ],
+  "incremental_invalidation": [
+    {
+      "stage": "baseline",
+      "seconds": 13.343500092625618,
+      "exit": 2,
+      "total_diagnostics": 23,
+      "canary_codes": [],
+      "baseline_unchanged": true,
+      "cache_bytes": 22010688
+    },
+    {
+      "stage": "warm-baseline",
+      "seconds": 2.342634966596961,
+      "exit": 2,
+      "total_diagnostics": 23,
+      "canary_codes": [],
+      "baseline_unchanged": true,
+      "cache_bytes": 22010688
+    },
+    {
+      "stage": "added-clean",
+      "seconds": 4.857538625597954,
+      "exit": 2,
+      "total_diagnostics": 23,
+      "canary_codes": [],
+      "baseline_unchanged": true,
+      "cache_bytes": 22014930
+    },
+    {
+      "stage": "edited-broken",
+      "seconds": 2.376753021031618,
+      "exit": 2,
+      "total_diagnostics": 26,
+      "canary_codes": [
+        2322,
+        2339,
+        2322
+      ],
+      "baseline_unchanged": true,
+      "cache_bytes": 22015564
+    },
+    {
+      "stage": "cached-broken",
+      "seconds": 2.4744307305663824,
+      "exit": 2,
+      "total_diagnostics": 26,
+      "canary_codes": [
+        2322,
+        2339,
+        2322
+      ],
+      "baseline_unchanged": true,
+      "cache_bytes": 22015564
+    },
+    {
+      "stage": "dependency-changed",
+      "seconds": 4.4460793267935514,
+      "exit": 2,
+      "total_diagnostics": 24,
+      "canary_codes": [
+        2322
+      ],
+      "baseline_unchanged": true,
+      "cache_bytes": 22014993
+    },
+    {
+      "stage": "repaired",
+      "seconds": 5.386196935549378,
+      "exit": 2,
+      "total_diagnostics": 23,
+      "canary_codes": [],
+      "baseline_unchanged": true,
+      "cache_bytes": 22014849
+    },
+    {
+      "stage": "deleted",
+      "seconds": 2.3985875993967056,
+      "exit": 2,
+      "total_diagnostics": 23,
+      "canary_codes": [],
+      "baseline_unchanged": true,
+      "cache_bytes": 22010688
+    }
+  ],
+  "compiler_option_invalidation": [
+    {
+      "stage": "config-loose",
+      "exit": 0,
+      "diagnostics": 0,
+      "cache_written": true
+    },
+    {
+      "stage": "config-strict",
+      "exit": 2,
+      "diagnostics": 1,
+      "cache_written": true
+    },
+    {
+      "stage": "config-loose-repaired",
+      "exit": 0,
+      "diagnostics": 0,
+      "cache_written": true
+    }
+  ],
+  "default_configuration_changed": false,
+  "campaign_baselines_changed": false,
+  "notes": [
+    "Probes are single exploratory samples, not a statistical ranking.",
+    "Incremental full-project checks preserve all 23 existing diagnostic messages, including cached diagnostics from previous failed checks.",
+    "Cache state was isolated in temporary directories and removed afterward; no persistent cache was enabled by these experiments.",
+    "Use incremental state only as an explicit local repeat-check mode; keep independent cold CI and campaign checks.",
+    "Profile instrumentation was excluded from timed candidate comparisons."
+  ]
+}
