@@ -173,14 +173,14 @@ export function progressHtml(): string {
     '<div class="t-wrap">' +
     '<header class="t-page-head"><span class="t-eyebrow">Progress</span>' +
     "<h1>One verified wave at a time.</h1>" +
-    "<p>tsc-rs moves in small waves. Each one targets a family of diagnostics, and is merged only with a cache-free before and after comparison " +
-    "that shows which cases newly pass and that no passing case was lost.</p>" +
+    "<p>tsc-rs moves in small waves. Baseline improvements include cache-free before and after comparisons. " +
+    "Integration and documentation waves record their own checks and may carry forward earlier native diagnostic totals. See each entry for what was measured.</p>" +
     '<div class="t-stamp"><span><b>Waves</b> ' + waves.length + "</span><span><b>From</b> " + esc(dateLabel(waves[0].date)) +
     "</span><span><b>To</b> " + esc(dateLabel(last.date)) + "</span></div></header>" +
 
     '<section class="t-block"><div class="cv rv">' +
     '<div class="cv-head"><div><h2>Diagnostic cases gained</h2>' +
-    "<p>Whole-case diagnostic matches gained since the first recorded wave, by test suite.</p></div>" +
+    "<p>Whole-case diagnostic matches gained since the first recorded wave, by test suite. Counts carry forward between native measurements.</p></div>" +
     '<ul class="cv-legend">' +
     '<li><i class="cv-key cv-s1"></i><span>Compiler suite</span><b>+' + gainC + "</b><em>" + num(diag.compiler.passed) + " of " + num(diag.compiler.total) +
     " passing, " + pctLabel(diag.compiler.passed, diag.compiler.total) + "</em></li>" +

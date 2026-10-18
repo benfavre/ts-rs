@@ -6,7 +6,7 @@
 
 import {
   REPO_BLOB,
-  currentLanes, accuracyLanes, expandedLanes, measuredDate, baselineCounts, lspInventory, lspRows, latestWaveDate, dateLabel, pct, pctLabel, num,
+  currentLanes, accuracyLanes, expandedLanes, measuredDate, baselineCounts, lspInventory, lspRows, dateLabel, pct, pctLabel, num,
 } from "../lib/site";
 import { esc, button, codeBlock, meter } from "../lib/html";
 
@@ -43,7 +43,7 @@ function current(): string {
     "Baseline lanes",
     "One configuration per test case, compared with the baseline file that tsc itself produced. " +
       "The emit lane skips " + num(baselineCounts().compiler.js.skipped) + " compiler and " + num(baselineCounts().conformance.js.skipped) + " conformance cases that have no .js oracle (mostly noEmit); the diagnostics lane exercises all of them. Symbols and types skip " + num(baselineCounts().compiler.symbols.skipped) + " compiler and " + num(baselineCounts().conformance.symbols.skipped) + " conformance cases without a uniquely selected oracle.",
-    "Wave of " + dateLabel(latestWaveDate()),
+    "Native measurement " + dateLabel(measuredDate()),
     "now",
     html,
   );
@@ -176,9 +176,9 @@ export function conformanceHtml(): string {
     '<header class="t-page-head"><span class="t-eyebrow">Conformance report</span>' +
     "<h1>How close is tsc-rs to tsc?</h1>" +
     "<p>tsc-rs is measured against the TypeScript project's own test suites, using the baseline files that the real compiler produced. " +
-    "This page reports every lane, including the ones that are far from done.</p>" +
+    "This page reports the native implementation at its dated measurement, including incomplete lanes. External tsrs checking is measured separately.</p>" +
     '<div class="t-stamp"><span><b>Suites</b> compiler, conformance, fourslash</span><span><b>Oracle</b> tsc reference baselines</span>' +
-    "<span><b>Latest wave</b> " + esc(dateLabel(latestWaveDate())) + "</span></div></header>" +
+    "<span><b>Native measurement</b> " + esc(dateLabel(measuredDate())) + "</span></div></header>" +
     current() + expanded() + earlier() + lsp() + work() + method() +
     '<div style="padding:1rem 0 0;display:flex;gap:.7rem;flex-wrap:wrap">' +
     button({ href: "/progress", label: "See the wave log", kind: "primary", icon: "arrow" }) +
