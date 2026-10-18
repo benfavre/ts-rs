@@ -194,7 +194,7 @@ impl Drop for ApiChild {
     }
 }
 
-struct ConfigApi {
+pub(crate) struct ConfigApi {
     _child: ApiChild,
     input: std::process::ChildStdin,
     output: BufReader<std::process::ChildStdout>,
@@ -246,10 +246,24 @@ impl ConfigApi {
     }
 }
 
-pub fn parse_config(config: &Path) -> Result<serde_json::Value, String> {
+pub fn parse_config(
+    config: &Path,
+    api: &mut Option<ConfigApi>,
+) -> Result<serde_json::Value, String> {
     let config =
         std::fs::canonicalize(config).map_err(|error| format!("tsconfig path: {error}"))?;
-    ConfigApi::new()?.parse(&config)
+    if api.is_none() {
+        *api = Some(ConfigApi::new()?);
+    }
+    let result = api
+        .as_mut()
+        .expect("initialized configuration API")
+        .parse(&config);
+    if result.is_err() {
+        // A failed transport cannot poison the worker's next project.
+        api.take();
+    }
+    result
 }
 
 #[cfg(test)]

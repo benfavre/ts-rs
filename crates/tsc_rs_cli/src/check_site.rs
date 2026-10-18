@@ -142,8 +142,11 @@ fn new_report(site: &Path) -> Report {
 fn check_site(site: &Path, framework: Option<PathBuf>, max: usize) -> Report {
     let start = std::time::Instant::now();
     let mut report = new_report(site);
-    let result =
-        prepare(site, framework, &mut report).and_then(|check| check.run(max, &mut report));
+    let prepared = {
+        let mut api = None;
+        prepare(site, framework, &mut report, &mut api)
+    };
+    let result = prepared.and_then(|check| check.run(max, &mut report));
     if let Err(reason) = result {
         report.skipped = Some(reason);
     }
@@ -173,13 +176,15 @@ fn check_sites(
         .collect();
     let lock = |i: usize| slots[i].lock().unwrap_or_else(|e| e.into_inner());
     let next = AtomicUsize::new(0);
-    let pool = |work: &(dyn Fn(usize) + Sync), order: &[usize]| {
+    let pool = |work: &(dyn Fn(usize, &mut Option<crate::tsrs::ConfigApi>) + Sync),
+                order: &[usize]| {
         next.store(0, Ordering::Relaxed);
         std::thread::scope(|scope| {
             for _ in 0..jobs {
                 scope.spawn(|| {
+                    let mut api = None;
                     while let Some(&i) = order.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        work(i);
+                        work(i, &mut api);
                     }
                 });
             }
@@ -187,11 +192,11 @@ fn check_sites(
     };
     let in_order: Vec<usize> = (0..sites.len()).collect();
     pool(
-        &|i| {
+        &|i, api| {
             let start = std::time::Instant::now();
             let mut slot = lock(i);
             let (report, check, elapsed) = &mut *slot;
-            *check = Some(prepare(&sites[i], framework.clone(), report));
+            *check = Some(prepare(&sites[i], framework.clone(), report, api));
             *elapsed = start.elapsed();
         },
         &in_order,
@@ -199,7 +204,7 @@ fn check_sites(
     let mut largest_first = in_order;
     largest_first.sort_by_key(|&i| std::cmp::Reverse(lock(i).0.files));
     pool(
-        &|i| {
+        &|i, _api| {
             let start = std::time::Instant::now();
             let (mut report, check, prepared) = {
                 let mut slot = lock(i);
@@ -281,13 +286,18 @@ struct Check {
 
 /// Fills the site part of `report` and writes the temporary tsconfig of the
 /// check.
-fn prepare(site: &Path, framework: Option<PathBuf>, report: &mut Report) -> Result<Check, String> {
+fn prepare(
+    site: &Path,
+    framework: Option<PathBuf>,
+    report: &mut Report,
+    api: &mut Option<crate::tsrs::ConfigApi>,
+) -> Result<Check, String> {
     let config = site.join("tsconfig.json");
     if !config.is_file() {
         return Err("no tsconfig.json".into());
     }
     report.tsconfig = Some(config.display().to_string());
-    let parsed = crate::tsrs::parse_config(&config)?;
+    let parsed = crate::tsrs::parse_config(&config, api)?;
     if let Some(errors) = parsed["errors"]
         .as_array()
         .filter(|errors| !errors.is_empty())

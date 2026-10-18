@@ -233,3 +233,71 @@ fn batched_configs_keep_project_relative_paths_and_recover_after_invalid_config(
     assert_eq!(reports[2]["errors"], 1, "{reports:?}");
     assert_eq!(reports[2]["diagnostics"][0]["code"], 2322, "{reports:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn configuration_api_is_reaped_after_single_and_batched_checks() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let version = include_str!("../../../TSRS_VERSION").trim();
+    let native = std::env::var_os("TSRS_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let system = PathBuf::from("/usr/local/share/tsc-rs/tsrs")
+                .join(version)
+                .join("tsrs");
+            if system.is_file() {
+                system
+            } else {
+                PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                    .join(".local/share/tsc-rs/tsrs")
+                    .join(version)
+                    .join("tsrs")
+            }
+        });
+    assert!(native.is_file(), "install the pinned native tsrs checker");
+    let fixture = Fixture::new();
+    for name in ["first", "second"] {
+        fixture.write(
+            &format!("{name}/tsconfig.json"),
+            r#"{"files":["input.ts"]}"#,
+        );
+        fixture.write(&format!("{name}/input.ts"), "export const value = 1;\n");
+    }
+    fixture.write("proxy", "#!/bin/sh\nif [ \"$1\" = --api ]; then printf '%s\\n' \"$$\" >> \"$API_PID_LOG\"; fi\nexec \"$NATIVE_TSRS\" \"$@\"\n");
+    let proxy = fixture.0.join("proxy");
+    fs::set_permissions(&proxy, fs::Permissions::from_mode(0o755)).unwrap();
+    let log = fixture.0.join("api-pids");
+    for batch in [false, true] {
+        let mut cmd = command();
+        cmd.env("TSRS_BINARY", &proxy)
+            .env("NATIVE_TSRS", &native)
+            .env("API_PID_LOG", &log)
+            .arg("check-site")
+            .arg(fixture.0.join("first"));
+        if batch {
+            cmd.arg(fixture.0.join("second"));
+        }
+        let output = cmd.args(["--json", "--jobs", "1"]).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        for line in String::from_utf8(output.stdout).unwrap().lines() {
+            let report: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(report.get("skipped").is_none(), "{report}");
+        }
+        let pids = fs::read_to_string(&log).unwrap();
+        assert_eq!(pids.lines().count(), if batch { 2 } else { 1 });
+        for pid in pids.lines() {
+            let pid: libc::pid_t = pid.parse().unwrap();
+            // SAFETY: signal 0 checks existence without sending a signal.
+            assert_eq!(
+                unsafe { libc::kill(pid, 0) },
+                -1,
+                "API process {pid} survived CLI exit"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+}
