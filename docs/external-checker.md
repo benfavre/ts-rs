@@ -95,3 +95,10 @@ Five interleaved rounds measured median wall time of 2.261 s before and
 2.176 s after (3.8% lower), with overlapping timing ranges and identical
 reports. Each site still launches its own checker. Sessions are reaped before
 checking starts and do not persist across CLI invocations.
+
+
+The Bext bridge retains upstream lazy-member evaluation and four checker
+threads. The [2026-10-18 lazy-member comparison](tsrs-lazy-performance.md)
+records a large-app improvement, unchanged diagnostics on that app and 32
+sites, and a slower small synthetic fixture. Project CLI checks can explicitly
+pass `--noLazyMembers` when reproducing the forced-eager comparison.

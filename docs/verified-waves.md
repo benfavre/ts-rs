@@ -3381,3 +3381,22 @@ reduction, or diagnostic parity on large applications.
 
 Native conformance remains the 2026-10-14 snapshot; no new baseline percentage
 is claimed. Source integration is still newer than existing v0.4.2 artifacts.
+
+
+## 2026-10-18: retain upstream lazy-member evaluation for checking
+
+Source `77de548146` stops forcing eager member evaluation in the Bext bridge.
+Four checker threads, Go assignment, no emit and the existing memory controls
+remain. Native transpilation is independent.
+
+The [recorded flag comparison](tsrs-lazy-performance.md) measured large-app
+medians of 18.208 s before and 14.482 s after, with maximum RSS medians of
+7.189 and 6.391 GiB. All 23 diagnostic messages matched in six full-app runs.
+Thirty-two Bext site reports also matched, with all existing errors retained.
+A small synthetic fixture was slower; one-thread modes changed diagnostics
+and were rejected. No across-project speedup or Microsoft parity is claimed.
+
+The changed CLI passed its 21 unit and eight external integration tests, and
+`make ci` passed in both checkouts. A real tRPC/Zod/environment focused canary
+passed clean, rejected three deliberate errors and passed after repair.
+The native compatibility snapshot remains 2026-10-14, not a new measurement.

@@ -1,0 +1,205 @@
+{
+  "measured_at": "2026-10-18",
+  "tsrs_version": "0.16.0-ts7.1.0-dev.20260929",
+  "public_site_bridge_after_commit": "77de54814627536aa8e845165f97a16f176173c5",
+  "change": "Stop forcing --noLazyMembers. Keep four checkers, Go assignment, no emit and existing memory/time guards.",
+  "environment": {
+    "platform": "Linux x86_64",
+    "cpu": "AMD Ryzen 9 5900X (12 cores / 24 threads)",
+    "MemoryMax": "12G",
+    "MemorySwapMax": "0",
+    "RAYON_NUM_THREADS": 4,
+    "app_hard_rss_guard_gib": 10,
+    "app_soft_memory_target": "4G"
+  },
+  "app": {
+    "rounds": 3,
+    "order": [
+      "eager4",
+      "lazy4",
+      "lazy4",
+      "eager4",
+      "eager4",
+      "lazy4"
+    ],
+    "samples": {
+      "eager4": [
+        {
+          "seconds": 18.850747806951404,
+          "peak_rss_kib": 7541940,
+          "exit": 2,
+          "diagnostic_lines": 23,
+          "diagnostics_sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57",
+          "reports_equal": true
+        },
+        {
+          "seconds": 18.20792507007718,
+          "peak_rss_kib": 7538636,
+          "exit": 2,
+          "diagnostic_lines": 23,
+          "diagnostics_sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57",
+          "reports_equal": true
+        },
+        {
+          "seconds": 15.786806158721447,
+          "peak_rss_kib": 7532036,
+          "exit": 2,
+          "diagnostic_lines": 23,
+          "diagnostics_sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57",
+          "reports_equal": true
+        }
+      ],
+      "lazy4": [
+        {
+          "seconds": 15.568409755825996,
+          "peak_rss_kib": 6700996,
+          "exit": 2,
+          "diagnostic_lines": 23,
+          "diagnostics_sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57",
+          "reports_equal": true
+        },
+        {
+          "seconds": 14.276578923687339,
+          "peak_rss_kib": 6712404,
+          "exit": 2,
+          "diagnostic_lines": 23,
+          "diagnostics_sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57",
+          "reports_equal": true
+        },
+        {
+          "seconds": 14.482251286506653,
+          "peak_rss_kib": 6693560,
+          "exit": 2,
+          "diagnostic_lines": 23,
+          "diagnostics_sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57",
+          "reports_equal": true
+        }
+      ]
+    },
+    "median_seconds": {
+      "eager4": 18.20792507007718,
+      "lazy4": 14.482251286506653
+    },
+    "median_peak_rss_kib": {
+      "eager4": 7538636,
+      "lazy4": 6700996
+    },
+    "diagnostics_identical_in_all_six_runs": true
+  },
+  "bext_32_sites": {
+    "sites": 32,
+    "rounds": 3,
+    "jobs": 4,
+    "checkers": 4,
+    "seconds": {
+      "before": [
+        0.8851064741611481,
+        0.8662037458270788,
+        0.8521943129599094
+      ],
+      "after": [
+        0.7802183851599693,
+        0.81477852165699,
+        0.8398422710597515
+      ]
+    },
+    "median_seconds": {
+      "before": 0.8662037458270788,
+      "after": 0.81477852165699
+    },
+    "reports_equal": true,
+    "errors": 595,
+    "external_errors": 41,
+    "sha256": {
+      "before": "4d42fbcfe11c1c05b1cb8d3593ebc5ff2039ce433ca4d4494c9812646a39ef53",
+      "after": "a899cd6a7aebda747bc62be475e29e45a5cb43267dad874a77dcfee1ac054938"
+    }
+  },
+  "exploratory_tuning": {
+    "generated128": {
+      "seconds": {
+        "eager4": [
+          2.78380074724555,
+          2.3414365388453007,
+          2.298637118190527
+        ],
+        "lazy4": [
+          2.67729315161705,
+          2.580769155174494,
+          2.404675653204322
+        ],
+        "eager1": [
+          2.800954170525074,
+          2.5312229599803686,
+          2.479375606402755
+        ],
+        "lazy1": [
+          2.7280433531850576,
+          2.670476894825697,
+          2.6765552181750536
+        ]
+      },
+      "median_seconds": {
+        "eager4": 2.3414365388453007,
+        "lazy4": 2.580769155174494,
+        "eager1": 2.5312229599803686,
+        "lazy1": 2.6765552181750536
+      },
+      "reports_equal": true,
+      "mismatch_modes": [],
+      "error_counts": {
+        "eager4": 19,
+        "lazy4": 19,
+        "eager1": 19,
+        "lazy1": 19
+      }
+    },
+    "bext4": {
+      "seconds": {
+        "eager4": [
+          0.5052916593849659,
+          0.508687749505043,
+          0.5023595001548529
+        ],
+        "lazy4": [
+          0.523313544690609,
+          0.48983965441584587,
+          0.482561020180583
+        ],
+        "eager1": [
+          1.186645869165659,
+          1.1838408522307873,
+          1.10412965901196
+        ],
+        "lazy1": [
+          1.1176988687366247,
+          1.184202827513218,
+          1.1177875399589539
+        ]
+      },
+      "median_seconds": {
+        "eager4": 0.5052916593849659,
+        "lazy4": 0.48983965441584587,
+        "eager1": 1.1838408522307873,
+        "lazy1": 1.1177875399589539
+      },
+      "reports_equal": false,
+      "mismatch_modes": [
+        "eager1",
+        "lazy1"
+      ],
+      "error_counts": {
+        "eager4": 139,
+        "lazy4": 139,
+        "eager1": 137,
+        "lazy1": 137
+      }
+    }
+  },
+  "limits": [
+    "A shared-server sample, not a general speedup or complete upstream parity result.",
+    "The generated 128-project fixture was slower with lazy evaluation in this exploratory sample.",
+    "One-checker modes changed real-site diagnostics and were rejected.",
+    "RSS is measured with /usr/bin/time; it includes the guarded command and is not aggregate concurrent process-tree RSS."
+  ]
+}

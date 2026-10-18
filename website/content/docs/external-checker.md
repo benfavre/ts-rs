@@ -98,3 +98,10 @@ Median wall time over five interleaved rounds was 2.261 s before and 2.176 s
 after (3.8% lower). Timing ranges overlap; reports matched. Each site still
 launches its own checker. Sessions are reaped before checking starts and do
 not persist across CLI invocations.
+
+
+The Bext bridge retains upstream lazy-member evaluation with four checker
+threads. A [separate 2026-10-18 comparison](https://github.com/benfavre/ts-rs/blob/main/docs/tsrs-lazy-performance.md)
+measured lower time and memory on a large app, with unchanged diagnostics on
+that app and 32 sites. A small synthetic fixture was slower; the result does
+not establish an across-project speedup. Native transpilation is independent.

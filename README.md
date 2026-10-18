@@ -206,6 +206,8 @@ parity with Microsoft's compiler has not been established. See
 [installation, platforms, memory limits and report-only site checks](docs/external-checker.md).
 The [configuration-session benchmark](docs/tsrs-config-performance.md) records
 the measured startup improvement and its limits.
+The [lazy-member comparison](docs/tsrs-lazy-performance.md) records a separate
+large-app time and memory improvement, including cases that did not improve.
 
 ### Transpile only
 
