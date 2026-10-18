@@ -216,5 +216,44 @@
     "Cache state was isolated in temporary directories and removed afterward; no persistent cache was enabled by these experiments.",
     "Use incremental state only as an explicit local repeat-check mode; keep independent cold CI and campaign checks.",
     "Profile instrumentation was excluded from timed candidate comparisons."
-  ]
+  ],
+  "followup_probes": [
+    {
+      "mode": "go4-reference",
+      "seconds": 12.745516827329993,
+      "peak_rss_kib": 6723524,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57"
+    },
+    {
+      "mode": "locality4-static",
+      "seconds": 56.09973541647196,
+      "peak_rss_kib": 4660724,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57"
+    },
+    {
+      "mode": "go4-no-soft-target",
+      "seconds": 19.416465144604445,
+      "peak_rss_kib": 6702876,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57"
+    },
+    {
+      "mode": "go4-reference-repeat",
+      "seconds": 15.644610449671745,
+      "peak_rss_kib": 6702496,
+      "exit": 2,
+      "diagnostics": 23,
+      "identical_diagnostics": true,
+      "sha256": "a3fc0c37311eb5b07c751685e61fa446b60af11c39cf44cf078b18cbf605cc57"
+    }
+  ],
+  "followup_decision": "Keep Go assignment, four checker threads and the 4G soft target. Static locality and disabling the soft target preserved all 23 messages but were slower in single bounded probes. Baseline was repeated to expose host variability; these are exploratory measurements, not statistical speed rankings."
 }

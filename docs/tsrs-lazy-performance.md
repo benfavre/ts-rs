@@ -101,7 +101,8 @@ checker_pin="$(cat /usr/local/share/tsc-rs/TSRS_VERSION)"
 check_cache="${XDG_CACHE_HOME:-$HOME/.cache}/tsc-rs/$checker_pin/$project_key"
 mkdir -p "$check_cache"
 systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 \
-  choom -n 1000 -- env RAYON_NUM_THREADS=4 TSGO_MAX_PEAK_RSS_GIB=10 \
+  choom -n 1000 -- env RAYON_NUM_THREADS=4 TS_WAVE_CHECKER=tsrs \
+    TSGO_MAX_PEAK_RSS_GIB=10 TSGO_TIMEOUT_MS=90000 \
   node scripts/ts-waves/safe-tsgo.mjs \
     --noEmit -p apps/app/tsconfig.json --pretty false \
     --incremental true --tsBuildInfoFile "$check_cache/app.tsbuildinfo"
@@ -122,6 +123,14 @@ threads took 13.230 s versus 14.354 s at four, but used about 8.419 GiB rather
 than 6.396 GiB. Raising the soft target to 6 GiB measured 13.782 s and essentially
 the same RSS as the current setting; one sample does not establish a gain.
 These are tradeoffs and rejected default changes, not a statistical ranking.
+
+A follow-up search bracketed two more cold probes with the current setting:
+Go assignment took 12.746 s and 15.645 s; explicit static locality took
+56.100 s / 4.445 GiB maximum RSS, and disabling the soft target (`--maxMemory 0`)
+took 19.416 s / 6.392 GiB. All four runs retained the same 23 complete diagnostic
+messages and nonzero status. Neither candidate justified a default change.
+The repeated reference exposes host variability; these single probes do not
+establish a statistical ranking or a general memory/speed guarantee.
 
 The instrumented profile identified large tRPC and Prisma type materialization
 as the dominant work. Its extra instrumentation was excluded from candidate
